@@ -8,6 +8,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     && rm -rf /var/lib/apt/lists/*
 
+# Create non-root user (UID 1000) for bot execution
+# Phase 0 stub doesn't enforce USER yet, but Phase 1+ MUST use:
+#   USER 1000:1000
+# SECURITY: running as root exposes host if container escapes. For a bot
+# trading real money, non-root is a hard requirement (SECURITY.md P0 #3).
+
 # Python deps (Phase 0: requirements.txt; Phase 1+ will use poetry)
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt

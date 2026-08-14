@@ -12,11 +12,13 @@ services:
       - .env
     volumes:
       - ./logs:/app/logs
-      - ./data:/app/data:ro
     networks:
       - alphard-net
     # Phase 0: healthcheck отключён (entrypoint — stub, не поднимает HTTP)
     # TODO Phase 1: реальный health endpoint через FastAPI
+    # SECURITY: running as root. Phase 1+ MUST add:
+    #   user: "1000:1000"
+    # to reduce attack surface (SECURITY.md P0 #3).
     deploy:
       resources:
         limits:

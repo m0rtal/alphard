@@ -2,6 +2,8 @@
 
 Autonomous trading bot на MOEX. Apache-2.0, self-hosted, Docker-only.
 
+> **⚠️ Phase 0 skeleton (commit 3c48d23).** Это bootstrap: Risk Agent scaffold, Docker stack, docs. **Бот НЕ торгует.** Phase 1+ добавят Data Agent, Quant Agent, Macro Agent, Execution Agent, Coordinator. Все claims в этом README про "live trading" относятся к Phase 4+, не к текущему state.
+
 ## Что это
 
 Alphard — автономный multi-agent trading system:
@@ -27,10 +29,14 @@ cd alphard
 cp .env.example .env
 # Edit .env — заполнить TINKOFF_SANDBOX_TOKEN обязательно
 
-# 3. Запустить через Docker Compose
+# 3. Установить pre-commit hooks (gitleaks активен)
+pip install pre-commit
+pre-commit install
+
+# 4. Запустить через Docker Compose
 docker compose up -d
 
-# 4. Проверить
+# 5. Проверить
 docker compose ps
 docker compose logs -f alphard-bot
 curl http://localhost:8080/health
