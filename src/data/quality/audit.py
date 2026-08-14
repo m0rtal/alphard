@@ -56,7 +56,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime, timezone
-from typing import Protocol
+from typing import Any, Protocol
 
 from .severity import Issue
 
@@ -110,8 +110,8 @@ class PostgresAuditLog:
     def __init__(self, dsn: str | None = None, table: str = "data_quality_events") -> None:
         self._dsn = dsn or os.environ.get("ALPHARD_PG_DSN")
         self._table = table
-        self._conn = None
-        self._cursor = None
+        self._conn: Any = None
+        self._cursor: Any = None
 
     def _ensure_conn(self) -> None:
         if self._conn is not None:
@@ -122,8 +122,8 @@ class PostgresAuditLog:
             import psycopg  # type: ignore[import-not-found]
         except ImportError as e:  # pragma: no cover — environment-dependent
             raise RuntimeError("PostgresAuditLog needs psycopg: install with `pip install psycopg[binary]`") from e
-        self._conn = psycopg.connect(self._dsn)
-        self._cursor = self._conn.cursor()
+        self._conn = psycopg.connect(self._dsn)  # type: ignore[attr-defined]
+        self._cursor = self._conn.cursor()  # type: ignore[attr-defined]
 
     def write_event(self, issue: Issue, *, ticker: str, gate: str) -> None:
         self._ensure_conn()

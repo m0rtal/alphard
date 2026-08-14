@@ -96,10 +96,10 @@ class SourceSeries(BaseModel):
         raw = data.get("bars")
         if raw is not None:
             # Probe the first element to decide whether to coerce.
-            first = raw[0]  # type: ignore[index]
+            first = raw[0]  # type: ignore[index,attr-defined]
             if not isinstance(first, tuple):
                 coerced: list[tuple[date, float]] = []
-                for b in raw:  # type: ignore[union-iter]
+                for b in raw:  # type: ignore[union-iter,attr-defined]
                     coerced.append((b.primary_key, b.close))  # type: ignore[union-attr]
                 data["bars"] = tuple(coerced)
         super().__init__(**data)

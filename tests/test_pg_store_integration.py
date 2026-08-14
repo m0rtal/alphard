@@ -237,11 +237,14 @@ class TestOHLCVCRUD:
 
 
 class TestErrorPaths:
-    def test_invalid_dsn_raises(self):
+    def test_invalid_dsn_raises(self, monkeypatch):
         from src.data.store import StoreError
 
+        # CI sets ALPHARD_PG_DSN globally — must clear it for this test
+        monkeypatch.delenv("ALPHARD_PG_DSN", raising=False)
+
         with pytest.raises(StoreError):
-            # dsn=None explicitly + remove env so it actually raises
+            # dsn=None explicitly + env cleared so it actually raises
             PostgresDataStore(dsn=None)
 
     def test_close_idempotent(self, pg_store):

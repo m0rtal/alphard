@@ -239,7 +239,7 @@ class TinkoffAccount(BrokerAccount):
 def from_env(env: Optional[dict] = None) -> TinkoffAccount:
     """Construct TinkoffAccount from environment variables."""
     if env is None:
-        env = os.environ
+        env = dict(os.environ)  # cast _Environ[str] to dict[str, str]
     sandbox_token = env.get("TINKOFF_SANDBOX_TOKEN")
     real_token = env.get("TINKOFF_REAL_TOKEN")
     account_id = env.get("TINKOFF_ACCOUNT_ID", "SB1")
