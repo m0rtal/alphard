@@ -25,9 +25,14 @@ Alphard — автономный multi-agent trading system:
 git clone https://github.com/m0rtal/alphard.git
 cd alphard
 
-# 2. Скопировать .env и заполнить
+# 2. Скопировать .env.example и сгенерировать секреты
 cp .env.example .env
-# Edit .env — заполнить TINKOFF_SANDBOX_TOKEN обязательно
+# Сгенерируй пароли для postgres/redis/grafana (≥16 chars каждый):
+echo "POSTGRES_PASSWORD=$(openssl rand -base64 24)" >> .env
+echo "REDIS_PASSWORD=$(openssl rand -base64 24)" >> .env
+echo "GRAFANA_ADMIN_PASSWORD=$(openssl rand -base64 24)" >> .env
+# Заполни TINKOFF_SANDBOX_TOKEN обязательно (https://www.tbank.ru/invest/settings/api)
+# Открой .env в редакторе и впиши значения.
 
 # 3. Установить pre-commit hooks (gitleaks активен)
 pip install pre-commit
@@ -41,6 +46,9 @@ docker compose ps
 docker compose logs -f alphard-bot
 # NB: Phase 0 — stub. /health endpoint появится в Phase 1.
 # Сейчас "увидеть alive" можно только через docker compose logs.
+
+# Опционально: поднять observability (Prometheus + Grafana, Phase 3+)
+docker compose --profile observability up -d
 ```
 
 ## Структура

@@ -1,0 +1,19 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "graphTooltip": 0,
+  "panels": [],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["alphard", "phase-0"],
+  "templating": {"list": []},
+  "time": {"from": "now-6h", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Alphard — Phase 0 placeholder",
+  "uid": "alphard-phase0",
+  "version": 1,
+  "weekStart": ""
+}

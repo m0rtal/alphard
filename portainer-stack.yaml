@@ -1,25 +1,35 @@
 version: "3.9"
 
-# Alphard Phase 0 stack — все секреты обязательны (${VAR} refs, Portainer подставит из Env payload)
+# Alphard stack — Portainer deployment variant.
+# Все секреты обязательны (${VAR} refs, Portainer подставит из Env payload).
 # См. docs/SECURITY.md P0 #6: пароли > 16 chars обязательны.
 # См. README.md "Quickstart": перед deploy задай Env vars в Portainer UI или через API payload.
+#
+# ВАЖНО: этот файл синхронизирован с docker-compose.yaml (D-H3).
+# - image alphard-bot = alphard:latest (тот же image, что собирает локальный
+#   docker compose build; не запускаем python:3.11-slim с inline-установкой
+#   pytest в прод).
+# - env vars и volumes совпадают с docker-compose.yaml.
+# - Volume alphard-logs используется как named (на .107 нет ./logs bind-mount).
+# - Memory/CPU лимиты = те же 2G / 1.0 cpu.
+# Перед любым изменением — сверяйся с docker-compose.yaml.
 
 services:
   alphard-bot:
-    image: python:3.11-slim
+    image: alphard:latest
     container_name: alphard-bot
     restart: unless-stopped
-    command: >
-      sh -c "apt-get update && apt-get install -y --no-install-recommends curl git &&
-             pip install --no-cache-dir pydantic pytest pytest-cov &&
-             python -c 'import time; print(\"alphard-bot heartbeat\", flush=True); time.sleep(3600)'"
+    env_file:
+      - .env
     environment:
-      TINKOFF_SANDBOX_TOKEN: ${TINKOFF_SANDBOX_TOKEN}
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
-      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      ENV: ${ENV:-production}
+      TINKOFF_SANDBOX_TOKEN: ${TINKOFF_SANDBOX_TOKEN:?TINKOFF_SANDBOX_TOKEN required}
+      TINKOFF_REAL_TOKEN: ${TINKOFF_REAL_TOKEN:-}
+      POSTGRES_USER: ${POSTGRES_USER:-alphard}
+      POSTGRES_DB: ${POSTGRES_DB:-alphard}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD required}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_DIR: ${LOG_DIR:-/app/logs}
       RISK_MAX_DD_PCT: ${RISK_MAX_DD_PCT:-10}
       RISK_MAX_POSITION_PCT: ${RISK_MAX_POSITION_PCT:-5}
       RISK_MAX_SECTOR_PCT: ${RISK_MAX_SECTOR_PCT:-30}
@@ -34,19 +44,26 @@ services:
       - alphard-net
     # Phase 0: healthcheck отключён (entrypoint — stub, не поднимает HTTP)
     # TODO Phase 1: реальный health endpoint через FastAPI
+    # SECURITY: работает под non-root user alphard (UID 1000) из Dockerfile.
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "1.0"
 
   postgres:
     image: postgres:16-alpine
     container_name: alphard-postgres
     restart: unless-stopped
     environment:
-      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_USER: ${POSTGRES_USER:-alphard}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}
-      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_DB: ${POSTGRES_DB:-alphard}
     volumes:
       - alphard-postgres-data:/var/lib/postgresql/data
+    # ports: NO — postgres ТОЛЬКО внутри alphard-net (SECURITY.md P0 #8)
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-alphard}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -70,10 +87,45 @@ services:
     networks:
       - alphard-net
 
+  # Observability — опциональный профиль (Phase 3+)
+  # Включается через Portainer: stack edit → Profiles → observability.
+  # Skeleton-конфиги в docker/prometheus/ и docker/grafana/dashboards/.
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: alphard-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - alphard-prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - alphard-net
+    profiles: ["observability"]
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: alphard-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD required}
+    volumes:
+      - alphard-grafana-data:/var/lib/grafana
+      - ./docker/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - alphard-net
+    profiles: ["observability"]
+
 volumes:
   alphard-logs:
   alphard-postgres-data:
   alphard-redis-data:
+  alphard-prometheus-data:
+  alphard-grafana-data:
 
 networks:
   alphard-net:

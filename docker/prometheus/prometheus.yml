@@ -1,0 +1,22 @@
+# Prometheus skeleton config — Phase 3+
+# Включается через профиль: docker compose --profile observability up -d
+# Targets наполняются в Phase 1+ (Data Agent, Quant Agent, Execution Agent).
+# Сейчас только self-scrape для проверки что Prometheus alive.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+# Retention is configured via --storage.tsdb.retention-time flag (default 15d).
+# Override via PROMETHEUS_RETENTION_DAYS in .env (Phase 3+).
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # Phase 3+: добавить jobs для alphard-bot metrics endpoint
+  # (требует /metrics HTTP endpoint в src/main.py).
+  # - job_name: alphard-bot
+  #   static_configs:
+  #     - targets: ["alphard-bot:8000"]
