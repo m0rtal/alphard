@@ -2,6 +2,7 @@
 
 Pure pydantic, no broker SDK dependency. Used by both RiskGate and TinkoffAccount.
 """
+
 from __future__ import annotations
 
 from decimal import Decimal
@@ -74,6 +75,7 @@ class LimitOrder(BaseModel):
     @classmethod
     def _upper(cls, v: str) -> str:
         return v.upper().strip()
+
     @field_validator("price")
     @classmethod
     def _positive(cls, v: Decimal) -> Decimal:

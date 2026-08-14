@@ -7,6 +7,7 @@ chunks, max 30 minutes total, with rate-limit TokenBucket.
 Use: OrderSlicer.slice(intent, adv_shares, risk_limits) -> list[slice_batch]
 where each slice_batch has cumulative_pct + start_at + end_at.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -61,8 +62,6 @@ class OrderSlicer:
             start_at = datetime.utcnow()
 
         chunks = []
-        remaining = self.parent_qty
-        cumulative = Decimal("0")
 
         # If parent fits in 5% ADV single chunk
         if self.parent_qty <= self.adv_shares * self.CHUNK_PCT / Decimal("100"):
@@ -81,9 +80,8 @@ class OrderSlicer:
         # Multiple chunks: 5% ADV per batch
         chunk_size = self.adv_shares * self.CHUNK_PCT / Decimal("100")
         n_chunks = max(1, int((self.parent_qty / chunk_size).to_integral_value()))
-        # Cap n_chunks so total duration <= MAX_DURATION (with safe margin)
+        # Cap n_chunks so total duration <= MAX_DURATION
         n_chunks = max(1, n_chunks)
-        # ensure last_end_at - first_start_at <= MAX_DURATION
         while n_chunks > 1:
             interval = self.MAX_DURATION / n_chunks
             last_end = start_at + n_chunks * interval

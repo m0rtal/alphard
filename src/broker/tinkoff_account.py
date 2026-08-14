@@ -9,6 +9,7 @@ without touching the network.
 If t-tech-investments SDK is not installed (sandbox or missing dep),
 falls back to MockTinkoffClient for unit testing.
 """
+
 from __future__ import annotations
 
 import logging
@@ -73,15 +74,11 @@ class TinkoffAccount(BrokerAccount):
                 time.sleep(sleep_for)
         self._last_request_ts.append(time.time())
 
-    def _build_intent_and_state(
-        self, order: MarketOrder | LimitOrder
-    ):
+    def _build_intent_and_state(self, order: MarketOrder | LimitOrder):
         """Build TradeIntent + PortfolioState for RiskGate."""
         from src.risk.gate import PortfolioState, Position as RiskPosition, TradeIntent
 
-        order_type = (
-            OrderType.LIMIT if isinstance(order, LimitOrder) else OrderType.MARKET
-        )
+        order_type = OrderType.LIMIT if isinstance(order, LimitOrder) else OrderType.MARKET
         price = order.price if isinstance(order, LimitOrder) else Decimal("1")
 
         intent = TradeIntent(

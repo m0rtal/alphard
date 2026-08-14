@@ -223,9 +223,7 @@ def _nearest_integer(ratio: float) -> int | None:
     return -int(n)  # negative sentinel -> reverse
 
 
-def apply_split_adjustment(
-    bars: Iterable[Bar], splits: Sequence[SplitEvent]
-) -> list[Bar]:
+def apply_split_adjustment(bars: Iterable[Bar], splits: Sequence[SplitEvent]) -> list[Bar]:
     """Return a NEW list of bars where pre-split bars are adjusted.
 
     For each split at date D with stored ratio R, every bar STRICTLY
@@ -355,16 +353,10 @@ def check_historical(
                 kind=IssueKind.HST_SPLIT_DETECTED,
                 message=(
                     f"{len(events)} split event(s) detected: "
-                    + ", ".join(
-                        f"{e.date.isoformat()}={e.ratio:g}x" for e in events
-                    )
+                    + ", ".join(f"{e.date.isoformat()}={e.ratio:g}x" for e in events)
                 ),
                 count=len(events),
-                extra={
-                    "events": ",".join(
-                        f"{e.date.isoformat()}:{e.ratio:g}" for e in events
-                    )
-                },
+                extra={"events": ",".join(f"{e.date.isoformat()}:{e.ratio:g}" for e in events)},
             )
         )
 

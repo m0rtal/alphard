@@ -67,10 +67,7 @@ def load_bars_from_csv(path: str) -> list[Bar]:
         reader = csv.DictReader(f)
         missing = [c for c in REQUIRED_CSV_COLUMNS if c not in (reader.fieldnames or [])]
         if missing:
-            raise ValueError(
-                f"CSV missing required columns: {','.join(missing)}; "
-                f"got {reader.fieldnames}"
-            )
+            raise ValueError(f"CSV missing required columns: {','.join(missing)}; " f"got {reader.fieldnames}")
         for row in reader:
             try:
                 bar = Bar(
@@ -93,9 +90,7 @@ def load_closes_from_csv(path: str, source_name: str) -> SourceSeries:
     with open(path, "r", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            pairs.append(
-                (date.fromisoformat(row["primary_key"]), float(row["close"]))
-            )
+            pairs.append((date.fromisoformat(row["primary_key"]), float(row["close"])))
     return SourceSeries(source_name=source_name, bars=tuple(pairs))
 
 

@@ -7,12 +7,12 @@ OrderFlow is the canonical entry point for placing an order:
 4. TinkoffAccount.place_order() — submit each slice
 5. Audit log to Postgres (Phase 3.1)
 """
+
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Optional
 
 from src.broker.account import BrokerAccount, PortfolioSnapshot
 from src.broker.orders import (
@@ -56,13 +56,6 @@ class OrderFlow:
         quantity: Decimal,
         portfolio: PortfolioSnapshot,
     ) -> OrderFlowResult:
-        from src.risk.gate import (
-            PortfolioState,
-            Position as RiskPosition,
-            RiskDecision,
-            TradeIntent,
-        )
-
         # 1. Universe filter
         if self._universe_filter and not self._universe_filter(symbol):
             logger.warning("Symbol %s blocked by universe filter", symbol)
@@ -77,6 +70,8 @@ class OrderFlow:
             )
 
         # 2. RiskGate
+        from src.risk.gate import RiskDecision, TradeIntent
+
         state = self._portfolio_to_state(portfolio)
         intent = TradeIntent(
             symbol=symbol.upper(),
@@ -145,9 +140,7 @@ class OrderFlow:
             )
             for p in portfolio.positions
         ]
-        total = portfolio.cash + sum(
-            (p.quantity * p.avg_price for p in portfolio.positions), Decimal("0")
-        )
+        total = portfolio.cash + sum((p.quantity * p.avg_price for p in portfolio.positions), Decimal("0"))
         return PortfolioState(
             total_equity=total,
             cash=portfolio.cash,

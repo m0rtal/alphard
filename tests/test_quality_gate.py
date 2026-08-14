@@ -115,10 +115,7 @@ class TestSeverity:
         assert Severity.worst() is None
         assert Severity.worst(Severity.LOW) == Severity.LOW
         assert Severity.worst(Severity.HIGH, Severity.LOW) == Severity.HIGH
-        assert (
-            Severity.worst(Severity.LOW, Severity.MEDIUM, Severity.CRITICAL)
-            == Severity.CRITICAL
-        )
+        assert Severity.worst(Severity.LOW, Severity.MEDIUM, Severity.CRITICAL) == Severity.CRITICAL
 
     def test_catalog_is_exhaustive(self) -> None:
         """Every IssueKind has a severity — no silent defaults."""
@@ -128,11 +125,7 @@ class TestSeverity:
 
     def test_catalog_invariants(self) -> None:
         """CRITICAL must mean hard-reject; HIGH must mean skip-ticker."""
-        critical_kinds = {
-            k for k, v in [
-                (k, severity_for(k)) for k in IssueKind
-            ] if v == Severity.CRITICAL
-        }
+        critical_kinds = {k for k, v in [(k, severity_for(k)) for k in IssueKind] if v == Severity.CRITICAL}
         high_kinds = {k for k in IssueKind if severity_for(k) == Severity.HIGH}
         medium_kinds = {k for k in IssueKind if severity_for(k) == Severity.MEDIUM}
         low_kinds = {k for k in IssueKind if severity_for(k) == Severity.LOW}
@@ -178,17 +171,13 @@ class TestSeverity:
         assert not empty.rejected
         assert not empty.skipped
 
-        crit_issue = Issue.make(
-            gate="g", kind=IssueKind.ING_MISSING_COLUMNS, message="x"
-        )
+        crit_issue = Issue.make(gate="g", kind=IssueKind.ING_MISSING_COLUMNS, message="x")
         r = QualityReport(ticker="X", gate="g", issues=(crit_issue,))
         assert not r.passed
         assert r.rejected
         assert not r.skipped
 
-        high_issue = Issue.make(
-            gate="g", kind=IssueKind.ING_RANGE_VIOLATION, message="x"
-        )
+        high_issue = Issue.make(gate="g", kind=IssueKind.ING_RANGE_VIOLATION, message="x")
         r = QualityReport(ticker="X", gate="g", issues=(high_issue,))
         assert not r.passed
         assert not r.rejected
@@ -196,9 +185,7 @@ class TestSeverity:
 
     def test_deterministic_report(self) -> None:
         """Same issues -> same report (frozen model + tuple)."""
-        i = Issue.make(
-            gate="g", kind=IssueKind.ING_OUTLIER, message="x", count=3
-        )
+        i = Issue.make(gate="g", kind=IssueKind.ING_OUTLIER, message="x", count=3)
         r1 = QualityReport(ticker="X", gate="g", issues=(i,))
         r2 = QualityReport(ticker="X", gate="g", issues=(i,))
         assert r1 == r2
@@ -234,9 +221,7 @@ class TestIngestionGate:
         # Update FROZEN_NOW to be 3 calendar days after the last bar so
         # staleness doesn't fire. The last bar will be a Friday-ish date.
         last = bars[-1].primary_key
-        now = datetime(last.year, last.month, last.day, tzinfo=timezone.utc) + timedelta(
-            days=1
-        )
+        now = datetime(last.year, last.month, last.day, tzinfo=timezone.utc) + timedelta(days=1)
         r = check_ingestion("SBER", bars, now=now)
         # We expect no range/zero/nan/outlier/stale issues. We may see
         # ING_LARGE_GAP (large_gap_calendar_days=7 default) if there
@@ -280,7 +265,9 @@ class TestIngestionGate:
         with pytest.raises(Exception):
             Bar(
                 primary_key=date(2026, 1, 1),
-                open=1.0, high=2.0, low=0.5,
+                open=1.0,
+                high=2.0,
+                low=0.5,
                 close=float("nan"),  # type: ignore[arg-type]
                 volume=0,
             )
@@ -405,13 +392,25 @@ class TestHistoricalGate:
         # We force that by setting open=close (no spread) so the
         # cross-field consistency check passes.
         pre = [
-            Bar(primary_key=_bars(1, base=date(2025, 1, 1))[0].primary_key + timedelta(days=i),
-                open=500.0, high=500.0, low=500.0, close=500.0, volume=10_000)
+            Bar(
+                primary_key=_bars(1, base=date(2025, 1, 1))[0].primary_key + timedelta(days=i),
+                open=500.0,
+                high=500.0,
+                low=500.0,
+                close=500.0,
+                volume=10_000,
+            )
             for i in range(5)
         ]
         post = [
-            Bar(primary_key=_bars(1, base=date(2025, 1, 10))[0].primary_key + timedelta(days=i),
-                open=100.0, high=100.0, low=100.0, close=100.0, volume=10_000)
+            Bar(
+                primary_key=_bars(1, base=date(2025, 1, 10))[0].primary_key + timedelta(days=i),
+                open=100.0,
+                high=100.0,
+                low=100.0,
+                close=100.0,
+                volume=10_000,
+            )
             for i in range(5)
         ]
         # Replace the pre bar dates with actual trading-day dates.
@@ -432,14 +431,22 @@ class TestHistoricalGate:
         pre = [
             Bar(
                 primary_key=d,
-                open=10.0, high=10.0, low=10.0, close=10.0, volume=10_000,
+                open=10.0,
+                high=10.0,
+                low=10.0,
+                close=10.0,
+                volume=10_000,
             )
             for d in base_dates[:5]
         ]
         post = [
             Bar(
                 primary_key=d,
-                open=100.0, high=100.0, low=100.0, close=100.0, volume=10_000,
+                open=100.0,
+                high=100.0,
+                low=100.0,
+                close=100.0,
+                volume=10_000,
             )
             for d in base_dates[5:10]
         ]
@@ -454,12 +461,10 @@ class TestHistoricalGate:
         """After applying a 5:1 forward split, pre bars close -> ~100."""
         base_dates = [b.primary_key for b in _bars(10, base=date(2025, 1, 1))]
         pre = [
-            Bar(primary_key=d, open=500.0, high=500.0, low=500.0, close=500.0, volume=10_000)
-            for d in base_dates[:5]
+            Bar(primary_key=d, open=500.0, high=500.0, low=500.0, close=500.0, volume=10_000) for d in base_dates[:5]
         ]
         post = [
-            Bar(primary_key=d, open=100.0, high=100.0, low=100.0, close=100.0, volume=10_000)
-            for d in base_dates[5:10]
+            Bar(primary_key=d, open=100.0, high=100.0, low=100.0, close=100.0, volume=10_000) for d in base_dates[5:10]
         ]
         bars = pre + post
         events = detect_splits(bars)
@@ -474,13 +479,9 @@ class TestHistoricalGate:
     def test_apply_split_adjustment_reverse(self) -> None:
         """After applying a 1:10 reverse split, pre bars close -> ~100."""
         base_dates = [b.primary_key for b in _bars(10, base=date(2025, 1, 1))]
-        pre = [
-            Bar(primary_key=d, open=10.0, high=10.0, low=10.0, close=10.0, volume=10_000)
-            for d in base_dates[:5]
-        ]
+        pre = [Bar(primary_key=d, open=10.0, high=10.0, low=10.0, close=10.0, volume=10_000) for d in base_dates[:5]]
         post = [
-            Bar(primary_key=d, open=100.0, high=100.0, low=100.0, close=100.0, volume=10_000)
-            for d in base_dates[5:10]
+            Bar(primary_key=d, open=100.0, high=100.0, low=100.0, close=100.0, volume=10_000) for d in base_dates[5:10]
         ]
         bars = pre + post
         events = detect_splits(bars)
@@ -493,12 +494,10 @@ class TestHistoricalGate:
         """Applying the same split twice to the same input is a no-op."""
         base_dates = [b.primary_key for b in _bars(10, base=date(2025, 1, 1))]
         pre = [
-            Bar(primary_key=d, open=500.0, high=500.0, low=500.0, close=500.0, volume=10_000)
-            for d in base_dates[:5]
+            Bar(primary_key=d, open=500.0, high=500.0, low=500.0, close=500.0, volume=10_000) for d in base_dates[:5]
         ]
         post = [
-            Bar(primary_key=d, open=100.0, high=100.0, low=100.0, close=100.0, volume=10_000)
-            for d in base_dates[5:10]
+            Bar(primary_key=d, open=100.0, high=100.0, low=100.0, close=100.0, volume=10_000) for d in base_dates[5:10]
         ]
         bars = pre + post
         events = detect_splits(bars)
@@ -510,7 +509,11 @@ class TestHistoricalGate:
         bars = _bars(5)
         future_bar = Bar(
             primary_key=date(2030, 1, 1),
-            open=100.0, high=101.0, low=99.0, close=100.0, volume=1000,
+            open=100.0,
+            high=101.0,
+            low=99.0,
+            close=100.0,
+            volume=1000,
         )
         r = check_historical("X", bars + [future_bar], now=datetime(2026, 8, 14, tzinfo=timezone.utc))
         assert IssueKind.HST_FUTURE_ROW in {i.kind for i in r.issues}
@@ -521,9 +524,7 @@ class TestHistoricalGate:
     def test_delisted_is_high(self) -> None:
         bars = _bars(10)
         p = HistoricalParams(delisted_at=date(2025, 1, 5))
-        r = check_historical(
-            "X", bars, params=p, now=datetime(2026, 8, 14, tzinfo=timezone.utc)
-        )
+        r = check_historical("X", bars, params=p, now=datetime(2026, 8, 14, tzinfo=timezone.utc))
         assert IssueKind.HST_DELISTED in {i.kind for i in r.issues}
 
     def test_no_split_no_event(self) -> None:
@@ -534,12 +535,10 @@ class TestHistoricalGate:
     def test_split_event_reported(self) -> None:
         base_dates = [b.primary_key for b in _bars(10, base=date(2025, 1, 1))]
         pre = [
-            Bar(primary_key=d, open=500.0, high=500.0, low=500.0, close=500.0, volume=10_000)
-            for d in base_dates[:5]
+            Bar(primary_key=d, open=500.0, high=500.0, low=500.0, close=500.0, volume=10_000) for d in base_dates[:5]
         ]
         post = [
-            Bar(primary_key=d, open=100.0, high=100.0, low=100.0, close=100.0, volume=10_000)
-            for d in base_dates[5:10]
+            Bar(primary_key=d, open=100.0, high=100.0, low=100.0, close=100.0, volume=10_000) for d in base_dates[5:10]
         ]
         bars = pre + post
         r = check_historical("X", bars, now=datetime(2026, 8, 14, tzinfo=timezone.utc))
@@ -600,10 +599,7 @@ class TestCrossSource:
             bars=tuple(list(sa.bars)[:-5]),
         )
         r = check_cross_source("X", sa_short, sb_full)
-        assert any(
-            i.kind == IssueKind.XSC_SOURCE_MISSING and i.extra.get("dropped_b") == 5
-            for i in r.issues
-        )
+        assert any(i.kind == IssueKind.XSC_SOURCE_MISSING and i.extra.get("dropped_b") == 5 for i in r.issues)
 
 
 # ---------------------------------------------------------------------------
@@ -633,6 +629,7 @@ class TestAudit:
 
         # Ensure ALPHARD_PG_DSN is unset for this test.
         import os
+
         old = os.environ.pop("ALPHARD_PG_DSN", None)
         try:
             sink = make_default_audit_log()
@@ -710,13 +707,13 @@ class TestCLI:
         last = bars[-1].primary_key
         # Patch datetime.now to a known point so staleness is happy.
         import datetime as _dt
-        fixed_now = _dt.datetime(
-            last.year, last.month, last.day, tzinfo=_dt.timezone.utc
-        ) + _dt.timedelta(days=1)
+
+        fixed_now = _dt.datetime(last.year, last.month, last.day, tzinfo=_dt.timezone.utc) + _dt.timedelta(days=1)
         from src.data.quality import ingestion_gate, __main__ as cli_mod
 
         orig_now = ingestion_gate.datetime
         orig_main_now = cli_mod.datetime
+
         # Stub: replace datetime.now() everywhere by monkeypatching.
         class _FrozenDateTime(_dt.datetime):
             @classmethod
@@ -768,10 +765,14 @@ class TestCLI:
             [
                 "cross_source",
                 "SBER",
-                "--csv", str(a),
-                "--csv-b", str(b),
-                "--source-a", "tinkoff",
-                "--source-b", "moex",
+                "--csv",
+                str(a),
+                "--csv-b",
+                str(b),
+                "--source-a",
+                "tinkoff",
+                "--source-b",
+                "moex",
                 "--allow-high",
             ]
         )
@@ -806,7 +807,9 @@ class TestInvariants:
         with pytest.raises(Exception):
             Bar(
                 primary_key=date(2026, 1, 1),
-                open=1.0, high=2.0, low=0.5,
+                open=1.0,
+                high=2.0,
+                low=0.5,
                 close=float("nan"),  # type: ignore[arg-type]
                 volume=0,
             )
@@ -815,9 +818,7 @@ class TestInvariants:
         bars = _bars(10)
         bad = bars[3].model_copy(update={"high": 50.0, "low": 200.0})
         r = check_ingestion("X", bars[:3] + [bad] + bars[4:])
-        assert IssueKind.ING_RANGE_VIOLATION in {i.kind for i in r.issues}, (
-            "range violation must be flagged"
-        )
+        assert IssueKind.ING_RANGE_VIOLATION in {i.kind for i in r.issues}, "range violation must be flagged"
 
     def test_severity_assignment_known_good_vs_known_bad(self) -> None:
         """Spec acceptance: severity correctly assigned for known-good vs bad.
@@ -828,9 +829,7 @@ class TestInvariants:
         # Known-good: 300 smooth bars ending today.
         bars = _bars(300)
         last = bars[-1].primary_key
-        now = datetime(last.year, last.month, last.day, tzinfo=timezone.utc) + timedelta(
-            days=1
-        )
+        now = datetime(last.year, last.month, last.day, tzinfo=timezone.utc) + timedelta(days=1)
         r_good = check_ingestion("X", bars, now=now)
         # We accept any of the LOW-only issues (e.g. ING_LOW_VOLUME if
         # by chance >10% of rows have vol=0). None of our default bars
@@ -933,7 +932,11 @@ class TestExtraIngestion:
         with pytest.raises(Exception):
             Bar(
                 primary_key=date(2026, 1, 1),
-                open=-1.0, high=2.0, low=0.5, close=1.0, volume=0,
+                open=-1.0,
+                high=2.0,
+                low=0.5,
+                close=1.0,
+                volume=0,
             )
 
     def test_ingestion_params_frozen(self) -> None:
@@ -948,7 +951,10 @@ class TestExtraAudit:
         """InMemoryAuditLog preserves the extra dict round-trip."""
         sink = InMemoryAuditLog()
         i = Issue.make(
-            gate="g", kind=IssueKind.ING_OUTLIER, message="x", count=3,
+            gate="g",
+            kind=IssueKind.ING_OUTLIER,
+            message="x",
+            count=3,
             extra={"first_index": 7, "threshold": 6.0},
         )
         sink.write_event(i, ticker="X", gate="g")
@@ -1043,9 +1049,7 @@ class TestExtraHistorical:
         splits = [SplitEvent(date=earlier, ratio=2.0, confirmed=True)]
         adj = apply_split_adjustment(bars, splits)
         for orig, new in zip(bars, adj):
-            assert orig.close == new.close, (
-                "bars at-or-after split date must be untouched"
-            )
+            assert orig.close == new.close, "bars at-or-after split date must be untouched"
 
     def test_apply_split_adjustment_pre_split_bar_adjusted(self) -> None:
         """Bars STRICTLY BEFORE the split date are adjusted."""
@@ -1096,14 +1100,22 @@ class TestExtraIngestion:
         with pytest.raises(Exception):
             Bar(
                 primary_key=date(2026, 1, 1),
-                open=-1.0, high=2.0, low=0.5, close=1.0, volume=0,
+                open=-1.0,
+                high=2.0,
+                low=0.5,
+                close=1.0,
+                volume=0,
             )
 
     def test_bar_model_rejects_zero_volume(self) -> None:
         """Bar model allows volume=0 (zero trading day) — only the gate flags it."""
         bar = Bar(
             primary_key=date(2026, 1, 1),
-            open=1.0, high=2.0, low=0.5, close=1.0, volume=0,
+            open=1.0,
+            high=2.0,
+            low=0.5,
+            close=1.0,
+            volume=0,
         )
         assert bar.volume == 0  # OK — gate has its own threshold.
 
@@ -1119,7 +1131,10 @@ class TestExtraAudit:
         """InMemoryAuditLog preserves the extra dict round-trip."""
         sink = InMemoryAuditLog()
         i = Issue.make(
-            gate="g", kind=IssueKind.ING_OUTLIER, message="x", count=3,
+            gate="g",
+            kind=IssueKind.ING_OUTLIER,
+            message="x",
+            count=3,
             extra={"first_index": 7, "threshold": 6.0},
         )
         sink.write_event(i, ticker="X", gate="g")

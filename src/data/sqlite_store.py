@@ -281,17 +281,13 @@ class InMemorySQLiteStore(DataStore):
             raise StoreError(f"upsert_corporate_actions failed: {exc}") from exc
         return len(rows)
 
-    def query_corporate_actions(
-        self, ticker: str, start: date, end: date
-    ) -> list[CorporateAction]:
+    def query_corporate_actions(self, ticker: str, start: date, end: date) -> list[CorporateAction]:
         sql = (
             "SELECT ticker, ts, kind, value, source FROM corporate_actions "
             "WHERE ticker = ? AND ts BETWEEN ? AND ? ORDER BY ts"
         )
         try:
-            cur = self._conn.execute(
-                sql, (ticker.upper(), start.isoformat(), end.isoformat())
-            )
+            cur = self._conn.execute(sql, (ticker.upper(), start.isoformat(), end.isoformat()))
         except sqlite3.Error as exc:
             raise StoreError(f"query_corporate_actions failed: {exc}") from exc
         return [_row_to_action(r) for r in cur.fetchall()]

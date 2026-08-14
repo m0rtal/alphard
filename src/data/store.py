@@ -98,9 +98,7 @@ class DataStore(abc.ABC):
         """Insert-or-update corporate actions."""
 
     @abc.abstractmethod
-    def query_corporate_actions(
-        self, ticker: str, start: date, end: date
-    ) -> list[CorporateAction]:
+    def query_corporate_actions(self, ticker: str, start: date, end: date) -> list[CorporateAction]:
         """Read corporate actions for ``ticker`` in ``[start, end]``."""
 
     # ---- diagnostics ----------------------------------------------------

@@ -118,8 +118,7 @@ class MOEXDataLoader(DataLoader):
                 "start": page * self._page_size,
             }
             url = (
-                f"{BASE_URL}/iss/engines/stock/markets/shares/securities/"
-                f"{urllib.parse.quote(ticker)}/candles.json"
+                f"{BASE_URL}/iss/engines/stock/markets/shares/securities/" f"{urllib.parse.quote(ticker)}/candles.json"
             )
             payload = self._get_json(url, params=params)
             candles = self._extract_block(payload, "candles")
@@ -177,9 +176,7 @@ class MOEXDataLoader(DataLoader):
                 return m
         return None
 
-    def _get_json(
-        self, url: str, *, params: dict[str, Any] | None = None
-    ) -> dict[str, Any]:
+    def _get_json(self, url: str, *, params: dict[str, Any] | None = None) -> dict[str, Any]:
         self.bucket.acquire()
         try:
             resp = self._session.get(url, params=params, timeout=self._timeout)

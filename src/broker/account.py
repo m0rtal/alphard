@@ -4,13 +4,13 @@ All concrete brokers (Tinkoff, BCS, Finam) implement this interface.
 The interface is intentionally narrow — only methods that need broker
 round-trip live here. Local computation belongs to other agents.
 """
+
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from typing import Optional
 
 from src.broker.orders import LimitOrder, MarketOrder, OrderStatus
 

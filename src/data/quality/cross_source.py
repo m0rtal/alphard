@@ -147,9 +147,7 @@ def _pearson(xs: list[float], ys: list[float]) -> float | None:
     return cov / math.sqrt(varx * vary)
 
 
-def _align(
-    series_a: SourceSeries, series_b: SourceSeries
-) -> tuple[list[date], list[float], list[float], int, int]:
+def _align(series_a: SourceSeries, series_b: SourceSeries) -> tuple[list[date], list[float], list[float], int, int]:
     """Inner-join two SourceSeries on primary_key.
 
     Returns
@@ -226,9 +224,7 @@ def check_cross_source(
             Issue.make(
                 gate="cross_source",
                 kind=IssueKind.XSC_SOURCE_MISSING,
-                message=(
-                    f"only {len(common)} aligned date(s); need >= {p.correlation_min_aligned_points}"
-                ),
+                message=(f"only {len(common)} aligned date(s); need >= {p.correlation_min_aligned_points}"),
                 count=p.correlation_min_aligned_points - len(common),
                 extra={"aligned_count": len(common)},
             )
@@ -256,8 +252,7 @@ def check_cross_source(
                 gate="cross_source",
                 kind=IssueKind.XSC_CORRELATION_LOW,
                 message=(
-                    f"Pearson correlation {corr:.4f} < {p.correlation_min:.4f} "
-                    f"on {len(common)} aligned dates"
+                    f"Pearson correlation {corr:.4f} < {p.correlation_min:.4f} " f"on {len(common)} aligned dates"
                 ),
                 count=1,
                 extra={
@@ -278,10 +273,7 @@ def check_cross_source(
             window_b = closes_b[i : i + win]
             if any(c <= 0 for c in window_a + window_b):
                 continue
-            mean_div = sum(
-                abs(math.log(a) - math.log(b))
-                for a, b in zip(window_a, window_b)
-            ) / win
+            mean_div = sum(abs(math.log(a) - math.log(b)) for a, b in zip(window_a, window_b)) / win
             if mean_div > max_mean_div:
                 max_mean_div = mean_div
                 max_window_end = common[i + win - 1]
@@ -299,9 +291,7 @@ def check_cross_source(
                     extra={
                         "max_mean_divergence": round(max_mean_div, 6),
                         "threshold": p.rolling_max_mean_divergence,
-                        "window_end": (
-                            max_window_end.isoformat() if max_window_end is not None else ""
-                        ),
+                        "window_end": (max_window_end.isoformat() if max_window_end is not None else ""),
                     },
                 )
             )

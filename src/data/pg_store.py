@@ -47,13 +47,9 @@ class PostgresDataStore(DataStore):
     def __init__(self, dsn: str | None = None, *, schema_sql_path: str | None = None) -> None:
         dsn = dsn or os.environ.get("ALPHARD_PG_DSN")
         if not dsn:
-            raise StoreError(
-                "PostgresDataStore: no DSN — pass dsn= or set $ALPHARD_PG_DSN"
-            )
+            raise StoreError("PostgresDataStore: no DSN — pass dsn= or set $ALPHARD_PG_DSN")
         self._dsn = dsn
-        self._schema_sql_path = schema_sql_path or os.path.join(
-            os.path.dirname(__file__), "schema.sql"
-        )
+        self._schema_sql_path = schema_sql_path or os.path.join(os.path.dirname(__file__), "schema.sql")
         # Imported lazily so the rest of the package works without psycopg.
         import psycopg
 
@@ -148,13 +144,11 @@ class PostgresDataStore(DataStore):
         self._connect()
         with self._conn.cursor() as cur:
             cur.execute(
-                "UPDATE ticker_universe SET delisted = TRUE, delisted_at = %s, "
-                "updated_at = NOW() WHERE ticker = %s",
+                "UPDATE ticker_universe SET delisted = TRUE, delisted_at = %s, " "updated_at = NOW() WHERE ticker = %s",
                 (at, ticker),
             )
             cur.execute(
-                "INSERT INTO delisting_log (ticker, delisted_at, reason, source) "
-                "VALUES (%s, %s, %s, 'manual')",
+                "INSERT INTO delisting_log (ticker, delisted_at, reason, source) " "VALUES (%s, %s, %s, 'manual')",
                 (ticker, at, reason),
             )
         self._conn.commit()
@@ -179,8 +173,17 @@ class PostgresDataStore(DataStore):
                 updated_at = NOW()
         """
         params = [
-            (r.ticker, r.ts, str(r.open), str(r.high), str(r.low),
-             str(r.close), str(r.volume), str(r.adj_close), r.source)
+            (
+                r.ticker,
+                r.ts,
+                str(r.open),
+                str(r.high),
+                str(r.low),
+                str(r.close),
+                str(r.volume),
+                str(r.adj_close),
+                r.source,
+            )
             for r in rows
         ]
         with self._conn.cursor() as cur:
@@ -230,9 +233,7 @@ class PostgresDataStore(DataStore):
         self._conn.commit()
         return len(rows)
 
-    def query_corporate_actions(
-        self, ticker: str, start: date, end: date
-    ) -> list[CorporateAction]:
+    def query_corporate_actions(self, ticker: str, start: date, end: date) -> list[CorporateAction]:
         self._connect()
         sql = (
             "SELECT ticker, ts, kind, value, source FROM corporate_actions "

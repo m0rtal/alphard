@@ -8,6 +8,7 @@ Local test:
     export ALPHARD_PG_DSN="host=192.168.48.3 port=5432 dbname=alphard user=alphard password=***"
     pytest tests/test_pg_store_integration.py -v
 """
+
 from __future__ import annotations
 
 import os
@@ -240,7 +241,8 @@ class TestErrorPaths:
         from src.data.store import StoreError
 
         with pytest.raises(StoreError):
-            PostgresDataStore(dsn="")
+            # dsn=None explicitly + remove env so it actually raises
+            PostgresDataStore(dsn=None)
 
     def test_close_idempotent(self, pg_store):
         pg_store.close()

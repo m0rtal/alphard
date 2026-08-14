@@ -117,15 +117,11 @@ class PostgresAuditLog:
         if self._conn is not None:
             return
         if not self._dsn:
-            raise RuntimeError(
-                "PostgresAuditLog requires a DSN: pass dsn=... or set $ALPHARD_PG_DSN"
-            )
+            raise RuntimeError("PostgresAuditLog requires a DSN: pass dsn=... or set $ALPHARD_PG_DSN")
         try:
             import psycopg  # type: ignore[import-not-found]
         except ImportError as e:  # pragma: no cover — environment-dependent
-            raise RuntimeError(
-                "PostgresAuditLog needs psycopg: install with `pip install psycopg[binary]`"
-            ) from e
+            raise RuntimeError("PostgresAuditLog needs psycopg: install with `pip install psycopg[binary]`") from e
         self._conn = psycopg.connect(self._dsn)
         self._cursor = self._conn.cursor()
 

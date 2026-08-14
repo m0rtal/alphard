@@ -7,6 +7,7 @@
 - Broker ABC contract (PortfolioSnapshot, get_positions)
 - Integration: OrderFlow end-to-end with mocked broker
 """
+
 from __future__ import annotations
 
 import os
@@ -32,6 +33,7 @@ from src.broker.tinkoff_account import BrokerError, TinkoffAccount
 # ────────────────────────────────────────────
 # Orders tests
 # ────────────────────────────────────────────
+
 
 class TestMarketOrder:
     def test_basic_creation(self):
@@ -89,6 +91,7 @@ class TestLimitOrder:
 # ────────────────────────────────────────────
 # Slicer tests
 # ────────────────────────────────────────────
+
 
 class TestOrderSlicer:
     def test_small_order_one_chunk(self):
@@ -157,6 +160,7 @@ class TestOrderSlicer:
 # TinkoffAccount tests
 # ────────────────────────────────────────────
 
+
 class TestTinkoffAccount:
     def test_sandbox_detection_true(self):
         a = TinkoffAccount(token="t.LjBLkGwDdj1rNBVODJyIRt3FR9BCad")
@@ -184,9 +188,8 @@ class TestTinkoffAccount:
         # Mock RiskGate that says NO
         mock_rg = MagicMock()
         from src.risk.gate import RiskDecision
-        mock_rg.evaluate.return_value = RiskDecision(
-            allowed=False, violations=("DD_EXCEEDED",)
-        )
+
+        mock_rg.evaluate.return_value = RiskDecision(allowed=False, violations=("DD_EXCEEDED",))
         a = TinkoffAccount(token="t.x", risk_gate=mock_rg)
         order = MarketOrder(ticker="SBER", side=OrderSide.BUY, quantity=Decimal("10"))
         status = a.place_order(order)
@@ -196,6 +199,7 @@ class TestTinkoffAccount:
     def test_risk_gate_approved_submits(self):
         mock_rg = MagicMock()
         from src.risk.gate import RiskDecision
+
         mock_rg.evaluate.return_value = RiskDecision(allowed=True, violations=())
         a = TinkoffAccount(token="t.x", risk_gate=mock_rg)
         order = MarketOrder(ticker="SBER", side=OrderSide.BUY, quantity=Decimal("10"))
@@ -206,6 +210,7 @@ class TestTinkoffAccount:
     def test_limit_order_submits(self):
         mock_rg = MagicMock()
         from src.risk.gate import RiskDecision
+
         mock_rg.evaluate.return_value = RiskDecision(allowed=True, violations=())
         a = TinkoffAccount(token="t.x", risk_gate=mock_rg)
         order = LimitOrder(ticker="SBER", side=OrderSide.BUY, quantity=Decimal("10"), price=Decimal("250"))
@@ -216,6 +221,7 @@ class TestTinkoffAccount:
         a = TinkoffAccount(token="t.x", rate_limit_per_sec=2)
         # Push 5 requests, count time taken
         import time
+
         start = time.time()
         for _ in range(3):
             a._rate_limit_acquire()
@@ -255,6 +261,7 @@ class TestTinkoffAccount:
         monkeypatch.setenv("TINKOFF_SANDBOX_TOKEN", "t.sandbox_token_value")
         monkeypatch.delenv("TINKOFF_REAL_TOKEN", raising=False)
         from src.broker.tinkoff_account import from_env
+
         a = from_env()
         assert a.is_sandbox() is True
         assert a._token == "t.sandbox_token_value"
@@ -263,6 +270,7 @@ class TestTinkoffAccount:
         monkeypatch.setenv("TINKOFF_SANDBOX_TOKEN", "placeholder_get_from_tbank")
         monkeypatch.delenv("TINKOFF_REAL_TOKEN", raising=False)
         from src.broker.tinkoff_account import from_env
+
         with pytest.raises(BrokerError):
             from_env()
 
@@ -270,6 +278,7 @@ class TestTinkoffAccount:
         monkeypatch.delenv("TINKOFF_SANDBOX_TOKEN", raising=False)
         monkeypatch.delenv("TINKOFF_REAL_TOKEN", raising=False)
         from src.broker.tinkoff_account import from_env
+
         with pytest.raises(BrokerError):
             from_env()
 
@@ -277,6 +286,7 @@ class TestTinkoffAccount:
         monkeypatch.delenv("TINKOFF_SANDBOX_TOKEN", raising=False)
         monkeypatch.setenv("TINKOFF_REAL_TOKEN", "real_account_token_xyz")
         from src.broker.tinkoff_account import from_env
+
         a = from_env()
         assert a._token == "real_account_token_xyz"
         assert a.is_sandbox() is False
@@ -295,6 +305,7 @@ class TestTinkoffAccount:
 
         # Portfolio with positions
         from datetime import datetime as _dt
+
         mock_pos = MagicMock()
         mock_pos.ticker = "SBER"
         # Mock Tinkoff MoneyValue struct: avg_position_price has Quotation
@@ -323,6 +334,7 @@ class TestTinkoffAccount:
         mock_client.instruments.find_instrument.return_value = inst
 
         import sys
+
         fake_module = MagicMock()
         fake_module.Client = mock_client_class
         monkeypatch.setitem(sys.modules, "tinkoff.invest", fake_module)
@@ -346,6 +358,7 @@ class TestTinkoffAccount:
         mock_client.users.get_accounts.return_value.accounts = [mock_acc]
 
         import sys
+
         fake_module = MagicMock()
         fake_module.Client = mock_client_class
         monkeypatch.setitem(sys.modules, "tinkoff.invest", fake_module)
@@ -362,6 +375,7 @@ class TestTinkoffAccount:
         mock_client.users.get_accounts.side_effect = RuntimeError("tinkoff down")
 
         import sys
+
         fake_module = MagicMock()
         fake_module.Client = mock_client_class
         monkeypatch.setitem(sys.modules, "tinkoff.invest", fake_module)
@@ -379,6 +393,7 @@ class TestTinkoffAccount:
         # RiskGate OK
         mock_rg = MagicMock()
         from src.risk.gate import RiskDecision
+
         mock_rg.evaluate.return_value = RiskDecision(allowed=True, violations=())
 
         # FIGI lookup
@@ -392,6 +407,7 @@ class TestTinkoffAccount:
         mock_client.orders.post_order.return_value = resp
 
         import sys
+
         fake_module = MagicMock()
         fake_module.Client = mock_client_class
         # Need the attribute access pattern used by code
@@ -415,6 +431,7 @@ class TestTinkoffAccount:
 
         mock_rg = MagicMock()
         from src.risk.gate import RiskDecision
+
         mock_rg.evaluate.return_value = RiskDecision(allowed=True, violations=())
 
         inst = MagicMock()
@@ -426,6 +443,7 @@ class TestTinkoffAccount:
         mock_client.orders.post_order.return_value = resp
 
         import sys
+
         fake_module = MagicMock()
         fake_module.Client = mock_client_class
         fake_module.orders.OrderDirection.ORDER_DIRECTION_BUY = "BUY"
@@ -436,8 +454,10 @@ class TestTinkoffAccount:
 
         a = TinkoffAccount(token="t.x", risk_gate=mock_rg)
         order = LimitOrder(
-            ticker="SBER", side=OrderSide.BUY,
-            quantity=Decimal("10"), price=Decimal("250.5"),
+            ticker="SBER",
+            side=OrderSide.BUY,
+            quantity=Decimal("10"),
+            price=Decimal("250.5"),
         )
         status = a.place_order(order)
         assert status == OrderStatus.FILLED
@@ -450,6 +470,7 @@ class TestTinkoffAccount:
 
         mock_rg = MagicMock()
         from src.risk.gate import RiskDecision
+
         mock_rg.evaluate.return_value = RiskDecision(allowed=True, violations=())
 
         inst = MagicMock()
@@ -459,6 +480,7 @@ class TestTinkoffAccount:
         mock_client.orders.post_order.side_effect = RuntimeError("api error")
 
         import sys
+
         fake_module = MagicMock()
         fake_module.Client = mock_client_class
         fake_module.orders.OrderDirection.ORDER_DIRECTION_BUY = "BUY"
@@ -481,6 +503,7 @@ class TestTinkoffAccount:
 
         mock_rg = MagicMock()
         from src.risk.gate import RiskDecision
+
         mock_rg.evaluate.return_value = RiskDecision(allowed=True, violations=())
 
         # FIGI found in TQBR class
@@ -501,6 +524,7 @@ class TestTinkoffAccount:
         mock_client.orders.post_order.return_value = resp
 
         import sys
+
         fake_module = MagicMock()
         fake_module.Client = mock_client_class
         fake_module.orders.OrderDirection.ORDER_DIRECTION_BUY = "BUY"
@@ -539,6 +563,7 @@ class TestTinkoffAccount:
 
         mock_rg = MagicMock()
         from src.risk.gate import RiskDecision
+
         mock_rg.evaluate.return_value = RiskDecision(allowed=True, violations=())
 
         inst = MagicMock()
@@ -550,6 +575,7 @@ class TestTinkoffAccount:
         mock_client.orders.post_order.return_value = resp
 
         import sys
+
         fake_module = MagicMock()
         fake_module.Client = mock_client_class
         fake_module.orders.OrderDirection.ORDER_DIRECTION_BUY = "BUY"
@@ -573,6 +599,7 @@ class TestTinkoffAccount:
         mock_client_class.return_value.__exit__ = MagicMock(return_value=False)
 
         import sys
+
         fake_module = MagicMock()
         fake_module.Client = mock_client_class
         monkeypatch.setitem(sys.modules, "tinkoff.invest", fake_module)
@@ -590,6 +617,7 @@ class TestTinkoffAccount:
         mock_client.orders.cancel_order.side_effect = RuntimeError("cancel failed")
 
         import sys
+
         fake_module = MagicMock()
         fake_module.Client = mock_client_class
         monkeypatch.setitem(sys.modules, "tinkoff.invest", fake_module)
@@ -606,6 +634,7 @@ class TestTinkoffAccount:
         mock_client.instruments.find_instrument.side_effect = RuntimeError("network")
 
         import sys
+
         fake_module = MagicMock()
         fake_module.Client = mock_client_class
         monkeypatch.setitem(sys.modules, "tinkoff.invest", fake_module)
@@ -627,6 +656,7 @@ class TestTinkoffAccount:
 # OrderFlow tests (integration)
 # ────────────────────────────────────────────
 
+
 class TestOrderFlow:
     def _portfolio(self, cash="100000"):
         return PortfolioSnapshot(
@@ -639,12 +669,14 @@ class TestOrderFlow:
     def _approved_gate(self):
         rg = MagicMock()
         from src.risk.gate import RiskDecision
+
         rg.evaluate.return_value = RiskDecision(allowed=True, violations=())
         return rg
 
     def _blocked_gate(self, violations=("DD_EXCEEDED",)):
         rg = MagicMock()
         from src.risk.gate import RiskDecision
+
         rg.evaluate.return_value = RiskDecision(allowed=False, violations=violations)
         return rg
 
@@ -700,6 +732,7 @@ class TestOrderFlow:
 # ────────────────────────────────────────────
 # ABC contract
 # ────────────────────────────────────────────
+
 
 class TestBrokerABC:
     def test_cannot_instantiate_abc_directly(self):

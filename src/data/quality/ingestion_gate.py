@@ -165,9 +165,7 @@ def log_returns(closes: Sequence[float]) -> list[float]:
     return out
 
 
-def _zscore_threshold_filter(
-    returns: Sequence[float], threshold: float
-) -> list[tuple[int, float]]:
+def _zscore_threshold_filter(returns: Sequence[float], threshold: float) -> list[tuple[int, float]]:
     """Return indices + values of returns with |z| > threshold.
 
     Uses sample standard deviation. If stdev is 0 (constant prices),

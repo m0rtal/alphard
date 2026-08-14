@@ -90,9 +90,7 @@ class TinkoffDataLoader(DataLoader):
             if sandbox:
                 token = os.environ.get("TINKOFF_SANDBOX_TOKEN")
             else:
-                token = os.environ.get("TINKOFF_REAL_TOKEN") or os.environ.get(
-                    "TINKOFF_INVEST_TOKEN"
-                )
+                token = os.environ.get("TINKOFF_REAL_TOKEN") or os.environ.get("TINKOFF_INVEST_TOKEN")
         self._token = token
         self._sandbox = sandbox
         self._base = SANDBOX_BASE if sandbox else PROD_BASE
@@ -110,8 +108,7 @@ class TinkoffDataLoader(DataLoader):
     def list_tickers(self) -> list[TickerMeta]:
         if not self.is_configured:
             raise LoaderAuthError(
-                "Tinkoff auth token not set "
-                "(TINKOFF_SANDBOX_TOKEN / TINKOFF_REAL_TOKEN / explicit arg)"
+                "Tinkoff auth token not set " "(TINKOFF_SANDBOX_TOKEN / TINKOFF_REAL_TOKEN / explicit arg)"
             )
         if self._universe_cache is not None:
             return self._universe_cache
@@ -169,9 +166,7 @@ class TinkoffDataLoader(DataLoader):
         figi = self._figi_for(ticker)
         if figi is None:
             return
-        url = (
-            f"{self._base}/tinkoff.public.invest.api.contract.v1.InstrumentsService/GetDividends"
-        )
+        url = f"{self._base}/tinkoff.public.invest.api.contract.v1.InstrumentsService/GetDividends"
         body = {"figi": figi, "from": _to_instant(start), "to": _to_instant(end, end_of_day=True)}
         try:
             payload = self._post_json(url, body)
@@ -198,9 +193,7 @@ class TinkoffDataLoader(DataLoader):
             "Accept": "application/json",
         }
         try:
-            resp = self._session.post(
-                url, headers=headers, json=body, timeout=self._timeout
-            )
+            resp = self._session.post(url, headers=headers, json=body, timeout=self._timeout)
         except requests.RequestException as exc:
             raise LoaderError(f"network error posting {url}: {exc}") from exc
         if resp.status_code in (401, 403):
@@ -321,11 +314,7 @@ def _to_instant(d: date, *, end_of_day: bool = False) -> str:
     hh = 23 if end_of_day else 0
     mm = 59 if end_of_day else 0
     ss = 59 if end_of_day else 0
-    return (
-        datetime(d.year, d.month, d.day, hh, mm, ss, tzinfo=timezone.utc)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
+    return datetime(d.year, d.month, d.day, hh, mm, ss, tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 __all__ = ["TinkoffDataLoader", "PROD_BASE", "SANDBOX_BASE"]

@@ -562,15 +562,9 @@ class TestMOEXDataLoader:
     def test_iter_corporate_actions_no_crash(self) -> None:
         """MOEX has no delisted_at column; calling iter_corporate_actions
         on a delisted ticker must succeed with zero events."""
-        handlers = [
-            _FakeResponse(
-                _ticker_block([["YNDX", "Yandex", 1, "NL0009805522", "DELISTED"]])
-            )
-        ]
+        handlers = [_FakeResponse(_ticker_block([["YNDX", "Yandex", 1, "NL0009805522", "DELISTED"]]))]
         loader, _ = self._loader(handlers)
-        actions = list(
-            loader.iter_corporate_actions("YNDX", date(2026, 1, 1), date(2026, 6, 1))
-        )
+        actions = list(loader.iter_corporate_actions("YNDX", date(2026, 1, 1), date(2026, 6, 1)))
         assert isinstance(actions, list)
 
     def test_pagination_multi_page(self) -> None:
