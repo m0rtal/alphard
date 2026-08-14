@@ -374,9 +374,13 @@ class TestFailSafe:
             TradeIntent(symbol="   ", side="buy", quantity=Decimal("1"), price=Decimal("1"))
 
     def test_fail_safe_invalid_side(self, limits: RiskLimits, base_state: PortfolioState) -> None:
-        """'sell' is not supported in the skeleton -> ValidationError."""
+        """Phase 1.3: 'short' is no longer accepted at the model layer
+        (syntactic only) — only 'buy' and 'sell' are valid sides. The semantic
+        whether a *sell* opens a short is enforced by the gate (``_check_side``).
+        Anything outside {"buy","sell"} is rejected here.
+        """
         with pytest.raises(ValidationError):
-            TradeIntent(symbol="SBER", side="sell", quantity=Decimal("1"), price=Decimal("1"))
+            TradeIntent(symbol="SBER", side="short", quantity=Decimal("1"), price=Decimal("1"))
 
     def test_fail_safe_negative_quantity(self, limits: RiskLimits, base_state: PortfolioState) -> None:
         """Negative quantity is rejected at the model layer (fail-safe)."""

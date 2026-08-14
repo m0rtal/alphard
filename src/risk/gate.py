@@ -66,18 +66,47 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 class TradeIntent(BaseModel):
     """A single proposed trade to be risk-checked before execution.
 
-    Placeholder schema — fields match the Phase 1.3 contract but no broker
-    is wired up yet. `side` is "buy" only for the skeleton; "sell" / "short"
-    will be added in Phase 1.3 once Portfolio bookkeeping is real.
+    ``side`` semantics (Phase 1.3):
+      - ``"buy"``  — opens or adds to a long position. Always allowed at the
+        model layer; subject to risk limits downstream.
+      - ``"sell"`` — closes or trims a long position. Always allowed at the
+        model layer (flat/positive positions are by definition the owner's).
+        Whether the SELL can *open* a short position depends on
+        ``RiskLimits.allow_short`` — see :meth:`RiskGate.evaluate`.
+
+    Why a model-layer choice PLUS a gate-layer check?
+    The model layer cannot enforce ``allow_short`` (it doesn't have access to
+    the limits) — so the SYNTACTIC check on the side string is permissive
+    and the SEMANTIC check lives in the gate. This is intentional: keeping
+    data-layer validation dependency-free is a long-standing project rule
+    ("Risk gate immutability" — SECURITY.md §Level 4).
     """
 
     model_config = ConfigDict(extra="forbid", frozen=False)
 
     symbol: str = Field(..., min_length=1, description="Instrument ticker, e.g. 'SBER'")
-    side: str = Field(..., description="'buy' (placeholder: only 'buy' supported in skeleton)")
+    side: str = Field(
+        ...,
+        description="'buy' (open/add long) | 'sell' (close/trim long; gate may deny if it opens a short)",
+    )
     quantity: Decimal = Field(..., ge=Decimal("0"), description="Number of shares/lots; >= 0")
     price: Decimal = Field(..., gt=Decimal("0"), description="Limit/market price; > 0")
     sector: str | None = Field(default=None, description="Sector tag, e.g. 'energy'. Placeholder.")
+    account_id: str = Field(
+        default="default",
+        min_length=1,
+        description=(
+            "Broker account identifier (Phase 1.3 multi-account plumbing). "
+            "Default 'default' keeps Phase 1.0/1.1/1.2 tests green."
+        ),
+    )
+    client_order_id: str | None = Field(
+        default=None,
+        description=(
+            "Idempotency key sent to the broker. If two intents share this "
+            "string, only one will result in a live order."
+        ),
+    )
 
     @field_validator("symbol")
     @classmethod
@@ -91,11 +120,26 @@ class TradeIntent(BaseModel):
     @classmethod
     def _validate_side(cls, v: str) -> str:
         v_norm = v.strip().lower()
-        # Skeleton: only 'buy' is meaningfully wired. Anything else is rejected
-        # at the validation layer (fail-safe).
-        if v_norm not in {"buy"}:
-            raise ValueError(f"side must be 'buy' in skeleton (got {v!r})")
+        # Syntactic check only — 'short' is explicitly OUT: it is indistinguishable
+        # from an *uncovered* sell, and we want the caller's intent named explicitly.
+        if v_norm not in {"buy", "sell"}:
+            raise ValueError(f"side must be 'buy' or 'sell' (got {v!r})")
         return v_norm
+
+    @field_validator("client_order_id")
+    @classmethod
+    def _validate_client_order_id(cls, v: str | None) -> str | None:
+        # Brokers usually cap client_order_id at ~32 chars (Tinkoff: 36).
+        # Keep the model decoupled from a specific broker cap by using a soft
+        # project-wide limit of 64 — long enough for UUIDs + prefixes.
+        if v is None:
+            return None
+        v = v.strip()
+        if not v:
+            return None
+        if len(v) > 64:
+            raise ValueError(f"client_order_id too long ({len(v)} > 64 chars): {v!r}")
+        return v
 
     @property
     def notional(self) -> Decimal:
@@ -237,7 +281,9 @@ class RiskGate:
         meta: dict[str, Any] = {}
 
         self._check_position_size(intent, state, violations, meta)
+        self._check_side(intent, state, violations, meta)
         self._check_sector_exposure(intent, state, violations, meta)
+        self._check_leverage(intent, state, violations, meta)
         self._check_daily_loss(state, violations, meta)
         self._check_drawdown(state, violations, meta)
 
@@ -246,6 +292,27 @@ class RiskGate:
             violations=tuple(violations),
             meta=meta,
         )
+
+    def project_post_trade_position(
+        self, intent: TradeIntent, state: PortfolioState
+    ) -> Decimal:
+        """Return the projected position quantity after the intent fills.
+
+        Sign convention matches :class:`Position.quantity`:
+          - ``quantity > 0`` => long ``abs(quantity)`` shares
+          - ``quantity == 0`` => flat
+          - ``quantity < 0`` => short ``abs(quantity)`` shares
+
+        Pure projection — does not consult limits. Used by broker code AND
+        by ``_check_side`` to decide whether a SELL would open a short.
+        """
+        existing = Decimal("0")
+        for pos in state.positions:
+            if pos.symbol == intent.symbol:
+                existing = pos.quantity
+                break
+        signed = intent.quantity if intent.side == "buy" else -intent.quantity
+        return existing + signed
 
     # ---- individual checks ----------------------------------------------
 
@@ -277,6 +344,50 @@ class RiskGate:
                 f"RISK_POSITION: intent notional {notional} = {position_pct:.4f}% of equity "
                 f"exceeds limit {self.limits.max_position_pct}%"
             )
+
+    def _check_side(
+        self,
+        intent: TradeIntent,
+        state: PortfolioState,
+        violations: list[str],
+        meta: dict[str, Any],
+    ) -> None:
+        """Enforce the no-short-by-default rule (Phase 1.3 hard rule).
+
+        A ``sell`` intent is ALLOWED only when it does not open a new short
+        position. Equivalent restatements of the rule:
+
+        - A SELL of X shares from a flat/short position would *increase* the
+          magnitude of the short (or open one) → blocked unless
+          ``RiskLimits.allow_short`` is true.
+        - A SELL of X shares from a long position of size L is fine iff
+          ``X <= L`` (you are trimming or closing, not shorting).
+
+        BUY intents are unaffected by ``allow_short`` — they open or add
+        longs.
+        """
+        if intent.side == "buy":
+            meta["side_check"] = "skipped: side='buy' is always permitted"
+            return
+
+        projected = self.project_post_trade_position(intent, state)
+        meta["projected_position_qty"] = float(projected)
+
+        if projected >= Decimal("0"):
+            # Trimming or closing a long — always fine.
+            meta["side_check"] = "sell reduces/closes long; allowed"
+            return
+
+        # SELL would open or enlarge a short — gate by allow_short.
+        if self.limits.allow_short:
+            meta["side_check"] = "sell opens/extends short; permitted (allow_short=True)"
+            return
+
+        violations.append(
+            f"RISK_SIDE: sell of {intent.quantity} {intent.symbol} would open short of "
+            f"{abs(projected)} shares, but RiskLimits.allow_short=False"
+        )
+        meta["side_check"] = "rejected: would open short and allow_short=False"
 
     def _check_sector_exposure(
         self,
@@ -313,6 +424,58 @@ class RiskGate:
                 f"RISK_SECTOR: projected {intent.sector} exposure "
                 f"{projected_sector_value} = {sector_pct:.4f}% of equity "
                 f"exceeds limit {self.limits.max_sector_pct}%"
+            )
+
+    def _check_leverage(
+        self,
+        intent: TradeIntent,
+        state: PortfolioState,
+        violations: list[str],
+        meta: dict[str, Any],
+    ) -> None:
+        """Enforce the leverage cap (Phase 1.3 hard rule).
+
+        Projected gross exposure after the intent must not exceed
+        ``leverage_max * total_equity``. We compute projected gross as the
+        sum of absolute market_value across positions after applying the
+        intent, divided by total_equity. The result is a unitless leverage
+        multiplier (1.0 = no leverage, 1.5 = 50% gross exposure above NAV).
+
+        We treat BUY as adding ``intent.notional`` of long exposure and SELL
+        of X from existing long L as removing ``min(L, X)`` of long exposure.
+        SELL of X from flat/short is added as additional short exposure of
+        size ``X`` (or ``X - L_short`` after netting).
+        """
+        if state.total_equity <= 0:
+            # Defence-in-depth — already enforced by PortfolioState validator.
+            return
+
+        # Compute existing absolute exposure.
+        existing_abs = sum((abs(p.market_value) for p in state.positions), start=Decimal("0"))
+        intent_delta = intent.notional  # BUY: +exposure ; flat SELL: -exposure ; SELL opening short: +exposure
+        if intent.side == "sell":
+            # Find current position for this symbol.
+            current = Decimal("0")
+            for pos in state.positions:
+                if pos.symbol == intent.symbol:
+                    current = pos.quantity
+                    break
+            if current > intent.quantity:
+                # Trimming — net long reduces by exactly the sell qty.
+                intent_delta = -intent.quantity * intent.price
+            else:
+                # Crossing through zero into short: gross exposure grows.
+                intent_delta = intent.quantity * intent.price
+
+        projected_gross = existing_abs + intent_delta
+        projected_leverage = projected_gross / state.total_equity
+        meta["projected_leverage"] = float(projected_leverage)
+
+        if projected_leverage > self.limits.leverage_max:
+            violations.append(
+                f"RISK_LEVERAGE: projected gross exposure {projected_gross} / equity "
+                f"{state.total_equity} = {projected_leverage:.4f}x exceeds limit "
+                f"{self.limits.leverage_max}x"
             )
 
     def _check_daily_loss(
