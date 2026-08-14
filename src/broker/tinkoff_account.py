@@ -76,9 +76,10 @@ class TinkoffAccount(BrokerAccount):
 
     def _build_intent_and_state(self, order: MarketOrder | LimitOrder):
         """Build TradeIntent + PortfolioState for RiskGate."""
-        from src.risk.gate import PortfolioState, Position as RiskPosition, TradeIntent
+        from src.risk.gate import PortfolioState, TradeIntent
 
         order_type = OrderType.LIMIT if isinstance(order, LimitOrder) else OrderType.MARKET
+        _ = order_type  # currently unused, reserved for Phase 2
         price = order.price if isinstance(order, LimitOrder) else Decimal("1")
 
         intent = TradeIntent(

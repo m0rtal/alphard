@@ -10,23 +10,21 @@
 
 from __future__ import annotations
 
-import os
 from datetime import datetime, timedelta
 from decimal import Decimal
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
 from src.broker.account import BrokerAccount, PortfolioSnapshot, Position
-from src.broker.integration import OrderFlow, OrderFlowResult
+from src.broker.integration import OrderFlow
 from src.broker.orders import (
     LimitOrder,
     MarketOrder,
     OrderSide,
     OrderStatus,
-    OrderType,
 )
-from src.broker.slicer import OrderSlicer, SliceBatch
+from src.broker.slicer import OrderSlicer
 from src.broker.tinkoff_account import BrokerError, TinkoffAccount
 
 
@@ -304,7 +302,6 @@ class TestTinkoffAccount:
         mock_client.users.get_accounts.return_value.accounts = [mock_acc]
 
         # Portfolio with positions
-        from datetime import datetime as _dt
 
         mock_pos = MagicMock()
         mock_pos.ticker = "SBER"
