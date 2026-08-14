@@ -1,0 +1,51 @@
+[tool.poetry]
+name = "alphard"
+version = "0.1.0"
+description = "Alphard: autonomous trading bot on MOEX"
+authors = ["m0rtal <m0rtal@example.com>"]
+license = "Apache-2.0"
+readme = "README.md"
+python = "^3.11"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+pydantic = "^2.0"
+# Phase 1+: добавляем по мере надобности
+# tinkoff-investments = "^2.0"
+# riskfolio-lib = "^0.1"
+# lightgbm = "^4.0"
+# vectorbt = "^0.1"
+# pandas = "^2.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.0"
+pytest-cov = "^4.0"
+black = "^24.0"
+flake8 = "^7.0"
+mypy = "^1.10"
+gitleaks = "^8.18"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-ra --strict-markers --strict-config --cov=src --cov-report=term-missing --cov-fail-under=95"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+
+[tool.coverage.run]
+source = ["src"]
+omit = [
+    "*/tests/*",
+    "*/__init__.py",
+    "src/main.py",  # Phase 0 stub, not production code
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+]
