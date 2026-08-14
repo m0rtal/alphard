@@ -6,6 +6,10 @@ authors = ["m0rtal <m0rtal@example.com>"]
 license = "Apache-2.0"
 readme = "README.md"
 python = "^3.11"
+# src-layout: package code lives under src/, declared explicitly so that
+# `pip install -e .` works (poetry-core otherwise looks for a top-level
+# `alphard/` directory which does not exist).
+packages = [{ include = "src" }]
 
 [tool.poetry.dependencies]
 python = "^3.11"
@@ -49,3 +53,8 @@ exclude_lines = [
     "raise NotImplementedError",
     "if __name__ == .__main__.:",
 ]
+
+[tool.black]
+# Kept in sync with flake8 max-line-length in .github/workflows/ci.yml.
+line-length = 120
+target-version = ["py311"]
