@@ -55,7 +55,7 @@ from .cross_source import (
 )
 from .historical import HistoricalParams, check_historical
 from .ingestion_gate import Bar, IngestionParams, check_ingestion
-from .severity import QualityReport, Severity
+from .severity import QualityReport
 
 
 class DataQualityCritical(Exception):

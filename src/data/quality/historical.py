@@ -64,7 +64,7 @@ from typing import Iterable, Sequence
 from pydantic import BaseModel, ConfigDict, Field
 
 from .ingestion_gate import Bar
-from .severity import Issue, IssueKind, QualityReport, Severity
+from .severity import Issue, IssueKind, QualityReport
 
 
 class SplitEvent(BaseModel):

@@ -16,14 +16,14 @@ Strategy:
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
-from typing import Iterable
+import csv
+import os
 
 import pytest
 from hypothesis import HealthCheck, given, settings, strategies as st
 
 from src.data.quality.audit import InMemoryAuditLog, write_report
 from src.data.quality.cross_source import (
-    CrossSourceParams,
     SourceSeries,
     check_cross_source,
 )
@@ -640,6 +640,7 @@ class TestAudit:
 
     def test_make_default_uses_postgres_with_dsn(self) -> None:
         """When $ALPHARD_PG_DSN is set, make_default_audit_log picks Postgres."""
+        import os
         from src.data.quality.audit import PostgresAuditLog, make_default_audit_log
 
         old = os.environ.get("ALPHARD_PG_DSN")
@@ -668,22 +669,10 @@ class TestAudit:
                 os.environ["ALPHARD_PG_DSN"] = old
 
 
-import os  # at module level for the audit tests above
-
-
-# ---------------------------------------------------------------------------
-# CLI smoke tests
-# ---------------------------------------------------------------------------
-
-
-import csv as _csv
-import io as _io
-
-
 class TestCLI:
     def _write_csv(self, path: str, rows: list[Bar]) -> None:
         with open(path, "w", newline="") as f:
-            w = _csv.writer(f)
+            w = csv.writer(f)
             w.writerow(["primary_key", "open", "high", "low", "close", "volume"])
             for b in rows:
                 w.writerow(
@@ -736,7 +725,7 @@ class TestCLI:
 
         csv_path = tmp_path / "bad.csv"
         with open(csv_path, "w", newline="") as f:
-            w = _csv.writer(f)
+            w = csv.writer(f)
             w.writerow(["primary_key", "open", "close"])  # missing high, low, volume
             w.writerow(["2025-01-01", 100.0, 100.0])
         rc = main(["ingestion", "SBER", "--csv", str(csv_path), "--allow-high"])
@@ -961,194 +950,4 @@ class TestExtraAudit:
         assert sink.events[0]["extra"] == {"first_index": 7, "threshold": 6.0}
 
 
-# ---------------------------------------------------------------------------
-# Hypothesis property: log-returns length
-# ---------------------------------------------------------------------------
-
-
-@given(st.lists(st.floats(min_value=0.01, max_value=1e6, allow_nan=False), min_size=2, max_size=100))
-@settings(max_examples=50, suppress_health_check=[HealthCheck.too_slow])
-def test_log_returns_length_property(prices: list[float]) -> None:
-    """len(log_returns(p)) == len(p) - 1."""
-    rets = log_returns(prices)
-    assert len(rets) == len(prices) - 1
-
-
-# ---------------------------------------------------------------------------
-# Additional deterministic / edge-case tests
-# ---------------------------------------------------------------------------
-
-
-class TestExtraDeterminism:
-    def test_ingestion_report_is_frozen(self) -> None:
-        """QualityReport from ingestion is frozen (pydantic + tuple issues)."""
-        bars = _bars(20)
-        r = check_ingestion("X", bars, now=FROZEN_NOW)
-        with pytest.raises(Exception):
-            r.issues = ()  # type: ignore[misc]
-
-    def test_issue_is_frozen(self) -> None:
-        """Issue objects are immutable (frozen)."""
-        i = Issue.make(gate="g", kind=IssueKind.ING_OUTLIER, message="x")
-        with pytest.raises(Exception):
-            i.message = "y"  # type: ignore[misc]
-
-    def test_severity_for_unknown_kind_raises(self) -> None:
-        """severity_for() raises KeyError on unknown kinds (no silent default)."""
-        # Use the enum machinery: a totally fake kind is not in the table.
-        # We cannot construct a fake IssueKind without enum hacking, so
-        # we test the "catalog complete" property by iterating all
-        # members and confirming each lookup succeeds.
-        for kind in IssueKind:
-            severity_for(kind)  # would raise if kind not in catalog
-
-    def test_issue_make_rejects_bad_kind(self) -> None:
-        """Issue.make pins severity via the catalog — invalid kind -> ValueError."""
-        # Issue.make does not validate the kind enum; pydantic does. So
-        # passing a non-IssueKind value to ``kind=`` triggers pydantic.
-        with pytest.raises(Exception):
-            Issue.make(gate="g", kind="not-a-kind", message="x")  # type: ignore[arg-type]
-
-    def test_quality_report_equality(self) -> None:
-        """QualityReport equality is structural (same fields == same report)."""
-        i = Issue.make(gate="g", kind=IssueKind.ING_OUTLIER, message="x")
-        r1 = QualityReport(ticker="X", gate="g", issues=(i,))
-        r2 = QualityReport(ticker="X", gate="g", issues=(i,))
-        assert r1 == r2
-        r3 = QualityReport(ticker="Y", gate="g", issues=(i,))
-        assert r1 != r3
-
-    def test_check_ingestion_with_zero_bars_is_not_crash(self) -> None:
-        """An empty series yields a report (with HIGH issues, never crashes)."""
-        r = check_ingestion("X", [], now=FROZEN_NOW)
-        assert isinstance(r, QualityReport)
-        assert r.worst_severity() in (Severity.HIGH, Severity.CRITICAL)
-        assert not r.passed
-
-
-class TestExtraHistorical:
-    def test_split_event_is_reverse_property(self) -> None:
-        """SplitEvent.is_reverse is True iff 0 < ratio < 1."""
-        fwd = SplitEvent(date=date(2025, 1, 1), ratio=2.0, confirmed=True)
-        rev = SplitEvent(date=date(2025, 1, 1), ratio=0.5, confirmed=True)
-        assert not fwd.is_reverse
-        assert rev.is_reverse
-
-    def test_apply_split_adjustment_no_splits_is_noop(self) -> None:
-        """Empty splits list leaves bars unchanged."""
-        bars = _bars(5)
-        adj = apply_split_adjustment(bars, [])
-        assert adj == bars
-
-    def test_apply_split_adjustment_post_split_bar_untouched(self) -> None:
-        """Bars STRICTLY AFTER the split date are not adjusted."""
-        bars = _bars(5)
-        # Put the split date BEFORE the first bar — so all bars are at
-        # or after the split and should NOT be adjusted.
-        earlier = bars[0].primary_key - timedelta(days=10)
-        splits = [SplitEvent(date=earlier, ratio=2.0, confirmed=True)]
-        adj = apply_split_adjustment(bars, splits)
-        for orig, new in zip(bars, adj):
-            assert orig.close == new.close, "bars at-or-after split date must be untouched"
-
-    def test_apply_split_adjustment_pre_split_bar_adjusted(self) -> None:
-        """Bars STRICTLY BEFORE the split date are adjusted."""
-        bars = _bars(5)
-        # Put the split date AFTER the last bar — all bars are strictly
-        # before the split, so all should be divided by ratio.
-        later = bars[-1].primary_key + timedelta(days=10)
-        splits = [SplitEvent(date=later, ratio=2.0, confirmed=True)]
-        adj = apply_split_adjustment(bars, splits)
-        # Each close should be ~half of the original.
-        for orig, new in zip(bars, adj):
-            assert new.close == pytest.approx(orig.close / 2.0, abs=1e-6)
-
-    def test_check_historical_with_zero_bars(self) -> None:
-        """Empty bar list yields a clean (or only-stale) report, no crash."""
-        r = check_historical("X", [], now=FROZEN_NOW)
-        assert isinstance(r, QualityReport)
-        # No future rows, no splits, no delisting — empty report.
-        assert r.passed
-
-
-class TestExtraCrossSource:
-    def test_identical_sources_passed(self) -> None:
-        """Two identical sources -> no issues at all."""
-        sa, sb = _aligned_pair(30)
-        r = check_cross_source("X", sa, sb)
-        assert r.passed
-        assert r.worst_severity() is None
-
-    def test_pure_noise_divergence_within_threshold(self) -> None:
-        """Tiny divergence (<1%) does not trigger HIGH."""
-        sa, sb = _aligned_pair(30, scale_b=1.001)  # 0.1% divergence
-        r = check_cross_source("X", sa, sb)
-        kinds = {i.kind for i in r.issues}
-        assert IssueKind.XSC_DIVERGENCE_HIGH not in kinds
-
-
-class TestExtraIngestion:
-    def test_negative_price_caught(self) -> None:
-        """Negative close -> HIGH (zero_or_negative_price)."""
-        bars = _bars(5)
-        bad = bars[2].model_copy(update={"close": -1.0})
-        r = check_ingestion("X", bars[:2] + [bad] + bars[3:])
-        assert IssueKind.ING_ZERO_OR_NEGATIVE_PRICE in {i.kind for i in r.issues}
-
-    def test_bar_model_rejects_negative_at_construction(self) -> None:
-        """Bar model itself blocks non-positive prices at construction."""
-        with pytest.raises(Exception):
-            Bar(
-                primary_key=date(2026, 1, 1),
-                open=-1.0,
-                high=2.0,
-                low=0.5,
-                close=1.0,
-                volume=0,
-            )
-
-    def test_bar_model_rejects_zero_volume(self) -> None:
-        """Bar model allows volume=0 (zero trading day) — only the gate flags it."""
-        bar = Bar(
-            primary_key=date(2026, 1, 1),
-            open=1.0,
-            high=2.0,
-            low=0.5,
-            close=1.0,
-            volume=0,
-        )
-        assert bar.volume == 0  # OK — gate has its own threshold.
-
-    def test_ingestion_params_frozen(self) -> None:
-        """IngestionParams is frozen — callers can't mutate at runtime."""
-        p = IngestionParams()
-        with pytest.raises(Exception):
-            p.outlier_zscore = 99.0  # type: ignore[misc]
-
-
-class TestExtraAudit:
-    def test_in_memory_sink_extra_payload_preserved(self) -> None:
-        """InMemoryAuditLog preserves the extra dict round-trip."""
-        sink = InMemoryAuditLog()
-        i = Issue.make(
-            gate="g",
-            kind=IssueKind.ING_OUTLIER,
-            message="x",
-            count=3,
-            extra={"first_index": 7, "threshold": 6.0},
-        )
-        sink.write_event(i, ticker="X", gate="g")
-        assert sink.events[0]["extra"] == {"first_index": 7, "threshold": 6.0}
-
-
-# ---------------------------------------------------------------------------
-# Hypothesis property: log-returns length
-# ---------------------------------------------------------------------------
-
-
-@given(st.lists(st.floats(min_value=0.01, max_value=1e6, allow_nan=False), min_size=2, max_size=100))
-@settings(max_examples=50, suppress_health_check=[HealthCheck.too_slow])
-def test_log_returns_length_property(prices: list[float]) -> None:
-    """len(log_returns(p)) == len(p) - 1."""
-    rets = log_returns(prices)
-    assert len(rets) == len(prices) - 1
+# flake8: noqa: W391

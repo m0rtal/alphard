@@ -51,11 +51,11 @@ from __future__ import annotations
 
 import math
 from datetime import date
-from typing import Iterable
+
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .severity import Issue, IssueKind, QualityReport, Severity
+from .severity import Issue, IssueKind, QualityReport
 
 
 class CrossSourceParams(BaseModel):

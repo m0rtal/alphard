@@ -56,7 +56,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime, timezone
-from typing import Iterable, Protocol
+from typing import Protocol
 
 from .severity import Issue
 

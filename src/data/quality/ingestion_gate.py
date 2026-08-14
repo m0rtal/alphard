@@ -59,7 +59,7 @@ from typing import Iterable, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .severity import Issue, IssueKind, QualityReport, Severity
+from .severity import Issue, IssueKind, QualityReport
 
 
 # ---------------------------------------------------------------------------
