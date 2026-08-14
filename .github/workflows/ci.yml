@@ -58,9 +58,12 @@ jobs:
       - name: Install linters
         run: |
           python -m pip install --upgrade pip
-          pip install flake8 black mypy pytest pytest-cov
+          # Pinned deps first (black==24.10.0 etc.) to ensure local == CI formatting.
+          # If we install unconstrained pip may grab a newer black whose formatter
+          # diffs from the local install → CI fails on byte-different output.
           pip install -r requirements.txt
           pip install -e .
+          pip install flake8 mypy
 
       - name: Black formatting check
         run: black --check src/ tests/

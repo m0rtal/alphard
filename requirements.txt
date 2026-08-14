@@ -3,3 +3,8 @@
 pydantic>=2.5,<3.0
 pytest>=7.4,<8.0
 pytest-cov>=4.1,<5.0
+# CI 2026-08-14 found black 24.10.0 (local) vs 24.11+ (CI runner) diverge in formatting.
+# Pin exact patch version so local == CI == CI runner for byte-identical diffs.
+black==24.10.0
+flake8>=7.0,<8.0
+mypy>=1.10,<2.0
