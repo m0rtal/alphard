@@ -1,5 +1,8 @@
 # Alphard
 
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Tests](https://github.com/m0rtal/alphard/actions/workflows/ci.yml/badge.svg)](https://github.com/m0rtal/alphard/actions/workflows/ci.yml)
+
 Autonomous trading bot на MOEX. Apache-2.0, self-hosted, Docker-only.
 
 > **⚠️ Phase 0 skeleton (commit 3c48d23).** Это bootstrap: Risk Agent scaffold, Docker stack, docs. **Бот НЕ торгует.** Phase 1+ добавят Data Agent, Quant Agent, Macro Agent, Execution Agent, Coordinator. Все claims в этом README про "live trading" относятся к Phase 4+, не к текущему state.

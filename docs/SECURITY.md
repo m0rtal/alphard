@@ -6,6 +6,12 @@
 
 ---
 
+## Содержание
+
+Документ состоит из шести разделов: **§1 Threat Model** (активы, угрозы по STRIDE, adversaries), **§2 Defense Layers** (5 уровней — от secrets hygiene до recovery), **§3 Конкретные меры** (P0 / P1 / P2 по приоритету), **§4 Что я делаю сейчас (Phase 0.6 — OPSEC basics)**, **§5 Honest limitations** (что OPSEC не покрывает), **§6 Когда стопор** (triggers для rotate / pause / halt). Incident response playbook см. в [docs/RUNBOOK.md](RUNBOOK.md).
+
+---
+
 ## 1. Threat Model
 
 ### 1.1 Активы
@@ -188,7 +194,7 @@
 ## 6. Когда стопор
 
 Если вижу:
-- Секреты в git history (даже в старых commits) → СТОП, rotate secrets, git-filter-branch
+- Секреты в git history (даже в старых commits) → СТОП, rotate secrets, [git-filter-repo](https://github.com/newren/git-filter-repo)
 - Бот торгует аномально (X trade/sec) → auto-pause + alert
 - DD > 5% → halt + alert
 - API calls spike без trading reason → investigate
