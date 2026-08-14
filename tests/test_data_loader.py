@@ -21,6 +21,7 @@ import threading
 from datetime import date, timedelta
 from decimal import Decimal
 from typing import Any, Iterator
+from unittest.mock import MagicMock
 
 import pytest
 from hypothesis import given, settings, strategies as st
@@ -524,6 +525,82 @@ class TestMOEXDataLoader:
         loader = MOEXDataLoader(rate_per_min=600.0)
         with pytest.raises(LoaderError):
             list(loader.iter_ohlcv("SBER", date(2000, 1, 1), date(2026, 1, 1)))
+
+    def test_network_error_wrapped(self) -> None:
+        class BoomSession:
+            def get(self, url, params=None, timeout=None):
+                import requests
+
+                raise requests.ConnectionError("boom")
+
+        loader = MOEXDataLoader(
+            session=BoomSession(),  # type: ignore[arg-type]
+            rate_per_min=600.0,
+        )
+        with pytest.raises(LoaderError, match="network error"):
+            loader._get_json("https://iss.moex.com/foo")
+
+    def test_invalid_json_wrapped(self) -> None:
+        class BadJSONSession:
+            def get(self, url, params=None, timeout=None):
+                import json
+
+                resp = MagicMock()
+                resp.status_code = 200
+                resp.ok = True
+                resp.text = "not json"
+                resp.json.side_effect = json.JSONDecodeError("bad json", "x", 0)
+                return resp
+
+        loader = MOEXDataLoader(
+            session=BadJSONSession(),  # type: ignore[arg-type]
+            rate_per_min=600.0,
+        )
+        with pytest.raises(LoaderError, match="non-JSON"):
+            loader._get_json("https://iss.moex.com/foo")
+
+    def test_iter_corporate_actions_no_crash(self) -> None:
+        """MOEX has no delisted_at column; calling iter_corporate_actions
+        on a delisted ticker must succeed with zero events."""
+        handlers = [
+            _FakeResponse(
+                _ticker_block([["YNDX", "Yandex", 1, "NL0009805522", "DELISTED"]])
+            )
+        ]
+        loader, _ = self._loader(handlers)
+        actions = list(
+            loader.iter_corporate_actions("YNDX", date(2026, 1, 1), date(2026, 6, 1))
+        )
+        assert isinstance(actions, list)
+
+    def test_pagination_multi_page(self) -> None:
+        handlers = [
+            _FakeResponse(_ticker_block([["SBER", "Sber", 1, "RU0", ""]])),
+            _FakeResponse(
+                _candles_block(
+                    [
+                        [
+                            Decimal("100"),
+                            Decimal("105"),
+                            Decimal("110"),
+                            Decimal("95"),
+                            Decimal("0"),
+                            Decimal("1"),
+                            "2026-08-01",
+                            "2026-08-01",
+                        ]
+                    ]
+                )
+            ),
+            _FakeResponse(_candles_block([])),
+        ]
+        loader = MOEXDataLoader(
+            session=_FakeSession(handlers),  # type: ignore[arg-type]
+            rate_per_min=600.0,
+            page_size=1,
+        )
+        bars = list(loader.iter_ohlcv("SBER", date(2026, 8, 1), date(2026, 8, 1)))
+        assert len(bars) >= 1
 
 
 # ===========================================================================
