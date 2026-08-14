@@ -140,3 +140,4 @@ Apache-2.0. См. [LICENSE](LICENSE).
 
 Александр (m0rtal) — creator и maintainer.
 Вопросы → issues или discussions на GitHub.
+# Phase 1.2 status: broker/ 100%, risk/ 97%, quality integration 94%, pg_store integration tests ready, CI Postgres service. Phase 2: loader + sqlite_store (live API).
