@@ -59,11 +59,8 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            # latest tag on main
             type=raw,value=latest,enable={{is_default_branch}}
-            # semver tags on releases
             type=semver,pattern={{version}}
-            # git sha tag for traceability
             type=sha,format=short
 
       - name: Build + push
