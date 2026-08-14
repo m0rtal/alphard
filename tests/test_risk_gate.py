@@ -11,6 +11,7 @@ Strategy:
 - Validation tests for the pydantic models themselves (they're part of
   the gate's contract — bad data must be rejected at the model layer).
 """
+
 from __future__ import annotations
 
 from decimal import Decimal
@@ -177,7 +178,7 @@ class TestDrawdown:
     def test_dd_exceeded(self, limits: RiskLimits) -> None:
         """DD = 16% (limit 15%) must be rejected."""
         state = PortfolioState(
-            total_equity=Decimal("840000"),   # -16% from 1M peak
+            total_equity=Decimal("840000"),  # -16% from 1M peak
             cash=Decimal("840000"),
             positions=[],
             daily_pnl=Decimal("0"),
@@ -226,25 +227,9 @@ class TestDrawdown:
 class TestSectorExposure:
     def test_sector_exposure_exceeded(self, limits: RiskLimits) -> None:
         """Existing + intent sector exposure > 30% must be rejected."""
-        state = PortfolioState(
-            total_equity=Decimal("1000000"),
-            cash=Decimal("700000"),
-            positions=[
-                Position(
-                    symbol="LKOH",
-                    quantity=Decimal("2000"),
-                    avg_price=Decimal("100"),
-                    sector="energy",
-                ),
-            ],
-            daily_pnl=Decimal("0"),
-            peak_equity=Decimal("1000000"),
-        )
-        # Existing energy exposure = 200,000 = 20% of equity.
-        # Intent notional = 200 * 100 = 20,000.
-        # Projected = 220,000 = 22% — under limit.
-        # To exceed: existing 250,000 + intent 100,000 = 350,000 = 35%.
-        # Let's do it properly:
+        # Existing energy exposure = 250,000 = 25% of equity.
+        # Intent notional = 100 * 100 = 10,000.
+        # Projected = 350,000 = 35% > 30%.
         big_state = PortfolioState(
             total_equity=Decimal("1000000"),
             cash=Decimal("600000"),
@@ -385,7 +370,6 @@ class TestFailSafe:
         translate these into structured risk violations. The contract is
         "bad inputs never reach evaluate()".
         """
-        gate = RiskGate(limits)
         with pytest.raises(ValidationError):
             TradeIntent(symbol="   ", side="buy", quantity=Decimal("1"), price=Decimal("1"))
 
@@ -537,7 +521,7 @@ class TestLimits:
             max_daily_loss_pct=Decimal("3"),
         )
         # Direct attribute assignment is blocked by pydantic frozen=True
-        with pytest.raises((ValidationError, Exception)) as exc_info:
+        with pytest.raises((ValidationError, Exception)):
             limits.max_dd_pct = Decimal("200")
         # Verify validators still reject invalid even if frozen is bypassed:
         with pytest.raises(ValidationError):

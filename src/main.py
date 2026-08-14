@@ -1,10 +1,11 @@
 """Alphard bot entrypoint (Phase 0 stub)."""
+
 import sys
 import logging
 import time
 
 
-def main():
+def main() -> None:
     """Main loop stub."""
     logging.basicConfig(
         level=logging.INFO,

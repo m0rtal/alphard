@@ -49,6 +49,7 @@ WHAT IS NOT HERE (intentional gaps)
 If a Phase 1.3 feature is needed but missing, the gate's behaviour is
 defined as "reject" — i.e. fail-safe.
 """
+
 from __future__ import annotations
 
 from decimal import Decimal
@@ -141,9 +142,7 @@ class PortfolioState(BaseModel):
         # Invariant: peak_equity >= total_equity always. If a caller passes a
         # state where this doesn't hold, it's an upstream bug — reject here.
         if self.peak_equity < self.total_equity:
-            raise ValueError(
-                f"peak_equity ({self.peak_equity}) must be >= total_equity ({self.total_equity})"
-            )
+            raise ValueError(f"peak_equity ({self.peak_equity}) must be >= total_equity ({self.total_equity})")
         return self
 
 
@@ -227,9 +226,7 @@ class RiskGate:
 
     # ---- public API -----------------------------------------------------
 
-    def evaluate(
-        self, intent: TradeIntent, state: PortfolioState
-    ) -> RiskDecision:
+    def evaluate(self, intent: TradeIntent, state: PortfolioState) -> RiskDecision:
         """Evaluate a TradeIntent against current PortfolioState.
 
         Returns a RiskDecision. ALWAYS returns a decision — never raises for
@@ -364,9 +361,7 @@ class RiskGate:
         # (PortfolioState validator already enforces peak_equity >= total_equity,
         # so dd_pct is always >= 0 in practice).
         if dd_pct > self.limits.max_dd_pct:
-            violations.append(
-                f"RISK_DD: drawdown {dd_pct:.4f}% exceeds limit {self.limits.max_dd_pct}%"
-            )
+            violations.append(f"RISK_DD: drawdown {dd_pct:.4f}% exceeds limit {self.limits.max_dd_pct}%")
 
 
 __all__ = [
