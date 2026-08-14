@@ -1,18 +1,28 @@
 version: "3.9"
 
-# Alphard stack — единый источник правды.
+# =============================================================================
+# Alphard Phase 0 — docker-compose.yaml
+# =============================================================================
 #
-# Используется:
-# - Локальный dev/prod: `docker compose up -d` (volumes = bind mounts)
-# - Portainer: через Git repository URL + compose path
-#   (Portainer UI → Stacks → Add stack → Repository → Git → URL=https://github.com/m0rtal/alphard.git → Compose path=docker-compose.yaml)
-# - CI smoke-test: `docker compose config` (validation only)
+# Phase 0 ships the bare infrastructure:
+#   - alphard-bot   : stub entrypoint (heartbeat loop in src/main.py)
+#   - postgres      : DataStore (Phase 0 schema_version only; Phase 1+ add
+#                     OHLCV, decision_lineage, audit_log tables)
+#   - redis         : in-memory cache (Phase 3+ uses for risk state, news,
+#                     portfolio drift tracking)
 #
-# SECURITY highlights (full list: docs/SECURITY.md):
-# - Network isolation: postgres/redis НЕ exposed наружу, только `alphard-net`.
-# - Все секреты через `.env` file (никогда не коммитится).
-# - ${VAR:?msg} синтаксис для обязательных паролей (fail-fast при deploy).
-# - Контейнер работает под non-root user alphard (UID 1000) из Dockerfile.
+# Phase 3+ will add via `profiles: ["observability"]`:
+#   - prometheus    : scrape /metrics from alphard-bot (Phase 3+)
+#   - grafana       : dashboards + alerting (Phase 3+)
+#
+# Phase 1+ changes (NOT Phase 0):
+#   - src/main.py becomes a FastAPI app with /health, /metrics, /rebalance
+#   - Data Agent adds OHLCV ingestion (Tinkoff + MOEX ISS)
+#   - Risk Agent moves from gateway.py stub into Coordinator
+#   - docker-compose.yaml grows env vars for TINKOFF_SANDBOX_TOKEN + OFZ weights
+#
+# Phase 0 vs Phase 1+ различия в комментариях в каждом service-блоке.
+# =============================================================================
 
 services:
   alphard-bot:
