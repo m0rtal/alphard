@@ -1,259 +1,529 @@
-"""Tests for Risk Agent.
-
-CRITICAL: 95%+ coverage required. Risk gate is the foundation.
 """
+Alphard Risk Agent — Skeleton tests.
+
+Coverage target: 95%+ of risk_layer.py.
+
+Strategy:
+- One test per hard limit (position, sector, daily loss, drawdown).
+- One test for the no-violation happy path.
+- One test for the multi-violation case.
+- Fail-safe / anomaly tests for bad inputs and edge cases.
+- Validation tests for the pydantic models themselves (they're part of
+  the gate's contract — bad data must be rejected at the model layer).
+"""
+from __future__ import annotations
+
+from decimal import Decimal
 
 import pytest
+from pydantic import ValidationError
 
-from src.risk import RiskGate, RiskDecision, TradeIntent, PortfolioState, RiskLimits
+from src.risk.gate import (
+    PortfolioState,
+    Position,
+    RiskDecision,
+    RiskGate,
+    RiskLimits,
+    TradeIntent,
+)
 
 
-# ===== Fixtures =====
+# ---------------------------------------------------------------------------
+# Fixtures — keep tests readable
+# ---------------------------------------------------------------------------
 
 
 @pytest.fixture
-def default_gate():
-    return RiskGate(limits=RiskLimits(
-        max_position_pct=5.0,
-        max_sector_pct=30.0,
-        max_daily_loss_pct=3.0,
-        max_dd_pct=10.0,
-    ))
+def limits() -> RiskLimits:
+    """Standard risk limits for most tests."""
+    return RiskLimits(
+        max_dd_pct=Decimal("15.0"),
+        max_position_pct=Decimal("10.0"),
+        max_sector_pct=Decimal("30.0"),
+        max_daily_loss_pct=Decimal("3.0"),
+    )
 
 
 @pytest.fixture
-def healthy_state():
-    """State без violations."""
+def base_state() -> PortfolioState:
+    """Healthy portfolio state: no drawdown, no loss, no positions."""
     return PortfolioState(
-        nav=1_000_000,
-        positions={},
-        daily_pnl_pct=0.5,
-        drawdown_from_peak_pct=-2.0,
+        total_equity=Decimal("1000000"),
+        cash=Decimal("1000000"),
+        positions=[],
+        daily_pnl=Decimal("0"),
+        peak_equity=Decimal("1000000"),
     )
 
 
-# ===== Happy path =====
-
-
-def test_healthy_position_allowed(default_gate, healthy_state):
-    """Small position в healthy state → allowed."""
-    intent = TradeIntent(ticker="SBER", side="BUY", quantity=10, price=250)
-    decision = default_gate.evaluate(intent, healthy_state)
-    assert decision.allowed is True
-    assert decision.violations == []
-    assert decision.reason == "ok"
-
-
-def test_exactly_at_position_limit_allowed(default_gate, healthy_state):
-    """Position size ровно на лимите → allowed (не > а =)."""
-    # 5% от 1M = 50000₽. price=250 → qty=200
-    intent = TradeIntent(ticker="SBER", side="BUY", quantity=200, price=250)
-    decision = default_gate.evaluate(intent, healthy_state)
-    assert decision.allowed is True
-
-
-# ===== Position size violations =====
-
-
-def test_position_size_exceeded(default_gate, healthy_state):
-    """Позиция больше лимита → DENY."""
-    intent = TradeIntent(ticker="SBER", side="BUY", quantity=300, price=250)
-    # 300 × 250 = 75000₽ = 7.5% > 5%
-    decision = default_gate.evaluate(intent, healthy_state)
-    assert decision.allowed is False
-    assert any("position_pct" in v for v in decision.violations)
-
-
-def test_position_size_at_zero_nav_blocked():
-    """NAV=0 → всегда blocked."""
-    gate = RiskGate()
-    intent = TradeIntent(ticker="SBER", side="BUY", quantity=10, price=250)
-    state = PortfolioState(nav=0)
-    decision = gate.evaluate(intent, state)
-    assert decision.allowed is False
-    assert "nav_invalid_or_zero" in decision.violations
-
-
-# ===== Sector violations =====
-
-
-def test_sector_concentration_exceeded(default_gate, healthy_state):
-    """Превышение sector limit → DENY."""
-    # NAV=1M, sector_limit=30% → max sector exposure = 300000₽
-    # Existing position: 250000₽ в "energy"
-    healthy_state.positions = {
-        "LKOH": {"qty": 100, "avg_price": 2500, "sector": "energy"},  # 250000
-    }
-    intent = TradeIntent(ticker="ROSN", side="BUY", quantity=100, price=600, sector="energy")
-    # New: 100 × 600 = 60000. Total: 310000 > 300000 (30% от 1M)
-    decision = default_gate.evaluate(intent, healthy_state)
-    assert decision.allowed is False
-    assert any("sector_exposure" in v for v in decision.violations)
-
-
-def test_sector_without_constraint_fine(default_gate, healthy_state):
-    """Intent без sector → sector check пропускается."""
-    intent = TradeIntent(ticker="SBER", side="BUY", quantity=10, price=250, sector=None)
-    decision = default_gate.evaluate(intent, healthy_state)
-    assert decision.allowed is True
-
-
-# ===== Daily loss violations =====
-
-
-def test_daily_loss_exceeded(default_gate):
-    """Daily loss > 3% → DENY."""
-    state = PortfolioState(
-        nav=1_000_000,
-        positions={},
-        daily_pnl_pct=-3.5,  # больше лимита
-        drawdown_from_peak_pct=-2.0,
+def _intent(
+    symbol: str = "SBER",
+    qty: int = 10,
+    price: str = "100",
+    sector: str | None = "energy",
+) -> TradeIntent:
+    """Helper to build a TradeIntent with sensible defaults."""
+    return TradeIntent(
+        symbol=symbol,
+        side="buy",
+        quantity=Decimal(qty),
+        price=Decimal(price),
+        sector=sector,
     )
-    intent = TradeIntent(ticker="SBER", side="BUY", quantity=10, price=250)
-    decision = default_gate.evaluate(intent, state)
-    assert decision.allowed is False
-    assert any("daily_loss" in v for v in decision.violations)
 
 
-def test_daily_loss_at_limit_allowed(default_gate):
-    """Daily loss ровно на лимите → allowed (=, не <)."""
-    state = PortfolioState(
-        nav=1_000_000,
-        positions={},
-        daily_pnl_pct=-3.0,
-        drawdown_from_peak_pct=-2.0,
-    )
-    intent = TradeIntent(ticker="SBER", side="BUY", quantity=10, price=250)
-    decision = default_gate.evaluate(intent, state)
-    assert decision.allowed is True
+# ===========================================================================
+# Position-size checks
+# ===========================================================================
 
 
-# ===== Drawdown violations =====
+class TestPositionSize:
+    def test_position_size_exceeded(self, limits: RiskLimits, base_state: PortfolioState) -> None:
+        """A 11% position (limit 10%) must be rejected."""
+        # 110,000 / 1,000,000 = 11% > 10%
+        intent = _intent(qty=1100, price="100")
+        gate = RiskGate(limits)
+
+        decision = gate.evaluate(intent, base_state)
+
+        assert decision.allowed is False
+        assert any("RISK_POSITION" in v for v in decision.violations)
+
+    def test_position_size_allowed(self, limits: RiskLimits, base_state: PortfolioState) -> None:
+        """A 9% position (limit 10%) must pass the position check.
+
+        With no drawdown / no daily loss / no sector exposure, the trade is
+        fully allowed.
+        """
+        # 90,000 / 1,000,000 = 9% < 10%
+        intent = _intent(qty=900, price="100")
+        gate = RiskGate(limits)
+
+        decision = gate.evaluate(intent, base_state)
+
+        assert decision.allowed is True
+        assert decision.violations == ()
+        # Meta should report the computed position_pct
+        assert decision.meta["position_pct"] == pytest.approx(9.0)
+
+    def test_position_size_at_limit_allowed(self, limits: RiskLimits, base_state: PortfolioState) -> None:
+        """A position EXACTLY at the limit (10.0%) is allowed (boundary check)."""
+        # 100,000 / 1,000,000 = exactly 10.0%
+        intent = _intent(qty=1000, price="100")
+        gate = RiskGate(limits)
+
+        decision = gate.evaluate(intent, base_state)
+
+        assert decision.allowed is True
 
 
-def test_drawdown_exceeded(default_gate):
-    """Drawdown > 10% → DENY."""
-    state = PortfolioState(
-        nav=1_000_000,
-        positions={},
-        daily_pnl_pct=0,
-        drawdown_from_peak_pct=-15.0,  # больше лимита
-    )
-    intent = TradeIntent(ticker="SBER", side="BUY", quantity=10, price=250)
-    decision = default_gate.evaluate(intent, state)
-    assert decision.allowed is False
-    assert any("drawdown" in v for v in decision.violations)
+# ===========================================================================
+# Daily-loss check
+# ===========================================================================
 
 
-# ===== Multi-violation =====
+class TestDailyLoss:
+    def test_daily_loss_exceeded(self, limits: RiskLimits) -> None:
+        """daily_pnl = -4% (limit 3%) must be rejected."""
+        state = PortfolioState(
+            total_equity=Decimal("1000000"),
+            cash=Decimal("0"),
+            positions=[],
+            daily_pnl=Decimal("-40000"),  # -4% of 1M
+            peak_equity=Decimal("1000000"),
+        )
+        intent = _intent(qty=10, price="100")
+        gate = RiskGate(limits)
+
+        decision = gate.evaluate(intent, state)
+
+        assert decision.allowed is False
+        assert any("RISK_DAILY_LOSS" in v for v in decision.violations)
+
+    def test_daily_loss_at_limit_allowed(self, limits: RiskLimits) -> None:
+        """daily_pnl = -3% exactly (limit 3%) is allowed (boundary)."""
+        state = PortfolioState(
+            total_equity=Decimal("1000000"),
+            cash=Decimal("0"),
+            positions=[],
+            daily_pnl=Decimal("-30000"),
+            peak_equity=Decimal("1000000"),
+        )
+        intent = _intent(qty=10, price="100")
+        gate = RiskGate(limits)
+
+        decision = gate.evaluate(intent, state)
+
+        assert decision.allowed is True
+
+    def test_daily_profit_always_allowed(self, limits: RiskLimits, base_state: PortfolioState) -> None:
+        """Positive daily P&L never triggers the daily-loss check."""
+        state = base_state.model_copy(update={"daily_pnl": Decimal("50000")})
+        intent = _intent(qty=10, price="100")
+        gate = RiskGate(limits)
+
+        decision = gate.evaluate(intent, state)
+
+        assert decision.allowed is True
+        assert decision.meta["daily_loss_pct"] == 0.0
 
 
-def test_multiple_violations_all_reported(default_gate):
-    """Несколько violations → все в списке, DENY."""
-    state = PortfolioState(
-        nav=1_000_000,
-        positions={},
-        daily_pnl_pct=-5.0,
-        drawdown_from_peak_pct=-15.0,
-    )
-    intent = TradeIntent(
-        ticker="SBER", side="BUY", quantity=500, price=250, sector="financials"
-    )
-    decision = default_gate.evaluate(intent, state)
-    assert decision.allowed is False
-    assert len(decision.violations) >= 3  # position + sector + daily + DD
+# ===========================================================================
+# Drawdown check
+# ===========================================================================
 
 
-# ===== Fail-safe default =====
+class TestDrawdown:
+    def test_dd_exceeded(self, limits: RiskLimits) -> None:
+        """DD = 16% (limit 15%) must be rejected."""
+        state = PortfolioState(
+            total_equity=Decimal("840000"),   # -16% from 1M peak
+            cash=Decimal("840000"),
+            positions=[],
+            daily_pnl=Decimal("0"),
+            peak_equity=Decimal("1000000"),
+        )
+        intent = _intent(qty=10, price="100")
+        gate = RiskGate(limits)
+
+        decision = gate.evaluate(intent, state)
+
+        assert decision.allowed is False
+        assert any("RISK_DD" in v for v in decision.violations)
+
+    def test_dd_at_limit_allowed(self, limits: RiskLimits) -> None:
+        """DD exactly at 15% is allowed (boundary)."""
+        state = PortfolioState(
+            total_equity=Decimal("850000"),
+            cash=Decimal("850000"),
+            positions=[],
+            daily_pnl=Decimal("0"),
+            peak_equity=Decimal("1000000"),
+        )
+        intent = _intent(qty=10, price="100")
+        gate = RiskGate(limits)
+
+        decision = gate.evaluate(intent, state)
+
+        assert decision.allowed is True
+
+    def test_no_dd_is_zero_pct(self, limits: RiskLimits, base_state: PortfolioState) -> None:
+        """When equity == peak, dd_pct is 0.0 (meta sanity check)."""
+        intent = _intent(qty=10, price="100")
+        gate = RiskGate(limits)
+
+        decision = gate.evaluate(intent, base_state)
+
+        assert decision.allowed is True
+        assert decision.meta["dd_pct"] == pytest.approx(0.0)
 
 
-def test_fail_safe_no_state_data_blocks():
-    """Любая anomaly → DENY (fail-safe)."""
-    gate = RiskGate()
-    # Empty positions, NAV = 0 (аномалия)
-    intent = TradeIntent(ticker="X", side="BUY", quantity=1, price=100)
-    state = PortfolioState(nav=0)
-    decision = gate.evaluate(intent, state)
-    assert decision.allowed is False
-    assert "nav_invalid_or_zero" in decision.violations
+# ===========================================================================
+# Sector-exposure check
+# ===========================================================================
 
 
-def test_fail_safe_negative_position_size_blocked(default_gate, healthy_state):
-    """Negative qty (аномалия данных) → sector math error → проверяем что fail-safe работает."""
-    intent = TradeIntent(ticker="X", side="BUY", quantity=-10, price=100)
-    # Negative qty → negative position_value → negative position_pct
-    # С negative pct проверка position_pct > limit не сработает
-    # → не violation → будет allowed
-    # Это HONEST GAP: нужен sanity check для negative qty
-    decision = default_gate.evaluate(intent, healthy_state)
-    # Документируем реальное поведение (можно улучшить в Phase 1.3)
-    assert decision.allowed is True  # current behavior
+class TestSectorExposure:
+    def test_sector_exposure_exceeded(self, limits: RiskLimits) -> None:
+        """Existing + intent sector exposure > 30% must be rejected."""
+        state = PortfolioState(
+            total_equity=Decimal("1000000"),
+            cash=Decimal("700000"),
+            positions=[
+                Position(
+                    symbol="LKOH",
+                    quantity=Decimal("2000"),
+                    avg_price=Decimal("100"),
+                    sector="energy",
+                ),
+            ],
+            daily_pnl=Decimal("0"),
+            peak_equity=Decimal("1000000"),
+        )
+        # Existing energy exposure = 200,000 = 20% of equity.
+        # Intent notional = 200 * 100 = 20,000.
+        # Projected = 220,000 = 22% — under limit.
+        # To exceed: existing 250,000 + intent 100,000 = 350,000 = 35%.
+        # Let's do it properly:
+        big_state = PortfolioState(
+            total_equity=Decimal("1000000"),
+            cash=Decimal("600000"),
+            positions=[
+                Position(
+                    symbol="LKOH",
+                    quantity=Decimal("2500"),
+                    avg_price=Decimal("100"),
+                    sector="energy",
+                ),
+            ],
+            daily_pnl=Decimal("0"),
+            peak_equity=Decimal("1000000"),
+        )
+        # 250,000 + 100,000 intent = 350,000 = 35% > 30%
+        intent = _intent(symbol="SBER", qty=1000, price="100", sector="energy")
+        gate = RiskGate(limits)
+
+        decision = gate.evaluate(intent, big_state)
+
+        assert decision.allowed is False
+        assert any("RISK_SECTOR" in v for v in decision.violations)
+
+    def test_sector_exposure_allowed(self, limits: RiskLimits) -> None:
+        """Sector exposure under 30% is allowed."""
+        state = PortfolioState(
+            total_equity=Decimal("1000000"),
+            cash=Decimal("900000"),
+            positions=[
+                Position(
+                    symbol="LKOH",
+                    quantity=Decimal("1000"),
+                    avg_price=Decimal("100"),
+                    sector="energy",
+                ),
+            ],
+            daily_pnl=Decimal("0"),
+            peak_equity=Decimal("1000000"),
+        )
+        # 100,000 existing + 10,000 intent = 110,000 = 11% < 30%
+        intent = _intent(symbol="SBER", qty=100, price="100", sector="energy")
+        gate = RiskGate(limits)
+
+        decision = gate.evaluate(intent, state)
+
+        assert decision.allowed is True
+
+    def test_sector_check_skipped_when_no_sector(self, limits: RiskLimits, base_state: PortfolioState) -> None:
+        """Skeleton behaviour: missing intent.sector skips the sector check."""
+        intent = _intent(sector=None)
+        gate = RiskGate(limits)
+
+        decision = gate.evaluate(intent, base_state)
+
+        assert decision.allowed is True
+        assert decision.meta.get("sector_check", "").startswith("skipped")
+
+    def test_other_sector_does_not_count(self, limits: RiskLimits) -> None:
+        """Existing position in 'tech' does not affect 'energy' sector check."""
+        state = PortfolioState(
+            total_equity=Decimal("1000000"),
+            cash=Decimal("500000"),
+            positions=[
+                Position(
+                    symbol="YNDX",
+                    quantity=Decimal("5000"),
+                    avg_price=Decimal("100"),
+                    sector="tech",
+                ),
+            ],
+            daily_pnl=Decimal("0"),
+            peak_equity=Decimal("1000000"),
+        )
+        # Existing tech = 500,000 (50% of equity, way over 30%) but it's TECH,
+        # not energy, so the energy check must not fire.
+        intent = _intent(symbol="SBER", qty=100, price="100", sector="energy")
+        gate = RiskGate(limits)
+
+        decision = gate.evaluate(intent, state)
+
+        # Energy sector check alone passes (10,000 = 1% of equity < 30%).
+        # Position-size check alone passes (10,000 = 1% of equity < 10%).
+        assert decision.allowed is True
 
 
-# ===== RiskLimits defaults =====
+# ===========================================================================
+# Multi-violation & fail-safe
+# ===========================================================================
 
 
-def test_risk_limits_defaults():
-    """Defaults из dataclass — sane values."""
-    limits = RiskLimits()
-    assert limits.max_position_pct == 5.0
-    assert limits.max_sector_pct == 30.0
-    assert limits.max_daily_loss_pct == 3.0
-    assert limits.max_dd_pct == 10.0
+class TestMultipleViolations:
+    def test_multiple_violations(self, limits: RiskLimits) -> None:
+        """A trade violating several limits at once reports ALL of them."""
+        # Equity 800k, peak 1M -> DD = 20% > 15%
+        # daily_pnl = -40k -> -5% > 3%
+        # intent notional = 200,000 -> 25% > 10% position limit
+        state = PortfolioState(
+            total_equity=Decimal("800000"),
+            cash=Decimal("600000"),
+            positions=[],
+            daily_pnl=Decimal("-40000"),
+            peak_equity=Decimal("1000000"),
+        )
+        intent = _intent(qty=2000, price="100")
+        gate = RiskGate(limits)
+
+        decision = gate.evaluate(intent, state)
+
+        assert decision.allowed is False
+        # Should have at least 3 violations: DD, daily loss, position
+        assert len(decision.violations) >= 3
+        codes = [v.split(":")[0] for v in decision.violations]
+        assert "RISK_DD" in codes
+        assert "RISK_DAILY_LOSS" in codes
+        assert "RISK_POSITION" in codes
+
+    def test_no_violations_allows(self, limits: RiskLimits, base_state: PortfolioState) -> None:
+        """Happy path: clean state, small trade -> allowed=True, empty violations."""
+        intent = _intent(qty=100, price="100")  # 10k = 1% of equity
+        gate = RiskGate(limits)
+
+        decision = gate.evaluate(intent, base_state)
+
+        assert isinstance(decision, RiskDecision)
+        assert decision.allowed is True
+        assert decision.violations == ()
+        # Meta should contain all computed metrics
+        assert "position_pct" in decision.meta
+        assert "dd_pct" in decision.meta
+        assert "daily_loss_pct" in decision.meta
 
 
-def test_risk_decision_bool_evaluation():
-    """RiskDecision поддерживает bool() для удобного использования."""
-    allowed_dec = RiskDecision(allowed=True)
-    blocked_dec = RiskDecision(allowed=False)
-    assert bool(allowed_dec) is True
-    assert bool(blocked_dec) is False
+class TestFailSafe:
+    def test_fail_safe_default_unknown_input(self, limits: RiskLimits, base_state: PortfolioState) -> None:
+        """A symbol that pydantic validation rejects (empty after strip) raises.
+
+        The skeleton surfaces this as a ValidationError — Phase 1.3 will
+        translate these into structured risk violations. The contract is
+        "bad inputs never reach evaluate()".
+        """
+        gate = RiskGate(limits)
+        with pytest.raises(ValidationError):
+            TradeIntent(symbol="   ", side="buy", quantity=Decimal("1"), price=Decimal("1"))
+
+    def test_fail_safe_invalid_side(self, limits: RiskLimits, base_state: PortfolioState) -> None:
+        """'sell' is not supported in the skeleton -> ValidationError."""
+        with pytest.raises(ValidationError):
+            TradeIntent(symbol="SBER", side="sell", quantity=Decimal("1"), price=Decimal("1"))
+
+    def test_fail_safe_negative_quantity(self, limits: RiskLimits, base_state: PortfolioState) -> None:
+        """Negative quantity is rejected at the model layer (fail-safe)."""
+        with pytest.raises(ValidationError):
+            TradeIntent(symbol="SBER", side="buy", quantity=Decimal("-1"), price=Decimal("1"))
+
+    def test_fail_safe_zero_price(self, limits: RiskLimits, base_state: PortfolioState) -> None:
+        """Zero price is rejected at the model layer."""
+        with pytest.raises(ValidationError):
+            TradeIntent(symbol="SBER", side="buy", quantity=Decimal("1"), price=Decimal("0"))
+
+    def test_fail_safe_negative_equity(self, limits: RiskLimits) -> None:
+        """PortfolioState with non-positive equity is rejected at the model layer."""
+        with pytest.raises(ValidationError):
+            PortfolioState(
+                total_equity=Decimal("0"),
+                cash=Decimal("0"),
+                positions=[],
+                daily_pnl=Decimal("0"),
+                peak_equity=Decimal("0"),
+            )
+
+    def test_fail_safe_peak_less_than_equity(self, limits: RiskLimits) -> None:
+        """peak_equity < total_equity violates an invariant — rejected."""
+        with pytest.raises(ValidationError):
+            PortfolioState(
+                total_equity=Decimal("1000"),
+                cash=Decimal("1000"),
+                positions=[],
+                daily_pnl=Decimal("0"),
+                peak_equity=Decimal("500"),  # < total_equity: impossible
+            )
+
+    def test_fail_safe_decision_invariant(self, limits: RiskLimits, base_state: PortfolioState) -> None:
+        """RiskDecision cannot be constructed with allowed=True AND violations.
+
+        This guards against a future code path that bypasses the gate.
+        """
+        with pytest.raises(ValidationError):
+            RiskDecision(allowed=True, violations=("RISK_X: should be empty",))
+
+    def test_fail_safe_invalid_limits(self) -> None:
+        """RiskLimits must be in (0, 100]. 0 and > 100 are rejected."""
+        with pytest.raises(ValidationError):
+            RiskLimits(
+                max_dd_pct=Decimal("0"),
+                max_position_pct=Decimal("10"),
+                max_sector_pct=Decimal("30"),
+                max_daily_loss_pct=Decimal("3"),
+            )
+        with pytest.raises(ValidationError):
+            RiskLimits(
+                max_dd_pct=Decimal("101"),
+                max_position_pct=Decimal("10"),
+                max_sector_pct=Decimal("30"),
+                max_daily_loss_pct=Decimal("3"),
+            )
 
 
-# ===== Default gate без limits =====
+# ===========================================================================
+# RiskLimits boundary tests
+# ===========================================================================
 
 
-def test_gate_uses_defaults_when_no_limits():
-    """RiskGate() без аргументов → RiskLimits defaults."""
-    gate = RiskGate()
-    assert gate.limits.max_position_pct == 5.0
+class TestLimits:
+    def test_limits_extra_field_rejected(self) -> None:
+        """RiskLimits rejects unknown fields — fail-safe against typo'd config."""
+        with pytest.raises(ValidationError):
+            RiskLimits(
+                max_dd_pct=Decimal("15"),
+                max_position_pct=Decimal("10"),
+                max_sector_pct=Decimal("30"),
+                max_daily_loss_pct=Decimal("3"),
+                max_something_else=Decimal("99"),  # type: ignore[call-arg]
+            )
 
 
-def test_gate_custom_limits():
-    """RiskGate с кастомными лимитами."""
-    custom = RiskLimits(max_position_pct=2.0)
-    gate = RiskGate(limits=custom)
-    assert gate.limits.max_position_pct == 2.0
-    assert gate.limits.max_dd_pct == 10.0  # defaults остальные
+# ===========================================================================
+# RiskGate behaviour
+# ===========================================================================
 
 
-# ===== Integration: realistic portfolio =====
+class TestGate:
+    def test_gate_stores_limits(self, limits: RiskLimits) -> None:
+        """RiskGate exposes its configured limits (read-only by convention)."""
+        gate = RiskGate(limits)
+        assert gate.limits is limits
+
+    def test_gate_evaluate_is_pure(self, limits: RiskLimits, base_state: PortfolioState) -> None:
+        """Calling evaluate() twice with the same inputs yields equal decisions.
+
+        Guarantees no hidden state, no I/O, no clock reads.
+        """
+        gate = RiskGate(limits)
+        intent = _intent(qty=100, price="100")
+        d1 = gate.evaluate(intent, base_state)
+        d2 = gate.evaluate(intent, base_state)
+        assert d1.allowed == d2.allowed
+        assert d1.violations == d2.violations
+
+    def test_meta_contains_all_metrics(self, limits: RiskLimits, base_state: PortfolioState) -> None:
+        """On a healthy state, every check should populate meta (or skip-key for sector)."""
+        intent = _intent(qty=100, price="100", sector="energy")
+        gate = RiskGate(limits)
+
+        decision = gate.evaluate(intent, base_state)
+
+        assert "position_pct" in decision.meta
+        assert "sector_pct" in decision.meta
+        assert "dd_pct" in decision.meta
+        assert "daily_loss_pct" in decision.meta
+        assert decision.meta["sector"] == "energy"
 
 
-def test_realistic_portfolio_rebalance():
-    """Realistic сценарий: rebalance после DD, покупка новой позиции."""
-    state = PortfolioState(
-        nav=5_000_000,
-        positions={
-            "SBER": {"qty": 1000, "avg_price": 250, "sector": "financials"},  # 250k = 5%
-            "LKOH": {"qty": 200, "avg_price": 5000, "sector": "energy"},     # 1M = 20%
-        },
-        daily_pnl_pct=0.3,
-        drawdown_from_peak_pct=-3.0,
-    )
-    # Adding GAZP (energy, $80) — sector energy is at 20% (1M)
-    # Can add up to 30% - 20% = 10% = 500k = 6250 shares
-    intent = TradeIntent(ticker="GAZP", side="BUY", quantity=1000, price=80, sector="energy")
-    decision = RiskGate().evaluate(intent, state)
-    assert decision.allowed is True
+# ===========================================================================
+# Position / TradeIntent helpers
+# ===========================================================================
 
 
-def test_realistic_sell_reduces_position(default_gate, healthy_state):
-    """SELL уменьшает exposure → должно быть allowed."""
-    healthy_state.positions = {
-        "SBER": {"qty": 200, "avg_price": 250, "sector": "financials"},
-    }
-    # Продаём 100 акций → остаётся 100 (5%) → 2.5% после продажи
-    intent = TradeIntent(ticker="SBER", side="SELL", quantity=100, price=250)
-    decision = default_gate.evaluate(intent, healthy_state)
-    assert decision.allowed is True
+class TestHelpers:
+    def test_position_market_value(self) -> None:
+        """Position.market_value == qty * avg_price (placeholder mark)."""
+        p = Position(symbol="X", quantity=Decimal("10"), avg_price=Decimal("50"), sector="x")
+        assert p.market_value == Decimal("500")
+
+    def test_intent_notional(self) -> None:
+        """TradeIntent.notional == qty * price."""
+        i = _intent(qty=5, price="200")
+        assert i.notional == Decimal("1000")
+
+    def test_intent_symbol_normalised(self) -> None:
+        """Symbol is stripped and uppercased."""
+        i = TradeIntent(symbol="  sber  ", side="buy", quantity=Decimal("1"), price=Decimal("1"))
+        assert i.symbol == "SBER"
