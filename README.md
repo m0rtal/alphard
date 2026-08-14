@@ -14,7 +14,7 @@ Alphard — автономный multi-agent trading system:
 
 ## Архитектура
 
-8 агентов + Coordinator (state machine). Подробности — internal design docs (не в репо).
+8 агентов + Coordinator (state machine). Подробности — internal.
 
 ## Quickstart
 
@@ -43,12 +43,12 @@ alphard/
 ├── src/                      # Код бота (агенты)
 │   └── risk_layer.py         # Risk Agent (Phase 0)
 ├── tests/                    # Тесты
-├── docs/                     # Публичная документация
-│   ├── ARCHITECTURE.md       # Архитектура (внутренний)
-│   ├── RISK.md              # Risk gate правила
-│   ├── RUNBOOK.md           # Операционные процедуры
-│   ├── BROKER.md            # Tinkoff integration
-│   └── DATA.md              # Data quality gate
+├── docs/                     # Документация
+│   ├── ARCHITECTURE.md
+│   ├── RISK.md
+│   ├── RUNBOOK.md
+│   ├── BROKER.md
+│   └── DATA.md
 ├── AGENTS.md                 # Правила для AI-агентов
 ├── docker-compose.yaml       # Stack
 ├── pyproject.toml            # Poetry
@@ -57,7 +57,7 @@ alphard/
 
 ## Что НЕ в репо
 
-- `rf-trading-agent-converged.md` — внутренний design doc (только на нашем сервере)
+- `rf-trading-agent-converged.md` — внутренний design doc, не для публичного доступа
 - `.env` — реальные секреты
 - `data/` — локальные данные
 - `models/` — обученные модели (в git-lfs или отдельно)
