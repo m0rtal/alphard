@@ -8,18 +8,18 @@ name: Build + Push Docker image
 #   3. Pushes to ghcr.io/m0rtal/alphard:latest (and :sha when tagged)
 #
 # Phase 1.3 deploy target:
-#   - Portainer on .107 uses `image: ghcr.io/m0rtal/alphard:latest`
+#   - Portainer on .107 uses image ghcr.io/m0rtal/alphard:latest
 #   - Watchtower (or manual pre-pull) updates container in-place
 #   - This solves the .107 → GitHub clone timeout (no build context needed)
 #
 # Phase 0 stop-gap:
-#   - Stack #97 already uses pre-built `alphard:latest` on .107 (built locally Phase 0)
+#   - Stack #97 already uses pre-built alphard:latest on .107 (built locally Phase 0)
 #   - Once this workflow fires, the image will be replaced with GHCR build
 
 on:
   push:
     branches: [main]
-    tags: ['v*']
+    tags: [v*]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -27,10 +27,6 @@ on:
 permissions:
   contents: read
   packages: write
-
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}  # m0rtal/alphard
 
 jobs:
   build:
@@ -49,7 +45,7 @@ jobs:
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
@@ -57,7 +53,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ghcr.io/${{ github.repository }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=semver,pattern={{version}}
@@ -74,38 +70,9 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: linux/amd64
-          # Build args if needed (none for now — requirements.txt is enough)
 
       - name: Smoke test image (PR only)
         if: github.event_name == 'pull_request'
         run: |
-          docker load --input "${{ steps.build-push-action.outputs.dockerfile }}" 2>/dev/null || \
-            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:pr-${{ github.event.pull_request.number }} || \
-            echo "PR smoke test skipped (image not available locally)"
-          # Quick smoke test: python -c "import sys; sys.exit(0)" inside the container
-          # ensures the image is at least importable.
-
-  trigger-portainer-pull:
-    name: Notify Portainer to pull
-    # Optional: webhook to Portainer after image pushed.
-    # Requires PORTAINER_WEBHOOK_URL secret in repo settings.
-    # Phase 1.3+: replace with actual webhook + Watchtower auto-pull.
-    needs: build
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Trigger Portainer redeploy webhook
-        if: ${{ secrets.PORTAINER_WEBHOOK_URL != '' }}
-        run: |
-          curl -X POST "${{ secrets.PORTAINER_WEBHOOK_URL }}" \
-            -H "Content-Type: application/json" \
-            -d '{"stack":"alphard","image":"ghcr.io/m0rtal/alphard:latest"}' \
-            || echo "Webhook failed (likely not configured yet)"
-        continue-on-error: true
-      - name: Manual instructions (when webhook not configured)
-        if: ${{ secrets.PORTAINER_WEBHOOK_URL == '' }}
-        run: |
-          echo "::notice::Image pushed to GHCR. To deploy on .107:"
-          echo "  ssh root@192.168.1.107 'docker pull ghcr.io/m0rtal/alphard:latest'"
-          echo "  Portainer UI → stack #97 → Editor → redeploy"
-          echo "Or set PORTAINER_WEBHOOK_URL secret for automation."
+          echo "PR smoke test - image was built but not pushed."
+          echo "Re-run on main to verify push works end-to-end."
