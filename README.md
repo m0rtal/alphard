@@ -54,6 +54,11 @@ docker compose logs -f alphard-bot
 docker compose --profile observability up -d
 ```
 
+> **One compose file. Anywhere.** `docker-compose.yaml` is the single source of truth
+> for both local development and Portainer deployment (Portainer stack → Add stack
+> → Repository → Git URL `https://github.com/m0rtal/alphard.git` → Compose path
+> `docker-compose.yaml`). No drift, no parallel files.
+
 ## Структура
 
 Фактический layout репо (Phase 0):
@@ -73,8 +78,7 @@ alphard/
 ├── tests/test_risk_gate.py    # 35 tests, 97% coverage gate.py
 ├── .dockerignore              # Excludes .env, .git, build cache
 ├── .env.example               # Шаблон секретов
-├── docker-compose.yaml        # Локальный stack
-├── portainer-stack.yaml       # Stack для .107 Portainer
+├── docker-compose.yaml        # Single compose file (local + Portainer deploy)
 ├── pyproject.toml             # Poetry (Phase 1+ deps)
 ├── requirements.txt           # Phase 0 deps (pinned)
 ├── LICENSE                    # Apache-2.0 (canonical, 11.3 KB)

@@ -1,8 +1,18 @@
 version: "3.9"
 
-# Alphard stack — локальный development/production deployment.
-# Перед любым изменением image/env/volume — сверяйся с portainer-stack.yaml.
-# Эти два файла синхронизированы в рамках D-H3 (см. AUDIT-Phase0-FINAL).
+# Alphard stack — единый источник правды.
+#
+# Используется:
+# - Локальный dev/prod: `docker compose up -d` (volumes = bind mounts)
+# - Portainer: через Git repository URL + compose path
+#   (Portainer UI → Stacks → Add stack → Repository → Git → URL=https://github.com/m0rtal/alphard.git → Compose path=docker-compose.yaml)
+# - CI smoke-test: `docker compose config` (validation only)
+#
+# SECURITY highlights (full list: docs/SECURITY.md):
+# - Network isolation: postgres/redis НЕ exposed наружу, только `alphard-net`.
+# - Все секреты через `.env` file (никогда не коммитится).
+# - ${VAR:?msg} синтаксис для обязательных паролей (fail-fast при deploy).
+# - Контейнер работает под non-root user alphard (UID 1000) из Dockerfile.
 
 services:
   alphard-bot:
@@ -14,15 +24,29 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      ENV: ${ENV:-production}
+      TINKOFF_SANDBOX_TOKEN: ${TINKOFF_SANDBOX_TOKEN:?TINKOFF_SANDBOX_TOKEN required}
+      TINKOFF_REAL_TOKEN: ${TINKOFF_REAL_TOKEN:-}
+      POSTGRES_USER: ${POSTGRES_USER:-alphard}
+      POSTGRES_DB: ${POSTGRES_DB:-alphard}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD required}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_DIR: ${LOG_DIR:-/app/logs}
+      RISK_MAX_DD_PCT: ${RISK_MAX_DD_PCT:-10}
+      RISK_MAX_POSITION_PCT: ${RISK_MAX_POSITION_PCT:-5}
+      RISK_MAX_SECTOR_PCT: ${RISK_MAX_SECTOR_PCT:-30}
+      RISK_MAX_DAILY_LOSS_PCT: ${RISK_MAX_DAILY_LOSS_PCT:-3}
+      RISK_ALLOW_SHORT: ${RISK_ALLOW_SHORT:-false}
+      RISK_LEVERAGE_MAX: ${RISK_LEVERAGE_MAX:-1.0}
+      DATA_DEFAULT_TIMEFRAME: ${DATA_DEFAULT_TIMEFRAME:-1d}
+      DATA_HISTORY_YEARS: ${DATA_HISTORY_YEARS:-5}
     volumes:
-      - ./logs:/app/logs
+      - alphard-logs:/app/logs
     networks:
       - alphard-net
     # Phase 0: healthcheck отключён (entrypoint — stub, не поднимает HTTP)
     # TODO Phase 1: реальный health endpoint через FastAPI
-    # SECURITY: running as root. Phase 1+ MUST add:
-    #   user: "1000:1000"
-    # to reduce attack surface (SECURITY.md P0 #3).
     deploy:
       resources:
         limits:
@@ -38,9 +62,8 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}
       POSTGRES_DB: ${POSTGRES_DB:-alphard}
     volumes:
-      - postgres_data:/var/lib/postgresql/data
-    # Bind-mount './docker/postgres/init.sql' omitted in Phase 0 — path doesn't exist;
-    # Phase 1+ may add via compose extension.
+      - alphard-postgres-data:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     # ports: NO — postgres ТОЛЬКО внутри alphard-net (SECURITY.md P0 #8)
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-alphard}"]
@@ -56,7 +79,7 @@ services:
     restart: unless-stopped
     command: redis-server --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD required}
     volumes:
-      - redis_data:/data
+      - alphard-redis-data:/data
     # Healthcheck uses ping without password to avoid leaking REDIS_PASSWORD
     # into /proc/1/cmdline (PIDC1 read by host processes leaks credential).
     healthcheck:
@@ -67,14 +90,15 @@ services:
     networks:
       - alphard-net
 
-  # Observability — Phase 0+ (optional)
+  # Observability — Phase 3+ (optional). Включается через `profiles`.
+  # Skeleton-конфиги: docker/prometheus/prometheus.yml + docker/grafana/dashboards/.
   prometheus:
     image: prom/prometheus:latest
     container_name: alphard-prometheus
     restart: unless-stopped
     volumes:
       - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - prometheus_data:/prometheus
+      - alphard-prometheus-data:/prometheus
     ports:
       - "9090:9090"
     networks:
@@ -86,9 +110,9 @@ services:
     container_name: alphard-grafana
     restart: unless-stopped
     environment:
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?required}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD required}
     volumes:
-      - grafana_data:/var/lib/grafana
+      - alphard-grafana-data:/var/lib/grafana
       - ./docker/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
     ports:
       - "3000:3000"
@@ -99,10 +123,11 @@ services:
     profiles: ["observability"]
 
 volumes:
-  postgres_data:
-  redis_data:
-  prometheus_data:
-  grafana_data:
+  alphard-logs:
+  alphard-postgres-data:
+  alphard-redis-data:
+  alphard-prometheus-data:
+  alphard-grafana-data:
 
 networks:
   alphard-net:
