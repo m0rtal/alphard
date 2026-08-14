@@ -105,7 +105,7 @@ jobs:
             -d '{"stack":"alphard","image":"ghcr.io/m0rtal/alphard:latest"}' \
             || echo "Webhook failed (likely not configured yet)"
         continue-on-error: true
-      - name: Manual instructions
+      - name: Manual instructions (when webhook not configured)
         if: ${{ secrets.PORTAINER_WEBHOOK_URL == '' }}
         run: |
           echo "::notice::Image pushed to GHCR. To deploy on .107:"
