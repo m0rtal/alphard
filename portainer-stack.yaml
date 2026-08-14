@@ -1,0 +1,72 @@
+version: "3.9"
+
+# Alphard Phase 0 stack — placeholder env, заполнишь позже
+services:
+  alphard-bot:
+    build:
+      context: https://github.com/m0rtal/alphard.git
+      dockerfile: docker/Dockerfile
+    image: alphard:latest
+    container_name: alphard-bot
+    restart: unless-stopped
+    env_file:
+      - alphard-env
+    volumes:
+      - alphard-logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - alphard-net
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: alphard-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: alphard
+      POSTGRES_PASSWORD: change_me_in_production
+      POSTGRES_DB: alphard
+    volumes:
+      - alphard-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U alphard"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - alphard-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: alphard-redis
+    restart: unless-stopped
+    command: redis-server --requirepass change_me_in_production
+    volumes:
+      - alphard-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "change_me_in_production", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - alphard-net
+
+volumes:
+  alphard-logs:
+  alphard-postgres-data:
+  alphard-redis-data:
+
+networks:
+  alphard-net:
+    driver: bridge
