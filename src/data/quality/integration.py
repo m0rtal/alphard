@@ -103,8 +103,8 @@ def gate_then_upsert(
         report = check_ingestion(ticker, bars, params=params)
         write_report(audit, report)
         if report.rejected:
-            sev = report.worst_severity()
-            sev_value = sev.value if sev is not None else "UNKNOWN"
+            # worst_severity is non-None when rejected (CRITICAL guarantees it)
+            sev_value = report.worst_severity().value  # type: ignore[union-attr]
             raise DataQualityCritical(
                 f"DataStore.upsert_ohlcv rejected for {ticker}: "
                 f"{sev_value} — " + "; ".join(i.message for i in report.issues)
