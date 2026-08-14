@@ -25,4 +25,4 @@ hypothesis>=6.100,<7.0
 # doesn't choke. Pin the major version: psycopg 3 has a different API
 # surface than psycopg2, so mixing them silently corrupts connections.
 # Uncomment locally:
-# psycopg[binary]>=3.1,<4.0
+psycopg[binary]>=3.1,<4.0  # Phase 1.2 — Postgres integration test

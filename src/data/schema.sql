@@ -101,14 +101,14 @@ CREATE INDEX IF NOT EXISTS idx_delisting_log_ticker
     ON delisting_log (ticker);
 
 -- ---------------------------------------------------------------------------
--- news_embedding  (RESERVED — Phase 3 will add vector(384) column)
+-- -- news_embedding  (RESERVED — Phase 3 will add vector(384) column) (pgvector disabled in Phase 1, Phase 3 will enable)
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS news_embedding (
     id            BIGSERIAL PRIMARY KEY,
     ticker        VARCHAR(12),
     ts            TIMESTAMPTZ NOT NULL,
     headline      TEXT NOT NULL,
-    embedding     vector(384),          -- requires pgvector (Phase 3)
+--     embedding     vector(384),          -- requires pgvector (Phase 3) (pgvector disabled in Phase 1, Phase 3 will enable)
     source        VARCHAR(8) NOT NULL DEFAULT 'manual',
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
