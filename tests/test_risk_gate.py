@@ -469,6 +469,52 @@ class TestLimits:
                 max_something_else=Decimal("99"),  # type: ignore[call-arg]
             )
 
+    def test_limits_default_leverage_and_short(self) -> None:
+        """Defaults: leverage_max=1.0 (no leverage), allow_short=False."""
+        limits = RiskLimits(
+            max_dd_pct=Decimal("10"),
+            max_position_pct=Decimal("5"),
+            max_sector_pct=Decimal("30"),
+            max_daily_loss_pct=Decimal("3"),
+        )
+        assert limits.leverage_max == Decimal("1.0")
+        assert limits.allow_short is False
+
+    def test_limits_custom_leverage_and_short(self) -> None:
+        """Custom leverage_max и allow_short принимаются."""
+        limits = RiskLimits(
+            max_dd_pct=Decimal("10"),
+            max_position_pct=Decimal("5"),
+            max_sector_pct=Decimal("30"),
+            max_daily_loss_pct=Decimal("3"),
+            leverage_max=Decimal("1.5"),
+            allow_short=True,
+        )
+        assert limits.leverage_max == Decimal("1.5")
+        assert limits.allow_short is True
+
+    def test_limits_leverage_below_one_rejected(self) -> None:
+        """leverage_max < 1.0 (отрицательный leverage) rejected by pydantic."""
+        with pytest.raises(ValidationError):
+            RiskLimits(
+                max_dd_pct=Decimal("10"),
+                max_position_pct=Decimal("5"),
+                max_sector_pct=Decimal("30"),
+                max_daily_loss_pct=Decimal("3"),
+                leverage_max=Decimal("0.5"),  # below 1.0 — invalid
+            )
+
+    def test_limits_leverage_above_two_rejected(self) -> None:
+        """leverage_max > 2.0 rejected (too risky for long-term investing)."""
+        with pytest.raises(ValidationError):
+            RiskLimits(
+                max_dd_pct=Decimal("10"),
+                max_position_pct=Decimal("5"),
+                max_sector_pct=Decimal("30"),
+                max_daily_loss_pct=Decimal("3"),
+                leverage_max=Decimal("3.0"),  # above 2.0 — invalid
+            )
+
 
 # ===========================================================================
 # RiskGate behaviour

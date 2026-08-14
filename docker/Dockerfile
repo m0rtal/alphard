@@ -17,8 +17,7 @@ COPY src/ ./src/
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD curl -f http://localhost:8080/health || exit 1
+# Phase 0: healthcheck отключён (entrypoint — stub, не поднимает HTTP)
+# TODO Phase 1: реальный health endpoint через FastAPI
 
 ENTRYPOINT ["/entrypoint.sh"]

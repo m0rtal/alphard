@@ -160,6 +160,10 @@ class RiskLimits(BaseModel):
     max_sector_pct: Decimal = Field(..., gt=Decimal("0"), le=Decimal("100"))
     # Maximum daily loss as % of equity. e.g. 3.0 == -3% kills trading for the day.
     max_daily_loss_pct: Decimal = Field(..., gt=Decimal("0"), le=Decimal("100"))
+    # Maximum leverage multiplier (1.0 = no leverage, 1.15 = 15% leverage).
+    leverage_max: Decimal = Field(default=Decimal("1.0"), ge=Decimal("1.0"), le=Decimal("2.0"))
+    # Allow short selling (requires qualified investor + margin account).
+    allow_short: bool = Field(default=False)
 
 
 class RiskDecision(BaseModel):

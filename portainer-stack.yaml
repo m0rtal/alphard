@@ -1,46 +1,52 @@
 version: "3.9"
 
-# Alphard Phase 0 stack — placeholder env, заполнишь позже
+# Alphard Phase 0 stack — все секреты обязательны (${VAR} refs, Portainer подставит из Env payload)
+# См. docs/SECURITY.md P0 #6: пароли > 16 chars обязательны.
+# См. README.md "Quickstart": перед deploy задай Env vars в Portainer UI или через API payload.
+
 services:
   alphard-bot:
-    build:
-      context: https://github.com/m0rtal/alphard.git
-      dockerfile: docker/Dockerfile
-    image: alphard:latest
+    image: python:3.11-slim
     container_name: alphard-bot
     restart: unless-stopped
-    env_file:
-      - alphard-env
+    command: >
+      sh -c "apt-get update && apt-get install -y --no-install-recommends curl git &&
+             pip install --no-cache-dir pydantic pytest pytest-cov &&
+             python -c 'import time; print(\"alphard-bot heartbeat\", flush=True); time.sleep(3600)'"
+    environment:
+      TINKOFF_SANDBOX_TOKEN: ${TINKOFF_SANDBOX_TOKEN}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      RISK_MAX_DD_PCT: ${RISK_MAX_DD_PCT:-10}
+      RISK_MAX_POSITION_PCT: ${RISK_MAX_POSITION_PCT:-5}
+      RISK_MAX_SECTOR_PCT: ${RISK_MAX_SECTOR_PCT:-30}
+      RISK_MAX_DAILY_LOSS_PCT: ${RISK_MAX_DAILY_LOSS_PCT:-3}
+      RISK_ALLOW_SHORT: ${RISK_ALLOW_SHORT:-false}
+      RISK_LEVERAGE_MAX: ${RISK_LEVERAGE_MAX:-1.0}
+      DATA_DEFAULT_TIMEFRAME: ${DATA_DEFAULT_TIMEFRAME:-1d}
+      DATA_HISTORY_YEARS: ${DATA_HISTORY_YEARS:-5}
     volumes:
       - alphard-logs:/app/logs
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    ports:
-      - "8080:8080"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
     networks:
       - alphard-net
+    # Phase 0: healthcheck отключён (entrypoint — stub, не поднимает HTTP)
+    # TODO Phase 1: реальный health endpoint через FastAPI
 
   postgres:
     image: postgres:16-alpine
     container_name: alphard-postgres
     restart: unless-stopped
     environment:
-      POSTGRES_USER: alphard
-      POSTGRES_PASSWORD: change_me_in_production
-      POSTGRES_DB: alphard
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     volumes:
       - alphard-postgres-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U alphard"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -51,11 +57,11 @@ services:
     image: redis:7-alpine
     container_name: alphard-redis
     restart: unless-stopped
-    command: redis-server --requirepass change_me_in_production
+    command: redis-server --requirepass ${REDIS_PASSWORD}
     volumes:
       - alphard-redis-data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "change_me_in_production", "ping"]
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
