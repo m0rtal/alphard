@@ -515,6 +515,39 @@ class TestLimits:
                 leverage_max=Decimal("3.0"),  # above 2.0 — invalid
             )
 
+    def test_limits_immutability(self) -> None:
+        """RiskLimits model is frozen: post-construction mutation must FAIL.
+
+        SECURITY: this is the **risk gate** — if a caller could mutate
+        limits.max_dd_pct = 200 after construction, the validators (gt=0, le=100)
+        would be bypassed entirely. Pydantic v2's `frozen=True` raises
+        ValidationError on `__setattr__`. We verify the public API is locked.
+
+        Note: `object.__setattr__` bypass is theoretical — Python runtime
+        cannot prevent low-level bypass without C-level interception. The
+        defence-in-depth is in the architecture: RiskGate is constructed
+        with limits ONCE, then carried by reference. A caller that has
+        the reference could in theory bypass but cannot also bypass
+        integration testing + audit log.
+        """
+        limits = RiskLimits(
+            max_dd_pct=Decimal("10"),
+            max_position_pct=Decimal("5"),
+            max_sector_pct=Decimal("30"),
+            max_daily_loss_pct=Decimal("3"),
+        )
+        # Direct attribute assignment is blocked by pydantic frozen=True
+        with pytest.raises((ValidationError, Exception)) as exc_info:
+            limits.max_dd_pct = Decimal("200")
+        # Verify validators still reject invalid even if frozen is bypassed:
+        with pytest.raises(ValidationError):
+            RiskLimits(
+                max_dd_pct=Decimal("200"),  # impossible via frozen bypass without removing it
+                max_position_pct=Decimal("5"),
+                max_sector_pct=Decimal("30"),
+                max_daily_loss_pct=Decimal("3"),
+            )
+
 
 # ===========================================================================
 # RiskGate behaviour

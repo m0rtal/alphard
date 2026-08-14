@@ -1,0 +1,59 @@
+# Exclude from Docker build context — keeps image small, .env safe.
+# See: https://docs.docker.com/engine/reference/builder/#dockerignore-file
+
+# Git
+.git/
+.gitignore
+.github/
+
+# Python cache
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+
+# Test artifacts
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# Local config (REAL secrets must NEVER enter the image)
+.env
+.env.*
+!.env.example
+
+# Auth — keys, certs, secrets
+*.pem
+*.key
+*.crt
+*.cert
+secrets/
+*.secret
+
+# IDE / OS junk
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Docker
+Dockerfile
+.dockerignore
+
+# Build / distribution
+dist/
+build/
+*.wheel
+
+# Logs and audit artifacts (don't bake them into image)
+logs/
+data/
+docs/AUDIT-*.md
+*.log
+
+# Testing-only files
+tests/fixtures/
+*.html.bak

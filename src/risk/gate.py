@@ -148,9 +148,16 @@ class PortfolioState(BaseModel):
 
 
 class RiskLimits(BaseModel):
-    """Hard limits enforced by the gate. All percentages are in % units (e.g. 5.0 = 5%)."""
+    """Hard limits enforced by the gate. All percentages are in % units (e.g. 5.0 = 5%).
 
-    model_config = ConfigDict(extra="forbid")
+    SECURITY: model is `frozen=True` — once constructed, fields cannot be mutated.
+    Without `frozen`, post-construction assignment would bypass all `Field` validators
+    (e.g., `limits.max_dd_pct = 200` would not raise ValidationError). This is
+    the **risk gate** — any code path that could mutate limits after validation is
+    an exploit vector. See SECURITY.md: "Risk gate immutability".
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     # Maximum drawdown from peak equity, in percent. e.g. 15.0 == 15% DD.
     max_dd_pct: Decimal = Field(..., gt=Decimal("0"), le=Decimal("100"))
