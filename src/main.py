@@ -48,9 +48,7 @@ def main() -> None:
     logger = logging.getLogger("alphard")
 
     logger.info("Alphard bot starting (Phase 0 stub)... ")
-    logger.warning(
-        "No agents implemented yet. Phase 0 ships a heartbeat only."
-    )
+    logger.warning("No agents implemented yet. Phase 0 ships a heartbeat only.")
 
     # Phase 1 replaces this loop with FastAPI app + /health + /metrics.
     try:
