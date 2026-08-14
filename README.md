@@ -39,62 +39,83 @@ docker compose up -d
 # 5. Проверить
 docker compose ps
 docker compose logs -f alphard-bot
-curl http://localhost:8080/health
+# NB: Phase 0 — stub. /health endpoint появится в Phase 1.
+# Сейчас "увидеть alive" можно только через docker compose logs.
 ```
 
 ## Структура
 
+Фактический layout репо (Phase 0):
+
 ```
 alphard/
-├── src/                      # Код бота (агенты)
-│   └── risk_layer.py         # Risk Agent (Phase 0)
-├── tests/                    # Тесты
-├── docs/                     # Документация
-│   ├── ARCHITECTURE.md
-│   ├── RISK.md
-│   ├── RUNBOOK.md
-│   ├── BROKER.md
-│   └── DATA.md
-├── AGENTS.md                 # Правила для AI-агентов
-├── docker-compose.yaml       # Stack
-├── pyproject.toml            # Poetry
-└── .env.example              # Шаблон секретов
+├── .github/workflows/ci.yml   # CI (pytest + black + flake8 + mypy + gitleaks)
+├── docker/                    # Dockerfile + entrypoint.sh
+├── docs/
+│   ├── SECURITY.md            # Threat model (5 layers + P0/P1/P2)
+│   ├── AUDIT-CodeQuality.md   # Phase 0 audit reports
+│   └── AUDIT-Phase0-FINAL.md
+├── src/
+│   ├── main.py                # Phase 0 heartbeat stub
+│   └── risk/
+│       └── gate.py            # Risk Agent (frozen pydantic validators, 97% coverage)
+├── tests/test_risk_gate.py    # 35 tests, 97% coverage gate.py
+├── .dockerignore              # Excludes .env, .git, build cache
+├── .env.example               # Шаблон секретов
+├── docker-compose.yaml        # Локальный stack
+├── portainer-stack.yaml       # Stack для .107 Portainer
+├── pyproject.toml             # Poetry (Phase 1+ deps)
+├── requirements.txt           # Phase 0 deps (pinned)
+├── LICENSE                    # Apache-2.0 (canonical, 11.3 KB)
+└── README.md
 ```
 
 ## Что НЕ в репо
 
-- `rf-trading-agent-converged.md` — внутренний design doc, не для публичного доступа
 - `.env` — реальные секреты
-- `data/` — локальные данные
-- `models/` — обученные модели (в git-lfs или отдельно)
+- `data/` — локальные данные (bind-mount)
+- `models/` — обученные модели (добавятся в Phase 2/3)
+- Внутренние design docs (architecture, agent topology) — не публикуются по соображениям конкурентной/стратегической безопасности
 
 ## Разработка
 
 ```bash
-# Установить pre-commit hooks
-poetry install
+# Установить pre-commit hooks (gitleaks обязательно)
+pip install pre-commit
 pre-commit install
 
 # Запустить тесты
-poetry run pytest
+python3 -m pytest
 
-# Проверить coverage
-poetry run pytest --cov=src --cov-report=html
+# Проверить coverage (gate required ≥95%)
+python3 -m pytest --cov=src --cov-report=html
+
+# Black / flake8 / mypy (запускаются автоматически в CI)
+python3 -m black --check src/ tests/
+python3 -m flake8 src/ tests/
+python3 -m mypy src/ --strict --ignore-missing-imports
 ```
 
 ## Безопасность
 
 - ✅ `.env` в `.gitignore`, никогда не коммитится
-- ✅ `gitleaks` pre-commit hook блокирует утечки секретов
+- ✅ `gitleaks` pre-commit + GitHub Actions CI блокируют утечки секретов
+- ✅ Контейнер работает от non-root user (UID 1000)
+- ✅ Risk Agent — `RiskLimits` frozen=True, любая мутация post-construction отклоняется
+- ✅ Сеть изолирована (postgres/redis только внутри `alphard-net`)
 - ✅ Все credentials через `.env`, шаблон в `.env.example`
-- ⚠️ Audit: `make audit-secrets` (TODO: добавить)
+- ⚠️ Audit: Phase 0 финальный отчёт → `docs/AUDIT-Phase0-FINAL.md` (8 critical, 10 high)
 
 ## Honest gaps
 
-- Phase 0: только skeleton Risk Agent
-- Нет брокер-абстракции, ML pipeline, backtest framework — в следующих фазах
-- Backtest на истории НЕ запущен (нужен OHLCV дамп)
-- Tinkoff API capabilities НЕ протестированы hands-on (нужен токен)
+- Phase 0: только Risk Agent. Data Agent, Quant Agent, Macro Agent, Portfolio, Execution, Coordinator — в Phase 1+
+- Брокер-абстракция, Tinkoff connector — Phase 1.3
+- Backtest framework (VectorBT) — Phase 2/3
+- ML pipeline (LightGBM) — Phase 2
+- News + RAG (pgvector) — Phase 3
+- `/health` HTTP endpoint не реализован (Phase 1)
+- Prometheus/Grafana observability — Phase 3
+- AGENTS.md для OSS contributors — на стадии подготовки
 
 ## Лицензия
 

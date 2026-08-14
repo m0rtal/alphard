@@ -35,7 +35,8 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-alphard}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    # Bind-mount './docker/postgres/init.sql' omitted in Phase 0 — path doesn't exist;
+    # Phase 1+ may add via compose extension.
     # ports: NO — postgres ТОЛЬКО внутри alphard-net (SECURITY.md P0 #8)
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-alphard}"]
@@ -52,9 +53,10 @@ services:
     command: redis-server --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD required}
     volumes:
       - redis_data:/data
-    # ports: NO — redis ТОЛЬКО внутри alphard-net (SECURITY.md P0 #8)
+    # Healthcheck uses ping without password to avoid leaking REDIS_PASSWORD
+    # into /proc/1/cmdline (PIDC1 read by host processes leaks credential).
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
