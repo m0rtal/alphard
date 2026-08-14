@@ -2,25 +2,17 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Системные зависимости
+# System dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# Poetry
-RUN pip install --no-cache-dir poetry==1.8.2
+# Python deps (Phase 0: requirements.txt; Phase 1+ will use poetry)
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Копируем pyproject.toml и poetry.lock (если есть)
-COPY pyproject.toml ./
-COPY poetry.lock* ./
-
-# Устанавливаем зависимости (без dev в production)
-RUN poetry config virtualenvs.create false \
-    && poetry install --no-interaction --only=main --no-root \
-    || poetry install --no-interaction --no-root
-
-# Код бота
+# Bot code
 COPY src/ ./src/
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
