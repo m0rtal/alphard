@@ -8,3 +8,21 @@ pytest-cov>=4.1,<5.0
 black==24.10.0
 flake8>=7.0,<8.0
 mypy>=1.10,<2.0
+
+# Phase 1.1 (data agent) — stdlib-first, single external HTTP client.
+requests>=2.31,<3.0
+python-dateutil>=2.8,<3.0
+# pydantic-settings is optional: TinkoffDataLoader reads env vars directly via
+# os.environ. We pin the upper bound so a future v3 release (breaking change)
+# cannot accidentally land in production.
+pydantic-settings>=2.0,<3.0
+
+# Phase 1.1 dev deps — property-based contract tests.
+hypothesis>=6.100,<7.0
+
+# Phase 1.1 production deps — only when Postgres is in use. NOT imported
+# by default; the module imports ``psycopg`` lazily so CI without Postgres
+# doesn't choke. Pin the major version: psycopg 3 has a different API
+# surface than psycopg2, so mixing them silently corrupts connections.
+# Uncomment locally:
+psycopg[binary]>=3.1,<4.0  # Phase 1.2 — Postgres integration test

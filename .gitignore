@@ -46,7 +46,7 @@ secrets/
 *.secret
 
 # Local data
-data/
+/data/
 data_local/
 backtest_results/
 logs/
