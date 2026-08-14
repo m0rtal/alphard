@@ -26,14 +26,29 @@ version: "3.9"
 
 services:
   alphard-bot:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile
-    image: alphard:latest
+    # IMAGE STRATEGY (Phase 1.3+):
+    #   - GHCR image `ghcr.io/m0rtal/alphard:latest` is the canonical source.
+    #     Built in GitHub Actions (.github/workflows/docker-image.yml) on every
+    #     push to main. Watchtower on .107 auto-pulls or manual pre-pull.
+    #   - Local dev can override via `docker compose pull && up` OR build from
+    #     local Dockerfile with `image: alphard:latest` (commented below for
+    #     explicit local builds — CI does NOT trigger from this override).
+    image: ghcr.io/m0rtal/alphard:latest
+    # For pure local development without GHCR, comment the line above and
+    # uncomment the block below:
+    #   build:
+    #     context: .
+    #     dockerfile: docker/Dockerfile
+    #   image: alphard:latest
     container_name: alphard-bot
     restart: unless-stopped
-    env_file:
-      - .env
+    # env_file references host filesystem which Portainer does
+    # not populate. We pass env vars via `environment:` block with Portainer
+    # Env array as the single source of truth (the install docs describe
+    # this in docs/RUNBOOK.md). Local `docker compose` users should still
+    # work because Portainer substitutes ${VAR} from Env array even when
+    # there's no env_file. For local-only development, copy .env.example
+    # to .env and use `docker compose --env-file .env up`.
     environment:
       ENV: ${ENV:-production}
       TINKOFF_SANDBOX_TOKEN: ${TINKOFF_SANDBOX_TOKEN:?TINKOFF_SANDBOX_TOKEN required}
