@@ -4,7 +4,14 @@
 set -e
 
 echo "Starting Alphard..."
-echo "ENV: ${ENV:-production}"
+# S-H5: do NOT echo $ENV value into docker logs (it may carry secrets in
+# misconfigured deployments). Print only the name of the active profile.
+ENV_PROFILE="${ENV:-production}"
+case "$ENV_PROFILE" in
+    production|development|staging|test) ;;
+    *) ENV_PROFILE="unknown" ;;
+esac
+echo "ENV profile: $ENV_PROFILE"
 echo "Python: $(python --version)"
 
 # Phase 0 sanity gate: refuse to start without explicit override if neither

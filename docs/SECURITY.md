@@ -97,9 +97,13 @@
 
 ### Level 4: Monitoring & detection
 
-**Уже есть:**
-- ✅ Prometheus metrics endpoint
-- ✅ Decision lineage в Postgres
+**Phase 3+ (НЕ Phase 0):**
+- 🔄 Prometheus metrics endpoint — `docker compose --profile observability up -d`
+  поднимает `alphard-prometheus` + `alphard-grafana`. Skeleton-конфиги в
+  `docker/prometheus/prometheus.yml` + `docker/grafana/dashboards/`.
+  Default scrape: только self. alphard-bot targets появятся в Phase 3, когда
+  `src/main.py` будет экспортировать `/metrics`.
+- ✅ Decision lineage в Postgres — Phase 1+
 
 **Phase 1 нужно:**
 - 🔄 **Anomaly detection** — если бот внезапно делает X trades/min → alert
@@ -142,7 +146,7 @@
 
 | # | Мера | Где |
 |---|---|---|
-| 11 | Anomaly detection alerts | Prometheus + AlertManager |
+| 11 | Anomaly detection alerts | Prometheus + AlertManager | TODO Phase 3 |
 | 12 | Loss alerts (telegram/SMS) | Phase 4 |
 | 13 | Failed trades spike detector | Phase 4 |
 | 14 | Token usage anomaly | Tinkoff wrapper |

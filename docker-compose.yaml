@@ -1,5 +1,9 @@
 version: "3.9"
 
+# Alphard stack — локальный development/production deployment.
+# Перед любым изменением image/env/volume — сверяйся с portainer-stack.yaml.
+# Эти два файла синхронизированы в рамках D-H3 (см. AUDIT-Phase0-FINAL).
+
 services:
   alphard-bot:
     build:
