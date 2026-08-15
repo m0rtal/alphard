@@ -245,29 +245,29 @@ class PostgresDataStore(DataStore):
         return {"inserted": len(filtered), "skipped": skipped}
 
     def migrate_deduplicate(self) -> int:
-        """One-time migration: collapse (ticker, ts, source) rows to a single row.
+        """One-time migration: collapse duplicate (ticker, ts) rows.
 
-        For each (ticker, ts) with multiple sources, KEEP the row from the
-        'tkf' source if present, else moex. Set covered_by_tkf/moex flags
-        appropriately. DELETE the duplicates.
+        The current schema (Phase 1.1) has PK (ticker, ts), so no duplicates
+        can exist. This function is a safety net for legacy states where
+        the PK was dropped (e.g. partial migration from old versioned
+        schema). It deletes duplicates keeping the row with the lowest
+        ctid (effectively whichever row was inserted first).
+
+        Note: this doesn't rewrite the covered_by_* flags because the
+        current schema already covers source provenance via the
+        primary_source column on insert.
 
         Returns count of rows deleted.
         """
         self._connect()
         with self._conn.cursor() as cur:
-            # Set primary_source = 'tkf' if exists, else 'moex'
-            # Set covered_by_tkf / covered_by_moex based on what exists
-            # Keep tkf row (or moex if no tkf), delete the other
             cur.execute(
                 """
                 WITH ranked AS (
                     SELECT ctid,
-                           ticker,
-                           ts,
-                           source,
                            ROW_NUMBER() OVER (
                                PARTITION BY ticker, ts
-                               ORDER BY CASE source WHEN 'tkf' THEN 0 WHEN 'moex' THEN 1 ELSE 2 END
+                               ORDER BY ctid
                            ) AS rn
                     FROM ohlcv_daily
                 ),
@@ -279,33 +279,6 @@ class PostgresDataStore(DataStore):
             """
             )
             deleted = int(cur.rowcount)
-
-            # Now update covered_by_* flags based on remaining rows
-            cur.execute(
-                """
-                UPDATE ohlcv_daily SET covered_by_tkf = TRUE
-                WHERE (ticker, ts) IN (SELECT ticker, ts FROM ohlcv_daily WHERE source = 'tkf')
-            """
-            )
-            cur.execute(
-                """
-                UPDATE ohlcv_daily SET covered_by_moex = TRUE
-                WHERE (ticker, ts) IN (SELECT ticker, ts FROM ohlcv_daily WHERE source = 'moex')
-            """
-            )
-            # Set primary_source correctly
-            cur.execute(
-                """
-                UPDATE ohlcv_daily SET primary_source = 'tkf'
-                WHERE source = 'tkf' AND primary_source <> 'tkf'
-            """
-            )
-            cur.execute(
-                """
-                UPDATE ohlcv_daily SET primary_source = 'moex'
-                WHERE source = 'moex' AND primary_source NOT IN ('tkf', 'moex')
-            """
-            )
         self._conn.commit()
         return deleted
 
