@@ -13,7 +13,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.data import LoaderAuthError, TickerMeta, TinkoffDataLoader
-from src.data.models import OHLCVRow
 
 
 class TestTinkoffDataLoader:

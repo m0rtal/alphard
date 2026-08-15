@@ -18,7 +18,6 @@ Capabilities matrix
 - Portfolio snapshot — Phase 5
 
 Why gRPC (not REST HTTPS)
---------------------------
 Tinkoff Invest REST HTTPS endpoint requires a Russian-trusted CA chain
 not present in minimal Python containers. gRPC uses its own TLS and
 ships with the SDK, so it works out of the box. We therefore use the
@@ -55,7 +54,6 @@ from .loader import (
     LoaderAuthError,
     LoaderError,
     LoaderNotFoundError,
-    LoaderRateLimitError,
 )
 from .models import CorporateAction, OHLCVRow, TickerMeta
 

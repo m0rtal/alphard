@@ -10,7 +10,6 @@ Structure
 5. ``test_tinkoff_loader`` — auth gating, sandbox vs prod URL.
 6. ``test_sqlite_store`` — contract tests, run twice via parametrize to also
    smoke-test any future ``PostgresDataStore`` if ``$ALPHARD_PG_DSN`` is set.
-7. ``test_property_based`` — hypothesis-driven roundtrip tests.
 
 Coverage target: ≥75% of ``src/data``.
 """
@@ -38,7 +37,6 @@ from src.data import (
     OHLCVRow,
     RateLimitError,
     TickerMeta,
-    TinkoffDataLoader,
     TokenBucket,
 )
 from src.data.models import TICKER_REGEX
