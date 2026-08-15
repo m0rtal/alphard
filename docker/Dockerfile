@@ -16,6 +16,8 @@ RUN groupadd -r -g 1000 alphard && \
 
 # Python deps (Phase 0: requirements.txt; Phase 1+ will use poetry)
 COPY requirements.txt ./
+RUN pip install --no-cache-dir t-tech-investments --index-url https://opensource.tbank.ru/api/v4/projects/238/packages/pypi/simple
+
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Bot code (with correct ownership before USER switch)
