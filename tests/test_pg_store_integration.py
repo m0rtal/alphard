@@ -27,16 +27,21 @@ SKIP_REASON = "ALPHARD_PG_DSN not set; skipping integration test"
 
 @pytest.fixture(scope="module")
 def pg_store():
-    """Skip if no DSN. Otherwise create isolated test schema."""
+    """Skip if no DSN. Otherwise create isolated test schema.
+
+    The ``search_path`` is passed to PostgresDataStore so it survives
+    connection re-opens (e.g. test_close_idempotent followed by another
+    test triggers _connect which recreates the conn with default
+    search_path=public otherwise).
+    """
     if not DSN:
         pytest.skip(SKIP_REASON)
-    store = PostgresDataStore(DSN)
+    store = PostgresDataStore(DSN, search_path="alphard_test, public")
     try:
         store._connect()
         # Use a separate test schema namespace to avoid colliding with prod
         with store._conn.cursor() as cur:
             cur.execute("CREATE SCHEMA IF NOT EXISTS alphard_test")
-            cur.execute("SET search_path TO alphard_test, public")
         store._conn.commit()
         store.init_schema()
         yield store
@@ -418,7 +423,6 @@ class TestMigrateDeduplicate:
         pg_store._conn.commit()
 
 
-
 class TestOHLCVQueryVariants:
     def test_query_ohlcv_filters_by_source(self, pg_store):
         meta = TickerMeta(
@@ -449,15 +453,11 @@ class TestOHLCVQueryVariants:
         assert len(rows) == 1
 
         # Match source → returns the row
-        rows = pg_store.query_ohlcv(
-            "PG_SRC", date(2026, 8, 1), date(2026, 8, 31), primary_source="tkf"
-        )
+        rows = pg_store.query_ohlcv("PG_SRC", date(2026, 8, 1), date(2026, 8, 31), primary_source="tkf")
         assert len(rows) == 1
 
         # Non-matching source → empty
-        rows = pg_store.query_ohlcv(
-            "PG_SRC", date(2026, 8, 1), date(2026, 8, 31), primary_source="moex"
-        )
+        rows = pg_store.query_ohlcv("PG_SRC", date(2026, 8, 1), date(2026, 8, 31), primary_source="moex")
         assert rows == []
 
     def test_count_ohlcv_all(self, pg_store):

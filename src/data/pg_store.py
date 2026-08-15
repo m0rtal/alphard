@@ -44,12 +44,21 @@ class PostgresDataStore(DataStore):
         module. Phase 2 will switch to a real migration framework.
     """
 
-    def __init__(self, dsn: str | None = None, *, schema_sql_path: str | None = None) -> None:
+    def __init__(
+        self,
+        dsn: str | None = None,
+        *,
+        schema_sql_path: str | None = None,
+        search_path: str | None = None,
+    ) -> None:
         dsn = dsn or os.environ.get("ALPHARD_PG_DSN")
         if not dsn:
             raise StoreError("PostgresDataStore: no DSN — pass dsn= or set $ALPHARD_PG_DSN")
         self._dsn = dsn
         self._schema_sql_path = schema_sql_path or os.path.join(os.path.dirname(__file__), "schema.sql")  # noqa: E501
+        # Optional: keep a custom search_path on every (re)connect.
+        # Used by tests to isolate against an alphard_test schema.
+        self._search_path = search_path
         # Imported lazily so the rest of the package works without psycopg.
         import psycopg
 
@@ -61,6 +70,9 @@ class PostgresDataStore(DataStore):
     def _connect(self) -> None:
         if self._conn is None or self._conn.closed:
             self._conn = self._psycopg.connect(self._dsn, autocommit=True)
+            if self._search_path:
+                with self._conn.cursor() as cur:
+                    cur.execute(f"SET search_path TO {self._search_path}")
 
     def close(self) -> None:
         if self._conn is not None and not self._conn.closed:
