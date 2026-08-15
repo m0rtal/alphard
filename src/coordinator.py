@@ -312,7 +312,7 @@ class Coordinator:
                 quantity=self.config.quantity,
             )
             status = account.place_order(order)
-            return status.value
+            return str(status.value)
         except Exception as exc:
             logger.error("BROKER submit failed for %s: %s", self.config.ticker, exc)
             return f"ERROR:{type(exc).__name__}"
