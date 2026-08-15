@@ -58,6 +58,7 @@ USAGE
     result = coord.run_once()
     print(result.decision)
 """
+
 from __future__ import annotations
 
 import logging

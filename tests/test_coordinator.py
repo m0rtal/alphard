@@ -1,4 +1,5 @@
 """Tests for the Coordinator stub (Phase 1.5)."""
+
 from __future__ import annotations
 
 from datetime import date, timedelta
@@ -17,6 +18,7 @@ from src.coordinator import (
 # -----------------------------------------------------------------------------
 # Fixtures
 # -----------------------------------------------------------------------------
+
 
 def _limits() -> MagicMock:
     return MagicMock(
@@ -50,6 +52,7 @@ def _config(**overrides: object) -> CoordinatorConfig:
 # Config dataclass
 # -----------------------------------------------------------------------------
 
+
 class TestCoordinatorConfig:
     def test_config_is_immutable(self) -> None:
         cfg = _config()
@@ -67,6 +70,7 @@ class TestCoordinatorConfig:
 # -----------------------------------------------------------------------------
 # Coordinator.run_once() — fetch stage
 # -----------------------------------------------------------------------------
+
 
 class TestCoordinatorFetchStage:
     def test_fetch_failure_short_circuits_to_done(self) -> None:
@@ -98,28 +102,29 @@ class TestCoordinatorFetchStage:
 # Coordinator.run_once() — risk stage
 # -----------------------------------------------------------------------------
 
+
 class TestCoordinatorRiskStage:
     def test_risk_allowed_continues_to_execute(self) -> None:
-        with patch.object(Coordinator, "_fetch", return_value=[_bar()]), patch.object(
-            Coordinator, "_validate", return_value=True
-        ), patch.object(
-            Coordinator, "_risk_check", return_value=(True, ())
-        ), patch.object(
-            Coordinator, "_execute", return_value="REJECTED_LIVE_TRADING_FALSE"
-        ), patch.object(Coordinator, "_audit", return_value=None):
+        with (
+            patch.object(Coordinator, "_fetch", return_value=[_bar()]),
+            patch.object(Coordinator, "_validate", return_value=True),
+            patch.object(Coordinator, "_risk_check", return_value=(True, ())),
+            patch.object(Coordinator, "_execute", return_value="REJECTED_LIVE_TRADING_FALSE"),
+            patch.object(Coordinator, "_audit", return_value=None),
+        ):
             coord = Coordinator(_config())
             result = coord.run_once()
         assert result.risk_allowed is True
         assert result.broker_status == "REJECTED_LIVE_TRADING_FALSE"
 
     def test_risk_denied_blocks_execute(self) -> None:
-        with patch.object(Coordinator, "_fetch", return_value=[_bar()]), patch.object(
-            Coordinator, "_validate", return_value=True
-        ), patch.object(
-            Coordinator, "_risk_check", return_value=(False, ("RISK_DD: 12% > 10%",))
-        ), patch.object(
-            Coordinator, "_execute", return_value="REJECTED_RISK_GATE"
-        ), patch.object(Coordinator, "_audit", return_value=None):
+        with (
+            patch.object(Coordinator, "_fetch", return_value=[_bar()]),
+            patch.object(Coordinator, "_validate", return_value=True),
+            patch.object(Coordinator, "_risk_check", return_value=(False, ("RISK_DD: 12% > 10%",))),
+            patch.object(Coordinator, "_execute", return_value="REJECTED_RISK_GATE"),
+            patch.object(Coordinator, "_audit", return_value=None),
+        ):
             coord = Coordinator(_config())
             result = coord.run_once()
         assert result.risk_allowed is False
@@ -131,15 +136,17 @@ class TestCoordinatorRiskStage:
 # Coordinator.run_once() — execute stage (LIVE_TRADING gate)
 # -----------------------------------------------------------------------------
 
+
 class TestCoordinatorExecuteStage:
     def test_live_trading_false_refuses_every_order(self) -> None:
         """The hard Phase 1 guarantee — even with risk approval, no order if LIVE_TRADING=false."""
         cfg = _config(live_trading=False)
-        with patch.object(Coordinator, "_fetch", return_value=[_bar()]), patch.object(
-            Coordinator, "_validate", return_value=True
-        ), patch.object(
-            Coordinator, "_risk_check", return_value=(True, ())
-        ), patch.object(Coordinator, "_audit", return_value=None):
+        with (
+            patch.object(Coordinator, "_fetch", return_value=[_bar()]),
+            patch.object(Coordinator, "_validate", return_value=True),
+            patch.object(Coordinator, "_risk_check", return_value=(True, ())),
+            patch.object(Coordinator, "_audit", return_value=None),
+        ):
             coord = Coordinator(cfg)
             result = coord.run_once()
         assert result.broker_status == "REJECTED_LIVE_TRADING_FALSE"
@@ -148,26 +155,26 @@ class TestCoordinatorExecuteStage:
     def test_live_trading_true_with_risk_calls_execute(self) -> None:
         """If LIVE_TRADING=true and risk=allowed, _execute() is called and returned."""
         cfg = _config(live_trading=True)
-        with patch.object(Coordinator, "_fetch", return_value=[_bar()]), patch.object(
-            Coordinator, "_validate", return_value=True
-        ), patch.object(
-            Coordinator, "_risk_check", return_value=(True, ())
-        ), patch.object(
-            Coordinator, "_execute", return_value="FILLED"
-        ), patch.object(Coordinator, "_audit", return_value=None):
+        with (
+            patch.object(Coordinator, "_fetch", return_value=[_bar()]),
+            patch.object(Coordinator, "_validate", return_value=True),
+            patch.object(Coordinator, "_risk_check", return_value=(True, ())),
+            patch.object(Coordinator, "_execute", return_value="FILLED"),
+            patch.object(Coordinator, "_audit", return_value=None),
+        ):
             coord = Coordinator(cfg)
             result = coord.run_once()
         assert result.broker_status == "FILLED"
 
     def test_live_trading_true_with_risk_denied_blocks(self) -> None:
         cfg = _config(live_trading=True)
-        with patch.object(Coordinator, "_fetch", return_value=[_bar()]), patch.object(
-            Coordinator, "_validate", return_value=True
-        ), patch.object(
-            Coordinator, "_risk_check", return_value=(False, ("RISK_DD: x",))
-        ), patch.object(
-            Coordinator, "_execute", return_value="REJECTED_RISK_GATE"
-        ), patch.object(Coordinator, "_audit", return_value=None):
+        with (
+            patch.object(Coordinator, "_fetch", return_value=[_bar()]),
+            patch.object(Coordinator, "_validate", return_value=True),
+            patch.object(Coordinator, "_risk_check", return_value=(False, ("RISK_DD: x",))),
+            patch.object(Coordinator, "_execute", return_value="REJECTED_RISK_GATE"),
+            patch.object(Coordinator, "_audit", return_value=None),
+        ):
             coord = Coordinator(cfg)
             result = coord.run_once()
         assert result.broker_status == "REJECTED_RISK_GATE"
@@ -176,6 +183,7 @@ class TestCoordinatorExecuteStage:
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
+
 
 def _bar() -> MagicMock:
     """Minimal OHLCVRow stand-in (MagicMock) for fetch stage."""
