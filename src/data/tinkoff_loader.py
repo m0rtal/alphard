@@ -225,19 +225,19 @@ class TinkoffInvestDataLoader(DataLoader):
     def get_ticker(self, ticker: str) -> TickerMeta:
         """Find a ticker across all instrument universes (shares, bonds, etfs).
 
-        Search order: full-share-universe (incl. delisted) → live shares
-        → bonds → ETFs. This ensures delisted tickers (e.g., VSMO) resolve
-        to a TickerMeta with FIGI, allowing fetch_ohlcv() to retrieve history.
+        Search order: full-share-universe across ALL class codes (TQBR, SPBXM,
+        TQOB, TQCB, TQTE) → live shares → bonds → ETFs. This ensures delisted
+        tickers (e.g., VSMO) AND cross-board tickers (e.g., AAPL on SPBXM)
+        resolve to a TickerMeta with FIGI, allowing fetch_ohlcv() to retrieve
+        history.
         """
         t = ticker.upper()
-        # 1) Full share universe (live + delisted) — preferred for OHLCV lookup
-        for class_code in ("TQBR",):
-            cache_attr = f"_shares_all_{class_code}"
-            cached = cast(list[TickerMeta] | None, getattr(self, cache_attr, None))
-            if cached is not None:
-                for meta in cached:
+        # 1) Full share universe (live + delisted) — try ALL cached class codes
+        for attr_name, attr_value in list(vars(self).items()):
+            if attr_name.startswith("_shares_all_") and isinstance(attr_value, list):
+                for meta in attr_value:
                     if meta.ticker == t:
-                        return meta
+                        return cast(TickerMeta, meta)
         # 2) Live-only universe, bonds, ETFs
         for cache_getter in (self._ensure_universe, self._ensure_bonds, self._ensure_etfs):
             cache = cast(dict[str, TickerMeta], cache_getter())  # type: ignore[redundant-cast]

@@ -1076,3 +1076,44 @@ class TestTinkoffLoaderCoverage:
             loader = TinkoffDataLoader(token="t")
             result = loader._ensure_etfs()
         assert result["GOOD"].currency == "RUB"
+
+    # ----------------------------------------------------------- get_ticker
+
+    def test_get_ticker_finds_across_cached_class_codes(self) -> None:
+        """SPBXM-issued ticker must resolve via list_shares_all('SPBXM')."""
+        aapl = self._share(
+            ticker="AAPL",
+            figi="BBG000B9XRY4",
+            class_code="SPBXM",
+            name="Apple",
+        )
+        cls, _ = self._mock_client_for([aapl], "shares")
+        with patch("t_tech.invest.Client", cls):
+            loader = TinkoffDataLoader(token="t")
+            loader.list_shares_all(class_code="SPBXM")
+            meta = loader.get_ticker("AAPL")
+        assert meta.figi == "BBG000B9XRY4"
+        assert meta.class_code == "SPBXM"
+
+    def test_get_ticker_searches_all_cached_universes(self) -> None:
+        """Ticker in any cached _shares_all_* list must be found."""
+        cls, _ = self._mock_client_for([], "shares")
+        with patch("t_tech.invest.Client", cls):
+            loader = TinkoffDataLoader(token="t")
+            loader._shares_all_SPBXM = [
+                self._share(ticker="TSLA", figi="BBG_TSLA", class_code="SPBXM"),
+            ]
+            loader._shares_all_TQBR = [
+                self._share(ticker="SBER", figi="BBG_SBER", class_code="TQBR"),
+            ]
+            aapl = loader.get_ticker("TSLA")
+            sber = loader.get_ticker("SBER")
+        assert aapl.figi == "BBG_TSLA"
+        assert sber.figi == "BBG_SBER"
+
+    def test_get_ticker_raises_when_not_found_anywhere(self) -> None:
+        cls, _ = self._mock_client_for([], "shares")
+        with patch("t_tech.invest.Client", cls):
+            loader = TinkoffDataLoader(token="t")
+            with pytest.raises(Exception, match="not found in Tinkoff universe"):
+                loader.get_ticker("NOPE")

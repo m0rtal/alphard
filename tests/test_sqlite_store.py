@@ -260,26 +260,11 @@ class TestOhlcvStorageAndQuery:
         assert len(read_rows) == 2
         # Check the change on the first day
         first_day = read_rows[0]
-        assert first_day.covered_by_tkf == True
-        # Ensure the other fields were preserved (e.g., original covered_by_moex was True)
-        assert first_day.covered_by_moex == True
+        assert first_day.covered_by_tkf is True
+        assert first_day.covered_by_moex is True
 
     def test_upsert_ohlcv_error_handling(self, sqlite_store: InMemorySQLiteStore):
         """Test failure during transaction (e.g., bad data)."""
-        bad_row = OHLCVRow(
-            ticker="SBER",
-            ts=date(2026, 8, 1),
-            open=Decimal("100"),
-            high=Decimal("110"),
-            low=Decimal("95"),
-            close=Decimal("105"),
-            volume=Decimal("1000"),
-            adj_close=Decimal("105"),
-            primary_source="moex",
-            covered_by_tkf=False,
-            covered_by_moex=False,
-        )
-
         # This is designed to fail the primary key structure which would normally fail
         # on the underlying sqlite3.Error which we must check for.
         # To force an error without breaking the schema, we'll try to insert a bad type
@@ -359,7 +344,7 @@ class TestCountOhlcv:
         )
         sqlite_store.upsert_tickers([sber])
 
-        count = sqlite_store.upsert_ohlcv(sample_ohlcv_rows)  # Inserts 2 rows
+        sqlite_store.upsert_ohlcv(sample_ohlcv_rows)  # Inserts 2 rows
         total = sqlite_store.count_ohlcv()
         assert total == 2
 

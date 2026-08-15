@@ -2,24 +2,43 @@
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Tests](https://github.com/m0rtal/alphard/actions/workflows/ci.yml/badge.svg)](https://github.com/m0rtal/alphard/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/badge/coverage-89%25-yellow.svg)](https://github.com/m0rtal/alphard)
 
-Autonomous trading bot на MOEX. Apache-2.0, self-hosted, Docker-only.
+Автономный multi-agent trading bot на MOEX/Tinkoff. Apache-2.0, self-hosted, Docker-only.
 
-> **⚠️ Phase 0 skeleton (commit 3c48d23).** Это bootstrap: Risk Agent scaffold, Docker stack, docs. **Бот НЕ торгует.** Phase 1+ добавят Data Agent, Quant Agent, Macro Agent, Execution Agent, Coordinator. Все claims в этом README про "live trading" относятся к Phase 4+, не к текущему state.
+> **Статус: Phase 1.2 closed, Phase 2 pending.** Data Agent работает end-to-end
+> через Tinkoff Invest gRPC (1516 SPBXM + 150 TQBR). Risk Agent enforce 5 fail-safe
+> лимитов. **Бот НЕ торгует на реальные деньги** — `LIVE_TRADING=false` hardlock
+> в `src/broker/tinkoff_account.py`. Real sandbox order placement ещё не выполнен
+> (Phase 1.4). Quant Agent, Macro Agent, ML pipeline — Phase 2+.
 
 ## Что это
 
 Alphard — автономный multi-agent trading system:
-- Сам принимает решения (без approval)
-- Сам исполняет через Tinkoff API + sandbox validation
-- Hard risk gate (невозможно override)
-- Continuous monitoring (event-driven, не scheduled)
-- Self-validation (baseline vs IMOEX TR, LLM-as-judge weekly)
-- Defensive rotation (4-tier при кризисе)
+
+- Сам принимает решения (event-driven, не scheduled)
+- Сам исполняет через Tinkoff Invest API (sandbox-first, real после Phase 1.4)
+- Hard risk gate (frozen pydantic, любая мутация post-construction = reject)
+- Continuous monitoring + 4-tier defensive rotation при кризисе
+- Self-validation (baseline vs IMOEX TR, regime detection)
+- ML pipeline (anonymized tickers, OHLCV-only features)
 
 ## Архитектура
 
-8 агентов + Coordinator (state machine). Подробности — internal.
+8 агентов + Coordinator:
+
+| Agent | Phase | Status |
+|---|---|---|
+| Data | 1.2 | ✅ Tinkoff gRPC + MOEX ISS, 270k+ bars |
+| Risk | 1.1 | ✅ 35 tests, 97% coverage, 5 fail-safe limits |
+| Quality | 1.2 | ✅ 3 уровня (CRITICAL/HIGH/MEDIUM/LOW) |
+| Broker | 1.3 | ✅ TinkoffAccount, sandbox switch, LIVE_TRADING=false |
+| Coordinator | 1.5 | ✅ fetch→validate→risk→execute→audit decision log |
+| Quant | 2 | ⏳ ML pipeline |
+| Macro | 2 | ⏳ CBR/IMOEX/USD-RUB regime |
+| Portfolio | 3 | ⏳ |
+
+Coordinator, hard-gate, token-gate — подробности internal (не публикуются).
 
 ## Quickstart
 
@@ -30,12 +49,11 @@ cd alphard
 
 # 2. Скопировать .env.example и сгенерировать секреты
 cp .env.example .env
-# Сгенерируй пароли для postgres/redis/grafana (≥16 chars каждый):
+# Сгенерируй пароли для postgres/redis (≥16 chars каждый):
 echo "POSTGRES_PASSWORD=$(openssl rand -base64 24)" >> .env
 echo "REDIS_PASSWORD=$(openssl rand -base64 24)" >> .env
-echo "GRAFANA_ADMIN_PASSWORD=$(openssl rand -base64 24)" >> .env
-# Заполни TINKOFF_SANDBOX_TOKEN обязательно (https://www.tbank.ru/invest/settings/api)
-# Открой .env в редакторе и впиши значения.
+echo "TINKOFF_SANDBOX_TOKEN=$(cat /tmp/your_real_token)" >> .env
+# (Token берётся на https://www.tbank.ru/invest/settings/api)
 
 # 3. Установить pre-commit hooks (gitleaks активен)
 pip install pre-commit
@@ -47,41 +65,68 @@ docker compose up -d
 # 5. Проверить
 docker compose ps
 docker compose logs -f alphard-bot
-# NB: Phase 0 — stub. /health endpoint появится в Phase 1.
-# Сейчас "увидеть alive" можно только через docker compose logs.
-
-# Опционально: поднять observability (Prometheus + Grafana, Phase 3+)
-docker compose --profile observability up -d
+# PG database: alphard-postgres:5432 (см. .env)
+# Daily sync: Mon-Fri 19:00 MSK (см. /root/.hermes/cron/alphard-daily-sync.sh)
 ```
 
-> **One compose file. Anywhere.** `docker-compose.yaml` is the single source of truth
-> for both local development and Portainer deployment (Portainer stack → Add stack
-> → Repository → Git URL `https://github.com/m0rtal/alphard.git` → Compose path
-> `docker-compose.yaml`). No drift, no parallel files.
+```bash
+# Запуск бэкфилла (полный universe, 5y OHLCV):
+docker exec alphard-bot python3 scripts/backfill_spbxm_universe.py
+# 1516 SPBXM × 5y ≈ 75 мин при 100 req/min
+```
+
+> **One compose file. Anywhere.** `docker-compose.yaml` — single source of truth
+> для local dev и Portainer deploy. Portainer: Add stack → Repository → Git URL
+> `https://github.com/m0rtal/alphard.git` → Compose path `docker-compose.yaml`.
 
 ## Структура
 
-Фактический layout репо (Phase 0):
-
-```
+```text
 alphard/
-├── .github/workflows/ci.yml   # CI (pytest + black + flake8 + mypy + gitleaks)
-├── docker/                    # Dockerfile + entrypoint.sh
+├── .github/workflows/
+│   ├── ci.yml                  # pytest + black + flake8 + mypy + gitleaks + PostgreSQL service
+│   └── docker-image.yml        # GHCR pipeline → ghcr.io/m0rtal/alphard:latest
+├── docker/
+│   ├── Dockerfile              # Self-contained, deps baked at build time
+│   └── entrypoint.sh
 ├── docs/
-│   ├── SECURITY.md            # Threat model (5 layers + P0/P1/P2)
-│   ├── AUDIT-CodeQuality.md   # Phase 0 audit reports
-│   └── AUDIT-Phase0-FINAL.md
+│   ├── SECURITY.md             # Threat model (5 layers + P0/P1/P2)
+│   ├── RUNBOOK.md              # Incident response playbook
+│   ├── AUDIT-Phase0.md         # Phase 0 audit
+│   ├── AUDIT-Phase0-FINAL.md   # Phase 0 final synthesis
+│   └── AUDIT-CodeQuality.md
 ├── src/
-│   ├── main.py                # Phase 0 heartbeat stub
-│   └── risk/
-│       └── gate.py            # Risk Agent (frozen pydantic validators, 97% coverage)
-├── tests/test_risk_gate.py    # 35 tests, 97% coverage gate.py
-├── .dockerignore              # Excludes .env, .git, build cache
-├── .env.example               # Шаблон секретов
-├── docker-compose.yaml        # Single compose file (local + Portainer deploy)
-├── pyproject.toml             # Poetry (Phase 1+ deps)
-├── requirements.txt           # Phase 0 deps (pinned)
-├── LICENSE                    # Apache-2.0 (canonical, 11.3 KB)
+│   ├── main.py                 # Coordinator entry point
+│   ├── broker/                 # TinkoffAccount (LIVE_TRADING=false hardlock)
+│   ├── risk/                   # Risk Agent (5 fail-safe limits, 97% coverage)
+│   ├── data/                   # TinkoffInvestDataLoader + MOEXDataLoader + PostgresDataStore
+│   │   ├── tinkoff_loader.py   # gRPC, Decimal precision, share/bond/ETF
+│   │   ├── moex_loader.py      # REST fallback (no-auth)
+│   │   ├── pg_store.py         # psycopg v3, ON CONFLICT, search_path
+│   │   ├── sqlite_store.py     # Local fallback
+│   │   ├── quality/            # 3-tier quality gate
+│   │   └── models.py           # TickerMeta, OHLCVRow, CorporateAction
+│   ├── coordinator.py          # Data→Quality→Risk→Broker pipeline
+│   └── _types.py
+├── tests/
+│   ├── test_pg_store_integration.py   # 271 passed, 89.37% coverage
+│   ├── test_risk_gate.py
+│   ├── test_coordinator.py
+│   ├── test_tinkoff_grpc.py
+│   ├── test_broker_connector.py
+│   └── test_quality/
+├── scripts/
+│   ├── daily_sync.py                  # Cron 19:00 MSK Mon-Fri
+│   ├── backfill_spbxm_universe.py     # Full SPBXM/TQBR backfill
+│   ├── backfill_full_universe.py
+│   ├── ci_local.sh
+│   └── backfill_delisted_via_tinkoff.py
+├── .dockerignore
+├── .env.example                # Шаблон секретов
+├── docker-compose.yaml         # Single compose file
+├── pyproject.toml              # Poetry (Phase 2+ deps)
+├── requirements.txt            # Pinned CI deps
+├── LICENSE                     # Apache-2.0 (canonical, 11.3 KB)
 └── README.md
 ```
 
@@ -90,7 +135,8 @@ alphard/
 - `.env` — реальные секреты
 - `data/` — локальные данные (bind-mount)
 - `models/` — обученные модели (добавятся в Phase 2/3)
-- Внутренние design docs (architecture, agent topology) — не публикуются по соображениям конкурентной/стратегической безопасности
+- Внутренние design docs (architecture, agent topology, signal logic) — не публикуются
+  по соображениям конкурентной/стратегической безопасности
 
 ## Разработка
 
@@ -102,42 +148,55 @@ pre-commit install
 # Запустить тесты
 python3 -m pytest
 
-# Проверить coverage (gate required ≥95%)
+# Coverage (CI gate ≥95%, локально PG-зависимые тесты skip)
 python3 -m pytest --cov=src --cov-report=html
 
-# Black / flake8 / mypy (запускаются автоматически в CI)
+# Black / flake8 / mypy (CI)
 python3 -m black --check src/ tests/
 python3 -m flake8 src/ tests/
 python3 -m mypy src/ --strict --ignore-missing-imports
 ```
 
+CI workflow:
+
+1. **lint** — black + flake8 + mypy --strict
+2. **tests** — pytest + coverage (Postgres 16 service в GitHub Actions)
+3. **secrets** — gitleaks action v2 (блокирует PUSH если найдены credentials)
+4. **docker-image** — build + push GHCR `ghcr.io/m0rtal/alphard:latest`
+
 ## Безопасность
 
-- ✅ `.env` в `.gitignore`, никогда не коммитится
-- ✅ `gitleaks` pre-commit + GitHub Actions CI блокируют утечки секретов
-- ✅ Контейнер работает от non-root user (UID 1000)
-- ✅ Risk Agent — `RiskLimits` frozen=True, любая мутация post-construction отклоняется
-- ✅ Сеть изолирована (postgres/redis только внутри `alphard-net`)
-- ✅ Все credentials через `.env`, шаблон в `.env.example`
-- ⚠️ Audit: Phase 0 финальный отчёт → `docs/AUDIT-Phase0-FINAL.md` (8 critical, 10 high)
+- `.env` исключён через `.gitignore` + `.dockerignore`, никогда не коммитится
+- `gitleaks` pre-commit + GitHub Actions CI блокируют утечки секретов
+- Контейнер работает от non-root user (UID 1000)
+- Risk Agent — `RiskLimits` frozen=True, любая мутация post-construction → reject
+- Сеть изолирована (postgres/redis только внутри `alphard-net`)
+- Все credentials через `.env`, шаблон в `.env.example`
+- `LIVE_TRADING=false` hardlock в `src/broker/tinkoff_account.py` — bot НЕ размещает
+  real orders даже при подмене credentials
+- `TinkoffAccount.place_order()` обёрнут в fail-safe check: ANY env-resolved
+  real token + LIVE_TRADING=false → raise `BrokerError` без сетевого вызова
+- Audit reports: `docs/AUDIT-Phase0-FINAL.md` (8 critical, 10 high → все 8 fixed)
 
 ## Honest gaps
 
-- Phase 0: только Risk Agent. Data Agent, Quant Agent, Macro Agent, Portfolio, Execution, Coordinator — в Phase 1+
-- Брокер-абстракция, Tinkoff connector — Phase 1.3
-- Backtest framework (VectorBT) — Phase 2/3
-- ML pipeline (LightGBM) — Phase 2
-- News + RAG (pgvector) — Phase 3
-- `/health` HTTP endpoint не реализован (Phase 1)
-- Prometheus/Grafana observability — Phase 3
-- AGENTS.md для OSS contributors — на стадии подготовки
+| Gap | Phase | ETA |
+|---|---|---|
+| Real sandbox order placement (smoke test) | 1.4 | this week |
+| Bond backfill complete (1,601 OFZ, 5y) | 1.5 | this week |
+| Quant Agent (LightGBM panel features) | 2 | 2-3 weeks |
+| Macro Agent (CBR, IMOEX, regime detection) | 2 | 2-3 weeks |
+| Backtest framework (VectorBT) | 2/3 | 4 weeks |
+| News + RAG (pgvector) | 3 | 6 weeks |
+| Web UI | 4 | 8 weeks |
+| Coordinator continuous loop (state machine) | 1.5 | next |
+| ETF universe (Tinkoff doesn't return ETFs) | 2 | TBD |
 
 ## Лицензия
 
-Apache-2.0. См. [LICENSE](LICENSE).
+Apache-2.0. See [LICENSE](LICENSE).
 
 ## Контакты
 
 Александр (m0rtal) — creator и maintainer.
-Вопросы → issues или discussions на GitHub.
-# Phase 1.2 status: broker/ 100%, risk/ 97%, quality integration 94%, pg_store integration tests ready, CI Postgres service. Phase 2: loader + sqlite_store (live API).
+Issues / discussions на GitHub.
