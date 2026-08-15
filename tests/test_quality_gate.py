@@ -125,7 +125,9 @@ class TestSeverity:
 
     def test_catalog_invariants(self) -> None:
         """CRITICAL must mean hard-reject; HIGH must mean skip-ticker."""
-        critical_kinds = {k for k, v in [(k, severity_for(k)) for k in IssueKind] if v == Severity.CRITICAL}
+        critical_kinds = {
+            k for k, v in [(k, severity_for(k)) for k in IssueKind] if v == Severity.CRITICAL
+        }  # noqa: E501
         high_kinds = {k for k in IssueKind if severity_for(k) == Severity.HIGH}
         medium_kinds = {k for k in IssueKind if severity_for(k) == Severity.MEDIUM}
         low_kinds = {k for k in IssueKind if severity_for(k) == Severity.LOW}
@@ -343,7 +345,7 @@ class TestIngestionGate:
 # ---------------------------------------------------------------------------
 
 
-@given(st.lists(st.floats(min_value=0.01, max_value=1e6, allow_nan=False), min_size=2, max_size=100))
+@given(st.lists(st.floats(min_value=0.01, max_value=1e6, allow_nan=False), min_size=2, max_size=100))  # noqa: E501
 @settings(max_examples=50, suppress_health_check=[HealthCheck.too_slow])
 def test_log_returns_length_property(prices: list[float]) -> None:
     """len(log_returns(p)) == len(p) - 1."""
@@ -461,10 +463,12 @@ class TestHistoricalGate:
         """After applying a 5:1 forward split, pre bars close -> ~100."""
         base_dates = [b.primary_key for b in _bars(10, base=date(2025, 1, 1))]
         pre = [
-            Bar(primary_key=d, open=500.0, high=500.0, low=500.0, close=500.0, volume=10_000) for d in base_dates[:5]
+            Bar(primary_key=d, open=500.0, high=500.0, low=500.0, close=500.0, volume=10_000)
+            for d in base_dates[:5]  # noqa: E501
         ]
         post = [
-            Bar(primary_key=d, open=100.0, high=100.0, low=100.0, close=100.0, volume=10_000) for d in base_dates[5:10]
+            Bar(primary_key=d, open=100.0, high=100.0, low=100.0, close=100.0, volume=10_000)
+            for d in base_dates[5:10]  # noqa: E501
         ]
         bars = pre + post
         events = detect_splits(bars)
@@ -479,9 +483,13 @@ class TestHistoricalGate:
     def test_apply_split_adjustment_reverse(self) -> None:
         """After applying a 1:10 reverse split, pre bars close -> ~100."""
         base_dates = [b.primary_key for b in _bars(10, base=date(2025, 1, 1))]
-        pre = [Bar(primary_key=d, open=10.0, high=10.0, low=10.0, close=10.0, volume=10_000) for d in base_dates[:5]]
+        pre = [
+            Bar(primary_key=d, open=10.0, high=10.0, low=10.0, close=10.0, volume=10_000)
+            for d in base_dates[:5]  # noqa: E501
+        ]  # noqa: E501
         post = [
-            Bar(primary_key=d, open=100.0, high=100.0, low=100.0, close=100.0, volume=10_000) for d in base_dates[5:10]
+            Bar(primary_key=d, open=100.0, high=100.0, low=100.0, close=100.0, volume=10_000)
+            for d in base_dates[5:10]  # noqa: E501
         ]
         bars = pre + post
         events = detect_splits(bars)
@@ -494,10 +502,12 @@ class TestHistoricalGate:
         """Applying the same split twice to the same input is a no-op."""
         base_dates = [b.primary_key for b in _bars(10, base=date(2025, 1, 1))]
         pre = [
-            Bar(primary_key=d, open=500.0, high=500.0, low=500.0, close=500.0, volume=10_000) for d in base_dates[:5]
+            Bar(primary_key=d, open=500.0, high=500.0, low=500.0, close=500.0, volume=10_000)
+            for d in base_dates[:5]  # noqa: E501
         ]
         post = [
-            Bar(primary_key=d, open=100.0, high=100.0, low=100.0, close=100.0, volume=10_000) for d in base_dates[5:10]
+            Bar(primary_key=d, open=100.0, high=100.0, low=100.0, close=100.0, volume=10_000)
+            for d in base_dates[5:10]  # noqa: E501
         ]
         bars = pre + post
         events = detect_splits(bars)
@@ -515,7 +525,7 @@ class TestHistoricalGate:
             close=100.0,
             volume=1000,
         )
-        r = check_historical("X", bars + [future_bar], now=datetime(2026, 8, 14, tzinfo=timezone.utc))
+        r = check_historical("X", bars + [future_bar], now=datetime(2026, 8, 14, tzinfo=timezone.utc))  # noqa: E501
         assert IssueKind.HST_FUTURE_ROW in {i.kind for i in r.issues}
         for i in r.issues:
             if i.kind == IssueKind.HST_FUTURE_ROW:
@@ -535,10 +545,12 @@ class TestHistoricalGate:
     def test_split_event_reported(self) -> None:
         base_dates = [b.primary_key for b in _bars(10, base=date(2025, 1, 1))]
         pre = [
-            Bar(primary_key=d, open=500.0, high=500.0, low=500.0, close=500.0, volume=10_000) for d in base_dates[:5]
+            Bar(primary_key=d, open=500.0, high=500.0, low=500.0, close=500.0, volume=10_000)
+            for d in base_dates[:5]  # noqa: E501
         ]
         post = [
-            Bar(primary_key=d, open=100.0, high=100.0, low=100.0, close=100.0, volume=10_000) for d in base_dates[5:10]
+            Bar(primary_key=d, open=100.0, high=100.0, low=100.0, close=100.0, volume=10_000)
+            for d in base_dates[5:10]  # noqa: E501
         ]
         bars = pre + post
         r = check_historical("X", bars, now=datetime(2026, 8, 14, tzinfo=timezone.utc))
@@ -599,7 +611,9 @@ class TestCrossSource:
             bars=tuple(list(sa.bars)[:-5]),
         )
         r = check_cross_source("X", sa_short, sb_full)
-        assert any(i.kind == IssueKind.XSC_SOURCE_MISSING and i.extra.get("dropped_b") == 5 for i in r.issues)
+        assert any(
+            i.kind == IssueKind.XSC_SOURCE_MISSING and i.extra.get("dropped_b") == 5 for i in r.issues  # noqa: E501
+        )  # noqa: E501
 
 
 # ---------------------------------------------------------------------------
@@ -697,7 +711,11 @@ class TestCLI:
         # Patch datetime.now to a known point so staleness is happy.
         import datetime as _dt
 
-        fixed_now = _dt.datetime(last.year, last.month, last.day, tzinfo=_dt.timezone.utc) + _dt.timedelta(days=1)
+        fixed_now = _dt.datetime(
+            last.year, last.month, last.day, tzinfo=_dt.timezone.utc
+        ) + _dt.timedelta(  # noqa: E501
+            days=1
+        )  # noqa: E501
         from src.data.quality import ingestion_gate, __main__ as cli_mod
 
         orig_now = ingestion_gate.datetime
@@ -807,7 +825,9 @@ class TestInvariants:
         bars = _bars(10)
         bad = bars[3].model_copy(update={"high": 50.0, "low": 200.0})
         r = check_ingestion("X", bars[:3] + [bad] + bars[4:])
-        assert IssueKind.ING_RANGE_VIOLATION in {i.kind for i in r.issues}, "range violation must be flagged"
+        assert IssueKind.ING_RANGE_VIOLATION in {
+            i.kind for i in r.issues
+        }, "range violation must be flagged"  # noqa: E501
 
     def test_severity_assignment_known_good_vs_known_bad(self) -> None:
         """Spec acceptance: severity correctly assigned for known-good vs bad.

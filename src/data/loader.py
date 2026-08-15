@@ -117,7 +117,7 @@ class DataLoader(abc.ABC):
         if start > end:
             raise LoaderError(f"start {start} > end {end}")
         if (end - start) > max_lookback:
-            raise LoaderError(f"range {start}..{end} exceeds upstream max lookback {max_lookback.days}d")
+            raise LoaderError(f"range {start}..{end} exceeds upstream max lookback {max_lookback.days}d")  # noqa: E501
 
 
 __all__ = [

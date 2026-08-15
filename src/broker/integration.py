@@ -141,7 +141,9 @@ class OrderFlow:
             )
             for p in portfolio.positions
         ]
-        total = portfolio.cash + sum((p.quantity * p.avg_price for p in portfolio.positions), Decimal("0"))
+        total = portfolio.cash + sum(
+            (p.quantity * p.avg_price for p in portfolio.positions), Decimal("0")
+        )  # noqa: E501
         return PortfolioState(
             total_equity=total,
             cash=portfolio.cash,

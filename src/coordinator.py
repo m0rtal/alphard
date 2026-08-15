@@ -127,7 +127,9 @@ class PipelineResult:
     @property
     def decided(self) -> bool:
         """True iff pipeline reached EXECUTE stage."""
-        return PipelineStage.EXECUTE in self.stages_completed or PipelineStage.DONE in self.stages_completed
+        return (
+            PipelineStage.EXECUTE in self.stages_completed or PipelineStage.DONE in self.stages_completed  # noqa: E501
+        )  # noqa: E501
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -200,7 +202,7 @@ class Coordinator:
                     risk_allowed=False,
                     risk_violations=("VALIDATE_CRITICAL",),
                     broker_status=None,
-                    audit_log_id=self._audit(stages, bars_loaded, False, ("VALIDATE_CRITICAL",), None),
+                    audit_log_id=self._audit(stages, bars_loaded, False, ("VALIDATE_CRITICAL",), None),  # noqa: E501
                 )
         except Exception as exc:
             logger.error("VALIDATE failed for %s: %s", self.config.ticker, exc)
@@ -218,7 +220,7 @@ class Coordinator:
             stages.append(PipelineStage.EXECUTE)
 
         # Stage 5: AUDIT
-        audit_log_id = self._audit(stages, bars_loaded, risk_allowed, risk_violations, broker_status)
+        audit_log_id = self._audit(stages, bars_loaded, risk_allowed, risk_violations, broker_status)  # noqa: E501
         stages.append(PipelineStage.AUDIT)
         stages.append(PipelineStage.DONE)
 

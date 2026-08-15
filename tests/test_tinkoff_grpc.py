@@ -76,7 +76,7 @@ class TestTinkoffDataLoader:
         assert len(bars) == 1
         assert bars[0].ticker == "SBER"
         assert bars[0].close == Decimal("311")
-        assert bars[0].source == "tkf"
+        assert bars[0].primary_source == "tkf"
 
     def test_iter_corporate_actions_yields_nothing_phase_1(self) -> None:
         loader = TinkoffDataLoader(token="t")

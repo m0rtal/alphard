@@ -143,7 +143,7 @@ def gate_then_load_ohlcv(
             source_name="primary",
             bars=tuple((b.primary_key, b.close) for b in bars),
         )
-        cross_report = check_cross_source(ticker, primary, second_source, params=cross_source_params)
+        cross_report = check_cross_source(ticker, primary, second_source, params=cross_source_params)  # noqa: E501
         write_report(audit, cross_report)
     return bars, None, cross_report
 

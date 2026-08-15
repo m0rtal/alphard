@@ -158,7 +158,9 @@ class TestOHLCVCRUD:
             close=Decimal("105.00"),
             volume=Decimal("1000000"),
             adj_close=Decimal("105.00"),
-            source="manual",
+            primary_source="manual",
+            covered_by_tkf=False,
+            covered_by_moex=False,
         )
         n = pg_store.upsert_ohlcv([row])
         assert n == 1
@@ -174,7 +176,9 @@ class TestOHLCVCRUD:
             name="Replace Co",
             lot=1,
             currency="RUB",
-            source="manual",
+            primary_source="manual",
+            covered_by_tkf=False,
+            covered_by_moex=False,
         )
         pg_store.upsert_ticker(meta)
         row1 = OHLCVRow(
@@ -186,7 +190,9 @@ class TestOHLCVCRUD:
             close=Decimal("105"),
             volume=Decimal("1000"),
             adj_close=Decimal("105"),
-            source="manual",
+            primary_source="manual",
+            covered_by_tkf=False,
+            covered_by_moex=False,
         )
         row2 = OHLCVRow(
             ticker="PG_REPL",
@@ -197,7 +203,9 @@ class TestOHLCVCRUD:
             close=Decimal("210"),
             volume=Decimal("2000"),
             adj_close=Decimal("210"),
-            source="manual",
+            primary_source="manual",
+            covered_by_tkf=False,
+            covered_by_moex=False,
         )
         pg_store.upsert_ohlcv([row1])
         pg_store.upsert_ohlcv([row2])
@@ -215,7 +223,9 @@ class TestOHLCVCRUD:
             name="Count Co",
             lot=1,
             currency="RUB",
-            source="manual",
+            primary_source="manual",
+            covered_by_tkf=False,
+            covered_by_moex=False,
         )
         pg_store.upsert_ticker(meta)
         rows = [
@@ -228,7 +238,9 @@ class TestOHLCVCRUD:
                 close=Decimal("105"),
                 volume=Decimal("1000"),
                 adj_close=Decimal("105"),
-                source="manual",
+                primary_source="manual",
+                covered_by_tkf=False,
+                covered_by_moex=False,
             )
             for d in range(1, 6)
         ]

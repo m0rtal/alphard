@@ -49,20 +49,28 @@ CREATE INDEX IF NOT EXISTS idx_ticker_universe_figi
     ON ticker_universe (figi) WHERE figi IS NOT NULL;
 
 -- ---------------------------------------------------------------------------
--- ohlcv_daily  (PK = ticker, ts, source — multi-source reconciliation OK)
+-- ohlcv_daily  (PK = ticker, ts — single source-of-truth bar)
 -- ---------------------------------------------------------------------------
+-- Each (ticker, ts) is stored ONCE. Provenance is tracked via flags:
+--   - covered_by_tkf  — Tinkoff Invest gRPC supplied this bar (primary source)
+--   - covered_by_moex — MOEX ISS supplied this bar (cross-source validation)
+-- When both flags are true, the OHLCV values match (verified by Phase 1.2
+-- CrossSource validator). A disagreement would set a quality flag and
+-- trigger the QualityGate pipeline.
 CREATE TABLE IF NOT EXISTS ohlcv_daily (
-    ticker       VARCHAR(12) NOT NULL,
-    ts           DATE NOT NULL,
-    open         NUMERIC(20, 8) NOT NULL,
-    high         NUMERIC(20, 8) NOT NULL,
-    low          NUMERIC(20, 8) NOT NULL,
-    close        NUMERIC(20, 8) NOT NULL,
-    volume       NUMERIC(20, 0) NOT NULL,
-    adj_close    NUMERIC(20, 8) NOT NULL,
-    source       VARCHAR(8) NOT NULL,
-    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (ticker, ts, source),
+    ticker           VARCHAR(12) NOT NULL,
+    ts               DATE NOT NULL,
+    open             NUMERIC(20, 8) NOT NULL,
+    high             NUMERIC(20, 8) NOT NULL,
+    low              NUMERIC(20, 8) NOT NULL,
+    close            NUMERIC(20, 8) NOT NULL,
+    volume           NUMERIC(20, 0) NOT NULL,
+    adj_close        NUMERIC(20, 8) NOT NULL,
+    covered_by_tkf   BOOLEAN NOT NULL DEFAULT FALSE,
+    covered_by_moex  BOOLEAN NOT NULL DEFAULT FALSE,
+    primary_source   VARCHAR(8) NOT NULL DEFAULT 'tkf',  -- which source's value was stored
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (ticker, ts),
     CONSTRAINT fk_ohlcv_ticker FOREIGN KEY (ticker)
         REFERENCES ticker_universe(ticker) ON DELETE RESTRICT
 );
@@ -72,6 +80,12 @@ CREATE INDEX IF NOT EXISTS idx_ohlcv_daily_ticker_ts
 
 CREATE INDEX IF NOT EXISTS idx_ohlcv_daily_ts
     ON ohlcv_daily (ts);
+
+CREATE INDEX IF NOT EXISTS idx_ohlcv_daily_covered_tkf
+    ON ohlcv_daily (ts) WHERE covered_by_tkf;
+
+CREATE INDEX IF NOT EXISTS idx_ohlcv_daily_covered_moex
+    ON ohlcv_daily (ts) WHERE covered_by_moex;
 
 -- ---------------------------------------------------------------------------
 -- corporate_actions  (splits, dividends, ticker renames)

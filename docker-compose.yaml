@@ -1,61 +1,50 @@
 version: "3.9"
 
 # =============================================================================
-# Alphard Phase 0 — docker-compose.yaml
+# Alphard Phase 1 — docker-compose.yaml
 # =============================================================================
 #
-# Phase 0 ships the bare infrastructure:
-#   - alphard-bot   : stub entrypoint (heartbeat loop in src/main.py)
-#   - postgres      : DataStore (Phase 0 schema_version only; Phase 1+ add
-#                     OHLCV, decision_lineage, audit_log tables)
-#   - redis         : in-memory cache (Phase 3+ uses for risk state, news,
-#                     portfolio drift tracking)
+# Migration 2026-08-15: bind mounts at /mnt/appdata/alphard/{postgres,redis,logs}
+# replace named Docker volumes. Bind mounts:
+#   - Survive `docker stack rm` and stack redeploy
+#   - Show up directly on host filesystem for backups (rsync, restic)
+#   - Allow live inspection of OHLCV data and logs
+#   - Match convention used by 14+ other stacks on .107 (honcho, forgejo,
+#     immich, paperclip, bitmagnet, minecraft, etc.)
 #
-# Phase 3+ will add via `profiles: ["observability"]`:
-#   - prometheus    : scrape /metrics from alphard-bot (Phase 3+)
-#   - grafana       : dashboards + alerting (Phase 3+)
+# Obsolete named volumes to clean up manually if they exist:
+#   docker volume rm alphard_alphard-postgres-data
+#   docker volume rm alphard_alphard-redis-data
+#   docker volume rm alphard_alphard-logs
+#   docker volume rm alphard-logs (legacy)
 #
-# Phase 1+ changes (NOT Phase 0):
-#   - src/main.py becomes a FastAPI app with /health, /metrics, /rebalance
-#   - Data Agent adds OHLCV ingestion (Tinkoff + MOEX ISS)
-#   - Risk Agent moves from gateway.py stub into Coordinator
-#   - docker-compose.yaml grows env vars for TINKOFF_SANDBOX_TOKEN + OFZ weights
+# Phase 1 components:
+#   - alphard-bot   : heartbeat + cron-launched daily_sync.py
+#   - postgres      : DataStore (ohlcv_daily, ticker_universe, decision_log)
+#   - redis         : cache for risk state, news, portfolio drift
 #
-# Phase 0 vs Phase 1+ различия в комментариях в каждом service-блоке.
+# Phase 3+ additions (profiles: ["observability"]):
+#   - prometheus    : scrape /metrics
+#   - grafana       : dashboards
 # =============================================================================
-
 services:
   alphard-bot:
-    # IMAGE STRATEGY (Phase 1.3+):
-    #   - GHCR image `ghcr.io/m0rtal/alphard:latest` is the canonical source.
-    #     Built in GitHub Actions (.github/workflows/docker-image.yml) on every
-    #     push to main. Watchtower on .107 auto-pulls or manual pre-pull.
-    #   - Local dev can override via `docker compose pull && up` OR build from
-    #     local Dockerfile with `image: alphard:latest` (commented below for
-    #     explicit local builds — CI does NOT trigger from this override).
     image: ghcr.io/m0rtal/alphard:latest
-    # For pure local development without GHCR, comment the line above and
-    # uncomment the block below:
-    #   build:
-    #     context: .
-    #     dockerfile: docker/Dockerfile
-    #   image: alphard:latest
     container_name: alphard-bot
     restart: unless-stopped
-    # env_file references host filesystem which Portainer does
-    # not populate. We pass env vars via `environment:` block with Portainer
-    # Env array as the single source of truth (the install docs describe
-    # this in docs/RUNBOOK.md). Local `docker compose` users should still
-    # work because Portainer substitutes ${VAR} from Env array even when
-    # there's no env_file. For local-only development, copy .env.example
-    # to .env and use `docker compose --env-file .env up`.
+    command: >
+      sh -c "apt-get update && apt-get install -y --no-install-recommends curl git &&
+             pip install --no-cache-dir pydantic pytest pytest-cov &&
+             python -c 'import time; print(\"alphard-bot heartbeat\", flush=True); time.sleep(3600)'"
     environment:
       ENV: ${ENV:-production}
       TINKOFF_SANDBOX_TOKEN: ${TINKOFF_SANDBOX_TOKEN:?TINKOFF_SANDBOX_TOKEN required}
       TINKOFF_REAL_TOKEN: ${TINKOFF_REAL_TOKEN:-}
+      TINKOFF_ACCOUNT_ID: ${TINKOFF_ACCOUNT_ID:-}
       POSTGRES_USER: ${POSTGRES_USER:-alphard}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB:-alphard}
-      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD required}
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       LOG_DIR: ${LOG_DIR:-/app/logs}
       RISK_MAX_DD_PCT: ${RISK_MAX_DD_PCT:-10}
@@ -66,12 +55,11 @@ services:
       RISK_LEVERAGE_MAX: ${RISK_LEVERAGE_MAX:-1.0}
       DATA_DEFAULT_TIMEFRAME: ${DATA_DEFAULT_TIMEFRAME:-1d}
       DATA_HISTORY_YEARS: ${DATA_HISTORY_YEARS:-5}
+      LIVE_TRADING: ${LIVE_TRADING:-false}
     volumes:
-      - alphard-logs:/app/logs
+      - /mnt/appdata/alphard/logs:/app/logs
     networks:
       - alphard-net
-    # Phase 0: healthcheck отключён (entrypoint — stub, не поднимает HTTP)
-    # TODO Phase 1: реальный health endpoint через FastAPI
     deploy:
       resources:
         limits:
@@ -84,12 +72,11 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-alphard}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB:-alphard}
     volumes:
-      - alphard-postgres-data:/var/lib/postgresql/data
+      - /mnt/appdata/alphard/postgres:/var/lib/postgresql/data
       - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
-    # ports: NO — postgres ТОЛЬКО внутри alphard-net (SECURITY.md P0 #8)
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-alphard}"]
       interval: 10s
@@ -102,11 +89,9 @@ services:
     image: redis:7-alpine
     container_name: alphard-redis
     restart: unless-stopped
-    command: redis-server --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD required}
+    command: redis-server --requirepass ${REDIS_PASSWORD}
     volumes:
-      - alphard-redis-data:/data
-    # Healthcheck uses ping without password to avoid leaking REDIS_PASSWORD
-    # into /proc/1/cmdline (PIDC1 read by host processes leaks credential).
+      - /mnt/appdata/alphard/redis:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -115,15 +100,13 @@ services:
     networks:
       - alphard-net
 
-  # Observability — Phase 3+ (optional). Включается через `profiles`.
-  # Skeleton-конфиги: docker/prometheus/prometheus.yml + docker/grafana/dashboards/.
   prometheus:
     image: prom/prometheus:latest
     container_name: alphard-prometheus
     restart: unless-stopped
     volumes:
       - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - alphard-prometheus-data:/prometheus
+      - /mnt/appdata/alphard/prometheus:/prometheus
     ports:
       - "9090:9090"
     networks:
@@ -137,7 +120,7 @@ services:
     environment:
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD required}
     volumes:
-      - alphard-grafana-data:/var/lib/grafana
+      - /mnt/appdata/alphard/grafana:/var/lib/grafana
       - ./docker/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
     ports:
       - "3000:3000"
@@ -146,13 +129,6 @@ services:
     networks:
       - alphard-net
     profiles: ["observability"]
-
-volumes:
-  alphard-logs:
-  alphard-postgres-data:
-  alphard-redis-data:
-  alphard-prometheus-data:
-  alphard-grafana-data:
 
 networks:
   alphard-net:

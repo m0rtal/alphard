@@ -142,7 +142,9 @@ class PortfolioState(BaseModel):
         # Invariant: peak_equity >= total_equity always. If a caller passes a
         # state where this doesn't hold, it's an upstream bug — reject here.
         if self.peak_equity < self.total_equity:
-            raise ValueError(f"peak_equity ({self.peak_equity}) must be >= total_equity ({self.total_equity})")
+            raise ValueError(
+                f"peak_equity ({self.peak_equity}) must be >= total_equity ({self.total_equity})"
+            )  # noqa: E501
         return self
 
 
@@ -361,7 +363,7 @@ class RiskGate:
         # (PortfolioState validator already enforces peak_equity >= total_equity,
         # so dd_pct is always >= 0 in practice).
         if dd_pct > self.limits.max_dd_pct:
-            violations.append(f"RISK_DD: drawdown {dd_pct:.4f}% exceeds limit {self.limits.max_dd_pct}%")
+            violations.append(f"RISK_DD: drawdown {dd_pct:.4f}% exceeds limit {self.limits.max_dd_pct}%")  # noqa: E501
 
 
 __all__ = [

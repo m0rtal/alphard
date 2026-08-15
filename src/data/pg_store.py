@@ -49,7 +49,7 @@ class PostgresDataStore(DataStore):
         if not dsn:
             raise StoreError("PostgresDataStore: no DSN — pass dsn= or set $ALPHARD_PG_DSN")
         self._dsn = dsn
-        self._schema_sql_path = schema_sql_path or os.path.join(os.path.dirname(__file__), "schema.sql")
+        self._schema_sql_path = schema_sql_path or os.path.join(os.path.dirname(__file__), "schema.sql")  # noqa: E501
         # Imported lazily so the rest of the package works without psycopg.
         import psycopg
 
@@ -144,11 +144,13 @@ class PostgresDataStore(DataStore):
         self._connect()
         with self._conn.cursor() as cur:
             cur.execute(
-                "UPDATE ticker_universe SET delisted = TRUE, delisted_at = %s, " "updated_at = NOW() WHERE ticker = %s",
+                "UPDATE ticker_universe SET delisted = TRUE, delisted_at = %s, "
+                "updated_at = NOW() WHERE ticker = %s",  # noqa: E501
                 (at, ticker),
             )
             cur.execute(
-                "INSERT INTO delisting_log (ticker, delisted_at, reason, source) " "VALUES (%s, %s, %s, 'manual')",
+                "INSERT INTO delisting_log (ticker, delisted_at, reason, source) "
+                "VALUES (%s, %s, %s, 'manual')",  # noqa: E501
                 (ticker, at, reason),
             )
         self._conn.commit()
@@ -156,20 +158,25 @@ class PostgresDataStore(DataStore):
     # ---------------------------------------------------------- OHLCV
 
     def upsert_ohlcv(self, rows: list[OHLCVRow]) -> int:
+        """Upsert OHLCV bars. PK = (ticker, ts). Source flags updated via ON CONFLICT.
+
+        Behaviour: writes each (ticker, ts) row. If the row exists, the
+        existing OHLCV values are KEPT (preserves whichever source arrived
+        first); only the covered_by_* flags are OR'd in to reflect all
+        sources that have confirmed this bar.
+        """
         if not rows:
             return 0
         self._connect()
         sql = """
             INSERT INTO ohlcv_daily
-                (ticker, ts, open, high, low, close, volume, adj_close, source, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-            ON CONFLICT (ticker, ts, source) DO UPDATE SET
-                open = EXCLUDED.open,
-                high = EXCLUDED.high,
-                low = EXCLUDED.low,
-                close = EXCLUDED.close,
-                volume = EXCLUDED.volume,
-                adj_close = EXCLUDED.adj_close,
+                (ticker, ts, open, high, low, close, volume, adj_close,
+                 covered_by_tkf, covered_by_moex, primary_source, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, NOW())
+            ON CONFLICT (ticker, ts) DO UPDATE SET
+                covered_by_tkf = ohlcv_daily.covered_by_tkf OR EXCLUDED.covered_by_tkf,
+                covered_by_moex = ohlcv_daily.covered_by_moex OR EXCLUDED.covered_by_moex,
                 updated_at = NOW()
         """
         params = [
@@ -182,7 +189,9 @@ class PostgresDataStore(DataStore):
                 str(r.close),
                 str(r.volume),
                 str(r.adj_close),
-                r.source,
+                r.covered_by_tkf,
+                r.covered_by_moex,
+                r.primary_source,
             )
             for r in rows
         ]
@@ -191,23 +200,121 @@ class PostgresDataStore(DataStore):
         self._conn.commit()
         return len(rows)
 
+    def backfill_with_dedup(
+        self,
+        new_bars: list[OHLCVRow],
+        source: str = "moex",
+    ) -> dict[str, int]:
+        """Insert bars but ONLY if (ticker, ts) is not yet covered by ANY source.
+
+        Used by MOEX backfill script: skip dates already covered by Tinkoff
+        or any other source. Updates covered_by_<source> flag on insert.
+        Returns dict with stats: {'inserted': N, 'skipped': M}.
+        """
+        if not new_bars:
+            return {"inserted": 0, "skipped": 0}
+
+        pairs = list({(r.ticker, r.ts) for r in new_bars})
+        self._connect()
+        with self._conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT DISTINCT ticker, ts FROM ohlcv_daily
+                WHERE (ticker, ts) IN ({','.join(['(%s,%s)'] * len(pairs))})
+                """,
+                [v for pair in pairs for v in pair],
+            )
+            covered = {(row[0], row[1]) for row in cur.fetchall()}
+
+        filtered = [r for r in new_bars if (r.ticker, r.ts) not in covered]
+        skipped = len(new_bars) - len(filtered)
+        if filtered:
+            self.upsert_ohlcv(filtered)
+        return {"inserted": len(filtered), "skipped": skipped}
+
+    def migrate_deduplicate(self) -> int:
+        """One-time migration: collapse (ticker, ts, source) rows to a single row.
+
+        For each (ticker, ts) with multiple sources, KEEP the row from the
+        'tkf' source if present, else moex. Set covered_by_tkf/moex flags
+        appropriately. DELETE the duplicates.
+
+        Returns count of rows deleted.
+        """
+        self._connect()
+        with self._conn.cursor() as cur:
+            # Set primary_source = 'tkf' if exists, else 'moex'
+            # Set covered_by_tkf / covered_by_moex based on what exists
+            # Keep tkf row (or moex if no tkf), delete the other
+            cur.execute(
+                """
+                WITH ranked AS (
+                    SELECT ctid,
+                           ticker,
+                           ts,
+                           source,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY ticker, ts
+                               ORDER BY CASE source WHEN 'tkf' THEN 0 WHEN 'moex' THEN 1 ELSE 2 END
+                           ) AS rn
+                    FROM ohlcv_daily
+                ),
+                to_delete AS (
+                    SELECT ctid FROM ranked WHERE rn > 1
+                )
+                DELETE FROM ohlcv_daily
+                WHERE ctid IN (SELECT ctid FROM to_delete)
+            """
+            )
+            deleted = cur.rowcount
+
+            # Now update covered_by_* flags based on remaining rows
+            cur.execute(
+                """
+                UPDATE ohlcv_daily SET covered_by_tkf = TRUE
+                WHERE (ticker, ts) IN (SELECT ticker, ts FROM ohlcv_daily WHERE source = 'tkf')
+            """
+            )
+            cur.execute(
+                """
+                UPDATE ohlcv_daily SET covered_by_moex = TRUE
+                WHERE (ticker, ts) IN (SELECT ticker, ts FROM ohlcv_daily WHERE source = 'moex')
+            """
+            )
+            # Set primary_source correctly
+            cur.execute(
+                """
+                UPDATE ohlcv_daily SET primary_source = 'tkf'
+                WHERE source = 'tkf' AND primary_source <> 'tkf'
+            """
+            )
+            cur.execute(
+                """
+                UPDATE ohlcv_daily SET primary_source = 'moex'
+                WHERE source = 'moex' AND primary_source NOT IN ('tkf', 'moex')
+            """
+            )
+        self._conn.commit()
+        return deleted
+
     def query_ohlcv(
         self,
         ticker: str,
         start: date,
         end: date,
         *,
-        source: str | None = None,
+        primary_source: str | None = None,
     ) -> list[OHLCVRow]:
         self._connect()
         sql = (
-            "SELECT ticker, ts, open, high, low, close, volume, adj_close, source "
+            "SELECT ticker, ts, open, high, low, close, volume, adj_close, "
+            "primary_source, covered_by_tkf, covered_by_moex "
             "FROM ohlcv_daily WHERE ticker = %s AND ts BETWEEN %s AND %s"
         )
         params: list[Any] = [ticker.upper(), start, end]
-        if source:
-            sql += " AND source = %s"
-            params.append(source)
+        if primary_source:
+            sql += " AND primary_source = %s"
+            params.append(primary_source)
         sql += " ORDER BY ts"
         with self._conn.cursor() as cur:
             cur.execute(sql, params)
@@ -283,7 +390,9 @@ def _row_to_ohlcv(r: Any) -> OHLCVRow:
         close=Decimal(str(r[5])),
         volume=Decimal(str(r[6])),
         adj_close=Decimal(str(r[7])),
-        source=r[8],
+        primary_source=r[8] if len(r) > 8 else "tkf",
+        covered_by_tkf=bool(r[9]) if len(r) > 9 else False,
+        covered_by_moex=bool(r[10]) if len(r) > 10 else False,
     )
 
 

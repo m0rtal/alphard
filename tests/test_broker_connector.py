@@ -85,17 +85,17 @@ class TestMarketOrder:
 
 class TestLimitOrder:
     def test_basic_creation(self):
-        o = LimitOrder(ticker="SBER", side=OrderSide.BUY, quantity=Decimal("10"), price=Decimal("250.5"))
+        o = LimitOrder(ticker="SBER", side=OrderSide.BUY, quantity=Decimal("10"), price=Decimal("250.5"))  # noqa: E501
         assert o.ticker == "SBER"
         assert o.price == Decimal("250.5")
 
     def test_negative_price_rejected(self):
         with pytest.raises(Exception):
-            LimitOrder(ticker="SBER", side=OrderSide.BUY, quantity=Decimal("10"), price=Decimal("-1"))
+            LimitOrder(ticker="SBER", side=OrderSide.BUY, quantity=Decimal("10"), price=Decimal("-1"))  # noqa: E501
 
     def test_zero_price_rejected(self):
         with pytest.raises(Exception):
-            LimitOrder(ticker="SBER", side=OrderSide.BUY, quantity=Decimal("10"), price=Decimal("0"))
+            LimitOrder(ticker="SBER", side=OrderSide.BUY, quantity=Decimal("10"), price=Decimal("0"))  # noqa: E501
 
 
 # ────────────────────────────────────────────
@@ -225,7 +225,9 @@ class TestTinkoffAccount:
         status = a.place_order(order)
         assert status == OrderStatus.SUBMITTED
 
-    def test_limit_order_submits(self):  # Mock t_tech.invest (SDK is now installed, but we want offline unit tests)
+    def test_limit_order_submits(
+        self,
+    ):  # Mock t_tech.invest (SDK is now installed, but we want offline unit tests)  # noqa: E501
         import sys as _sys
 
         _fake = MagicMock()
@@ -237,7 +239,9 @@ class TestTinkoffAccount:
 
         mock_rg.evaluate.return_value = RiskDecision(allowed=True, violations=())
         a = TinkoffAccount(token="t.x", risk_gate=mock_rg)
-        order = LimitOrder(ticker="SBER", side=OrderSide.BUY, quantity=Decimal("10"), price=Decimal("250"))
+        order = LimitOrder(
+            ticker="SBER", side=OrderSide.BUY, quantity=Decimal("10"), price=Decimal("250")
+        )  # noqa: E501
         status = a.place_order(order)
         assert status == OrderStatus.SUBMITTED
 
@@ -617,7 +621,7 @@ class TestTinkoffAccount:
                 data = {**data, "side": "buy"}
             return original_validate(data, *args, **kwargs)
 
-        monkeypatch.setattr(gate_module.TradeIntent, "model_validate", staticmethod(patched_validate))
+        monkeypatch.setattr(gate_module.TradeIntent, "model_validate", staticmethod(patched_validate))  # noqa: E501
 
         mock_client_class = MagicMock()
         mock_client = MagicMock()

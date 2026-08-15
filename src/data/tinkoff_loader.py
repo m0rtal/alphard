@@ -1,7 +1,7 @@
 """TinkoffInvestDataLoader — primary source for MOEX data.
 
 SDK: t-tech-investments (T-Bank official, Apache-2.0).
-Install: pip install t-tech-investments --index-url https://opensource.tbank.ru/api/v4/projects/238/packages/pypi/simple
+Install: pip install t-tech-investments --index-url https://opensource.tbank.ru/api/v4/projects/238/packages/pypi/simple  # noqa: E501
 
 API surface used
 ----------------
@@ -113,7 +113,9 @@ def _candle_to_row(ticker: str, candle: Any) -> OHLCVRow:
         close=_money_to_decimal(candle.close),
         volume=candle.volume,
         adj_close=_money_to_decimal(candle.close),
-        source="tkf",
+        primary_source="tkf",
+        covered_by_tkf=True,
+        covered_by_moex=False,
     )
 
 
@@ -137,7 +139,7 @@ class TinkoffInvestDataLoader(DataLoader):
             # Falls back to sandbox (150-share universe, 15 req/min)
             token = env.get("TINKOFF_REAL_TOKEN") or env.get("TINKOFF_SANDBOX_TOKEN")
         if not token:
-            raise LoaderAuthError("Tinkoff token not set: pass token= or export TINKOFF_SANDBOX_TOKEN")
+            raise LoaderAuthError("Tinkoff token not set: pass token= or export TINKOFF_SANDBOX_TOKEN")  # noqa: E501
         self._token = token
         self._universe_cache: dict[str, TickerMeta] | None = None
         self._bonds_cache: dict[str, TickerMeta] | None = None
@@ -149,6 +151,54 @@ class TinkoffInvestDataLoader(DataLoader):
         if self._universe_cache is not None:
             return list(self._universe_cache.values())
         return list(self._ensure_universe().values())
+
+    def list_shares_all(self, class_code: str = "TQBR") -> list[TickerMeta]:
+        """Full share universe INCLUDING DELISTED (1772 + 150 live = 1927).
+
+        NO filter on trading_status — captures live AND delisted/suspended
+        TQBR tickers via the same gRPC ``instruments.shares()`` endpoint
+        the broker uses internally. Each TickerMeta has ``delisted`` set
+        based on the SecurityTradingStatus enum value.
+        """
+        cache_attr = f"_shares_all_{class_code}"
+        cached = getattr(self, cache_attr, None)
+        if cached is not None:
+            return cached
+
+        from t_tech.invest import Client, SecurityTradingStatus
+
+        with Client(self._token) as client:
+            self.bucket.acquire()
+            response = client.instruments.shares()
+            out: list[TickerMeta] = []
+            for inst in response.instruments:
+                if inst.class_code != class_code:
+                    continue
+                ts_int = int(getattr(inst, "trading_status", 14) or 14)
+                try:
+                    status_name = SecurityTradingStatus(ts_int).name
+                except (ValueError, TypeError):
+                    status_name = "UNKNOWN"
+                delisted = (
+                    "NOT_AVAILABLE_FOR_TRADING" in status_name
+                    or "DELISTED" in status_name
+                    or "EXCLUDED" in status_name  # noqa: E501
+                )
+                out.append(
+                    TickerMeta(
+                        ticker=inst.ticker,
+                        figi=getattr(inst, "figi", None) or None,
+                        name=inst.name,
+                        lot=inst.lot,
+                        isin=getattr(inst, "isin", None),
+                        currency="RUB",
+                        class_code=getattr(inst, "class_code", None),
+                        delisted=delisted,
+                        source=self.SOURCE,  # type: ignore[arg-type]
+                    )
+                )
+        setattr(self, cache_attr, out)
+        return out
 
     def list_bonds(self) -> list[TickerMeta]:
         """Return tradeable MOEX bonds (TQOB OFZ + TQCB corporate/muni).
@@ -173,8 +223,22 @@ class TinkoffInvestDataLoader(DataLoader):
         return list(self._ensure_etfs().values())
 
     def get_ticker(self, ticker: str) -> TickerMeta:
-        """Find a ticker across all instrument universes (shares, bonds, etfs)."""
+        """Find a ticker across all instrument universes (shares, bonds, etfs).
+
+        Search order: full-share-universe (incl. delisted) → live shares
+        → bonds → ETFs. This ensures delisted tickers (e.g., VSMO) resolve
+        to a TickerMeta with FIGI, allowing fetch_ohlcv() to retrieve history.
+        """
         t = ticker.upper()
+        # 1) Full share universe (live + delisted) — preferred for OHLCV lookup
+        for class_code in ("TQBR",):
+            cache_attr = f"_shares_all_{class_code}"
+            cached = getattr(self, cache_attr, None)
+            if cached is not None:
+                for meta in cached:
+                    if meta.ticker == t:
+                        return meta
+        # 2) Live-only universe, bonds, ETFs
         for cache_getter in (self._ensure_universe, self._ensure_bonds, self._ensure_etfs):
             cache = cache_getter()
             meta = cache.get(t)
@@ -188,8 +252,15 @@ class TinkoffInvestDataLoader(DataLoader):
         start: date,
         end: date,
     ) -> list[OHLCVRow]:
-        """Fetch historical daily candles for [start, end]."""
-        self._validate_range(start, end, max_lookback=timedelta(days=5 * 365))
+        """Fetch historical daily candles for [start, end].
+
+        Note: the gRPC ``get_candles`` API rejects request periods > ~1 year
+        with INVALID_ARGUMENT 30014. We transparently split the requested
+        range into 1-year chunks. Works for both live and delisted tickers
+        (verified with VSMO which returned 1746 candles for 2020-2026).
+        """
+        # Validate range: gRPC cap is 5y, but chunked requests let us exceed it.
+        self._validate_range(start, end, max_lookback=timedelta(days=30 * 365))
         meta = self.get_ticker(ticker)
         if not meta.figi:
             raise LoaderError(f"Ticker {ticker} has no FIGI; cannot fetch from Tinkoff")
@@ -206,15 +277,27 @@ class TinkoffInvestDataLoader(DataLoader):
 
         from t_tech.invest import CandleInterval, Client
 
+        # Split into ≤1-year chunks (API rejects longer periods).
+        one_year = timedelta(days=365)
+        chunks: list[tuple[datetime, datetime]] = []
+        cursor = start_dt
+        while cursor < end_dt:
+            chunk_end = min(cursor + one_year, end_dt)
+            chunks.append((cursor, chunk_end))
+            cursor = chunk_end
+
+        bars: list[OHLCVRow] = []
         with Client(self._token) as client:
-            self.bucket.acquire()
-            response = client.market_data.get_candles(
-                instrument_id=meta.figi,
-                from_=start_dt,
-                to=end_dt,
-                interval=CandleInterval.CANDLE_INTERVAL_DAY,
-            )
-        bars = [_candle_to_row(ticker.upper(), c) for c in response.candles]
+            for chunk_start, chunk_end in chunks:
+                self.bucket.acquire()
+                response = client.market_data.get_candles(
+                    instrument_id=meta.figi,
+                    from_=chunk_start,
+                    to=chunk_end,
+                    interval=CandleInterval.CANDLE_INTERVAL_DAY,
+                )
+                for c in response.candles:
+                    bars.append(_candle_to_row(ticker.upper(), c))
         return bars
 
     def iter_ohlcv(

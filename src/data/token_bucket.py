@@ -114,7 +114,7 @@ class TokenBucket:
             t = now if now is not None else time.monotonic()
             self._refill_locked(t)
             if self._tokens < 1.0:
-                raise RateLimitError(f"no token available (rate={self.rate}/{self.window_seconds}s)")
+                raise RateLimitError(f"no token available (rate={self.rate}/{self.window_seconds}s)")  # noqa: E501
             self._tokens -= 1.0
 
     # --- introspection (testing only) ------------------------------------

@@ -107,7 +107,7 @@ class TestPositionSize:
         # Meta should report the computed position_pct
         assert decision.meta["position_pct"] == pytest.approx(9.0)
 
-    def test_position_size_at_limit_allowed(self, limits: RiskLimits, base_state: PortfolioState) -> None:
+    def test_position_size_at_limit_allowed(self, limits: RiskLimits, base_state: PortfolioState) -> None:  # noqa: E501
         """A position EXACTLY at the limit (10.0%) is allowed (boundary check)."""
         # 100,000 / 1,000,000 = exactly 10.0%
         intent = _intent(qty=1000, price="100")
@@ -157,7 +157,7 @@ class TestDailyLoss:
 
         assert decision.allowed is True
 
-    def test_daily_profit_always_allowed(self, limits: RiskLimits, base_state: PortfolioState) -> None:
+    def test_daily_profit_always_allowed(self, limits: RiskLimits, base_state: PortfolioState) -> None:  # noqa: E501
         """Positive daily P&L never triggers the daily-loss check."""
         state = base_state.model_copy(update={"daily_pnl": Decimal("50000")})
         intent = _intent(qty=10, price="100")
@@ -277,7 +277,9 @@ class TestSectorExposure:
 
         assert decision.allowed is True
 
-    def test_sector_check_skipped_when_no_sector(self, limits: RiskLimits, base_state: PortfolioState) -> None:
+    def test_sector_check_skipped_when_no_sector(
+        self, limits: RiskLimits, base_state: PortfolioState
+    ) -> None:  # noqa: E501
         """Skeleton behaviour: missing intent.sector skips the sector check."""
         intent = _intent(sector=None)
         gate = RiskGate(limits)
@@ -363,7 +365,9 @@ class TestMultipleViolations:
 
 
 class TestFailSafe:
-    def test_fail_safe_default_unknown_input(self, limits: RiskLimits, base_state: PortfolioState) -> None:
+    def test_fail_safe_default_unknown_input(
+        self, limits: RiskLimits, base_state: PortfolioState
+    ) -> None:  # noqa: E501
         """A symbol that pydantic validation rejects (empty after strip) raises.
 
         The skeleton surfaces this as a ValidationError — Phase 1.3 will
@@ -378,7 +382,7 @@ class TestFailSafe:
         with pytest.raises(ValidationError):
             TradeIntent(symbol="SBER", side="sell", quantity=Decimal("1"), price=Decimal("1"))
 
-    def test_fail_safe_negative_quantity(self, limits: RiskLimits, base_state: PortfolioState) -> None:
+    def test_fail_safe_negative_quantity(self, limits: RiskLimits, base_state: PortfolioState) -> None:  # noqa: E501
         """Negative quantity is rejected at the model layer (fail-safe)."""
         with pytest.raises(ValidationError):
             TradeIntent(symbol="SBER", side="buy", quantity=Decimal("-1"), price=Decimal("1"))
@@ -410,7 +414,7 @@ class TestFailSafe:
                 peak_equity=Decimal("500"),  # < total_equity: impossible
             )
 
-    def test_fail_safe_decision_invariant(self, limits: RiskLimits, base_state: PortfolioState) -> None:
+    def test_fail_safe_decision_invariant(self, limits: RiskLimits, base_state: PortfolioState) -> None:  # noqa: E501
         """RiskDecision cannot be constructed with allowed=True AND violations.
 
         This guards against a future code path that bypasses the gate.
@@ -556,7 +560,7 @@ class TestGate:
         assert d1.allowed == d2.allowed
         assert d1.violations == d2.violations
 
-    def test_meta_contains_all_metrics(self, limits: RiskLimits, base_state: PortfolioState) -> None:
+    def test_meta_contains_all_metrics(self, limits: RiskLimits, base_state: PortfolioState) -> None:  # noqa: E501
         """On a healthy state, every check should populate meta (or skip-key for sector)."""
         intent = _intent(qty=100, price="100", sector="energy")
         gate = RiskGate(limits)

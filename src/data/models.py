@@ -58,7 +58,9 @@ class OHLCVRow(BaseModel):
     close: Decimal = Field(..., ge=Decimal("0"))
     volume: Decimal = Field(..., ge=Decimal("0"))
     adj_close: Decimal = Field(..., ge=Decimal("0"))
-    source: SourceType = Field(..., description="Provenance tag: 'tkf' | 'moex' | 'manual'")
+    primary_source: SourceType = Field(..., description="Which source's OHLCV was stored")
+    covered_by_tkf: bool = Field(default=False, description="True if Tinkoff gRPC also confirms this bar")  # noqa: E501
+    covered_by_moex: bool = Field(default=False, description="True if MOEX ISS also confirms this bar")  # noqa: E501
 
     @field_validator("ticker")
     @classmethod
@@ -121,7 +123,7 @@ class TickerMeta(BaseModel):
     isin: str | None = Field(default=None, description="ISIN, e.g. 'RU0009029542'")
     currency: str = Field(default="RUB", min_length=3, max_length=3)
     # MOEX class code: TQBR (shares), TQOB (OFZ), TQCB (corp/muni), TQTE (ETFs), CETS (currencies)
-    class_code: str | None = Field(default=None, description="MOEX class code (TQBR/TQOB/TQCB/TQTE/CETS)")
+    class_code: str | None = Field(default=None, description="MOEX class code (TQBR/TQOB/TQCB/TQTE/CETS)")  # noqa: E501
     delisted: bool = Field(default=False)
     delisted_at: date | None = None
     listed_at: date | None = None

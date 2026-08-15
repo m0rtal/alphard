@@ -67,7 +67,9 @@ def load_bars_from_csv(path: str) -> list[Bar]:
         reader = csv.DictReader(f)
         missing = [c for c in REQUIRED_CSV_COLUMNS if c not in (reader.fieldnames or [])]
         if missing:
-            raise ValueError(f"CSV missing required columns: {','.join(missing)}; " f"got {reader.fieldnames}")
+            raise ValueError(
+                f"CSV missing required columns: {','.join(missing)}; " f"got {reader.fieldnames}"
+            )  # noqa: E501
         for row in reader:
             try:
                 bar = Bar(

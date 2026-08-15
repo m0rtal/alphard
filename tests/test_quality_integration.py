@@ -47,7 +47,8 @@ class TestGateThenUpsert:
 
     @pytest.mark.skip(
         reason=(
-            "IngestionGate uses z-score, not absolute threshold; " "crafting CRITICAL via synthetic data is brittle."
+            "IngestionGate uses z-score, not absolute threshold; "
+            "crafting CRITICAL via synthetic data is brittle."  # noqa: E501
         )
     )
     def test_critical_raises(self):
@@ -57,7 +58,7 @@ class TestGateThenUpsert:
             Bar(primary_key=date(2026, 8, 2), open=100, high=101, low=99, close=100, volume=1),
             Bar(primary_key=date(2026, 8, 3), open=100, high=101, low=99, close=100, volume=1),
             Bar(primary_key=date(2026, 8, 4), open=100, high=101, low=99, close=100, volume=1),
-            Bar(primary_key=date(2026, 8, 5), open=10000, high=10001, low=9999, close=10000, volume=1),
+            Bar(primary_key=date(2026, 8, 5), open=10000, high=10001, low=9999, close=10000, volume=1),  # noqa: E501
         ]
         upsert = MagicMock()
         with pytest.raises(DataQualityCritical):
@@ -93,7 +94,9 @@ class TestGateThenLoadOHLCV:
             source_name="secondary",
             bars=((date(2026, 8, 14), 100.0),),
         )
-        bars, ing, cross = gate_then_load_ohlcv(load, "T", date(2026, 8, 1), date(2026, 8, 14), second_source=secondary)
+        bars, ing, cross = gate_then_load_ohlcv(
+            load, "T", date(2026, 8, 1), date(2026, 8, 14), second_source=secondary
+        )  # noqa: E501
         assert bars == [load.return_value[0]]
         assert ing is None
         assert cross is not None
@@ -114,8 +117,13 @@ class TestGateThenLoadOHLCV:
 
     def test_audit_log_writes_issue(self):
         # Trigger: 1 huge jump → z-score outlier (HIGH, not CRITICAL)
-        bars = [Bar(primary_key=date(2026, 8, i), open=100, high=101, low=99, close=100, volume=1) for i in range(1, 6)]
-        bars.append(Bar(primary_key=date(2026, 8, 6), open=10000, high=10001, low=9999, close=10000, volume=1))
+        bars = [
+            Bar(primary_key=date(2026, 8, i), open=100, high=101, low=99, close=100, volume=1)
+            for i in range(1, 6)  # noqa: E501
+        ]  # noqa: E501
+        bars.append(
+            Bar(primary_key=date(2026, 8, 6), open=10000, high=10001, low=9999, close=10000, volume=1)  # noqa: E501
+        )  # noqa: E501
         audit = InMemoryAuditLog()
         upsert = MagicMock(return_value=6)
         params = IngestionParams(outlier_zscore=3.0)  # tighter, more likely to flag
@@ -131,7 +139,9 @@ class TestGateThenLoadOHLCV:
             source_name="secondary",
             bars=((date(2026, 8, 14), 200.0),),  # 100% off
         )
-        bars, _, cross = gate_then_load_ohlcv(load, "T", date(2026, 8, 1), date(2026, 8, 14), second_source=secondary)
+        bars, _, cross = gate_then_load_ohlcv(
+            load, "T", date(2026, 8, 1), date(2026, 8, 14), second_source=secondary
+        )  # noqa: E501
         # bars are still returned; report is in cross
         assert bars is not None
         assert cross is not None

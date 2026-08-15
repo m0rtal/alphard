@@ -50,9 +50,11 @@ CREATE TABLE IF NOT EXISTS ohlcv_daily (
     close      TEXT NOT NULL,
     volume     TEXT NOT NULL,
     adj_close  TEXT NOT NULL,
-    source     TEXT NOT NULL,
+    covered_by_tkf   INTEGER NOT NULL DEFAULT 0,
+    covered_by_moex  INTEGER NOT NULL DEFAULT 0,
+    primary_source   TEXT NOT NULL DEFAULT 'tkf',
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-    PRIMARY KEY (ticker, ts, source),
+    PRIMARY KEY (ticker, ts),
     FOREIGN KEY (ticker) REFERENCES ticker_universe(ticker)
 );
 CREATE INDEX IF NOT EXISTS idx_ohlcv_daily_ticker_ts
@@ -189,7 +191,7 @@ class InMemorySQLiteStore(DataStore):
                 (at.isoformat(), ticker.upper()),
             )
             self._conn.execute(
-                "INSERT INTO delisting_log (ticker, delisted_at, reason, source) VALUES (?, ?, ?, 'manual')",
+                "INSERT INTO delisting_log (ticker, delisted_at, reason, source) VALUES (?, ?, ?, 'manual')",  # noqa: E501
                 (ticker.upper(), at.isoformat(), reason),
             )
             self._conn.commit()
@@ -212,21 +214,20 @@ class InMemorySQLiteStore(DataStore):
                 str(r.close),
                 str(r.volume),
                 str(r.adj_close),
-                r.source,
+                int(r.covered_by_tkf),
+                int(r.covered_by_moex),
+                r.primary_source,
             )
             for r in rows
         ]
         sql = """
             INSERT INTO ohlcv_daily
-                (ticker, ts, open, high, low, close, volume, adj_close, source, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-            ON CONFLICT (ticker, ts, source) DO UPDATE SET
-                open = excluded.open,
-                high = excluded.high,
-                low = excluded.low,
-                close = excluded.close,
-                volume = excluded.volume,
-                adj_close = excluded.adj_close,
+                (ticker, ts, open, high, low, close, volume, adj_close,
+                 covered_by_tkf, covered_by_moex, primary_source, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT (ticker, ts) DO UPDATE SET
+                covered_by_tkf = MAX(ohlcv_daily.covered_by_tkf, excluded.covered_by_tkf),
+                covered_by_moex = MAX(ohlcv_daily.covered_by_moex, excluded.covered_by_moex),
                 updated_at = datetime('now')
         """
         try:
@@ -242,16 +243,17 @@ class InMemorySQLiteStore(DataStore):
         start: date,
         end: date,
         *,
-        source: str | None = None,
+        primary_source: str | None = None,
     ) -> list[OHLCVRow]:
         sql = (
-            "SELECT ticker, ts, open, high, low, close, volume, adj_close, source "
+            "SELECT ticker, ts, open, high, low, close, volume, adj_close, primary_source, "
+            "covered_by_tkf, covered_by_moex "
             "FROM ohlcv_daily WHERE ticker = ? AND ts BETWEEN ? AND ?"
         )
         params: list[Any] = [ticker.upper(), start.isoformat(), end.isoformat()]
-        if source:
-            sql += " AND source = ?"
-            params.append(source)
+        if primary_source:
+            sql += " AND primary_source = ?"
+            params.append(primary_source)
         sql += " ORDER BY ts"
         try:
             cur = self._conn.execute(sql, params)
@@ -330,7 +332,9 @@ def _row_to_ohlcv(r: Any) -> OHLCVRow:
         close=Decimal(str(r[5])),
         volume=Decimal(str(r[6])),
         adj_close=Decimal(str(r[7])),
-        source=r[8],
+        primary_source=r[8],
+        covered_by_tkf=bool(r[9]) if len(r) > 9 else False,
+        covered_by_moex=bool(r[10]) if len(r) > 10 else False,
     )
 
 

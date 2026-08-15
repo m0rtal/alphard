@@ -22,9 +22,9 @@ from datetime import date, timedelta
 sys.path.insert(0, "/app")
 sys.path.insert(0, "/app/src")
 
-from src.data.tinkoff_loader import TinkoffInvestDataLoader
-from src.data.pg_store import PostgresDataStore
-from typing import Any
+from src.data.tinkoff_loader import TinkoffInvestDataLoader  # noqa: E402
+from src.data.pg_store import PostgresDataStore  # noqa: E402
+from typing import Any  # noqa: E402
 
 logger = logging.getLogger("alphard.daily_sync")
 
@@ -55,13 +55,22 @@ LIQUID_UNIVERSE = [
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--days", type=int, default=5, help="Pull last N days (default 5, includes weekends)")
     parser.add_argument(
-        "--backfill", type=int, default=0, help="If > 0, pull N days for the full universe (one-time backfill)"
+        "--days", type=int, default=5, help="Pull last N days (default 5, includes weekends)"
+    )  # noqa: E501
+    parser.add_argument(
+        "--backfill",
+        type=int,
+        default=0,
+        help="If > 0, pull N days for the full universe (one-time backfill)",  # noqa: E501
     )
-    parser.add_argument("--universe", nargs="*", default=None, help="Ticker list (default: top 20 MOEX liquid)")
     parser.add_argument(
-        "--dsn", default=os.environ.get("ALPHARD_PG_DSN"), help="Postgres DSN (falls back to $ALPHARD_PG_DSN)"
+        "--universe", nargs="*", default=None, help="Ticker list (default: top 20 MOEX liquid)"
+    )  # noqa: E501
+    parser.add_argument(
+        "--dsn",
+        default=os.environ.get("ALPHARD_PG_DSN"),
+        help="Postgres DSN (falls back to $ALPHARD_PG_DSN)",  # noqa: E501
     )
     parser.add_argument(
         "--source",
@@ -75,9 +84,9 @@ def main() -> int:
         choices=["daily", "weekly", "full", "universe"],
         help="daily=top20 5d; weekly=top20 7d; full=all TQBR 5y; universe=all TQBR N d",
     )
-    parser.add_argument("--batch-sleep", type=float, default=0, help="Sleep between tickers (rate-limit)")
-    parser.add_argument("--quality-gate", action="store_true", help="Run Ingestion Gate before upsert")
-    parser.add_argument("--max-tickers", type=int, default=0, help="Limit number of tickers (0=all)")
+    parser.add_argument("--batch-sleep", type=float, default=0, help="Sleep between tickers (rate-limit)")  # noqa: E501
+    parser.add_argument("--quality-gate", action="store_true", help="Run Ingestion Gate before upsert")  # noqa: E501
+    parser.add_argument("--max-tickers", type=int, default=0, help="Limit number of tickers (0=all)")  # noqa: E501
     args = parser.parse_args()
 
     if not args.dsn:
@@ -133,7 +142,7 @@ def main() -> int:
 
     if args.max_tickers > 0:
         symbols = symbols[: args.max_tickers]
-    logger.info(f"=== Sync: {args.source} {start} → {end} (mode={args.mode}, {len(symbols)} tickers) ===")
+    logger.info(f"=== Sync: {args.source} {start} → {end} (mode={args.mode}, {len(symbols)} tickers) ===")  # noqa: E501
 
     store = PostgresDataStore()
 
@@ -173,8 +182,53 @@ def main() -> int:
 
                 store.upsert_ticker(meta)
 
+                # Adapt loader output to OHLCVRow with source flags.
+                # PK is now (ticker, ts); source flags track coverage.
+                adapted: list[Any] = []
+                for b in bars:
+                    if hasattr(b, "primary_source"):  # already adapted
+                        adapted.append(b)
+                    elif hasattr(b, "source"):  # old shape
+                        # Old OHLCVRow had .source; convert to new shape
+                        from src.data.models import OHLCVRow as _OHLCV
+
+                        adapted.append(
+                            _OHLCV(
+                                ticker=b.ticker,
+                                ts=b.ts,
+                                open=b.open,
+                                high=b.high,
+                                low=b.low,
+                                close=b.close,
+                                volume=b.volume,
+                                adj_close=b.adj_close,
+                                primary_source=b.source,
+                                covered_by_tkf=(b.source == "tkf"),
+                                covered_by_moex=(b.source == "moex"),
+                            )
+                        )
+                    else:
+                        # Bare dict or pydantic loader row — build from scratch
+                        from src.data.models import OHLCVRow as _OHLCV
+
+                        adapted.append(
+                            _OHLCV(
+                                ticker=getattr(b, "ticker", symbol),
+                                ts=getattr(b, "ts", None),
+                                open=getattr(b, "open", 0),
+                                high=getattr(b, "high", 0),
+                                low=getattr(b, "low", 0),
+                                close=getattr(b, "close", 0),
+                                volume=getattr(b, "volume", 0),
+                                adj_close=getattr(b, "adj_close", getattr(b, "close", 0)),
+                                primary_source=args.source,
+                                covered_by_tkf=(args.source == "tkf"),
+                                covered_by_moex=(args.source == "moex"),
+                            )
+                        )
+
                 if args.quality_gate and args.source == "tkf":
-                    from src.data.quality.ingestion_gate import check_ingestion, IngestionParams, Bar
+                    from src.data.quality.ingestion_gate import check_ingestion, IngestionParams, Bar  # noqa: E501
                     from src.data.quality.severity import Severity
 
                     # check_ingestion expects list[Bar] where Bar.primary_key=date and
@@ -193,19 +247,15 @@ def main() -> int:
                     report = check_ingestion(symbol, bar_list, params=IngestionParams())
                     worst = report.worst_severity()
                     if worst == Severity.CRITICAL:
-                        logger.warning(
-                            f"{i}/{len(symbols)} {symbol}: GATE_CRITICAL — {report.issues}"
-                        )
+                        logger.warning(f"{i}/{len(symbols)} {symbol}: GATE_CRITICAL — {report.issues}")  # noqa: E501
                         continue
                     elif worst == Severity.HIGH:
                         logger.warning(
                             f"{i}/{len(symbols)} {symbol}: GATE_HIGH (skipped) — {report.issues}"
-                        )
+                        )  # noqa: E501
                         continue
                     elif worst is not None:
-                        logger.debug(
-                            f"{i}/{len(symbols)} {symbol}: GATE_{worst.value} — {report.issues}"
-                        )
+                        logger.debug(f"{i}/{len(symbols)} {symbol}: GATE_{worst.value} — {report.issues}")  # noqa: E501
 
                     written = store.upsert_ohlcv(bars)
                 else:

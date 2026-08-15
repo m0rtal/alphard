@@ -322,7 +322,7 @@ def check_ingestion(
             Issue.make(
                 gate="ingestion",
                 kind=IssueKind.ING_RANGE_VIOLATION,
-                message=f"{range_violations} rows violate high>=max(open,close) or low<=min(open,close)",
+                message=f"{range_violations} rows violate high>=max(open,close) or low<=min(open,close)",  # noqa: E501
                 count=range_violations,
             )
         )
@@ -405,7 +405,7 @@ def check_ingestion(
                 Issue.make(
                     gate="ingestion",
                     kind=IssueKind.ING_STALE_DATA,
-                    message=f"latest bar {latest} is {age_days} days old (>{p.stale_max_calendar_days})",
+                    message=f"latest bar {latest} is {age_days} days old (>{p.stale_max_calendar_days})",  # noqa: E501
                     count=age_days,
                     extra={"latest_date": latest.isoformat(), "age_days": age_days},
                 )

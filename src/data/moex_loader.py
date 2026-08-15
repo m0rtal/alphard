@@ -131,7 +131,8 @@ class MOEXDataLoader(DataLoader):
                 "start": page * self._page_size,
             }
             url = (
-                f"{BASE_URL}/iss/engines/stock/markets/shares/securities/" f"{urllib.parse.quote(ticker)}/candles.json"
+                f"{BASE_URL}/iss/engines/stock/markets/shares/securities/"
+                f"{urllib.parse.quote(ticker)}/candles.json"  # noqa: E501
             )
             payload = self._get_json(url, params=params)
             candles = self._extract_block(payload, "candles")
@@ -313,7 +314,9 @@ class MOEXDataLoader(DataLoader):
                 close=c,
                 volume=vol_shares,
                 adj_close=c,  # Phase 1.1: no split adjustments for MOEX
-                source="moex",
+                primary_source="moex",
+                covered_by_tkf=False,
+                covered_by_moex=True,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("skipping malformed MOEX OHLCV row %r: %s", row, exc)
