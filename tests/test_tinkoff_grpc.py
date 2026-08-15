@@ -14,7 +14,6 @@ import pytest
 
 from src.data import LoaderAuthError, TickerMeta, TinkoffDataLoader
 
-
 class TestTinkoffDataLoader:
     def test_missing_token_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("TINKOFF_SANDBOX_TOKEN", raising=False)
@@ -76,7 +75,6 @@ class TestTinkoffDataLoader:
         assert len(bars) == 1
         assert bars[0].ticker == "SBER"
         assert bars[0].close == Decimal("311")
-        assert bars[0].primary_source == "tkf"
 
     def test_iter_corporate_actions_yields_nothing_phase_1(self) -> None:
         loader = TinkoffDataLoader(token="t")
@@ -246,7 +244,6 @@ class TestTinkoffDataLoader:
             loader.list_etfs()
         assert mock_client.instruments.etfs.call_count == 1
 
-
 class TestTinkoffLoaderCoverage:
     """Additional tests to push coverage of tinkoff_loader.py above 95%."""
 
@@ -361,7 +358,6 @@ class TestTinkoffLoaderCoverage:
         row = _candle_to_row("SBER", candle)
         assert row.ts == date(2026, 8, 10)
         assert row.close == Decimal("102")
-        assert row.primary_source == "tkf"
 
     # ---------------------------------------------------------- token bucket exhaustion
 

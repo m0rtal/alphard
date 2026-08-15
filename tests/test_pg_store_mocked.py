@@ -43,11 +43,9 @@ from src.data.pg_store import (
 )
 from src.data.store import StoreError
 
-
 # ---------------------------------------------------------------------------
 # Fake connection
 # ---------------------------------------------------------------------------
-
 
 class FakeCursor:
     """Minimal psycopg cursor stand-in.
@@ -106,7 +104,6 @@ class FakeCursor:
     def close(self) -> None:
         self.closed = True
 
-
 class FakeConnection:
     """Minimal psycopg connection stand-in.
 
@@ -158,11 +155,9 @@ class FakeConnection:
         """The most recently opened cursor (for assertions)."""
         return self.cursors[-1]
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
-
 
 class _ConnFactory:
     """Callable ``connect`` stand-in that records every issued connection.
@@ -187,7 +182,6 @@ class _ConnFactory:
     def first(self) -> FakeConnection:
         return self.instances[0]
 
-
 @pytest.fixture
 def fake_conn_cls() -> Any:
     """Patch psycopg.connect to return a FakeConnection factory.
@@ -198,7 +192,6 @@ def fake_conn_cls() -> Any:
     factory = _ConnFactory()
     with patch("psycopg.connect", side_effect=factory):
         yield factory
-
 
 @pytest.fixture
 def store(fake_conn_cls: Any) -> PostgresDataStore:
@@ -211,11 +204,9 @@ def store(fake_conn_cls: Any) -> PostgresDataStore:
     s._conn = fake_conn_cls.last
     return s
 
-
 # ---------------------------------------------------------------------------
 # __init__
 # ---------------------------------------------------------------------------
-
 
 class TestInit:
     def test_dsn_from_arg(self, fake_conn_cls: Any) -> None:
@@ -261,11 +252,9 @@ class TestInit:
         # Default path sits in the package directory (src/data/).
         assert s._schema_sql_path.endswith(os.path.join("src", "data", "schema.sql"))
 
-
 # ---------------------------------------------------------------------------
 # _connect / close / context manager
 # ---------------------------------------------------------------------------
-
 
 class TestConnectionLifecycle:
     def test_connect_lazy(self, fake_conn_cls: Any) -> None:
@@ -347,11 +336,9 @@ class TestConnectionLifecycle:
             pass
         assert fake_conn_cls.last.closed is True
 
-
 # ---------------------------------------------------------------------------
 # init_schema
 # ---------------------------------------------------------------------------
-
 
 class TestInitSchema:
     def test_init_schema_executes_file_and_commits(
@@ -372,11 +359,9 @@ class TestInitSchema:
         assert cur.calls[0][0] == "CREATE TABLE foo (id INT);"
         assert fake_conn_cls.last.commit_calls == 1
 
-
 # ---------------------------------------------------------------------------
 # upsert_ticker / upsert_tickers / list_tickers
 # ---------------------------------------------------------------------------
-
 
 def _meta(
     ticker: str = "SBER",
@@ -398,7 +383,6 @@ def _meta(
         delisted_at=delisted_at,
         listed_at=listed_at,
     )
-
 
 class TestTickerCRUD:
     def test_upsert_ticker_single_delegates_to_batch(self, store: PostgresDataStore) -> None:
@@ -578,11 +562,9 @@ class TestTickerCRUD:
         assert out[0].delisted is True
         assert out[0].delisted_at == date(2025, 1, 1)
 
-
 # ---------------------------------------------------------------------------
 # mark_delisted
 # ---------------------------------------------------------------------------
-
 
 class TestMarkDelisted:
     def test_mark_delisted(self, store: PostgresDataStore) -> None:
@@ -605,19 +587,14 @@ class TestMarkDelisted:
         # reason defaults to ""
         assert cur.calls[1][1] == ("GAZP", date(2026, 2, 1), "")
 
-
 # ---------------------------------------------------------------------------
 # OHLCV: upsert / query / dedup / migrate
 # ---------------------------------------------------------------------------
-
 
 def _bar(
     ticker: str = "SBER",
     ts: date = date(2026, 8, 14),
     close: str = "105.00",
-    primary_source: str = "manual",
-    covered_by_tkf: bool = False,
-    covered_by_moex: bool = False,
 ) -> OHLCVRow:
     return OHLCVRow(
         ticker=ticker,
@@ -628,11 +605,7 @@ def _bar(
         close=Decimal(close),
         volume=Decimal("1000000"),
         adj_close=Decimal(close),
-        primary_source=primary_source,  # type: ignore[arg-type]
-        covered_by_tkf=covered_by_tkf,
-        covered_by_moex=covered_by_moex,
     )
-
 
 class TestUpsertOHLCV:
     def test_empty_returns_zero(self, store: PostgresDataStore) -> None:
@@ -651,27 +624,19 @@ class TestUpsertOHLCV:
         sql, params = cur.executemany_calls[0]
         assert "INSERT INTO ohlcv_daily" in sql
         assert "ON CONFLICT (ticker, ts) DO UPDATE" in sql
-        assert "covered_by_tkf = ohlcv_daily.covered_by_tkf OR EXCLUDED.covered_by_tkf" in sql
         assert len(params) == 3
         # All Decimal columns converted via str()
         assert params[0][2] == "100.00"  # open
         assert params[0][5] == "105.00"  # close
         assert params[0][6] == "1000000"  # volume
         assert params[0][7] == "105.00"  # adj_close
-        # Source flags preserved as bool
-        assert params[0][8] is False  # covered_by_tkf
-        assert params[0][9] is False  # covered_by_moex
-        assert params[0][10] == "manual"  # primary_source
 
     def test_covered_flags_passed_through(self, store: PostgresDataStore) -> None:
-        row = _bar(covered_by_tkf=True, covered_by_moex=True, primary_source="tkf")
+        row = _bar()
         store.upsert_ohlcv([row])
         cur = store._conn.last_cursor()
         _, params = cur.executemany_calls[0]
-        assert params[0][8] is True
-        assert params[0][9] is True
-        assert params[0][10] == "tkf"
-
+        assert len(params[0]) == 8
 
 class TestBackfillWithDedup:
     def test_empty_returns_zero_zero(self, store: PostgresDataStore) -> None:
@@ -720,7 +685,6 @@ class TestBackfillWithDedup:
         result = store.backfill_with_dedup([_bar()], source="moex")
         assert result["inserted"] == 1
 
-
 class TestMigrateDeduplicate:
     def test_returns_rowcount(self, store: PostgresDataStore) -> None:
         store._conn.next_rowcount.append(7)
@@ -738,7 +702,6 @@ class TestMigrateDeduplicate:
         store._conn.next_rowcount.append(0)
         assert store.migrate_deduplicate() == 0
 
-
 class TestQueryOHLCV:
     def test_query_without_source(self, store: PostgresDataStore) -> None:
         store._conn.next_fetchall.append(
@@ -752,9 +715,6 @@ class TestQueryOHLCV:
                     "105.00",
                     "1000000",
                     "105.00",
-                    "tkf",
-                    True,
-                    False,
                 )
             ]
         )
@@ -762,7 +722,6 @@ class TestQueryOHLCV:
         cur = store._conn.last_cursor()
         sql, params = cur.calls[0]
         assert "FROM ohlcv_daily WHERE ticker = %s AND ts BETWEEN %s AND %s" in sql
-        assert "primary_source = %s" not in sql
         # Ticker is uppercased.
         assert params[0] == "SBER"
         assert params[1] == date(2026, 8, 1)
@@ -771,9 +730,6 @@ class TestQueryOHLCV:
         assert rows[0].ticker == "SBER"
         assert rows[0].close == Decimal("105.00")
         assert rows[0].volume == Decimal("1000000")
-        assert rows[0].primary_source == "tkf"
-        assert rows[0].covered_by_tkf is True
-        assert rows[0].covered_by_moex is False
 
     def test_query_with_source_filter(self, store: PostgresDataStore) -> None:
         store._conn.next_fetchall.append([])
@@ -781,29 +737,20 @@ class TestQueryOHLCV:
             "SBER",
             date(2026, 8, 1),
             date(2026, 8, 31),
-            primary_source="moex",
         )
         cur = store._conn.last_cursor()
         sql, params = cur.calls[0]
-        assert " AND primary_source = %s" in sql
         assert "ORDER BY ts" in sql
-        assert params == ["SBER", date(2026, 8, 1), date(2026, 8, 31), "moex"]
+        assert params == ["SBER", date(2026, 8, 1), date(2026, 8, 31)]
 
     def test_query_short_row_defaults(self) -> None:
-        """A row with < 11 columns uses defaults (primary_source='tkf',
-        covered_by_* = False)."""
-        # 9 columns: ticker, ts, o, h, l, c, v, adj_close, primary_source
-        row = ("SBER", date(2026, 8, 14), "100", "110", "95", "105", "1000", "105", "moex")
+        """A row with 8 columns parses into OHLCVRow."""
+        row = ("SBER", date(2026, 8, 14), "100", "110", "95", "105", "1000", "105")
         o = _row_to_ohlcv(row)
-        assert o.primary_source == "moex"
-        assert o.covered_by_tkf is False
-        assert o.covered_by_moex is False
-
 
 # ---------------------------------------------------------------------------
 # Corporate actions
 # ---------------------------------------------------------------------------
-
 
 class TestCorporateActions:
     def test_upsert_empty(self, store: PostgresDataStore) -> None:
@@ -854,11 +801,9 @@ class TestCorporateActions:
         assert rows[0].value == Decimal("12.50")
         assert rows[1].source == "moex"
 
-
 # ---------------------------------------------------------------------------
 # count_ohlcv
 # ---------------------------------------------------------------------------
-
 
 class TestCountOHLCV:
     def test_with_ticker(self, store: PostgresDataStore) -> None:
@@ -884,11 +829,9 @@ class TestCountOHLCV:
         n = store.count_ohlcv(ticker=None)
         assert n == 0
 
-
 # ---------------------------------------------------------------------------
 # Pure converters
 # ---------------------------------------------------------------------------
-
 
 class TestRowConverters:
     def test_row_to_ticker_full_row(self) -> None:
@@ -995,9 +938,6 @@ class TestRowConverters:
         assert o.close == Decimal("105.00")
         assert o.volume == Decimal("1000000")
         assert o.adj_close == Decimal("105.00")
-        assert o.primary_source == "tkf"
-        assert o.covered_by_tkf is True
-        assert o.covered_by_moex is False
 
     def test_row_to_ohlcv_numeric_inputs(self) -> None:
         """Integer / float values get coerced via str()."""
@@ -1005,8 +945,6 @@ class TestRowConverters:
         o = _row_to_ohlcv(row)
         assert o.open == Decimal("100")
         assert o.close == Decimal("105")
-        assert o.primary_source == "moex"
-        assert o.covered_by_moex is True
 
     def test_row_to_action(self) -> None:
         row = ("SBER", date(2026, 6, 1), "dividend", "12.50", "tkf")
@@ -1017,11 +955,9 @@ class TestRowConverters:
         assert a.value == Decimal("12.50")
         assert a.source == "tkf"
 
-
 # ---------------------------------------------------------------------------
 # Lazy import: psycopg is imported in __init__ only.
 # ---------------------------------------------------------------------------
-
 
 class TestPsycopgImport:
     def test_psycopg_attribute_bound(self, fake_conn_cls: Any) -> None:

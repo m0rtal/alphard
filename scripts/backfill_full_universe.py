@@ -24,7 +24,7 @@ import time
 from datetime import date, datetime, timedelta
 
 import psycopg
-from src.data.models import TickerMeta
+from src.data.models import OHLCVRow, TickerMeta
 from src.data.moex_loader import MOEXDataLoader
 from src.data.pg_store import PostgresDataStore
 
@@ -74,20 +74,11 @@ def _persist_universe_meta(store: PostgresDataStore, ticker_meta: TickerMeta) ->
         conn.commit()
 
 
-def _persist_ohlcv(store: PostgresDataStore, bars: list, source: str = "moex") -> int:
-    """Upsert OHLCV bars with deduplication.
+def _persist_ohlcv(store: PostgresDataStore, bars: list[OHLCVRow], source: str = "moex") -> int:
+    """Upsert OHLCV bars.
 
-    Pre-filters out rows where (ticker, ts) is already covered by an existing
-    source (default: 'tkf'). This prevents cross-source duplication:
-    MOEX backfill should ADD data for tickers/dates Tinkoff doesn't have,
-    not DUPLICATE existing rows.
+    Idempotent on (ticker, ts) PK via ON CONFLICT DO UPDATE.
     """
-    if not bars:
-        return 0
-    # Skip rows already covered by tkf (or other sources).
-    existing_sources = ("tkf",) if source != "tkf" else ()
-    if existing_sources:
-        bars = store.filter_already_covered(bars, existing_sources=existing_sources)
     if not bars:
         return 0
     return store.upsert_ohlcv(bars)

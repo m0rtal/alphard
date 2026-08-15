@@ -41,11 +41,9 @@ from src.data import (
 )
 from src.data.models import TICKER_REGEX
 
-
 # ===========================================================================
 # 1. pydantic models
 # ===========================================================================
-
 
 class TestOHLCVRow:
     def test_minimal_valid(self) -> None:
@@ -58,12 +56,8 @@ class TestOHLCVRow:
             close=Decimal("105"),
             volume=Decimal("1000"),
             adj_close=Decimal("105"),
-            primary_source="moex",
-            covered_by_tkf=False,
-            covered_by_moex=True,
         )
         assert row.ticker == "SBER"
-        assert row.primary_source == "moex"
         assert row.high >= row.low
 
     def test_ticker_normalised_to_upper(self) -> None:
@@ -76,9 +70,6 @@ class TestOHLCVRow:
             close=Decimal("105"),
             volume=Decimal("1"),
             adj_close=Decimal("105"),
-            primary_source="tkf",
-            covered_by_tkf=True,
-            covered_by_moex=False,
         )
         assert row.ticker == "SBER"
 
@@ -95,9 +86,6 @@ class TestOHLCVRow:
                 close=Decimal("1"),
                 volume=Decimal("0"),
                 adj_close=Decimal("1"),
-                primary_source="moex",
-                covered_by_tkf=False,
-                covered_by_moex=True,
             )
 
     def test_high_below_low_rejected(self) -> None:
@@ -111,9 +99,6 @@ class TestOHLCVRow:
                 close=Decimal("92"),
                 volume=Decimal("1"),
                 adj_close=Decimal("92"),
-                primary_source="moex",
-                covered_by_tkf=False,
-                covered_by_moex=True,
             )
 
     def test_low_above_open_rejected(self) -> None:
@@ -127,9 +112,6 @@ class TestOHLCVRow:
                 close=Decimal("100"),
                 volume=Decimal("1"),
                 adj_close=Decimal("100"),
-                primary_source="moex",
-                covered_by_tkf=False,
-                covered_by_moex=True,
             )
 
     def test_extra_field_forbidden(self) -> None:
@@ -159,28 +141,9 @@ class TestOHLCVRow:
             close=Decimal("105"),
             volume=Decimal("1"),
             adj_close=Decimal("105"),
-            primary_source="moex",
-            covered_by_tkf=False,
-            covered_by_moex=True,
         )
         with pytest.raises(Exception):  # ValidationError on mutation
             row.close = Decimal("200")  # type: ignore[misc]
-
-    def test_source_must_be_known(self) -> None:
-        with pytest.raises(ValueError):
-            OHLCVRow(
-                ticker="SBER",
-                ts=date(2026, 8, 1),
-                open=Decimal("1"),
-                high=Decimal("1"),
-                low=Decimal("1"),
-                close=Decimal("1"),
-                volume=Decimal("0"),
-                adj_close=Decimal("1"),
-                primary_source="coingecko",
-                covered_by_tkf=False,
-                covered_by_moex=False,  # type: ignore[arg-type]
-            )
 
 
 class TestCorporateAction:
@@ -214,7 +177,6 @@ class TestCorporateAction:
                 source="moex",
             )
 
-
 class TestTickerMeta:
     def test_minimal(self) -> None:
         tm = TickerMeta(
@@ -234,9 +196,6 @@ class TestTickerMeta:
                 ticker="SBER",
                 name="X",
                 lot=0,
-                primary_source="tkf",
-                covered_by_tkf=True,
-                covered_by_moex=False,  # noqa: E501
             )  # noqa: E501
 
     def test_delisted(self) -> None:
@@ -251,11 +210,9 @@ class TestTickerMeta:
         assert tm.delisted is True
         assert tm.delisted_at == date(2024, 1, 1)
 
-
 # ===========================================================================
 # 2. TokenBucket
 # ===========================================================================
-
 
 class TestTokenBucket:
     def test_initial_full(self) -> None:
@@ -323,11 +280,9 @@ class TestTokenBucket:
         t2.join()
         assert sum(results) == 100
 
-
 # ===========================================================================
 # 3. DataLoader ABC contract
 # ===========================================================================
-
 
 class FakeLoader(DataLoader):
     """In-memory loader used to exercise the ABC contract."""
@@ -360,7 +315,6 @@ class FakeLoader(DataLoader):
             if start <= a.ts <= end:
                 yield a
 
-
 class TestDataLoaderABC:
     def test_load_ohlcv_materialises(self) -> None:
         rows = [
@@ -373,9 +327,6 @@ class TestDataLoaderABC:
                 close=Decimal("105"),
                 volume=Decimal("1"),
                 adj_close=Decimal("105"),
-                primary_source="moex",
-                covered_by_tkf=False,
-                covered_by_moex=True,
             )
             for i in range(3)
         ]
@@ -398,11 +349,9 @@ class TestDataLoaderABC:
         # attribute exists and is a string.
         assert isinstance(_ABC.SOURCE, str)
 
-
 # ===========================================================================
 # 4. MOEXDataLoader (HTTP mocked)
 # ===========================================================================
-
 
 class _FakeResponse:
     def __init__(self, json_payload: dict[str, Any], status_code: int = 200) -> None:
@@ -413,7 +362,6 @@ class _FakeResponse:
 
     def json(self) -> dict[str, Any]:
         return self._payload
-
 
 class _FakeSession:
     """Minimal stand-in for requests.Session that records calls."""
@@ -434,7 +382,6 @@ class _FakeSession:
             raise AssertionError("no handler configured for " + url)
         return self._handlers.pop(0)
 
-
 def _candles_block(rows: list[list[Any]]) -> dict[str, Any]:
     return {
         "candles": {
@@ -443,7 +390,6 @@ def _candles_block(rows: list[list[Any]]) -> dict[str, Any]:
         }
     }
 
-
 def _ticker_block(rows: list[list[Any]]) -> dict[str, Any]:
     return {
         "securities": {
@@ -451,7 +397,6 @@ def _ticker_block(rows: list[list[Any]]) -> dict[str, Any]:
             "data": rows,
         }
     }
-
 
 class TestMOEXDataLoader:
     def _loader(self, handlers: list[Any]) -> tuple[MOEXDataLoader, _FakeSession]:
@@ -619,35 +564,28 @@ class TestMOEXDataLoader:
         bars = list(loader.iter_ohlcv("SBER", date(2026, 8, 1), date(2026, 8, 1)))
         assert len(bars) >= 1
 
-
 # ===========================================================================
 # 5. TinkoffDataLoader
 # ===========================================================================
 
-
 def _tinkoff_instruments(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return {"instruments": rows}
-
 
 def _tinkoff_candles(candles: list[dict[str, Any]]) -> dict[str, Any]:
     return {"candles": candles}
 
-
 def _tinkoff_dividends(divs: list[dict[str, Any]]) -> dict[str, Any]:
     return {"dividends": divs}
-
 
 # ===========================================================================
 # 6. DataStore contract (SQLite impl)
 # ===========================================================================
-
 
 @pytest.fixture
 def sqlite_store() -> Iterator[InMemorySQLiteStore]:
     s = InMemorySQLiteStore()
     yield s
     s.close()
-
 
 def _meta(ticker: str, **kw: Any) -> TickerMeta:
     defaults: dict[str, Any] = {
@@ -658,7 +596,6 @@ def _meta(ticker: str, **kw: Any) -> TickerMeta:
     }
     defaults.update(kw)
     return TickerMeta(**defaults)
-
 
 def _row(ticker: str, ts: date, **kw: Any) -> OHLCVRow:
     """Build a valid OHLCV row. ``close`` and ``open`` define the band;
@@ -678,11 +615,7 @@ def _row(ticker: str, ts: date, **kw: Any) -> OHLCVRow:
         "close": close_v,
         "volume": Decimal("1"),
         "adj_close": close_v,
-        "primary_source": "moex",
-        "covered_by_tkf": False,
-        "covered_by_moex": True,
     }
-    # Pass-through extras (e.g. ``primary_source="tkf", covered_by_tkf=True, covered_by_moex=False``) override defaults.  # noqa: E501
     defaults.update(kw)
     # Recompute high/low if caller didn't pin them AND close/open changed.
     if "high" not in kw:
@@ -690,7 +623,6 @@ def _row(ticker: str, ts: date, **kw: Any) -> OHLCVRow:
     if "low" not in kw:
         defaults["low"] = min(defaults["open"], defaults["close"])
     return OHLCVRow(**defaults)
-
 
 class TestDataStoreContract:
     def test_upsert_then_list(self, sqlite_store: InMemorySQLiteStore) -> None:
@@ -736,63 +668,13 @@ class TestDataStoreContract:
         assert len(out) == 3
         assert out[0].close == Decimal("105")
 
-    def test_ohlcv_filter_by_source(self, sqlite_store: InMemorySQLiteStore) -> None:
-        """Two rows with different (ticker, ts) should be filtered by primary_source."""
-        sqlite_store.upsert_ticker(_meta("SBER"))
-        rows = [
-            _row(
-                "SBER",
-                date(2026, 8, 1),
-                primary_source="moex",
-                covered_by_tkf=False,
-                covered_by_moex=True,  # noqa: E501
-            ),  # noqa: E501
-            _row(
-                "SBER", date(2026, 8, 2), primary_source="tkf", covered_by_tkf=True, covered_by_moex=False  # noqa: E501
-            ),  # noqa: E501
-        ]
-        sqlite_store.upsert_ohlcv(rows)
-        moex = sqlite_store.query_ohlcv("SBER", date(2026, 8, 1), date(2026, 8, 2), primary_source="moex")  # noqa: E501
-        tkf = sqlite_store.query_ohlcv("SBER", date(2026, 8, 1), date(2026, 8, 2), primary_source="tkf")  # noqa: E501
-        assert len(moex) == 1 and moex[0].primary_source == "moex"
-        assert len(tkf) == 1 and tkf[0].primary_source == "tkf"
-
     def test_ohlcv_upsert_keeps_first_ohlcv(self, sqlite_store: InMemorySQLiteStore) -> None:
-        """Dedup semantics: re-inserting the same (ticker, ts) keeps the first-arrived OHLCV values verbatim. Only covered_by_* flags are OR-merged."""  # noqa: E501
+        """Dedup semantics: re-inserting the same (ticker, ts) keeps the first-arrived OHLCV values verbatim."""  # noqa: E501
         sqlite_store.upsert_ticker(_meta("SBER"))
         sqlite_store.upsert_ohlcv([_row("SBER", date(2026, 8, 1), close=Decimal("100"))])
         sqlite_store.upsert_ohlcv([_row("SBER", date(2026, 8, 1), close=Decimal("200"))])
         out = sqlite_store.query_ohlcv("SBER", date(2026, 8, 1), date(2026, 8, 1))
         assert out[0].close == Decimal("100")
-
-    def test_ohlcv_upsert_merges_covered_flags(self, sqlite_store: InMemorySQLiteStore) -> None:
-        """Source flags accumulate across inserts: tkf row then moex row with same (ticker, ts) leaves covered_by_tkf=True AND covered_by_moex=True."""  # noqa: E501
-        sqlite_store.upsert_ticker(_meta("SBER"))
-        sqlite_store.upsert_ohlcv(
-            [
-                _row(
-                    "SBER",
-                    date(2026, 8, 1),
-                    primary_source="tkf",
-                    covered_by_tkf=True,
-                    covered_by_moex=False,  # noqa: E501
-                )  # noqa: E501
-            ]  # noqa: E501
-        )
-        sqlite_store.upsert_ohlcv(
-            [
-                _row(
-                    "SBER",
-                    date(2026, 8, 1),
-                    primary_source="moex",
-                    covered_by_tkf=False,
-                    covered_by_moex=True,  # noqa: E501
-                )  # noqa: E501
-            ]  # noqa: E501
-        )
-        out = sqlite_store.query_ohlcv("SBER", date(2026, 8, 1), date(2026, 8, 1))
-        assert out[0].covered_by_tkf is True
-        assert out[0].covered_by_moex is True
 
     def test_corp_actions_roundtrip(self, sqlite_store: InMemorySQLiteStore) -> None:
         sqlite_store.upsert_ticker(_meta("SBER"))
@@ -835,11 +717,9 @@ class TestDataStoreContract:
         out = sqlite_store.query_ohlcv("SBER", date(2026, 8, 1), date(2026, 8, 1))
         assert out[0].ticker == "SBER"
 
-
 # ===========================================================================
 # 7. property-based (hypothesis) roundtrip
 # ===========================================================================
-
 
 @settings(max_examples=50, deadline=None)
 @given(
@@ -864,9 +744,6 @@ def test_ohlcv_roundtrip_property(dates: list[date]) -> None:
                 close=Decimal("105"),
                 volume=Decimal("1"),
                 adj_close=Decimal("105"),
-                primary_source="moex",
-                covered_by_tkf=False,
-                covered_by_moex=True,
             )
             for d in dates
         ]
@@ -876,7 +753,6 @@ def test_ohlcv_roundtrip_property(dates: list[date]) -> None:
         assert len(out) == len(dates)
     finally:
         sqlite_store.close()
-
 
 @settings(max_examples=50, deadline=None)
 @given(
@@ -899,9 +775,6 @@ def test_ticker_regex_property(ticker: str) -> None:
                 close=Decimal("1"),
                 volume=Decimal("0"),
                 adj_close=Decimal("1"),
-                primary_source="moex",
-                covered_by_tkf=False,
-                covered_by_moex=True,
             )
     else:
         # Constructing should succeed.
@@ -914,11 +787,7 @@ def test_ticker_regex_property(ticker: str) -> None:
             close=Decimal("1"),
             volume=Decimal("0"),
             adj_close=Decimal("1"),
-            primary_source="moex",
-            covered_by_tkf=False,
-            covered_by_moex=True,
         )
-
 
 @settings(max_examples=30, deadline=None)
 @given(

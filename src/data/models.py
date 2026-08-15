@@ -58,9 +58,6 @@ class OHLCVRow(BaseModel):
     close: Decimal = Field(..., ge=Decimal("0"))
     volume: Decimal = Field(..., ge=Decimal("0"))
     adj_close: Decimal = Field(..., ge=Decimal("0"))
-    primary_source: SourceType = Field(..., description="Which source's OHLCV was stored")
-    covered_by_tkf: bool = Field(default=False, description="True if Tinkoff gRPC also confirms this bar")  # noqa: E501
-    covered_by_moex: bool = Field(default=False, description="True if MOEX ISS also confirms this bar")  # noqa: E501
 
     @field_validator("ticker")
     @classmethod

@@ -20,10 +20,8 @@ import pytest
 from src.data.models import OHLCVRow, TickerMeta
 from src.data.pg_store import PostgresDataStore
 
-
 DSN = os.environ.get("ALPHARD_PG_DSN")
 SKIP_REASON = "ALPHARD_PG_DSN not set; skipping integration test"
-
 
 @pytest.fixture(scope="module")
 def pg_store():
@@ -55,7 +53,6 @@ def pg_store():
             pass
         store.close()
 
-
 class TestPostgresDataStoreInit:
     def test_connection_succeeds(self, pg_store):
         assert pg_store._conn is not None
@@ -74,7 +71,6 @@ class TestPostgresDataStoreInit:
         assert "ohlcv_daily" in tables
         assert "corporate_actions" in tables
         # news_embedding skipped (Phase 3+)
-
 
 class TestTickerCRUD:
     def test_upsert_and_list_roundtrip(self, pg_store):
@@ -142,7 +138,6 @@ class TestTickerCRUD:
         listed = pg_store.list_tickers(include_delisted=False)
         assert not any(m.ticker == "PG_MARK" for m in listed)
 
-
 class TestOHLCVCRUD:
     def test_upsert_and_query_roundtrip(self, pg_store):
         # Need ticker first
@@ -163,9 +158,6 @@ class TestOHLCVCRUD:
             close=Decimal("105.00"),
             volume=Decimal("1000000"),
             adj_close=Decimal("105.00"),
-            primary_source="manual",
-            covered_by_tkf=False,
-            covered_by_moex=False,
         )
         n = pg_store.upsert_ohlcv([row])
         assert n == 1
@@ -180,7 +172,7 @@ class TestOHLCVCRUD:
 
         Documented behaviour in pg_store.upsert_ohlcv: when a (ticker, ts)
         row already exists, the existing OHLCV values are preserved (first
-        source wins); only covered_by_* flags are OR'd in.
+        source wins).
 
         To force a NEW bar value, the caller must delete the row first.
         This test pins that intentional invariant.
@@ -202,9 +194,6 @@ class TestOHLCVCRUD:
             close=Decimal("105"),
             volume=Decimal("1000"),
             adj_close=Decimal("105"),
-            primary_source="tkf",
-            covered_by_tkf=True,
-            covered_by_moex=False,
         )
         row2 = OHLCVRow(
             ticker="PG_REPL",
@@ -215,9 +204,6 @@ class TestOHLCVCRUD:
             close=Decimal("210"),
             volume=Decimal("2000"),
             adj_close=Decimal("210"),
-            primary_source="moex",
-            covered_by_tkf=False,
-            covered_by_moex=True,
         )
         pg_store.upsert_ohlcv([row1])
         pg_store.upsert_ohlcv([row2])
@@ -226,9 +212,6 @@ class TestOHLCVCRUD:
         # First-source-wins: row1's OHLCV preserved
         assert rows[0].close == Decimal("105")
         assert rows[0].volume == Decimal("1000")
-        # BUT covered_by_* flags OR'd — both sources now confirmed
-        assert rows[0].covered_by_tkf is True
-        assert rows[0].covered_by_moex is True
 
     def test_query_outside_range_empty(self, pg_store):
         rows = pg_store.query_ohlcv("PG_OHLCV", date(2099, 1, 1), date(2099, 12, 31))
@@ -253,15 +236,11 @@ class TestOHLCVCRUD:
                 close=Decimal("105"),
                 volume=Decimal("1000"),
                 adj_close=Decimal("105"),
-                primary_source="manual",
-                covered_by_tkf=False,
-                covered_by_moex=False,
             )
             for d in range(1, 6)
         ]
         pg_store.upsert_ohlcv(rows)
         assert pg_store.count_ohlcv("PG_COUNT") == 5
-
 
 class TestErrorPaths:
     def test_invalid_dsn_raises(self, monkeypatch):
@@ -278,7 +257,6 @@ class TestErrorPaths:
         pg_store.close()
         pg_store.close()  # should not raise
 
-
 class TestContextManager:
     def test_context_manager_returns_store(self, pg_store):
         """__enter__ / __exit__ exercise the lazy-connect + close paths."""
@@ -287,7 +265,6 @@ class TestContextManager:
             assert s._conn is not None
         # __exit__ calls close() → _conn reset to None
         assert pg_store._conn is None
-
 
 class TestCorporateActions:
     def test_upsert_and_query_roundtrip(self, pg_store):
@@ -347,7 +324,6 @@ class TestCorporateActions:
         assert len(rows) == 1
         assert rows[0].value == Decimal("3")  # latest write wins
 
-
 class TestMigrateDeduplicate:
     def test_deduplicate_no_op_when_no_duplicates(self, pg_store):
         """migrate_deduplicate returns 0 when no duplicates exist (steady-state).
@@ -372,15 +348,11 @@ class TestMigrateDeduplicate:
             close=Decimal("105"),
             volume=Decimal("1000"),
             adj_close=Decimal("105"),
-            primary_source="tkf",
-            covered_by_tkf=True,
-            covered_by_moex=False,
         )
         pg_store.upsert_ohlcv([row])
         deleted = pg_store.migrate_deduplicate()
         assert deleted == 0
         assert pg_store.count_ohlcv("PG_DEDUP_CL") == 1
-
 
 class TestOHLCVQueryVariants:
     def test_query_ohlcv_filters_by_source(self, pg_store):
@@ -401,23 +373,12 @@ class TestOHLCVQueryVariants:
             close=Decimal("105"),
             volume=Decimal("1000"),
             adj_close=Decimal("105"),
-            primary_source="tkf",
-            covered_by_tkf=True,
-            covered_by_moex=False,
         )
         pg_store.upsert_ohlcv([row])
 
-        # No source filter → returns the row
+        # No source filter → returns the row (primary_source kwarg removed)
         rows = pg_store.query_ohlcv("PG_SRC", date(2026, 8, 1), date(2026, 8, 31))
         assert len(rows) == 1
-
-        # Match source → returns the row
-        rows = pg_store.query_ohlcv("PG_SRC", date(2026, 8, 1), date(2026, 8, 31), primary_source="tkf")
-        assert len(rows) == 1
-
-        # Non-matching source → empty
-        rows = pg_store.query_ohlcv("PG_SRC", date(2026, 8, 1), date(2026, 8, 31), primary_source="moex")
-        assert rows == []
 
     def test_count_ohlcv_all(self, pg_store):
         # Insert rows for multiple tickers
@@ -439,9 +400,6 @@ class TestOHLCVQueryVariants:
                 close=Decimal("105"),
                 volume=Decimal("1000"),
                 adj_close=Decimal("105"),
-                primary_source="tkf",
-                covered_by_tkf=True,
-                covered_by_moex=False,
             )
             pg_store.upsert_ohlcv([row])
 
@@ -469,16 +427,12 @@ class TestOHLCVQueryVariants:
             close=Decimal("105"),
             volume=Decimal("1000"),
             adj_close=Decimal("105"),
-            primary_source="tkf",
-            covered_by_tkf=True,
-            covered_by_moex=False,
         )
         pg_store.upsert_ohlcv([row])
 
         # Lowercase query should still match (SQL does UPPER)
         rows = pg_store.query_ohlcv("pg_upper", date(2026, 8, 1), date(2026, 8, 31))
         assert len(rows) == 1
-
 
 class TestConnectionLifecycle:
     def test_connect_idempotent(self, pg_store):

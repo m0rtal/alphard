@@ -174,7 +174,7 @@ def main() -> int:
                 if args.source == "tkf":
                     bars = loader.fetch_ohlcv(symbol, start, end)
                 else:
-                    bars = list(loader.iter_ohlcv(symbol, start, end))  # type: ignore[attr-defined]
+                    bars = list(loader.iter_ohlcv(symbol, start, end))
 
                 if not bars:
                     logger.debug(f"{i}/{len(symbols)} {symbol}: no bars")
@@ -182,14 +182,26 @@ def main() -> int:
 
                 store.upsert_ticker(meta)
 
-                # Adapt loader output to OHLCVRow with source flags.
-                # PK is now (ticker, ts); source flags track coverage.
+                # Adapt loader output to OHLCVRow.
+                # PK is (ticker, ts); source flags no longer needed.
                 adapted: list[Any] = []
                 for b in bars:
-                    if hasattr(b, "primary_source"):  # already adapted
-                        adapted.append(b)
-                    elif hasattr(b, "source"):  # old shape
-                        # Old OHLCVRow had .source; convert to new shape
+                    if isinstance(b, dict):
+                        from src.data.models import OHLCVRow as _OHLCV
+                        adapted.append(
+                            _OHLCV(
+                                ticker=b.get("ticker", symbol),
+                                ts=b["ts"],
+                                open=b["open"],
+                                high=b["high"],
+                                low=b["low"],
+                                close=b["close"],
+                                volume=b["volume"],
+                                adj_close=b.get("adj_close", b["close"]),
+                            )
+                        )
+                    elif hasattr(b, "primary_source"):
+                        # Old shape with primary_source — strip the deprecated fields.
                         from src.data.models import OHLCVRow as _OHLCV
 
                         adapted.append(
@@ -202,30 +214,11 @@ def main() -> int:
                                 close=b.close,
                                 volume=b.volume,
                                 adj_close=b.adj_close,
-                                primary_source=b.source,
-                                covered_by_tkf=(b.source == "tkf"),
-                                covered_by_moex=(b.source == "moex"),
                             )
                         )
                     else:
-                        # Bare dict or pydantic loader row — build from scratch
-                        from src.data.models import OHLCVRow as _OHLCV
-
-                        adapted.append(
-                            _OHLCV(
-                                ticker=getattr(b, "ticker", symbol),
-                                ts=getattr(b, "ts", None),
-                                open=getattr(b, "open", 0),
-                                high=getattr(b, "high", 0),
-                                low=getattr(b, "low", 0),
-                                close=getattr(b, "close", 0),
-                                volume=getattr(b, "volume", 0),
-                                adj_close=getattr(b, "adj_close", getattr(b, "close", 0)),
-                                primary_source=args.source,
-                                covered_by_tkf=(args.source == "tkf"),
-                                covered_by_moex=(args.source == "moex"),
-                            )
-                        )
+                        # Native OHLCVRow — pass through.
+                        adapted.append(b)
 
                 if args.quality_gate and args.source == "tkf":
                     from src.data.quality.ingestion_gate import check_ingestion, IngestionParams, Bar  # noqa: E501

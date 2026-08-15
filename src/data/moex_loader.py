@@ -319,9 +319,6 @@ class MOEXDataLoader(DataLoader):
                 close=c,
                 volume=vol_shares,
                 adj_close=c,  # Phase 1.1: no split adjustments for MOEX
-                primary_source="moex",
-                covered_by_tkf=False,
-                covered_by_moex=True,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("skipping malformed MOEX OHLCV row %r: %s", row, exc)

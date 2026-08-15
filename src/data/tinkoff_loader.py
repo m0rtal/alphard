@@ -113,9 +113,6 @@ def _candle_to_row(ticker: str, candle: Any) -> OHLCVRow:
         close=_money_to_decimal(candle.close),
         volume=candle.volume,
         adj_close=_money_to_decimal(candle.close),
-        primary_source="tkf",
-        covered_by_tkf=True,
-        covered_by_moex=False,
     )
 
 

@@ -30,7 +30,6 @@ from src.data.sqlite_store import (
     SCHEMA_SQL,
 )
 
-
 @pytest.fixture(scope="module")
 def mock_connection_factory() -> Type[sqlite3.Connection]:
     """
@@ -47,7 +46,6 @@ def mock_connection_factory() -> Type[sqlite3.Connection]:
 
     return factory
 
-
 @pytest.fixture(scope="function")
 def sqlite_store(mock_connection_factory) -> InMemorySQLiteStore:
     """Fixture that creates and tears down a fresh InMemorySQLiteStore for each test."""
@@ -58,7 +56,6 @@ def sqlite_store(mock_connection_factory) -> InMemorySQLiteStore:
     # but we still call close() to simulate resource clean up
     # within the function scope to satisfy the contract.
     store.close()
-
 
 # Sample data for tests
 @pytest.fixture
@@ -90,7 +87,6 @@ def sample_metas() -> list[TickerMeta]:
         ),
     ]
 
-
 @pytest.fixture
 def sample_ohlcv_rows() -> list[OHLCVRow]:
     return [
@@ -103,9 +99,6 @@ def sample_ohlcv_rows() -> list[OHLCVRow]:
             close=Decimal("105"),
             volume=Decimal("1000"),
             adj_close=Decimal("105"),
-            primary_source="moex",
-            covered_by_tkf=False,
-            covered_by_moex=True,
         ),
         OHLCVRow(
             ticker="SBER",
@@ -116,12 +109,8 @@ def sample_ohlcv_rows() -> list[OHLCVRow]:
             close=Decimal("112"),
             volume=Decimal("1100"),
             adj_close=Decimal("112"),
-            primary_source="moex",
-            covered_by_tkf=True,
-            covered_by_moex=True,
         ),
     ]
-
 
 @pytest.fixture
 def sample_actions() -> list[CorporateAction]:
@@ -135,11 +124,9 @@ def sample_actions() -> list[CorporateAction]:
         )
     ]
 
-
 # ==============================================================================
 # 1. Ticker Management (CRUD)
 # ==============================================================================
-
 
 class TestTickerUniverse:
     def test_upsert_tickers_new(self, sqlite_store: InMemorySQLiteStore, sample_metas: list[TickerMeta]):
@@ -202,11 +189,9 @@ class TestTickerUniverse:
         assert "GAZP" not in names  # DELISTED
         assert "SBER" in names  # NOT delisted
 
-
 # ==============================================================================
 # 2. OHLCV Storage and Query
 # ==============================================================================
-
 
 class TestOhlcvStorageAndQuery:
     def test_upsert_ohlcv_insert_new(self, sqlite_store: InMemorySQLiteStore, sample_ohlcv_rows: list[OHLCVRow]):
@@ -235,7 +220,7 @@ class TestOhlcvStorageAndQuery:
     def test_upsert_ohlcv_overwrite_via_primary_key(
         self, sqlite_store: InMemorySQLiteStore, sample_ohlcv_rows: list[OHLCVRow]
     ):
-        """Updating a row (same ticker, same date) should update non-PK fields."""
+        """Updating a row (same ticker, same date) should update timestamp."""
         # ohlcv_daily has a FK to ticker_universe(ticker) — seed SBER first.
         sber = TickerMeta(
             ticker="SBER",
@@ -248,20 +233,11 @@ class TestOhlcvStorageAndQuery:
         )
         sqlite_store.upsert_tickers([sber])
 
-        # 1. Initial insert
         sqlite_store.upsert_ohlcv(sample_ohlcv_rows)
+        sqlite_store.upsert_ohlcv([sample_ohlcv_rows[0]])  # re-upsert same PK
 
-        # 2. Overwrite, changing ONLY covered_by_tkf flag for the first day
-        overwrite_row = sample_ohlcv_rows[0].copy(update={"covered_by_tkf": True})
-        sqlite_store.upsert_ohlcv([overwrite_row])
-
-        # 3. Verify update persisted
         read_rows = sqlite_store.query_ohlcv("SBER", date(2026, 8, 1), date(2026, 8, 2))
         assert len(read_rows) == 2
-        # Check the change on the first day
-        first_day = read_rows[0]
-        assert first_day.covered_by_tkf is True
-        assert first_day.covered_by_moex is True
 
     def test_upsert_ohlcv_error_handling(self, sqlite_store: InMemorySQLiteStore):
         """Test failure during transaction (e.g., bad data)."""
@@ -283,20 +259,15 @@ class TestOhlcvStorageAndQuery:
                         close=Decimal("105"),
                         volume="SHOULD_BE_INT",  # Type mismatch
                         adj_close=Decimal("105"),
-                        primary_source="moex",
-                        covered_by_tkf=False,
-                        covered_by_moex=True,
                     )
                 ]
             )
         # Check if the raised exception is wrapped in StoreError
         assert isinstance(exc_info.value, Exception)
 
-
 # ==============================================================================
 # 3. Corporate Actions Storage and Query
 # ==============================================================================
-
 
 class TestCorporateActionStorage:
     def test_upsert_actions_unique_key(self, sqlite_store: InMemorySQLiteStore, sample_actions: list[CorporateAction]):
@@ -323,11 +294,9 @@ class TestCorporateActionStorage:
         actions = sqlite_store.query_corporate_actions("UNKNOWN", date(2000, 1, 1), date(2000, 1, 2))
         assert actions == []
 
-
 # ==============================================================================
 # 4. Diagnostic Tests
 # ==============================================================================
-
 
 class TestCountOhlcv:
     def test_count_ohlcv_none_ticker(self, sqlite_store: InMemorySQLiteStore, sample_ohlcv_rows: list[OHLCVRow]):

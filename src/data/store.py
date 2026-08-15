@@ -86,15 +86,8 @@ class DataStore(abc.ABC):
         ticker: str,
         start: date,
         end: date,
-        *,
-        primary_source: str | None = None,
     ) -> list[OHLCVRow]:
-        """Read OHLCV bars for ``ticker`` in ``[start, end]``.
-
-        Filter by ``primary_source`` if set (e.g., 'tkf' for Tinkoff-only
-        bars). Cross-source coverage is tracked via OHLCVRow.covered_by_*
-        flags and can be inspected after the fact.
-        """
+        """Read OHLCV bars for ``ticker`` in ``[start, end]``."""
 
     # ---- corporate actions ----------------------------------------------
 

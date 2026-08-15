@@ -170,12 +170,11 @@ class PostgresDataStore(DataStore):
     # ---------------------------------------------------------- OHLCV
 
     def upsert_ohlcv(self, rows: list[OHLCVRow]) -> int:
-        """Upsert OHLCV bars. PK = (ticker, ts). Source flags updated via ON CONFLICT.
+        """Upsert OHLCV bars. PK = (ticker, ts). ON CONFLICT keeps existing values.
 
         Behaviour: writes each (ticker, ts) row. If the row exists, the
         existing OHLCV values are KEPT (preserves whichever source arrived
-        first); only the covered_by_* flags are OR'd in to reflect all
-        sources that have confirmed this bar.
+        first); updated_at is bumped.
         """
         if not rows:
             return 0
@@ -183,12 +182,10 @@ class PostgresDataStore(DataStore):
         sql = """
             INSERT INTO ohlcv_daily
                 (ticker, ts, open, high, low, close, volume, adj_close,
-                 covered_by_tkf, covered_by_moex, primary_source, updated_at)
+                 updated_at)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, NOW())
+                    NOW())
             ON CONFLICT (ticker, ts) DO UPDATE SET
-                covered_by_tkf = ohlcv_daily.covered_by_tkf OR EXCLUDED.covered_by_tkf,
-                covered_by_moex = ohlcv_daily.covered_by_moex OR EXCLUDED.covered_by_moex,
                 updated_at = NOW()
         """
         params = [
@@ -201,9 +198,6 @@ class PostgresDataStore(DataStore):
                 str(r.close),
                 str(r.volume),
                 str(r.adj_close),
-                r.covered_by_tkf,
-                r.covered_by_moex,
-                r.primary_source,
             )
             for r in rows
         ]
@@ -220,8 +214,7 @@ class PostgresDataStore(DataStore):
         """Insert bars but ONLY if (ticker, ts) is not yet covered by ANY source.
 
         Used by MOEX backfill script: skip dates already covered by Tinkoff
-        or any other source. Updates covered_by_<source> flag on insert.
-        Returns dict with stats: {'inserted': N, 'skipped': M}.
+        or any other source. Returns dict with stats: {'inserted': N, 'skipped': M}.
         """
         if not new_bars:
             return {"inserted": 0, "skipped": 0}
@@ -253,10 +246,6 @@ class PostgresDataStore(DataStore):
         schema). It deletes duplicates keeping the row with the lowest
         ctid (effectively whichever row was inserted first).
 
-        Note: this doesn't rewrite the covered_by_* flags because the
-        current schema already covers source provenance via the
-        primary_source column on insert.
-
         Returns count of rows deleted.
         """
         self._connect()
@@ -287,19 +276,13 @@ class PostgresDataStore(DataStore):
         ticker: str,
         start: date,
         end: date,
-        *,
-        primary_source: str | None = None,
     ) -> list[OHLCVRow]:
         self._connect()
         sql = (
-            "SELECT ticker, ts, open, high, low, close, volume, adj_close, "
-            "primary_source, covered_by_tkf, covered_by_moex "
+            "SELECT ticker, ts, open, high, low, close, volume, adj_close "
             "FROM ohlcv_daily WHERE ticker = %s AND ts BETWEEN %s AND %s"
         )
         params: list[Any] = [ticker.upper(), start, end]
-        if primary_source:
-            sql += " AND primary_source = %s"
-            params.append(primary_source)
         sql += " ORDER BY ts"
         with self._conn.cursor() as cur:
             cur.execute(sql, params)
@@ -375,9 +358,6 @@ def _row_to_ohlcv(r: Any) -> OHLCVRow:
         close=Decimal(str(r[5])),
         volume=Decimal(str(r[6])),
         adj_close=Decimal(str(r[7])),
-        primary_source=r[8] if len(r) > 8 else "tkf",
-        covered_by_tkf=bool(r[9]) if len(r) > 9 else False,
-        covered_by_moex=bool(r[10]) if len(r) > 10 else False,
     )
 
 
