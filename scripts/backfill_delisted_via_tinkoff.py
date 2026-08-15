@@ -86,9 +86,21 @@ def backfill(
     store = PostgresDataStore() if not dry_run else None
     loader = TinkoffInvestDataLoader(rate_per_min=200)  # real token = 200/min
 
-    # Get universe of all tickers (live + delisted) — already cached locally
-    universe_meta = {m.ticker: m for m in loader.list_shares_all("TQBR")}
-    logger.info(f"Tinkoff universe (TQBR): {len(universe_meta)} tickers")
+    # Aggregate ALL share boards from Tinkoff (TQBR + SPBXM + SPBHKEX +
+    # A27 + MTQR + SPBEQRU + SPBRU). The previous version only used
+    # TQBR (255 tickers) which left 1513 SPBXM/archived tickers uncovered.
+    # Tinkoff gRPC instruments.shares() returns the FULL universe (~1927
+    # TQBR + ~1516 SPBXM + smaller boards); list_shares_all(board) queries
+    # each board and dedup is handled by ticker PK in ticker_universe.
+    BOARDS = ("TQBR", "SPBXM", "SPBHKEX", "A27", "MTQR", "SPBEQRU", "SPBRU")
+    universe_meta: dict[str, TickerMeta] = {}
+    for board in BOARDS:
+        try:
+            for m in loader.list_shares_all(board):
+                universe_meta[m.ticker] = m
+        except Exception as exc:
+            logger.warning(f"list_shares_all({board}) failed: {exc}")
+    logger.info(f"Tinkoff universe (all boards): {len(universe_meta)} tickers")
 
     # Add bonds, ETFs
     try:
