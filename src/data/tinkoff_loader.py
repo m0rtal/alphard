@@ -63,7 +63,7 @@ import logging
 import os
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any, Iterator
+from typing import Any, Iterator, cast
 
 from .loader import (
     DataLoader,
@@ -161,7 +161,7 @@ class TinkoffInvestDataLoader(DataLoader):
         based on the SecurityTradingStatus enum value.
         """
         cache_attr = f"_shares_all_{class_code}"
-        cached = getattr(self, cache_attr, None)
+        cached = cast(list[TickerMeta] | None, getattr(self, cache_attr, None))
         if cached is not None:
             return cached
 
@@ -233,17 +233,17 @@ class TinkoffInvestDataLoader(DataLoader):
         # 1) Full share universe (live + delisted) — preferred for OHLCV lookup
         for class_code in ("TQBR",):
             cache_attr = f"_shares_all_{class_code}"
-            cached = getattr(self, cache_attr, None)
+            cached = cast(list[TickerMeta] | None, getattr(self, cache_attr, None))
             if cached is not None:
                 for meta in cached:
                     if meta.ticker == t:
                         return meta
         # 2) Live-only universe, bonds, ETFs
         for cache_getter in (self._ensure_universe, self._ensure_bonds, self._ensure_etfs):
-            cache = cache_getter()
-            meta = cache.get(t)
-            if meta is not None:
-                return meta
+            cache = cast(dict[str, TickerMeta], cache_getter())  # type: ignore[redundant-cast]
+            fetched: TickerMeta | None = cache.get(t)
+            if fetched is not None:
+                return fetched
         raise LoaderNotFoundError(f"Ticker {ticker} not found in Tinkoff universe")
 
     def fetch_ohlcv(

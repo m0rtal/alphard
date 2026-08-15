@@ -771,14 +771,22 @@ class TestDataStoreContract:
         sqlite_store.upsert_ohlcv(
             [
                 _row(
-                    "SBER", date(2026, 8, 1), primary_source="tkf", covered_by_tkf=True, covered_by_moex=False  # noqa: E501
+                    "SBER",
+                    date(2026, 8, 1),
+                    primary_source="tkf",
+                    covered_by_tkf=True,
+                    covered_by_moex=False,  # noqa: E501
                 )  # noqa: E501
             ]  # noqa: E501
         )
         sqlite_store.upsert_ohlcv(
             [
                 _row(
-                    "SBER", date(2026, 8, 1), primary_source="moex", covered_by_tkf=False, covered_by_moex=True  # noqa: E501
+                    "SBER",
+                    date(2026, 8, 1),
+                    primary_source="moex",
+                    covered_by_tkf=False,
+                    covered_by_moex=True,  # noqa: E501
                 )  # noqa: E501
             ]  # noqa: E501
         )

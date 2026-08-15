@@ -266,7 +266,7 @@ class PostgresDataStore(DataStore):
                 WHERE ctid IN (SELECT ctid FROM to_delete)
             """
             )
-            deleted = cur.rowcount
+            deleted = int(cur.rowcount)
 
             # Now update covered_by_* flags based on remaining rows
             cur.execute(
