@@ -32,6 +32,8 @@ CREATE TABLE IF NOT EXISTS ticker_universe (
     lot          INTEGER NOT NULL CHECK (lot > 0),
     isin         VARCHAR(12),
     currency     VARCHAR(3) NOT NULL DEFAULT 'RUB',
+    -- MOEX class code: TQBR (shares), TQOB (OFZ), TQCB (corp/muni), TQTE (ETFs), CETS (currencies), SPBFUT (futures)
+    class_code   VARCHAR(12),
     delisted     BOOLEAN NOT NULL DEFAULT FALSE,
     delisted_at  DATE,
     listed_at    DATE,
@@ -112,6 +114,25 @@ CREATE TABLE IF NOT EXISTS news_embedding (
     source        VARCHAR(8) NOT NULL DEFAULT 'manual',
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+
+-- ---------------------------------------------------------------------------
+-- decision_log  (Phase 1.5: Coordinator pipeline audit trail)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS decision_log (
+    id            BIGSERIAL PRIMARY KEY,
+    kind          VARCHAR(64) NOT NULL DEFAULT 'coordinator_pipeline',
+    ticker        VARCHAR(12),
+    decision      JSONB NOT NULL,
+    source        VARCHAR(8) NOT NULL DEFAULT 'alphard',
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_decision_log_kind_ticker
+    ON decision_log (kind, ticker);
+
+CREATE INDEX IF NOT EXISTS idx_decision_log_created
+    ON decision_log (created_at);
 
 -- ---------------------------------------------------------------------------
 -- seed sample data (optional — comment out for clean install)

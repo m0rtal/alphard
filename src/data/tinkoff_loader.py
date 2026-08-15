@@ -268,6 +268,7 @@ class TinkoffInvestDataLoader(DataLoader):
                     lot=inst.lot,
                     isin=inst.isin,
                     currency="RUB",  # Tinkoff shares MOEX are always RUB
+                    class_code=getattr(inst, "class_code", None),
                     delisted=False,
                     source=self.SOURCE,  # type: ignore[arg-type]
                 )
@@ -305,6 +306,7 @@ class TinkoffInvestDataLoader(DataLoader):
                     lot=inst.lot,
                     isin=inst.isin,
                     currency=getattr(inst, "currency", "RUB") or "RUB",
+                    class_code=getattr(inst, "class_code", None),
                     delisted=False,
                     source=self.SOURCE,  # type: ignore[arg-type]
                 )
@@ -341,6 +343,7 @@ class TinkoffInvestDataLoader(DataLoader):
                     lot=inst.lot,
                     isin=inst.isin,
                     currency=getattr(inst, "currency", "RUB") or "RUB",
+                    class_code=getattr(inst, "class_code", None),
                     delisted=False,
                     source=self.SOURCE,  # type: ignore[arg-type]
                 )

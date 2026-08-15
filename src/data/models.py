@@ -120,6 +120,8 @@ class TickerMeta(BaseModel):
     lot: int = Field(..., gt=0, description="Trade lot size (shares per lot)")
     isin: str | None = Field(default=None, description="ISIN, e.g. 'RU0009029542'")
     currency: str = Field(default="RUB", min_length=3, max_length=3)
+    # MOEX class code: TQBR (shares), TQOB (OFZ), TQCB (corp/muni), TQTE (ETFs), CETS (currencies)
+    class_code: str | None = Field(default=None, description="MOEX class code (TQBR/TQOB/TQCB/TQTE/CETS)")
     delisted: bool = Field(default=False)
     delisted_at: date | None = None
     listed_at: date | None = None

@@ -129,8 +129,8 @@ class PostgresDataStore(DataStore):
     def list_tickers(self, *, include_delisted: bool = True) -> list[TickerMeta]:
         self._connect()
         sql = (
-            "SELECT ticker, figi, name, lot, isin, currency, delisted, "
-            "delisted_at, listed_at, source FROM ticker_universe"
+            "SELECT ticker, figi, name, lot, isin, currency, class_code, "
+            "delisted, delisted_at, listed_at, source FROM ticker_universe"
         )
         if not include_delisted:
             sql += " WHERE delisted = FALSE"
@@ -263,10 +263,11 @@ def _row_to_ticker(r: Any) -> TickerMeta:
         lot=int(r[3]),
         isin=r[4],
         currency=r[5] or "RUB",
-        delisted=bool(r[6]),
-        delisted_at=r[7],
-        listed_at=r[8],
-        source=r[9],
+        class_code=r[6] if len(r) > 10 else None,
+        delisted=bool(r[7] if len(r) > 7 else False),
+        delisted_at=r[8] if len(r) > 8 else None,
+        listed_at=r[9] if len(r) > 9 else None,
+        source=r[10] if len(r) > 10 else r[9],
     )
 
 
