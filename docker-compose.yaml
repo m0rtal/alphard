@@ -34,6 +34,8 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
     environment:
       ENV: ${ENV:-production}
       TINKOFF_SANDBOX_TOKEN: ${TINKOFF_SANDBOX_TOKEN:?TINKOFF_SANDBOX_TOKEN required}
@@ -68,6 +70,8 @@ services:
     image: postgres:16-alpine
     container_name: alphard-postgres
     restart: unless-stopped
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-alphard}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -87,6 +91,8 @@ services:
     image: redis:7-alpine
     container_name: alphard-redis
     restart: unless-stopped
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
     command: redis-server --requirepass ${REDIS_PASSWORD}
     volumes:
       - /mnt/appdata/alphard/redis:/data
