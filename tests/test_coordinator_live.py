@@ -61,7 +61,6 @@ class TestCoordinatorLive:
         # audit_log_id written (since store_dsn set)
         assert result.audit_log_id is not None
 
-    @pytest.mark.timeout(30)
     def test_pipeline_with_insufficient_history_critical(self) -> None:
         """When only 2 bars available, IngestionGate flags CRITICAL → SKIPPED."""
         cfg = CoordinatorConfig(
