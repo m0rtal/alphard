@@ -107,7 +107,9 @@ class TinkoffInvestDataLoader(DataLoader):
         super().__init__(bucket=TokenBucket(rate=rate_per_min, window_seconds=60.0))
         env = os.environ
         if token is None:
-            token = env.get("TINKOFF_SANDBOX_TOKEN") or env.get("TINKOFF_REAL_TOKEN")
+            # Prefer REAL token if present (full universe, 200 req/min)
+            # Falls back to sandbox (150-share universe, 15 req/min)
+            token = env.get("TINKOFF_REAL_TOKEN") or env.get("TINKOFF_SANDBOX_TOKEN")
         if not token:
             raise LoaderAuthError("Tinkoff token not set: pass token= or export TINKOFF_SANDBOX_TOKEN")
         self._token = token

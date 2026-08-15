@@ -33,6 +33,18 @@ from src.broker.tinkoff_account import BrokerError, TinkoffAccount
 # ────────────────────────────────────────────
 
 
+# Phase 1 hard guarantee: real/sandbox tokens are DATA-ONLY by default.
+# Tests that exercise place_order() must explicitly opt-in via LIVE_TRADING=true.
+
+
+@pytest.fixture(autouse=True)
+def enable_live_trading(monkeypatch):
+    """Auto-enable LIVE_TRADING for all broker tests so RiskGate-gated
+    orders can route through the mock. Production code refuses on
+    LIVE_TRADING=false (see tinkoff_account.place_order)."""
+    monkeypatch.setenv("LIVE_TRADING", "true")
+
+
 class TestMarketOrder:
     def test_basic_creation(self):
         o = MarketOrder(ticker="SBER", side=OrderSide.BUY, quantity=Decimal("10"))

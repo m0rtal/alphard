@@ -60,7 +60,7 @@ class PostgresDataStore(DataStore):
 
     def _connect(self) -> None:
         if self._conn is None or self._conn.closed:
-            self._conn = self._psycopg.connect(self._dsn, autocommit=False)
+            self._conn = self._psycopg.connect(self._dsn, autocommit=True)
 
     def close(self) -> None:
         if self._conn is not None and not self._conn.closed:

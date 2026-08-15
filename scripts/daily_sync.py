@@ -24,6 +24,7 @@ sys.path.insert(0, "/app/src")
 
 from src.data.tinkoff_loader import TinkoffInvestDataLoader
 from src.data.pg_store import PostgresDataStore
+from typing import Any
 
 logger = logging.getLogger("alphard.daily_sync")
 
@@ -68,6 +69,15 @@ def main() -> int:
         choices=["tkf", "moex"],
         help="Primary source: tkf (Tinkoff, default) or moex (MOEX ISS)",
     )
+    parser.add_argument(
+        "--mode",
+        default="daily",
+        choices=["daily", "weekly", "full", "universe"],
+        help="daily=top20 5d; weekly=top20 7d; full=all TQBR 5y; universe=all TQBR N d",
+    )
+    parser.add_argument("--batch-sleep", type=float, default=0, help="Sleep between tickers (rate-limit)")
+    parser.add_argument("--quality-gate", action="store_true", help="Run Ingestion Gate before upsert")
+    parser.add_argument("--max-tickers", type=int, default=0, help="Limit number of tickers (0=all)")
     args = parser.parse_args()
 
     if not args.dsn:
@@ -81,14 +91,27 @@ def main() -> int:
         end = date.today()
         start = end - timedelta(days=args.backfill)
         symbols = args.universe or LIQUID_UNIVERSE
-    else:
+    elif args.mode == "full":
+        end = date.today()
+        start = end - timedelta(days=5 * 365)  # 5 years
+        symbols = None  # resolve from loader
+    elif args.mode == "weekly":
+        end = date.today()
+        start = end - timedelta(days=7)
+        symbols = args.universe or LIQUID_UNIVERSE
+    elif args.mode == "universe":
+        end = date.today()
+        start = end - timedelta(days=args.days)
+        symbols = None  # resolve from loader
+    else:  # daily
         end = date.today()
         start = end - timedelta(days=args.days)
         symbols = args.universe or LIQUID_UNIVERSE
 
-    logger.info(f"=== Sync: {args.source} {start} → {end} ({len(symbols)} tickers) ===")
+    logger.info(f"=== Sync: {args.source} {start} → {end} (mode={args.mode}) ===")
 
     # Loader selection
+    loader: Any = None
     if args.source == "tkf":
         try:
             loader = TinkoffInvestDataLoader()
@@ -99,6 +122,18 @@ def main() -> int:
         from src.data.moex_loader import MOEXDataLoader
 
         loader = MOEXDataLoader()
+
+    # Resolve full universe if mode required (store is created below)
+    if symbols is None:
+        try:
+            symbols = [m.ticker for m in loader.list_tickers()]
+        except Exception as e:
+            logger.error(f"Failed to list tickers: {e}")
+            return 2
+
+    if args.max_tickers > 0:
+        symbols = symbols[: args.max_tickers]
+    logger.info(f"=== Sync: {args.source} {start} → {end} (mode={args.mode}, {len(symbols)} tickers) ===")
 
     store = PostgresDataStore()
 
@@ -114,25 +149,77 @@ def main() -> int:
     errors = []
 
     try:
-        for symbol in symbols:
+        from src.data.models import TickerMeta as _TickerMeta
+
+        for i, symbol in enumerate(symbols, start=1):
             meta = meta_cache.get(symbol.upper())
             if meta is None:
-                logger.warning(f"{symbol}: not in universe, skipping")
-                continue
+                meta = _TickerMeta(
+                    ticker=symbol,
+                    name=symbol,
+                    lot=1,
+                    source=args.source,
+                )
 
             try:
-                store.upsert_ticker(meta)
                 if args.source == "tkf":
                     bars = loader.fetch_ohlcv(symbol, start, end)
                 else:
                     bars = list(loader.iter_ohlcv(symbol, start, end))  # type: ignore[attr-defined]
 
-                if bars:
+                if not bars:
+                    logger.debug(f"{i}/{len(symbols)} {symbol}: no bars")
+                    continue
+
+                store.upsert_ticker(meta)
+
+                if args.quality_gate and args.source == "tkf":
+                    from src.data.quality.ingestion_gate import check_ingestion, IngestionParams, Bar
+                    from src.data.quality.severity import Severity
+
+                    # check_ingestion expects list[Bar] where Bar.primary_key=date and
+                    # OHLC fields are floats. Map our OHLCVRow to Bar.
+                    bar_list = [
+                        Bar(
+                            primary_key=b.ts,
+                            open=float(b.open),
+                            high=float(b.high),
+                            low=float(b.low),
+                            close=float(b.close),
+                            volume=int(b.volume),
+                        )
+                        for b in bars
+                    ]
+                    report = check_ingestion(symbol, bar_list, params=IngestionParams())
+                    worst = report.worst_severity()
+                    if worst == Severity.CRITICAL:
+                        logger.warning(
+                            f"{i}/{len(symbols)} {symbol}: GATE_CRITICAL — {report.issues}"
+                        )
+                        continue
+                    elif worst == Severity.HIGH:
+                        logger.warning(
+                            f"{i}/{len(symbols)} {symbol}: GATE_HIGH (skipped) — {report.issues}"
+                        )
+                        continue
+                    elif worst is not None:
+                        logger.debug(
+                            f"{i}/{len(symbols)} {symbol}: GATE_{worst.value} — {report.issues}"
+                        )
+
                     written = store.upsert_ohlcv(bars)
-                    logger.info(f"{symbol}: {written} bars")
-                    total_bars += written
+                else:
+                    written = store.upsert_ohlcv(bars)
+
+                logger.info(f"{i}/{len(symbols)} {symbol}: {written} bars")
+                total_bars += written
+
+                if args.batch_sleep > 0:
+                    import time
+
+                    time.sleep(args.batch_sleep)
             except Exception as exc:
-                logger.error(f"{symbol}: {exc}")
+                logger.error(f"{i}/{len(symbols)} {symbol}: {exc}")
                 errors.append((symbol, str(exc)))
     finally:
         store.close()

@@ -147,7 +147,18 @@ class TinkoffAccount(BrokerAccount):
         """RiskGate first. Reject before touching broker.
 
         If risk_gate is None, order is rejected (fail-safe default).
+        LIVE_TRADING gate: if env LIVE_TRADING=false, refuse ALL orders.
+        This is a hard guarantee for Phase 1: real token may be present
+        but no orders are placed regardless of RiskGate.
         """
+        import os
+
+        if os.environ.get("LIVE_TRADING", "false").lower() != "true":
+            logger.warning(
+                "LIVE_TRADING=false — refusing order for %s (Phase 1 hard no-trade)",
+                order.ticker,
+            )
+            return OrderStatus.REJECTED
         if self._risk_gate is None:
             logger.warning("RiskGate not configured — rejecting all orders (fail-safe)")
             return OrderStatus.REJECTED
@@ -245,8 +256,9 @@ def from_env(env: Optional[dict[str, str]] = None) -> TinkoffAccount:
     real_token = env.get("TINKOFF_REAL_TOKEN")
     account_id = env.get("TINKOFF_ACCOUNT_ID", "SB1")
 
-    if sandbox_token and sandbox_token.strip() and sandbox_token != "placeholder_get_from_tbank":
-        return TinkoffAccount(token=sandbox_token, account_id=account_id)
+    # Prefer REAL token (full universe, 200 req/min)
     if real_token and real_token.strip():
         return TinkoffAccount(token=real_token, account_id=account_id)
+    if sandbox_token and sandbox_token.strip() and sandbox_token != "placeholder_get_from_tbank":
+        return TinkoffAccount(token=sandbox_token, account_id=account_id)
     raise BrokerError("No TINKOFF_SANDBOX_TOKEN or TINKOFF_REAL_TOKEN set")
