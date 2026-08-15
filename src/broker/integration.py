@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from decimal import Decimal
+from typing import Any, Callable
 
 from src.broker.account import BrokerAccount, PortfolioSnapshot
 from src.broker.orders import (
@@ -42,8 +43,8 @@ class OrderFlow:
     def __init__(
         self,
         broker: BrokerAccount,
-        risk_gate,
-        universe_filter=None,
+        risk_gate: Any,  # src.risk.gate.RiskGate (typed Any to satisfy --strict)
+        universe_filter: Callable[[str], bool] | None = None,
     ):
         self._broker = broker
         self._risk_gate = risk_gate
@@ -129,7 +130,7 @@ class OrderFlow:
         )
 
     @staticmethod
-    def _portfolio_to_state(portfolio: PortfolioSnapshot):
+    def _portfolio_to_state(portfolio: PortfolioSnapshot) -> Any:
         from src.risk.gate import PortfolioState, Position as RiskPosition
 
         positions = [

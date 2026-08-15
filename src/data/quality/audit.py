@@ -58,7 +58,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Protocol
 
-from .severity import Issue
+from .severity import Issue, QualityReport
 
 
 class AuditLog(Protocol):
@@ -119,11 +119,11 @@ class PostgresAuditLog:
         if not self._dsn:
             raise RuntimeError("PostgresAuditLog requires a DSN: pass dsn=... or set $ALPHARD_PG_DSN")
         try:
-            import psycopg  # type: ignore[import-not-found]
+            import psycopg
         except ImportError as e:  # pragma: no cover — environment-dependent
             raise RuntimeError("PostgresAuditLog needs psycopg: install with `pip install psycopg[binary]`") from e
-        self._conn = psycopg.connect(self._dsn)  # type: ignore[attr-defined]
-        self._cursor = self._conn.cursor()  # type: ignore[attr-defined]
+        self._conn = psycopg.connect(self._dsn)
+        self._cursor = self._conn.cursor()
 
     def write_event(self, issue: Issue, *, ticker: str, gate: str) -> None:
         self._ensure_conn()
@@ -186,7 +186,7 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 
-def write_report(audit: AuditLog, report) -> None:  # type: ignore[no-untyped-def]
+def write_report(audit: AuditLog, report: QualityReport) -> None:
     """Write every Issue in a QualityReport through the audit log."""
     for issue in report.issues:
         audit.write_event(issue, ticker=report.ticker, gate=report.gate)

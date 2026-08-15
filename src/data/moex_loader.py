@@ -32,7 +32,7 @@ import logging
 import urllib.parse
 from datetime import date, timedelta
 from decimal import Decimal
-from typing import Any, Iterator
+from typing import Any, Iterator, cast
 
 import requests  # type: ignore[import-untyped]
 
@@ -191,7 +191,7 @@ class MOEXDataLoader(DataLoader):
         if not resp.ok:
             raise LoaderError(f"HTTP {resp.status_code} from {url}: {resp.text[:200]}")
         try:
-            return resp.json()  # type: ignore[no-any-return]
+            return cast(dict[str, Any], resp.json())
         except json.JSONDecodeError as exc:
             raise LoaderError(f"non-JSON response from {url}: {exc}") from exc
 

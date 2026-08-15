@@ -17,7 +17,7 @@ import os
 import time
 from datetime import datetime
 from decimal import Decimal
-from typing import Optional
+from typing import Any, Optional
 
 from src.broker.account import BrokerAccount, PortfolioSnapshot, Position
 from src.broker.orders import (
@@ -50,7 +50,8 @@ class TinkoffAccount(BrokerAccount):
         self,
         token: str,
         account_id: str = "SB1",
-        risk_gate=None,  # src.risk.gate.RiskGate
+        # Use Any locally to satisfy --strict without runtime isinstance check
+        risk_gate: Any = None,  # src.risk.gate.RiskGate (typed Any to satisfy --strict)
         rate_limit_per_sec: int = 60,
     ):
         self._token = token
@@ -74,7 +75,7 @@ class TinkoffAccount(BrokerAccount):
                 time.sleep(sleep_for)
         self._last_request_ts.append(time.time())
 
-    def _build_intent_and_state(self, order: MarketOrder | LimitOrder):
+    def _build_intent_and_state(self, order: MarketOrder | LimitOrder) -> tuple[Any, Any]:
         """Build TradeIntent + PortfolioState for RiskGate."""
         from src.risk.gate import PortfolioState, TradeIntent
 
@@ -101,7 +102,7 @@ class TinkoffAccount(BrokerAccount):
         """Real call to Tinkoff. Mock for now if SDK unavailable."""
         self._rate_limit_acquire()
         try:
-            from tinkoff.invest import Client  # type: ignore
+            from tinkoff.invest import Client
         except ImportError:
             logger.warning("tinkoff SDK not installed — returning mock portfolio")
             return PortfolioSnapshot(
@@ -165,7 +166,7 @@ class TinkoffAccount(BrokerAccount):
         # RiskGate approved. Submit to broker.
         self._rate_limit_acquire()
         try:
-            from tinkoff.invest import Client  # type: ignore
+            from tinkoff.invest import Client
         except ImportError:
             logger.warning("tinkoff SDK not installed — returning mock SUBMITTED")
             return OrderStatus.SUBMITTED
@@ -202,7 +203,7 @@ class TinkoffAccount(BrokerAccount):
     def cancel_order(self, order_id: str) -> OrderStatus:
         self._rate_limit_acquire()
         try:
-            from tinkoff.invest import Client  # type: ignore
+            from tinkoff.invest import Client
         except ImportError:
             logger.warning("tinkoff SDK not installed — returning mock CANCELLED")
             return OrderStatus.CANCELLED
@@ -214,20 +215,20 @@ class TinkoffAccount(BrokerAccount):
             raise BrokerError(f"Tinkoff cancel failed: {e}") from e
 
     @staticmethod
-    def _ticker_to_figi(client, ticker: str) -> str:
+    def _ticker_to_figi(client: Any, ticker: str) -> str:
         """Map ticker to FIGI via Tinkoff instruments API."""
         try:
             instruments = client.instruments.find_instrument(query=ticker).instruments
             for inst in instruments:
                 if inst.ticker == ticker and inst.class_code == "TQBR":
-                    return inst.figi
+                    return str(inst.figi)
         except Exception:
             pass
         return ticker
 
     @staticmethod
     def _map_status(raw: str) -> OrderStatus:
-        mapping = {
+        mapping: dict[str, OrderStatus] = {
             "EXECUTION_REPORT_STATUS_FILL": OrderStatus.FILLED,
             "EXECUTION_REPORT_STATUS_PARTIALLYFILL": OrderStatus.FILLED,
             "EXECUTION_REPORT_STATUS_REJECTED": OrderStatus.REJECTED,
@@ -236,7 +237,7 @@ class TinkoffAccount(BrokerAccount):
         return mapping.get(raw, OrderStatus.SUBMITTED)
 
 
-def from_env(env: Optional[dict] = None) -> TinkoffAccount:
+def from_env(env: Optional[dict[str, str]] = None) -> TinkoffAccount:
     """Construct TinkoffAccount from environment variables."""
     if env is None:
         env = dict(os.environ)  # cast _Environ[str] to dict[str, str]
