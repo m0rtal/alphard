@@ -12,6 +12,7 @@ from src.coordinator import (
     Coordinator,
     CoordinatorConfig,
     CoordinatorSide,
+    PipelineResult,
     PipelineStage,
 )
 
@@ -278,3 +279,287 @@ class TestCoordinatorRiskCheck:
 
         assert allowed is True
         assert violations == ()
+
+
+# -----------------------------------------------------------------------------
+# Coordinator.run_once() — risk-gate exception path (lines 214-215)
+# -----------------------------------------------------------------------------
+
+
+class TestCoordinatorRiskException:
+    def test_risk_check_exception_does_not_block_execute(self) -> None:
+        """If _risk_check raises, run_once catches it and continues to EXECUTE.
+
+        Both risk_allowed and risk_violations remain at their pre-exception
+        defaults (False / ()), and the broker is still consulted (which then
+        refuses because live_trading=False).
+        """
+        with (
+            patch.object(Coordinator, "_fetch", return_value=[_bar()]),
+            patch.object(Coordinator, "_validate", return_value=True),
+            patch.object(
+                Coordinator,
+                "_risk_check",
+                side_effect=RuntimeError("risk engine down"),
+            ),
+        ):
+            result = Coordinator(_config(live_trading=False)).run_once()
+        assert PipelineStage.RISK not in result.stages_completed
+        assert result.risk_allowed is False
+        assert result.risk_violations == ()
+        # Broker still consulted: refused because LIVE_TRADING=False.
+        assert result.broker_status == "REJECTED_LIVE_TRADING_FALSE"
+        assert PipelineStage.EXECUTE in result.stages_completed
+        assert PipelineStage.DONE in result.stages_completed
+
+
+# -----------------------------------------------------------------------------
+# Coordinator._validate() — severity-branching (lines 267-270)
+# -----------------------------------------------------------------------------
+
+
+class TestCoordinatorValidateSeverity:
+    def test_validate_worst_severity_none_returns_true(self) -> None:
+        """check_ingestion returns report with worst_severity() == None → True."""
+        mock_report = MagicMock()
+        mock_report.worst_severity.return_value = None
+        with patch(
+            "src.data.quality.ingestion_gate.check_ingestion",
+            return_value=mock_report,
+        ):
+            coord = Coordinator(_config())
+            assert coord._validate([_bar()]) is True
+
+    def test_validate_worst_severity_critical_returns_false(self) -> None:
+        """Worst severity CRITICAL → False (block pipeline)."""
+        from src.data.quality.severity import Severity
+
+        mock_report = MagicMock()
+        mock_report.worst_severity.return_value = Severity.CRITICAL
+        with patch(
+            "src.data.quality.ingestion_gate.check_ingestion",
+            return_value=mock_report,
+        ):
+            coord = Coordinator(_config())
+            assert coord._validate([_bar()]) is False
+
+    def test_validate_worst_severity_high_returns_false(self) -> None:
+        """Worst severity HIGH → False (block pipeline)."""
+        from src.data.quality.severity import Severity
+
+        mock_report = MagicMock()
+        mock_report.worst_severity.return_value = Severity.HIGH
+        with patch(
+            "src.data.quality.ingestion_gate.check_ingestion",
+            return_value=mock_report,
+        ):
+            coord = Coordinator(_config())
+            assert coord._validate([_bar()]) is False
+
+
+# -----------------------------------------------------------------------------
+# Coordinator._execute() — risk-denied, success, and broker-error (lines 303-320)
+# -----------------------------------------------------------------------------
+
+
+class TestCoordinatorExecute:
+    def test_execute_live_trading_false_returns_refused(self) -> None:
+        """LIVE_TRADING=False → refuses before touching the broker."""
+        coord = Coordinator(_config(live_trading=False))
+        assert coord._execute(risk_allowed=True) == "REJECTED_LIVE_TRADING_FALSE"
+
+    def test_execute_risk_denied_returns_risk_gate_rejected(self) -> None:
+        """LIVE_TRADING=True AND risk_allowed=False → REJECTED_RISK_GATE.
+
+        This is the early-return branch at lines 303-304; no broker call
+        is made even though the broker would otherwise be reachable.
+        """
+        coord = Coordinator(_config(live_trading=True))
+        with patch("src.broker.tinkoff_account.TinkoffAccount") as mock_account:
+            status = coord._execute(risk_allowed=False)
+        assert status == "REJECTED_RISK_GATE"
+        mock_account.from_env.assert_not_called()
+
+    def test_execute_success_returns_status_value(self) -> None:
+        """LIVE_TRADING=True, risk_allowed=True, broker OK → str(status.value).
+
+        The coordinator source calls ``TinkoffAccount.from_env()`` with a
+        ``# type: ignore[attr-defined]`` (the real symbol is now a
+        module-level function, but the coordinator's lookup is on the
+        class). We patch the class attribute to match the actual call site.
+        """
+        from src.broker.orders import OrderStatus
+        from src.broker.tinkoff_account import TinkoffAccount
+
+        mock_account = MagicMock()
+        mock_account.place_order.return_value = OrderStatus.FILLED
+        with patch.object(TinkoffAccount, "from_env", return_value=mock_account, create=True):
+            coord = Coordinator(_config(live_trading=True))
+            status = coord._execute(risk_allowed=True)
+        assert status == str(OrderStatus.FILLED.value)
+
+    def test_execute_broker_exception_returns_error_status(self) -> None:
+        """Broker raises → 'ERROR:<ExceptionType>'."""
+        from src.broker.tinkoff_account import TinkoffAccount
+
+        with patch.object(
+            TinkoffAccount,
+            "from_env",
+            side_effect=ConnectionError("Tinkoff API down"),
+            create=True,
+        ):
+            coord = Coordinator(_config(live_trading=True))
+            status = coord._execute(risk_allowed=True)
+        assert status == "ERROR:ConnectionError"
+
+
+# -----------------------------------------------------------------------------
+# Coordinator._audit() — exception handler (lines 367-369)
+# -----------------------------------------------------------------------------
+
+
+class TestCoordinatorAuditErrors:
+    def test_audit_returns_none_when_psycopg_unavailable(self) -> None:
+        """If import psycopg / connect / execute fails, audit returns None.
+
+        Simulates the except handler at lines 367-369 by patching the
+        psycopg.connect call to raise during execution.
+        """
+        mock_psycopg = MagicMock()
+        mock_psycopg.connect.side_effect = OSError("postgres down")
+
+        with patch.dict("sys.modules", {"psycopg": mock_psycopg}):
+            coord = Coordinator(_config(store_dsn="postgresql://fake"))
+            result = coord._audit(
+                stages=[PipelineStage.FETCH, PipelineStage.DONE],
+                bars_loaded=10,
+                risk_allowed=True,
+                risk_violations=(),
+                broker_status="FILLED",
+            )
+        assert result is None
+
+    def test_audit_returns_none_when_cursor_returns_no_row(self) -> None:
+        """INSERT ... RETURNING id but fetchone() returns None → None."""
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = None
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+        mock_psycopg = MagicMock()
+        mock_psycopg.connect.return_value.__enter__.return_value = mock_conn
+
+        with patch.dict("sys.modules", {"psycopg": mock_psycopg}):
+            coord = Coordinator(_config(store_dsn="postgresql://fake"))
+            result = coord._audit(
+                stages=[PipelineStage.FETCH, PipelineStage.DONE],
+                bars_loaded=10,
+                risk_allowed=True,
+                risk_violations=(),
+                broker_status="FILLED",
+            )
+        assert result is None
+
+
+# -----------------------------------------------------------------------------
+# PipelineResult — decided property and to_dict (lines 130, 135)
+# -----------------------------------------------------------------------------
+
+
+class TestPipelineResult:
+    def _make_result(self, **overrides: object) -> PipelineResult:
+        kwargs: dict[str, object] = {
+            "config": _config(),
+            "stages_completed": (PipelineStage.FETCH,),
+            "bars_loaded": 1,
+            "risk_allowed": False,
+            "risk_violations": (),
+            "broker_status": None,
+            "audit_log_id": None,
+        }
+        kwargs.update(overrides)
+        return PipelineResult(**kwargs)  # type: ignore[arg-type]
+
+    def test_decided_true_when_execute_stage_present(self) -> None:
+        result = self._make_result(
+            stages_completed=(PipelineStage.FETCH, PipelineStage.EXECUTE),
+            broker_status="FILLED",
+        )
+        assert result.decided is True
+
+    def test_decided_true_when_done_stage_present(self) -> None:
+        result = self._make_result(
+            stages_completed=(PipelineStage.FETCH, PipelineStage.DONE),
+            broker_status=None,
+        )
+        assert result.decided is True
+
+    def test_decided_false_when_neither_execute_nor_done(self) -> None:
+        result = self._make_result(
+            stages_completed=(PipelineStage.FETCH, PipelineStage.SKIPPED),
+            broker_status=None,
+        )
+        assert result.decided is False
+
+    def test_to_dict_serializes_all_fields(self) -> None:
+        result = self._make_result(
+            stages_completed=(PipelineStage.FETCH, PipelineStage.RISK, PipelineStage.DONE),
+            bars_loaded=5,
+            risk_allowed=True,
+            risk_violations=("X",),
+            broker_status="FILLED",
+            audit_log_id=7,
+        )
+        d = result.to_dict()
+        assert d["ticker"] == "SBER"
+        assert d["side"] == "buy"
+        assert d["quantity"] == "1"
+        assert d["limit_price"] == "100"
+        assert d["stages_completed"] == ["fetch", "risk", "done"]
+        assert d["bars_loaded"] == 5
+        assert d["risk_allowed"] is True
+        assert d["risk_violations"] == ["X"]
+        assert d["broker_status"] == "FILLED"
+        assert d["audit_log_id"] == 7
+        assert d["decided"] is True
+        assert isinstance(d["timestamp"], str)
+
+
+# -----------------------------------------------------------------------------
+# End-to-end: run_once with live_trading=True and broker success populates audit
+# -----------------------------------------------------------------------------
+
+
+class TestCoordinatorRunOnceHappyPath:
+    def test_run_once_full_pipeline_writes_audit(self) -> None:
+        """Full happy path: fetch → validate → risk → execute → audit → done.
+
+        Uses live_trading=True to exercise the broker branch (lines 306-317).
+        """
+        from src.broker.orders import OrderStatus
+        from src.broker.tinkoff_account import TinkoffAccount
+
+        mock_account = MagicMock()
+        mock_account.place_order.return_value = OrderStatus.FILLED
+
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = (99,)
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+        mock_psycopg = MagicMock()
+        mock_psycopg.connect.return_value.__enter__.return_value = mock_conn
+
+        with (
+            patch.object(Coordinator, "_fetch", return_value=[_bar()]),
+            patch.object(Coordinator, "_validate", return_value=True),
+            patch.object(Coordinator, "_risk_check", return_value=(True, ())),
+            patch.object(TinkoffAccount, "from_env", return_value=mock_account, create=True),
+            patch.dict("sys.modules", {"psycopg": mock_psycopg}),
+        ):
+            result = Coordinator(_config(live_trading=True, store_dsn="postgresql://x")).run_once()
+
+        assert result.broker_status == str(OrderStatus.FILLED.value)
+        assert result.audit_log_id == 99
+        assert PipelineStage.EXECUTE in result.stages_completed
+        assert PipelineStage.AUDIT in result.stages_completed
+        assert PipelineStage.DONE in result.stages_completed
+        assert result.decided is True
