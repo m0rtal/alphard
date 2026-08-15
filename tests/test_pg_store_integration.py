@@ -176,9 +176,7 @@ class TestOHLCVCRUD:
             name="Replace Co",
             lot=1,
             currency="RUB",
-            primary_source="manual",
-            covered_by_tkf=False,
-            covered_by_moex=False,
+            source="tkf",
         )
         pg_store.upsert_ticker(meta)
         row1 = OHLCVRow(
@@ -223,9 +221,7 @@ class TestOHLCVCRUD:
             name="Count Co",
             lot=1,
             currency="RUB",
-            primary_source="manual",
-            covered_by_tkf=False,
-            covered_by_moex=False,
+            source="tkf",
         )
         pg_store.upsert_ticker(meta)
         rows = [
