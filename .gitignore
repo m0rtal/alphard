@@ -64,3 +64,8 @@ build/
 # Agent scratchpads (auto-generated)
 .alphard/
 *.swp
+
+# Database backups (large TSV files)
+backups/
+*.tsv
+*.tar.gz

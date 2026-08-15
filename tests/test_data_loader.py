@@ -451,7 +451,7 @@ class TestMOEXDataLoader:
             )
         ]
         loader, _ = self._loader(handlers)
-        tickers = loader.list_tickers()
+        tickers = loader.list_tickers(board_id=None)  # test mock has no BOARDID
         names = {t.ticker: t for t in tickers}
         assert names["SBER"].lot == 10
         assert names["SBER"].delisted is False
@@ -478,6 +478,8 @@ class TestMOEXDataLoader:
             ),
         ]
         loader, _ = self._loader(handlers)
+        # Prime the cache with all tickers (no board filter — test data has no BOARDID)
+        loader._universe_cache = loader.list_tickers(board_id=None)
         bars = list(loader.iter_ohlcv("sber", date(2026, 8, 1), date(2026, 8, 1)))
         assert len(bars) == 1
         assert bars[0].volume == Decimal("500")  # 100 lots × 5 lot size

@@ -84,20 +84,33 @@ class MOEXDataLoader(DataLoader):
         # Cache of ticker universe — list_tickers is one-shot but called
         # many times per session (store init, scheduler, etc.).
         self._universe_cache: list[TickerMeta] | None = None
+        self._board_filter: str | None | bool = None  # None|True if cached without filter
 
     # --------------------------------------------------------------- public
 
-    def list_tickers(self) -> list[TickerMeta]:
+    def list_tickers(self, board_id: str | None = "TQBR") -> list[TickerMeta]:
+        """Return MOEX share universe, optionally filtered by board_id.
+
+        Default ``board_id="TQBR"`` returns ~770 live + ~1157 archived TQBR
+        tickers (1927 total). Pass ``None`` for all boards.
+        """
         if self._universe_cache is not None:
-            return self._universe_cache
+            if board_id is None or self._board_filter is None:
+                return self._universe_cache
+            if self._board_filter == board_id:
+                return self._universe_cache
         url = f"{BASE_URL}/iss/engines/stock/markets/shares/securities.json"
         rows = self._fetch_all_rows(url, columns_metadata_key="securities")
         out: list[TickerMeta] = []
         for row in rows:
+            # MOEX ISS returns one row per (secid, boardid). Filter by board.
+            if board_id is not None and row.get("BOARDID") != board_id:
+                continue
             meta = self._row_to_ticker_meta(row)
             if meta is not None:
                 out.append(meta)
         self._universe_cache = out
+        self._board_filter = board_id
         return out
 
     def iter_ohlcv(
@@ -171,6 +184,8 @@ class MOEXDataLoader(DataLoader):
         return meta.lot
 
     def _meta_for(self, ticker: str) -> TickerMeta | None:
+        # list_tickers() returns the cached universe; for tests that pass
+        # board_id=None, the cached list contains test tickers without BOARDID.
         for m in self.list_tickers():
             if m.ticker == ticker:
                 return m

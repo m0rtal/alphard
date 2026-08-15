@@ -2,7 +2,8 @@
 --
 -- Conventions:
 --   * All identifiers use snake_case.
---   * NUMERIC(18, 8) for prices / amounts: fits MOEX lot prices (3-4 decimals)
+--   * NUMERIC(20, 8) for prices / amounts: fits MOEX values up to ~1e12
+--     (e.g. AFKS volume 193M, AFKS value 1.6B RUB on busy days).
 --     and equity prices (~10^6) with 8 fractional digits.
 --   * VARCHAR(12) for tickers (Tinkoff / MOEX both fit; Phase 1.3 may add
 --     qualifier tickers like 'SBER@SPB' which are still < 12 chars).
@@ -53,12 +54,12 @@ CREATE INDEX IF NOT EXISTS idx_ticker_universe_figi
 CREATE TABLE IF NOT EXISTS ohlcv_daily (
     ticker       VARCHAR(12) NOT NULL,
     ts           DATE NOT NULL,
-    open         NUMERIC(18, 8) NOT NULL,
-    high         NUMERIC(18, 8) NOT NULL,
-    low          NUMERIC(18, 8) NOT NULL,
-    close        NUMERIC(18, 8) NOT NULL,
-    volume       NUMERIC(18, 8) NOT NULL,
-    adj_close    NUMERIC(18, 8) NOT NULL,
+    open         NUMERIC(20, 8) NOT NULL,
+    high         NUMERIC(20, 8) NOT NULL,
+    low          NUMERIC(20, 8) NOT NULL,
+    close        NUMERIC(20, 8) NOT NULL,
+    volume       NUMERIC(20, 0) NOT NULL,
+    adj_close    NUMERIC(20, 8) NOT NULL,
     source       VARCHAR(8) NOT NULL,
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (ticker, ts, source),
