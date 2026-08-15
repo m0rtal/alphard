@@ -718,6 +718,230 @@ class TestTinkoffAccount:
         s = TinkoffAccount._map_status("EXECUTION_REPORT_STATUS_CANCELLED")
         assert s == OrderStatus.CANCELLED
 
+    # ────────────────────────────────────────
+    # Coverage-boost tests for lines 135, 142-145, 164-167, 191-195
+    # ────────────────────────────────────────
+
+    def test_place_order_live_trading_false_hardlock(self, monkeypatch):
+        """Lines 191-195: LIVE_TRADING != 'true' must reject BEFORE RiskGate.
+
+        Hard guarantee for Phase 1: even with a configured risk_gate,
+        orders are refused if LIVE_TRADING is not 'true' exactly.
+        """
+        monkeypatch.setenv("LIVE_TRADING", "false")
+        mock_rg = MagicMock()
+        a = TinkoffAccount(token="t.x", risk_gate=mock_rg)
+        order = MarketOrder(ticker="SBER", side=OrderSide.BUY, quantity=Decimal("10"))
+        status = a.place_order(order)
+        assert status == OrderStatus.REJECTED
+        # RiskGate must NOT have been consulted — short-circuit before it
+        mock_rg.evaluate.assert_not_called()
+
+    def test_place_order_live_trading_unset_hardlock(self, monkeypatch):
+        """Lines 191-195: when LIVE_TRADING is unset (env-stripped), default is 'false' → reject."""
+        monkeypatch.delenv("LIVE_TRADING", raising=False)
+        a = TinkoffAccount(token="t.x", risk_gate=MagicMock())
+        order = MarketOrder(ticker="SBER", side=OrderSide.BUY, quantity=Decimal("10"))
+        status = a.place_order(order)
+        assert status == OrderStatus.REJECTED
+
+    def test_place_order_live_trading_arbitrary_value_rejected(self, monkeypatch):
+        """Lines 191-195: any non-'true' value (e.g. 'yes', '1', 'enabled') is rejected.
+
+        Defensive parsing: only the exact literal 'true' (case-insensitive)
+        enables the live-trade path. This guards against accidental opt-in
+        via common truthy literals.
+        """
+        monkeypatch.setenv("LIVE_TRADING", "yes")
+        mock_rg = MagicMock()
+        a = TinkoffAccount(token="t.x", risk_gate=mock_rg)
+        order = MarketOrder(ticker="SBER", side=OrderSide.BUY, quantity=Decimal("10"))
+        status = a.place_order(order)
+        assert status == OrderStatus.REJECTED
+        mock_rg.evaluate.assert_not_called()
+
+    def test_get_portfolio_position_price_missing_falls_back_to_zero(self, monkeypatch):
+        """Line 135: when neither average_position_price nor average_buy_price
+        is set, avg_price defaults to Decimal('0')."""
+        mock_client_class = MagicMock()
+        mock_client = MagicMock()
+        mock_client_class.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_class.return_value.__exit__ = MagicMock(return_value=False)
+
+        mock_acc = MagicMock()
+        mock_acc.id = "SB1"
+        mock_client.users.get_accounts.return_value.accounts = [mock_acc]
+
+        mock_pos = MagicMock(spec=["ticker", "quantity"])
+        mock_pos.ticker = "SBER"
+        mock_pos.quantity = 10
+        # No average_position_price / average_buy_price attributes
+        portfolio = MagicMock()
+        portfolio.positions = [mock_pos]
+        mock_cash = MagicMock()
+        mock_cash.units = 100000
+        mock_cash.nano = 0
+        portfolio.total_amount_currencies = mock_cash
+        mock_client.operations.get_portfolio.return_value = portfolio
+
+        import sys
+
+        fake_module = MagicMock()
+        fake_module.Client = mock_client_class
+        monkeypatch.setitem(sys.modules, "t_tech.invest", fake_module)
+
+        a = TinkoffAccount(token="t.x")
+        snap = a.get_portfolio()
+        assert len(snap.positions) == 1
+        assert snap.positions[0].avg_price == Decimal("0")
+
+    def test_get_portfolio_legacy_money_value_position_price(self, monkeypatch):
+        """Lines 142-145: legacy SDK where avg price is Money.value (float).
+
+        Two sub-branches exercised:
+        - normal Money.value float → Decimal(str(value))
+        - malformed object → except fallback: Decimal(str(avg_price_q))
+        """
+        # Branch 1: normal legacy Money.value float
+        mock_client_class = MagicMock()
+        mock_client = MagicMock()
+        mock_client_class.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_class.return_value.__exit__ = MagicMock(return_value=False)
+        mock_acc = MagicMock()
+        mock_acc.id = "SB1"
+        mock_client.users.get_accounts.return_value.accounts = [mock_acc]
+
+        # Legacy: average_position_price has .value float but no .units/.nano
+        legacy_price = MagicMock(spec=["value"])
+        legacy_price.value = 250.75
+        mock_pos = MagicMock()
+        mock_pos.ticker = "SBER"
+        mock_pos.quantity = 10
+        mock_pos.average_position_price = legacy_price
+        portfolio = MagicMock()
+        portfolio.positions = [mock_pos]
+        mock_cash = MagicMock()
+        mock_cash.units = 100000
+        mock_cash.nano = 0
+        portfolio.total_amount_currencies = mock_cash
+        mock_client.operations.get_portfolio.return_value = portfolio
+
+        import sys
+
+        fake_module = MagicMock()
+        fake_module.Client = mock_client_class
+        monkeypatch.setitem(sys.modules, "t_tech.invest", fake_module)
+
+        a = TinkoffAccount(token="t.x")
+        snap = a.get_portfolio()
+        assert snap.positions[0].avg_price == Decimal("250.75")
+
+    def test_get_portfolio_legacy_money_value_falls_back_to_str(self, monkeypatch):
+        """Lines 142-145: legacy Money.value raises AttributeError → use Decimal(str(obj))."""
+        mock_client_class = MagicMock()
+        mock_client = MagicMock()
+        mock_client_class.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_class.return_value.__exit__ = MagicMock(return_value=False)
+        mock_acc = MagicMock()
+        mock_acc.id = "SB1"
+        mock_client.users.get_accounts.return_value.accounts = [mock_acc]
+
+        # Legacy price object that raises on .value access
+        class BrokenPrice:
+            def __init__(self):
+                self.ticker = "GAZP"
+
+            @property
+            def value(self):
+                raise AttributeError("no .value attribute")
+
+            def __str__(self):
+                return "199.99"
+
+        mock_pos = MagicMock()
+        mock_pos.ticker = "GAZP"
+        mock_pos.quantity = 5
+        mock_pos.average_position_price = BrokenPrice()
+        portfolio = MagicMock()
+        portfolio.positions = [mock_pos]
+        mock_cash = MagicMock()
+        mock_cash.units = 50000
+        mock_cash.nano = 0
+        portfolio.total_amount_currencies = mock_cash
+        mock_client.operations.get_portfolio.return_value = portfolio
+
+        import sys
+
+        fake_module = MagicMock()
+        fake_module.Client = mock_client_class
+        monkeypatch.setitem(sys.modules, "t_tech.invest", fake_module)
+
+        a = TinkoffAccount(token="t.x")
+        snap = a.get_portfolio()
+        # Falls back to Decimal(str(obj)) = Decimal("199.99")
+        assert snap.positions[0].avg_price == Decimal("199.99")
+
+    def test_get_portfolio_legacy_cash_money_value(self, monkeypatch):
+        """Lines 164-167: legacy cash Money.value float branch."""
+        mock_client_class = MagicMock()
+        mock_client = MagicMock()
+        mock_client_class.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_class.return_value.__exit__ = MagicMock(return_value=False)
+        mock_acc = MagicMock()
+        mock_acc.id = "SB1"
+        mock_client.users.get_accounts.return_value.accounts = [mock_acc]
+
+        portfolio = MagicMock()
+        portfolio.positions = []
+        # Legacy total_amount_currencies: has .value but no .units/.nano
+        legacy_cash = MagicMock(spec=["value"])
+        legacy_cash.value = 12345.67
+        portfolio.total_amount_currencies = legacy_cash
+        mock_client.operations.get_portfolio.return_value = portfolio
+
+        import sys
+
+        fake_module = MagicMock()
+        fake_module.Client = mock_client_class
+        monkeypatch.setitem(sys.modules, "t_tech.invest", fake_module)
+
+        a = TinkoffAccount(token="t.x")
+        snap = a.get_portfolio()
+        assert snap.cash == Decimal("12345.67")
+
+    def test_get_portfolio_legacy_cash_falls_back_to_str(self, monkeypatch):
+        """Lines 164-167: legacy cash raises on .value → Decimal(str(obj))."""
+        mock_client_class = MagicMock()
+        mock_client = MagicMock()
+        mock_client_class.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_class.return_value.__exit__ = MagicMock(return_value=False)
+        mock_acc = MagicMock()
+        mock_acc.id = "SB1"
+        mock_client.users.get_accounts.return_value.accounts = [mock_acc]
+
+        class BrokenCash:
+            @property
+            def value(self):
+                raise TypeError("not float-like")
+
+            def __str__(self):
+                return "7777.5"
+
+        portfolio = MagicMock()
+        portfolio.positions = []
+        portfolio.total_amount_currencies = BrokenCash()
+        mock_client.operations.get_portfolio.return_value = portfolio
+
+        import sys
+
+        fake_module = MagicMock()
+        fake_module.Client = mock_client_class
+        monkeypatch.setitem(sys.modules, "t_tech.invest", fake_module)
+
+        a = TinkoffAccount(token="t.x")
+        snap = a.get_portfolio()
+        assert snap.cash == Decimal("7777.5")
+
 
 # ────────────────────────────────────────────
 # OrderFlow tests (integration)
