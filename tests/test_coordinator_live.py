@@ -7,6 +7,7 @@ These tests require a real Tinkoff token and Postgres DSN in environment:
 Skipped otherwise. Live smoke only — no assertions about exact data,
 just that the pipeline runs end-to-end without raising.
 """
+
 from __future__ import annotations
 
 import os
