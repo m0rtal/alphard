@@ -272,3 +272,272 @@ class TestErrorPaths:
     def test_close_idempotent(self, pg_store):
         pg_store.close()
         pg_store.close()  # should not raise
+
+
+class TestContextManager:
+    def test_context_manager_returns_store(self, pg_store):
+        """__enter__ / __exit__ exercise the lazy-connect + close paths."""
+        with pg_store as s:
+            assert s is pg_store
+            assert s._conn is not None
+        # __exit__ calls close() → _conn reset to None
+        assert pg_store._conn is None
+
+
+class TestCorporateActions:
+    def test_upsert_and_query_roundtrip(self, pg_store):
+        from src.data.models import CorporateAction
+
+        meta = TickerMeta(
+            ticker="PG_CORP",
+            name="Corp Co",
+            lot=1,
+            currency="RUB",
+            source="manual",
+        )
+        pg_store.upsert_ticker(meta)
+        action = CorporateAction(
+            ticker="PG_CORP",
+            ts=date(2026, 8, 1),
+            kind="dividend",
+            value=Decimal("12.50"),
+            source="tkf",
+        )
+        n = pg_store.upsert_corporate_actions([action])
+        assert n == 1
+
+        rows = pg_store.query_corporate_actions("PG_CORP", date(2026, 1, 1), date(2026, 12, 31))
+        assert len(rows) == 1
+        assert rows[0].kind == "dividend"
+        assert rows[0].value == Decimal("12.50")
+
+    def test_upsert_replaces_existing_action(self, pg_store):
+        from src.data.models import CorporateAction
+
+        meta = TickerMeta(
+            ticker="PG_SPLIT",
+            name="Split Co",
+            lot=1,
+            currency="RUB",
+            source="manual",
+        )
+        pg_store.upsert_ticker(meta)
+        action1 = CorporateAction(
+            ticker="PG_SPLIT",
+            ts=date(2026, 8, 1),
+            kind="split",
+            value=Decimal("2"),
+            source="tkf",
+        )
+        action2 = CorporateAction(
+            ticker="PG_SPLIT",
+            ts=date(2026, 8, 1),
+            kind="split",
+            value=Decimal("3"),
+            source="tkf",
+        )
+        pg_store.upsert_corporate_actions([action1])
+        pg_store.upsert_corporate_actions([action2])
+        rows = pg_store.query_corporate_actions("PG_SPLIT", date(2026, 1, 1), date(2026, 12, 31))
+        assert len(rows) == 1
+        assert rows[0].value == Decimal("3")  # latest write wins
+
+
+class TestMigrateDeduplicate:
+    def test_deduplicate_no_op_when_no_duplicates(self, pg_store):
+        """migrate_deduplicate returns 0 when no duplicates exist (steady-state).
+
+        On the current schema with PK (ticker, ts), no duplicates can exist
+        in the first place, so this is the realistic path.
+        """
+        meta = TickerMeta(
+            ticker="PG_DEDUP_CLEAN",
+            name="Clean Co",
+            lot=1,
+            currency="RUB",
+            source="tkf",
+        )
+        pg_store.upsert_ticker(meta)
+        row = OHLCVRow(
+            ticker="PG_DEDUP_CLEAN",
+            ts=date(2026, 8, 1),
+            open=Decimal("100"),
+            high=Decimal("110"),
+            low=Decimal("95"),
+            close=Decimal("105"),
+            volume=Decimal("1000"),
+            adj_close=Decimal("105"),
+            primary_source="tkf",
+            covered_by_tkf=True,
+            covered_by_moex=False,
+        )
+        pg_store.upsert_ohlcv([row])
+        deleted = pg_store.migrate_deduplicate()
+        assert deleted == 0
+        assert pg_store.count_ohlcv("PG_DEDUP_CLEAN") == 1
+
+    def test_deduplicate_collapses_legacy_dupes(self, pg_store):
+        """Simulate legacy state where PK constraint is dropped and duplicates
+        exist for (ticker, ts). migrate_deduplicate collapses them.
+        """
+        meta = TickerMeta(
+            ticker="PG_DEDUP",
+            name="Legacy Co",
+            lot=1,
+            currency="RUB",
+            source="tkf",
+        )
+        pg_store.upsert_ticker(meta)
+        with pg_store._conn.cursor() as cur:
+            cur.execute("SET search_path TO alphard_test, public")
+            cur.execute("ALTER TABLE ohlcv_daily DROP CONSTRAINT ohlcv_daily_pkey")
+            cur.execute(
+                "INSERT INTO ohlcv_daily (ticker, ts, open, high, low, close, "
+                "volume, adj_close, primary_source, covered_by_tkf, covered_by_moex) "
+                "VALUES ('PG_DEDUP', '2026-08-01', 100, 110, 95, 105, 1000, 105, 'tkf', TRUE, FALSE)"
+            )
+            cur.execute(
+                "INSERT INTO ohlcv_daily (ticker, ts, open, high, low, close, "
+                "volume, adj_close, primary_source, covered_by_tkf, covered_by_moex) "
+                "VALUES ('PG_DEDUP', '2026-08-01', 200, 220, 190, 210, 2000, 210, 'moex', FALSE, TRUE)"
+            )
+        pg_store._conn.commit()
+        assert pg_store.count_ohlcv("PG_DEDUP") == 2
+
+        deleted = pg_store.migrate_deduplicate()
+        assert deleted == 1
+
+        rows = pg_store.query_ohlcv("PG_DEDUP", date(2026, 8, 1), date(2026, 8, 1))
+        assert len(rows) == 1
+        assert rows[0].covered_by_tkf is True
+        assert rows[0].covered_by_moex is True
+
+        with pg_store._conn.cursor() as cur:
+            cur.execute("SET search_path TO alphard_test, public")
+            cur.execute("ALTER TABLE ohlcv_daily ADD PRIMARY KEY (ticker, ts)")
+        pg_store._conn.commit()
+
+
+
+class TestOHLCVQueryVariants:
+    def test_query_ohlcv_filters_by_source(self, pg_store):
+        meta = TickerMeta(
+            ticker="PG_SRC",
+            name="Source Co",
+            lot=1,
+            currency="RUB",
+            source="tkf",
+        )
+        pg_store.upsert_ticker(meta)
+        row = OHLCVRow(
+            ticker="PG_SRC",
+            ts=date(2026, 8, 14),
+            open=Decimal("100"),
+            high=Decimal("110"),
+            low=Decimal("95"),
+            close=Decimal("105"),
+            volume=Decimal("1000"),
+            adj_close=Decimal("105"),
+            primary_source="tkf",
+            covered_by_tkf=True,
+            covered_by_moex=False,
+        )
+        pg_store.upsert_ohlcv([row])
+
+        # No source filter → returns the row
+        rows = pg_store.query_ohlcv("PG_SRC", date(2026, 8, 1), date(2026, 8, 31))
+        assert len(rows) == 1
+
+        # Match source → returns the row
+        rows = pg_store.query_ohlcv(
+            "PG_SRC", date(2026, 8, 1), date(2026, 8, 31), primary_source="tkf"
+        )
+        assert len(rows) == 1
+
+        # Non-matching source → empty
+        rows = pg_store.query_ohlcv(
+            "PG_SRC", date(2026, 8, 1), date(2026, 8, 31), primary_source="moex"
+        )
+        assert rows == []
+
+    def test_count_ohlcv_all(self, pg_store):
+        # Insert rows for multiple tickers
+        for tk in ("PG_CA1", "PG_CA2"):
+            meta = TickerMeta(
+                ticker=tk,
+                name=f"Co {tk}",
+                lot=1,
+                currency="RUB",
+                source="tkf",
+            )
+            pg_store.upsert_ticker(meta)
+            row = OHLCVRow(
+                ticker=tk,
+                ts=date(2026, 8, 14),
+                open=Decimal("100"),
+                high=Decimal("110"),
+                low=Decimal("95"),
+                close=Decimal("105"),
+                volume=Decimal("1000"),
+                adj_close=Decimal("105"),
+                primary_source="tkf",
+                covered_by_tkf=True,
+                covered_by_moex=False,
+            )
+            pg_store.upsert_ohlcv([row])
+
+        # Per-ticker count
+        assert pg_store.count_ohlcv("PG_CA1") == 1
+        assert pg_store.count_ohlcv("PG_CA2") == 1
+        # Total count (no ticker)
+        assert pg_store.count_ohlcv() >= 2
+
+    def test_query_ohlcv_uppercases_ticker(self, pg_store):
+        meta = TickerMeta(
+            ticker="PG_UPPER",
+            name="Upper Co",
+            lot=1,
+            currency="RUB",
+            source="tkf",
+        )
+        pg_store.upsert_ticker(meta)
+        row = OHLCVRow(
+            ticker="PG_UPPER",
+            ts=date(2026, 8, 14),
+            open=Decimal("100"),
+            high=Decimal("110"),
+            low=Decimal("95"),
+            close=Decimal("105"),
+            volume=Decimal("1000"),
+            adj_close=Decimal("105"),
+            primary_source="tkf",
+            covered_by_tkf=True,
+            covered_by_moex=False,
+        )
+        pg_store.upsert_ohlcv([row])
+
+        # Lowercase query should still match (SQL does UPPER)
+        rows = pg_store.query_ohlcv("pg_upper", date(2026, 8, 1), date(2026, 8, 31))
+        assert len(rows) == 1
+
+
+class TestConnectionLifecycle:
+    def test_connect_idempotent(self, pg_store):
+        """Calling _connect twice shouldn't break."""
+        pg_store._connect()
+        first_conn = pg_store._conn
+        pg_store._connect()  # no-op: conn is not None and not closed
+        assert pg_store._conn is first_conn
+
+    def test_close_clears_conn(self, pg_store):
+        pg_store._connect()
+        assert pg_store._conn is not None
+        pg_store.close()
+        assert pg_store._conn is None
+
+    def test_reconnect_after_close(self, pg_store):
+        pg_store._connect()
+        pg_store.close()
+        # Re-connect lazy on next operation
+        pg_store._connect()
+        assert pg_store._conn is not None
