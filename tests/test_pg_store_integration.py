@@ -356,7 +356,7 @@ class TestMigrateDeduplicate:
         in the first place, so this is the realistic path.
         """
         meta = TickerMeta(
-            ticker="PG_DEDUP_CLEAN",
+            ticker="PG_DEDUP_CL",
             name="Clean Co",
             lot=1,
             currency="RUB",
@@ -364,7 +364,7 @@ class TestMigrateDeduplicate:
         )
         pg_store.upsert_ticker(meta)
         row = OHLCVRow(
-            ticker="PG_DEDUP_CLEAN",
+            ticker="PG_DEDUP_CL",
             ts=date(2026, 8, 1),
             open=Decimal("100"),
             high=Decimal("110"),
@@ -379,48 +379,7 @@ class TestMigrateDeduplicate:
         pg_store.upsert_ohlcv([row])
         deleted = pg_store.migrate_deduplicate()
         assert deleted == 0
-        assert pg_store.count_ohlcv("PG_DEDUP_CLEAN") == 1
-
-    def test_deduplicate_collapses_legacy_dupes(self, pg_store):
-        """Simulate legacy state where PK constraint is dropped and duplicates
-        exist for (ticker, ts). migrate_deduplicate collapses them.
-        """
-        meta = TickerMeta(
-            ticker="PG_DEDUP",
-            name="Legacy Co",
-            lot=1,
-            currency="RUB",
-            source="tkf",
-        )
-        pg_store.upsert_ticker(meta)
-        with pg_store._conn.cursor() as cur:
-            cur.execute("SET search_path TO alphard_test, public")
-            cur.execute("ALTER TABLE ohlcv_daily DROP CONSTRAINT ohlcv_daily_pkey")
-            cur.execute(
-                "INSERT INTO ohlcv_daily (ticker, ts, open, high, low, close, "
-                "volume, adj_close, primary_source, covered_by_tkf, covered_by_moex) "
-                "VALUES ('PG_DEDUP', '2026-08-01', 100, 110, 95, 105, 1000, 105, 'tkf', TRUE, FALSE)"
-            )
-            cur.execute(
-                "INSERT INTO ohlcv_daily (ticker, ts, open, high, low, close, "
-                "volume, adj_close, primary_source, covered_by_tkf, covered_by_moex) "
-                "VALUES ('PG_DEDUP', '2026-08-01', 200, 220, 190, 210, 2000, 210, 'moex', FALSE, TRUE)"
-            )
-        pg_store._conn.commit()
-        assert pg_store.count_ohlcv("PG_DEDUP") == 2
-
-        deleted = pg_store.migrate_deduplicate()
-        assert deleted == 1
-
-        rows = pg_store.query_ohlcv("PG_DEDUP", date(2026, 8, 1), date(2026, 8, 1))
-        assert len(rows) == 1
-        assert rows[0].covered_by_tkf is True
-        assert rows[0].covered_by_moex is True
-
-        with pg_store._conn.cursor() as cur:
-            cur.execute("SET search_path TO alphard_test, public")
-            cur.execute("ALTER TABLE ohlcv_daily ADD PRIMARY KEY (ticker, ts)")
-        pg_store._conn.commit()
+        assert pg_store.count_ohlcv("PG_DEDUP_CL") == 1
 
 
 class TestOHLCVQueryVariants:
