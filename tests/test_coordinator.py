@@ -1,4 +1,5 @@
 """Tests for the Coordinator stub (Phase 1.5) — mocked pipeline paths."""
+
 from __future__ import annotations
 
 from datetime import date, timedelta
@@ -18,6 +19,7 @@ from src.coordinator import (
 # -----------------------------------------------------------------------------
 # Fixtures
 # -----------------------------------------------------------------------------
+
 
 def _limits() -> MagicMock:
     return MagicMock(
@@ -50,6 +52,7 @@ def _config(**overrides: object) -> CoordinatorConfig:
 # Config dataclass
 # -----------------------------------------------------------------------------
 
+
 class TestCoordinatorConfig:
     def test_config_is_immutable(self) -> None:
         cfg = _config()
@@ -67,6 +70,7 @@ class TestCoordinatorConfig:
 # -----------------------------------------------------------------------------
 # Coordinator.run_once() — full mocked paths
 # -----------------------------------------------------------------------------
+
 
 def _bar() -> MagicMock:
     """Minimal OHLCVRow stand-in."""
@@ -101,8 +105,9 @@ class TestCoordinatorFullPipeline:
 
     def test_validate_critical_returns_skipped(self) -> None:
         """VALIDATE returns False → SKIPPED, no risk check, no broker call."""
-        with patch.object(Coordinator, "_fetch", return_value=[_bar()]), patch.object(
-            Coordinator, "_validate", return_value=False
+        with (
+            patch.object(Coordinator, "_fetch", return_value=[_bar()]),
+            patch.object(Coordinator, "_validate", return_value=False),
         ):
             result = Coordinator(_config()).run_once()
         assert PipelineStage.SKIPPED in result.stages_completed
@@ -112,12 +117,11 @@ class TestCoordinatorFullPipeline:
 
     def test_validate_raises_does_not_block_risk_check(self) -> None:
         """If _validate raises, pipeline continues to RISK (conservative)."""
-        with patch.object(Coordinator, "_fetch", return_value=[_bar()]), patch.object(
-            Coordinator, "_validate", side_effect=RuntimeError("gate fail")
-        ), patch.object(
-            Coordinator, "_risk_check", return_value=(True, ())
-        ), patch.object(
-            Coordinator, "_execute", return_value="REJECTED_LIVE_TRADING_FALSE"
+        with (
+            patch.object(Coordinator, "_fetch", return_value=[_bar()]),
+            patch.object(Coordinator, "_validate", side_effect=RuntimeError("gate fail")),
+            patch.object(Coordinator, "_risk_check", return_value=(True, ())),
+            patch.object(Coordinator, "_execute", return_value="REJECTED_LIVE_TRADING_FALSE"),
         ):
             result = Coordinator(_config()).run_once()
         assert PipelineStage.RISK in result.stages_completed
@@ -125,10 +129,10 @@ class TestCoordinatorFullPipeline:
 
     def test_risk_allowed_live_trading_false_blocks_at_broker(self) -> None:
         """Risk passes but LIVE_TRADING=false → broker_status REJECTED_LIVE_TRADING_FALSE."""
-        with patch.object(Coordinator, "_fetch", return_value=[_bar()]), patch.object(
-            Coordinator, "_validate", return_value=True
-        ), patch.object(
-            Coordinator, "_risk_check", return_value=(True, ())
+        with (
+            patch.object(Coordinator, "_fetch", return_value=[_bar()]),
+            patch.object(Coordinator, "_validate", return_value=True),
+            patch.object(Coordinator, "_risk_check", return_value=(True, ())),
         ):
             result = Coordinator(_config(live_trading=False)).run_once()
         assert result.risk_allowed is True
@@ -136,12 +140,11 @@ class TestCoordinatorFullPipeline:
 
     def test_risk_denied_blocks_broker_live_trading_true(self) -> None:
         """Risk fails AND LIVE_TRADING=true → still blocks at risk gate."""
-        with patch.object(Coordinator, "_fetch", return_value=[_bar()]), patch.object(
-            Coordinator, "_validate", return_value=True
-        ), patch.object(
-            Coordinator, "_risk_check", return_value=(False, ("RISK_DD: 12% > 10%",))
-        ), patch.object(
-            Coordinator, "_execute", return_value="REJECTED_RISK_GATE"
+        with (
+            patch.object(Coordinator, "_fetch", return_value=[_bar()]),
+            patch.object(Coordinator, "_validate", return_value=True),
+            patch.object(Coordinator, "_risk_check", return_value=(False, ("RISK_DD: 12% > 10%",))),
+            patch.object(Coordinator, "_execute", return_value="REJECTED_RISK_GATE"),
         ):
             result = Coordinator(_config(live_trading=True)).run_once()
         assert result.risk_allowed is False
@@ -150,24 +153,22 @@ class TestCoordinatorFullPipeline:
 
     def test_risk_allowed_live_trading_true_calls_execute(self) -> None:
         """Risk passes AND LIVE_TRADING=true → _execute called, result returned."""
-        with patch.object(Coordinator, "_fetch", return_value=[_bar()]), patch.object(
-            Coordinator, "_validate", return_value=True
-        ), patch.object(
-            Coordinator, "_risk_check", return_value=(True, ())
-        ), patch.object(
-            Coordinator, "_execute", return_value="FILLED"
+        with (
+            patch.object(Coordinator, "_fetch", return_value=[_bar()]),
+            patch.object(Coordinator, "_validate", return_value=True),
+            patch.object(Coordinator, "_risk_check", return_value=(True, ())),
+            patch.object(Coordinator, "_execute", return_value="FILLED"),
         ):
             result = Coordinator(_config(live_trading=True)).run_once()
         assert result.broker_status == "FILLED"
 
     def test_broker_raises_returns_error_status(self) -> None:
         """If _execute raises (broker unavailable), main loop catches and returns ERROR:..."""
-        with patch.object(Coordinator, "_fetch", return_value=[_bar()]), patch.object(
-            Coordinator, "_validate", return_value=True
-        ), patch.object(
-            Coordinator, "_risk_check", return_value=(True, ())
-        ), patch.object(
-            Coordinator, "_execute", return_value="ERROR:RuntimeError"
+        with (
+            patch.object(Coordinator, "_fetch", return_value=[_bar()]),
+            patch.object(Coordinator, "_validate", return_value=True),
+            patch.object(Coordinator, "_risk_check", return_value=(True, ())),
+            patch.object(Coordinator, "_execute", return_value="ERROR:RuntimeError"),
         ):
             result = Coordinator(_config(live_trading=True)).run_once()
         assert result.broker_status == "ERROR:RuntimeError"
@@ -176,6 +177,7 @@ class TestCoordinatorFullPipeline:
 # -----------------------------------------------------------------------------
 # Coordinator._audit()
 # -----------------------------------------------------------------------------
+
 
 class TestCoordinatorAudit:
     def test_audit_skips_when_no_dsn(self) -> None:
@@ -218,6 +220,7 @@ class TestCoordinatorAudit:
 # Coordinator._fetch()
 # -----------------------------------------------------------------------------
 
+
 class TestCoordinatorFetch:
     def test_fetch_calls_loader_with_short_window(self) -> None:
         """_fetch uses 2-day window to minimise API call payload."""
@@ -240,6 +243,7 @@ class TestCoordinatorFetch:
 # Coordinator._validate()
 # -----------------------------------------------------------------------------
 
+
 class TestCoordinatorValidate:
     def test_validate_empty_bars_returns_false(self) -> None:
         """No bars → validation fails (skips pipeline)."""
@@ -259,6 +263,7 @@ class TestCoordinatorValidate:
 # -----------------------------------------------------------------------------
 # Coordinator._risk_check()
 # -----------------------------------------------------------------------------
+
 
 class TestCoordinatorRiskCheck:
     def test_risk_check_returns_decision(self) -> None:
