@@ -34,7 +34,7 @@ from datetime import date, timedelta
 from decimal import Decimal
 from typing import Any, Iterator, cast
 
-import requests  # type: ignore[import-untyped]
+import requests
 
 from .loader import (
     DataLoader,
