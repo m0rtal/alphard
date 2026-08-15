@@ -244,6 +244,11 @@ class MOEXDataLoader(DataLoader):
     def _rows_from_block(block: dict[str, Any]) -> list[dict[str, Any]]:
         cols = block.get("columns") or []
         data = block.get("data") or []
+        # If the server returned rows but no column metadata, we have no way
+        # to map positions → names — return [] rather than a list of empty
+        # dicts (which would silently swallow the data downstream).
+        if not cols:
+            return []
         out: list[dict[str, Any]] = []
         for row in data:
             if not isinstance(row, list):

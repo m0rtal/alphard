@@ -208,12 +208,15 @@ class TestTinkoffAccount:
 
     def test_risk_gate_approved_submits(
         self,
+        monkeypatch: pytest.MonkeyPatch,
     ):  # Mock t_tech.invest (SDK is now installed, but we want offline unit tests)
-        import sys as _sys
+        import sys
 
         _fake = MagicMock()
         _fake.Client = MagicMock()
-        _sys.modules["t_tech.invest"] = _fake
+        # Use monkeypatch.setitem so the real module is restored after the test
+        # and does not leak into later tests (e.g. test_tinkoff_grpc.py).
+        monkeypatch.setitem(sys.modules, "t_tech.invest", _fake)
 
         mock_rg = MagicMock()
         from src.risk.gate import RiskDecision
@@ -227,12 +230,15 @@ class TestTinkoffAccount:
 
     def test_limit_order_submits(
         self,
+        monkeypatch: pytest.MonkeyPatch,
     ):  # Mock t_tech.invest (SDK is now installed, but we want offline unit tests)  # noqa: E501
-        import sys as _sys
+        import sys
 
         _fake = MagicMock()
         _fake.Client = MagicMock()
-        _sys.modules["t_tech.invest"] = _fake
+        # Use monkeypatch.setitem so the real module is restored after the test
+        # and does not leak into later tests (e.g. test_tinkoff_grpc.py).
+        monkeypatch.setitem(sys.modules, "t_tech.invest", _fake)
 
         mock_rg = MagicMock()
         from src.risk.gate import RiskDecision
@@ -257,9 +263,9 @@ class TestTinkoffAccount:
         # Should block at least 1 second (3 reqs at 2/sec)
         assert elapsed >= 0.9
 
-    def test_get_portfolio_mock_when_no_sdk(self):
+    def test_get_portfolio_mock_when_no_sdk(self, monkeypatch: pytest.MonkeyPatch):
         # Mock t_tech.invest (SDK is now installed, but we want offline unit tests)
-        import sys as _sys
+        import sys
 
         mock_client_class = MagicMock()
         mock_client = MagicMock()
@@ -277,16 +283,18 @@ class TestTinkoffAccount:
         mock_client.operations.get_portfolio.return_value = portfolio
         _fake = MagicMock()
         _fake.Client = mock_client_class
-        _sys.modules["t_tech.invest"] = _fake
+        # Use monkeypatch.setitem so the real module is restored after the test
+        # and does not leak into later tests (e.g. test_tinkoff_grpc.py).
+        monkeypatch.setitem(sys.modules, "t_tech.invest", _fake)
 
         a = TinkoffAccount(token="t.x")
         snap = a.get_portfolio()
         assert snap.account_id == "SB1"
         assert snap.cash == Decimal("100000")
 
-    def test_get_positions_calls_portfolio(self):
+    def test_get_positions_calls_portfolio(self, monkeypatch: pytest.MonkeyPatch):
         # Mock t_tech.invest (SDK is now installed, but we want offline unit tests)
-        import sys as _sys
+        import sys
 
         mock_client_class = MagicMock()
         mock_client = MagicMock()
@@ -301,7 +309,9 @@ class TestTinkoffAccount:
         mock_client.operations.get_portfolio.return_value = portfolio
         _fake = MagicMock()
         _fake.Client = mock_client_class
-        _sys.modules["t_tech.invest"] = _fake
+        # Use monkeypatch.setitem so the real module is restored after the test
+        # and does not leak into later tests (e.g. test_tinkoff_grpc.py).
+        monkeypatch.setitem(sys.modules, "t_tech.invest", _fake)
 
         a = TinkoffAccount(token="t.x")
         positions = a.get_positions()
@@ -309,12 +319,15 @@ class TestTinkoffAccount:
 
     def test_cancel_order_returns_cancelled(
         self,
+        monkeypatch: pytest.MonkeyPatch,
     ):  # Mock t_tech.invest (SDK is now installed, but we want offline unit tests)
-        import sys as _sys
+        import sys
 
         _fake = MagicMock()
         _fake.Client = MagicMock()
-        _sys.modules["t_tech.invest"] = _fake
+        # Use monkeypatch.setitem so the real module is restored after the test
+        # and does not leak into later tests (e.g. test_tinkoff_grpc.py).
+        monkeypatch.setitem(sys.modules, "t_tech.invest", _fake)
 
         a = TinkoffAccount(token="t.x")
         status = a.cancel_order("ORD-123")
