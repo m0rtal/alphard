@@ -113,3 +113,135 @@ class TestTinkoffDataLoader:
             loader = TinkoffDataLoader(token="t")
             tickers = loader.list_tickers()
         assert {t.ticker for t in tickers} == {"SBER", "GAZP"}
+
+    def test_list_bonds_filters_class_and_status(self) -> None:
+        """TQOB OFZ + TQCB corp kept; wrong class_code and bad status filtered."""
+
+        def make_bond(
+            ticker: str,
+            figi: str,
+            class_code: str,
+            status: int,
+            api_trade: bool,
+        ) -> MagicMock:
+            b = MagicMock()
+            b.ticker = ticker
+            b.figi = figi
+            b.name = f"Bond-{ticker}"
+            b.lot = 1
+            b.isin = f"RU{ticker}"
+            b.class_code = class_code
+            b.trading_status = status
+            b.api_trade_available_flag = api_trade
+            b.currency = "RUB"
+            return b
+
+        bonds = [
+            make_bond("OFZ26207", "BBG002PD3452", "TQOB", 14, True),  # OFZ — keep
+            make_bond("CORP01", "BBGCORP01", "TQCB", 14, True),  # corp — keep
+            make_bond("WRONG", "BBGWRONG", "TQIE", 14, True),  # wrong class -> skip
+            make_bond("NOPRADE", "BBGNPR", "TQOB", 14, False),  # api_trade=False -> skip
+            make_bond("DELIST", "BBGDEL", "TQOB", 99, True),  # bad status -> skip
+        ]
+        mock_response = MagicMock()
+        mock_response.instruments = bonds
+        mock_client = MagicMock()
+        mock_client.instruments.bonds.return_value = mock_response
+        mock_client_class = MagicMock()
+        mock_client_class.return_value.__enter__.return_value = mock_client
+
+        with patch("t_tech.invest.Client", mock_client_class):
+            loader = TinkoffDataLoader(token="t")
+            result = loader.list_bonds()
+        assert {t.ticker for t in result} == {"OFZ26207", "CORP01"}
+        for meta in result:
+            assert meta.source == "tkf"
+            assert meta.currency == "RUB"
+
+    def test_list_bonds_caches(self) -> None:
+        """Second call must not re-hit the gRPC client."""
+        bond = MagicMock()
+        bond.ticker = "OFZ26207"
+        bond.figi = "BBG002PD3452"
+        bond.name = "OFZ 26207"
+        bond.lot = 1
+        bond.isin = "RU000A0JS4M1"
+        bond.class_code = "TQOB"
+        bond.trading_status = 14
+        bond.api_trade_available_flag = True
+        bond.currency = "RUB"
+
+        mock_response = MagicMock()
+        mock_response.instruments = [bond]
+        mock_client = MagicMock()
+        mock_client.instruments.bonds.return_value = mock_response
+        mock_client_class = MagicMock()
+        mock_client_class.return_value.__enter__.return_value = mock_client
+
+        with patch("t_tech.invest.Client", mock_client_class):
+            loader = TinkoffDataLoader(token="t")
+            loader.list_bonds()
+            loader.list_bonds()
+            loader.list_bonds()
+        assert mock_client.instruments.bonds.call_count == 1
+
+    def test_list_etfs_filters_class(self) -> None:
+        """TQTE kept; wrong class_code filtered."""
+
+        def make_etf(ticker: str, figi: str, class_code: str, status: int) -> MagicMock:
+            e = MagicMock()
+            e.ticker = ticker
+            e.figi = figi
+            e.name = f"ETF-{ticker}"
+            e.lot = 1
+            e.isin = f"RU{ticker}"
+            e.class_code = class_code
+            e.trading_status = status
+            e.api_trade_available_flag = True
+            e.currency = "RUB"
+            return e
+
+        etfs = [
+            make_etf("TMOS", "BBGTMOS01", "TQTE", 14),  # keep
+            make_etf("FXUS", "BBGFXUS01", "TQTE", 14),  # keep
+            make_etf("WRONG", "BBGWRONG", "TQTD", 14),  # wrong class -> skip
+            make_etf("SUSP", "BBGSUSP", "TQTE", 99),  # bad status -> skip
+        ]
+        mock_response = MagicMock()
+        mock_response.instruments = etfs
+        mock_client = MagicMock()
+        mock_client.instruments.etfs.return_value = mock_response
+        mock_client_class = MagicMock()
+        mock_client_class.return_value.__enter__.return_value = mock_client
+
+        with patch("t_tech.invest.Client", mock_client_class):
+            loader = TinkoffDataLoader(token="t")
+            result = loader.list_etfs()
+        assert {t.ticker for t in result} == {"TMOS", "FXUS"}
+        for meta in result:
+            assert meta.source == "tkf"
+
+    def test_list_etfs_caches(self) -> None:
+        etf = MagicMock()
+        etf.ticker = "TMOS"
+        etf.figi = "BBGTMOS01"
+        etf.name = "T-Капитал Индекс Мосбиржи"
+        etf.lot = 1
+        etf.isin = "RU000A101X68"
+        etf.class_code = "TQTE"
+        etf.trading_status = 14
+        etf.api_trade_available_flag = True
+        etf.currency = "RUB"
+
+        mock_response = MagicMock()
+        mock_response.instruments = [etf]
+        mock_client = MagicMock()
+        mock_client.instruments.etfs.return_value = mock_response
+        mock_client_class = MagicMock()
+        mock_client_class.return_value.__enter__.return_value = mock_client
+
+        with patch("t_tech.invest.Client", mock_client_class):
+            loader = TinkoffDataLoader(token="t")
+            loader.list_etfs()
+            loader.list_etfs()
+        assert mock_client.instruments.etfs.call_count == 1

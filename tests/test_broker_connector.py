@@ -206,7 +206,15 @@ class TestTinkoffAccount:
         assert status == OrderStatus.REJECTED
         mock_rg.evaluate.assert_called_once()
 
-    def test_risk_gate_approved_submits(self):
+    def test_risk_gate_approved_submits(
+        self,
+    ):  # Mock t_tech.invest (SDK is now installed, but we want offline unit tests)
+        import sys as _sys
+
+        _fake = MagicMock()
+        _fake.Client = MagicMock()
+        _sys.modules["t_tech.invest"] = _fake
+
         mock_rg = MagicMock()
         from src.risk.gate import RiskDecision
 
@@ -217,7 +225,13 @@ class TestTinkoffAccount:
         status = a.place_order(order)
         assert status == OrderStatus.SUBMITTED
 
-    def test_limit_order_submits(self):
+    def test_limit_order_submits(self):  # Mock t_tech.invest (SDK is now installed, but we want offline unit tests)
+        import sys as _sys
+
+        _fake = MagicMock()
+        _fake.Client = MagicMock()
+        _sys.modules["t_tech.invest"] = _fake
+
         mock_rg = MagicMock()
         from src.risk.gate import RiskDecision
 
@@ -240,17 +254,64 @@ class TestTinkoffAccount:
         assert elapsed >= 0.9
 
     def test_get_portfolio_mock_when_no_sdk(self):
+        # Mock t_tech.invest (SDK is now installed, but we want offline unit tests)
+        import sys as _sys
+
+        mock_client_class = MagicMock()
+        mock_client = MagicMock()
+        mock_client_class.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_class.return_value.__exit__ = MagicMock(return_value=False)
+        mock_acc = MagicMock()
+        mock_acc.id = "SB1"
+        mock_client.users.get_accounts.return_value.accounts = [mock_acc]
+        portfolio = MagicMock()
+        portfolio.positions = []
+        mock_cash = MagicMock()
+        mock_cash.units = 100000
+        mock_cash.nano = 0
+        portfolio.total_amount_currencies = mock_cash
+        mock_client.operations.get_portfolio.return_value = portfolio
+        _fake = MagicMock()
+        _fake.Client = mock_client_class
+        _sys.modules["t_tech.invest"] = _fake
+
         a = TinkoffAccount(token="t.x")
         snap = a.get_portfolio()
         assert snap.account_id == "SB1"
-        assert snap.cash == Decimal("100000.00")
+        assert snap.cash == Decimal("100000")
 
     def test_get_positions_calls_portfolio(self):
+        # Mock t_tech.invest (SDK is now installed, but we want offline unit tests)
+        import sys as _sys
+
+        mock_client_class = MagicMock()
+        mock_client = MagicMock()
+        mock_client_class.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_class.return_value.__exit__ = MagicMock(return_value=False)
+        mock_acc = MagicMock()
+        mock_acc.id = "SB1"
+        mock_client.users.get_accounts.return_value.accounts = [mock_acc]
+        portfolio = MagicMock()
+        portfolio.positions = []
+        portfolio.total_amount_currencies = MagicMock(units=100000, nano=0)
+        mock_client.operations.get_portfolio.return_value = portfolio
+        _fake = MagicMock()
+        _fake.Client = mock_client_class
+        _sys.modules["t_tech.invest"] = _fake
+
         a = TinkoffAccount(token="t.x")
         positions = a.get_positions()
         assert positions == []
 
-    def test_cancel_order_returns_cancelled(self):
+    def test_cancel_order_returns_cancelled(
+        self,
+    ):  # Mock t_tech.invest (SDK is now installed, but we want offline unit tests)
+        import sys as _sys
+
+        _fake = MagicMock()
+        _fake.Client = MagicMock()
+        _sys.modules["t_tech.invest"] = _fake
+
         a = TinkoffAccount(token="t.x")
         status = a.cancel_order("ORD-123")
         assert status == OrderStatus.CANCELLED
@@ -302,7 +363,7 @@ class TestTinkoffAccount:
         assert a.is_sandbox() is False
 
     def test_get_portfolio_with_mocked_sdk(self, monkeypatch):
-        """Mock tinkoff SDK to test real-code branches without dependency."""
+        """Mock t_tech SDK to test real-code branches without dependency."""
         mock_client_class = MagicMock()
         mock_client = MagicMock()
         mock_client_class.return_value.__enter__ = MagicMock(return_value=mock_client)
@@ -313,27 +374,20 @@ class TestTinkoffAccount:
         mock_acc.id = "ACC1"
         mock_client.users.get_accounts.return_value.accounts = [mock_acc]
 
-        # Portfolio with positions
-
+        # Portfolio with positions (new SDK: average_position_price is a Quotation
+        # with .units + .nano on the object itself, NOT nested .value)
         mock_pos = MagicMock()
         mock_pos.ticker = "SBER"
-        # Mock Tinkoff MoneyValue struct: avg_position_price has Quotation
-        # with units (int) and nano (int). Convert to Decimal via:
-        # value = units + nano / 1e9
         mock_pos.quantity = 10
         mock_price = MagicMock()
         mock_price.units = 250
         mock_price.nano = 0
-        # Override str() to return Decimal-parseable string
-        type(mock_price).__str__ = lambda self: "250.0"
-        mock_pos.average_position_price = MagicMock()
-        mock_pos.average_position_price.value = mock_price
+        mock_pos.average_position_price = mock_price
         portfolio = MagicMock()
         portfolio.positions = [mock_pos]
         mock_cash = MagicMock()
         mock_cash.units = 100000
         mock_cash.nano = 0
-        type(mock_cash).__str__ = lambda self: "100000.0"
         portfolio.total_amount_currencies = mock_cash
         mock_client.operations.get_portfolio.return_value = portfolio
 
@@ -346,7 +400,7 @@ class TestTinkoffAccount:
 
         fake_module = MagicMock()
         fake_module.Client = mock_client_class
-        monkeypatch.setitem(sys.modules, "tinkoff.invest", fake_module)
+        monkeypatch.setitem(sys.modules, "t_tech.invest", fake_module)
         monkeypatch.setitem(sys.modules, "tinkoff", MagicMock(invest=fake_module))
 
         a = TinkoffAccount(token="t.x", account_id="ACC1")
@@ -370,7 +424,7 @@ class TestTinkoffAccount:
 
         fake_module = MagicMock()
         fake_module.Client = mock_client_class
-        monkeypatch.setitem(sys.modules, "tinkoff.invest", fake_module)
+        monkeypatch.setitem(sys.modules, "t_tech.invest", fake_module)
 
         a = TinkoffAccount(token="t.x", account_id="MISSING")
         with pytest.raises(BrokerError, match="not found"):
@@ -387,7 +441,7 @@ class TestTinkoffAccount:
 
         fake_module = MagicMock()
         fake_module.Client = mock_client_class
-        monkeypatch.setitem(sys.modules, "tinkoff.invest", fake_module)
+        monkeypatch.setitem(sys.modules, "t_tech.invest", fake_module)
 
         a = TinkoffAccount(token="t.x")
         with pytest.raises(BrokerError, match="portfolio fetch failed"):
@@ -424,7 +478,7 @@ class TestTinkoffAccount:
         fake_module.orders.OrderDirection.ORDER_DIRECTION_SELL = "SELL"
         fake_module.orders.OrderType.ORDER_TYPE_MARKET = "MARKET"
         fake_module.orders.OrderType.ORDER_TYPE_LIMIT = "LIMIT"
-        monkeypatch.setitem(sys.modules, "tinkoff.invest", fake_module)
+        monkeypatch.setitem(sys.modules, "t_tech.invest", fake_module)
 
         a = TinkoffAccount(token="t.x", risk_gate=mock_rg, account_id="ACC1")
         order = MarketOrder(ticker="SBER", side=OrderSide.BUY, quantity=Decimal("10"))
@@ -459,7 +513,7 @@ class TestTinkoffAccount:
         fake_module.orders.OrderDirection.ORDER_DIRECTION_SELL = "SELL"
         fake_module.orders.OrderType.ORDER_TYPE_MARKET = "MARKET"
         fake_module.orders.OrderType.ORDER_TYPE_LIMIT = "LIMIT"
-        monkeypatch.setitem(sys.modules, "tinkoff.invest", fake_module)
+        monkeypatch.setitem(sys.modules, "t_tech.invest", fake_module)
 
         a = TinkoffAccount(token="t.x", risk_gate=mock_rg)
         order = LimitOrder(
@@ -496,7 +550,7 @@ class TestTinkoffAccount:
         fake_module.orders.OrderDirection.ORDER_DIRECTION_SELL = "SELL"
         fake_module.orders.OrderType.ORDER_TYPE_MARKET = "MARKET"
         fake_module.orders.OrderType.ORDER_TYPE_LIMIT = "LIMIT"
-        monkeypatch.setitem(sys.modules, "tinkoff.invest", fake_module)
+        monkeypatch.setitem(sys.modules, "t_tech.invest", fake_module)
 
         a = TinkoffAccount(token="t.x", risk_gate=mock_rg)
         order = MarketOrder(ticker="SBER", side=OrderSide.BUY, quantity=Decimal("10"))
@@ -540,7 +594,7 @@ class TestTinkoffAccount:
         fake_module.orders.OrderDirection.ORDER_DIRECTION_SELL = "SELL"
         fake_module.orders.OrderType.ORDER_TYPE_MARKET = "MARKET"
         fake_module.orders.OrderType.ORDER_TYPE_LIMIT = "LIMIT"
-        monkeypatch.setitem(sys.modules, "tinkoff.invest", fake_module)
+        monkeypatch.setitem(sys.modules, "t_tech.invest", fake_module)
 
         a = TinkoffAccount(token="t.x", risk_gate=mock_rg)
         order = MarketOrder(ticker="SBER", side=OrderSide.BUY, quantity=Decimal("10"))
@@ -591,7 +645,7 @@ class TestTinkoffAccount:
         fake_module.orders.OrderDirection.ORDER_DIRECTION_SELL = "SELL"
         fake_module.orders.OrderType.ORDER_TYPE_MARKET = "MARKET"
         fake_module.orders.OrderType.ORDER_TYPE_LIMIT = "LIMIT"
-        monkeypatch.setitem(sys.modules, "tinkoff.invest", fake_module)
+        monkeypatch.setitem(sys.modules, "t_tech.invest", fake_module)
 
         a = TinkoffAccount(token="t.x", risk_gate=mock_rg)
         order = MarketOrder(ticker="SBER", side=OrderSide.SELL, quantity=Decimal("10"))
@@ -611,7 +665,7 @@ class TestTinkoffAccount:
 
         fake_module = MagicMock()
         fake_module.Client = mock_client_class
-        monkeypatch.setitem(sys.modules, "tinkoff.invest", fake_module)
+        monkeypatch.setitem(sys.modules, "t_tech.invest", fake_module)
 
         a = TinkoffAccount(token="t.x")
         status = a.cancel_order("ORD-999")
@@ -629,7 +683,7 @@ class TestTinkoffAccount:
 
         fake_module = MagicMock()
         fake_module.Client = mock_client_class
-        monkeypatch.setitem(sys.modules, "tinkoff.invest", fake_module)
+        monkeypatch.setitem(sys.modules, "t_tech.invest", fake_module)
 
         a = TinkoffAccount(token="t.x")
         with pytest.raises(BrokerError, match="cancel failed"):
@@ -646,7 +700,7 @@ class TestTinkoffAccount:
 
         fake_module = MagicMock()
         fake_module.Client = mock_client_class
-        monkeypatch.setitem(sys.modules, "tinkoff.invest", fake_module)
+        monkeypatch.setitem(sys.modules, "t_tech.invest", fake_module)
 
         a = TinkoffAccount(token="t.x")
         figi = a._ticker_to_figi(mock_client, "SBER")

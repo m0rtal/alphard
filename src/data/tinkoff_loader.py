@@ -7,15 +7,31 @@ API surface used
 ----------------
 - t_tech.invest.Client(token) — sync gRPC client (context manager)
 - client.instruments.shares() — full MOEX share universe (1927+ instruments)
+- client.instruments.bonds() — full MOEX bond universe (OFZ + corp via class_code filter)
+- client.instruments.etfs() — full MOEX ETF universe (TQTE-class)
 - client.instruments.find_instrument(query='SBER') — find single instrument by ticker
 - client.market_data.get_candles(figi, from_, to, interval) — historical OHLCV
 
 Capabilities matrix
 -------------------
 - Full TQBR share universe (1927+ instruments via shares())
+- Full TQOB+TQCB bond universe (OFZ + corporate, ~1601 instruments via bonds())
+- Full TQTE ETF universe (~272 instruments via etfs())
 - Historical daily candles (gRPC) — primary path (≈5 years)
 - Order placement — Phase 6 (broker Connector)
 - Portfolio snapshot — Phase 5
+
+Russian market class codes
+--------------------------
+Tinkoff exposes every instrument with a MOEX ``class_code`` that we use to
+slice the bond universe:
+- ``TQOB`` — OFZ (federal) bonds
+- ``TQCB`` — corporate + municipal + sub-federal bonds
+- ``TQTE`` — exchange-traded funds (BPIFs)
+- ``TQBR`` — equities (main board)
+
+For Phase 1 we return both ``TQOB`` and ``TQCB`` so a fixed-income backtest
+can choose the OFZ slice downstream via ``isin`` prefix (RU000A0..0 = OFZ).
 
 Why gRPC (not REST HTTPS)
 Tinkoff Invest REST HTTPS endpoint requires a Russian-trusted CA chain
@@ -67,6 +83,16 @@ DEFAULT_RATE_PER_MIN = 100
 # built-in. Intraday is available but Phase 1.1 ships daily only.
 DAILY_INTERVAL = "CANDLE_INTERVAL_DAY"
 
+# MOEX class codes we want to surface from the bond universe.
+#   TQOB — OFZ (federal government bonds)
+#   TQCB — corporate, municipal, sub-federal bonds
+# Tinkoff's bonds() endpoint returns both; any other class_code is
+# exchange-internal / non-tradeable and gets filtered.
+_BOND_CLASS_CODES: frozenset[str] = frozenset({"TQOB", "TQCB"})
+
+# MOEX class code for exchange-traded funds (BPIFs included).
+_ETF_CLASS_CODE: str = "TQTE"
+
 
 def _money_to_decimal(money: Any) -> Decimal:
     """Convert tinkoff invest ``Money`` (units + nano) to Decimal."""
@@ -114,6 +140,8 @@ class TinkoffInvestDataLoader(DataLoader):
             raise LoaderAuthError("Tinkoff token not set: pass token= or export TINKOFF_SANDBOX_TOKEN")
         self._token = token
         self._universe_cache: dict[str, TickerMeta] | None = None
+        self._bonds_cache: dict[str, TickerMeta] | None = None
+        self._etfs_cache: dict[str, TickerMeta] | None = None
 
     # --------------------------------------------------------------- public
 
@@ -122,12 +150,37 @@ class TinkoffInvestDataLoader(DataLoader):
             return list(self._universe_cache.values())
         return list(self._ensure_universe().values())
 
+    def list_bonds(self) -> list[TickerMeta]:
+        """Return tradeable MOEX bonds (TQOB OFZ + TQCB corporate/muni).
+
+        Cached on first call: the gRPC ``bonds()`` endpoint returns the full
+        bond universe (~1601 instruments) in one round-trip. Both OFZ and
+        corporate bonds are returned; callers that need the OFZ-only slice
+        should filter on the ``isin`` prefix (RU000A0..0).
+        """
+        if self._bonds_cache is not None:
+            return list(self._bonds_cache.values())
+        return list(self._ensure_bonds().values())
+
+    def list_etfs(self) -> list[TickerMeta]:
+        """Return tradeable MOEX ETFs / BPIFs (TQTE class).
+
+        Cached on first call. No class-code filter is required because the
+        ``etfs()`` endpoint already returns only ETF instruments.
+        """
+        if self._etfs_cache is not None:
+            return list(self._etfs_cache.values())
+        return list(self._ensure_etfs().values())
+
     def get_ticker(self, ticker: str) -> TickerMeta:
-        universe = self._ensure_universe()
-        meta = universe.get(ticker.upper())
-        if meta is None:
-            raise LoaderNotFoundError(f"Ticker {ticker} not found in Tinkoff universe")
-        return meta
+        """Find a ticker across all instrument universes (shares, bonds, etfs)."""
+        t = ticker.upper()
+        for cache_getter in (self._ensure_universe, self._ensure_bonds, self._ensure_etfs):
+            cache = cache_getter()
+            meta = cache.get(t)
+            if meta is not None:
+                return meta
+        raise LoaderNotFoundError(f"Ticker {ticker} not found in Tinkoff universe")
 
     def fetch_ohlcv(
         self,
@@ -219,4 +272,77 @@ class TinkoffInvestDataLoader(DataLoader):
                     source=self.SOURCE,  # type: ignore[arg-type]
                 )
         self._universe_cache = universe
+        return universe
+
+    def _ensure_bonds(self) -> dict[str, TickerMeta]:
+        if self._bonds_cache is not None:
+            return self._bonds_cache
+        from t_tech.invest import Client
+
+        with Client(self._token) as client:
+            self.bucket.acquire()
+            response = client.instruments.bonds()
+            universe: dict[str, TickerMeta] = {}
+            for inst in response.instruments:
+                # bonds() returns both OFZ (TQOB) and corporate (TQCB).
+                # Drop exchange-internal / non-tradeable classes.
+                if inst.class_code not in _BOND_CLASS_CODES:
+                    continue
+                # Mirror shares() filter: NORMAL_TRADING + DEALER_NORMAL_TRADING + auctions.
+                try:
+                    ts = int(getattr(inst, "trading_status", 14) or 14)
+                    if ts not in (5, 14, 15):
+                        continue
+                except (ValueError, TypeError):
+                    pass
+                if getattr(inst, "api_trade_available_flag", None) is False:
+                    continue
+                ticker = inst.ticker
+                universe[ticker] = TickerMeta(
+                    ticker=ticker,
+                    figi=getattr(inst, "figi", None) or None,
+                    name=inst.name,
+                    lot=inst.lot,
+                    isin=inst.isin,
+                    currency=getattr(inst, "currency", "RUB") or "RUB",
+                    delisted=False,
+                    source=self.SOURCE,  # type: ignore[arg-type]
+                )
+        self._bonds_cache = universe
+        return universe
+
+    def _ensure_etfs(self) -> dict[str, TickerMeta]:
+        if self._etfs_cache is not None:
+            return self._etfs_cache
+        from t_tech.invest import Client
+
+        with Client(self._token) as client:
+            self.bucket.acquire()
+            response = client.instruments.etfs()
+            universe: dict[str, TickerMeta] = {}
+            for inst in response.instruments:
+                # etfs() returns only ETF instruments — TQTE on MOEX main board.
+                # Defensive: skip any non-MOEX or sub-class entries.
+                if inst.class_code != _ETF_CLASS_CODE:
+                    continue
+                try:
+                    ts = int(getattr(inst, "trading_status", 14) or 14)
+                    if ts not in (5, 14, 15):
+                        continue
+                except (ValueError, TypeError):
+                    pass
+                if getattr(inst, "api_trade_available_flag", None) is False:
+                    continue
+                ticker = inst.ticker
+                universe[ticker] = TickerMeta(
+                    ticker=ticker,
+                    figi=getattr(inst, "figi", None) or None,
+                    name=inst.name,
+                    lot=inst.lot,
+                    isin=inst.isin,
+                    currency=getattr(inst, "currency", "RUB") or "RUB",
+                    delisted=False,
+                    source=self.SOURCE,  # type: ignore[arg-type]
+                )
+        self._etfs_cache = universe
         return universe

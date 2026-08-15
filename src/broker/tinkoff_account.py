@@ -99,41 +99,75 @@ class TinkoffAccount(BrokerAccount):
         return intent, state
 
     def get_portfolio(self) -> PortfolioSnapshot:
-        """Real call to Tinkoff. Mock for now if SDK unavailable."""
+        """Real call to Tinkoff. Returns empty mock if SDK unavailable.
+
+        Live API contract (t_tech.invest SDK 1.49):
+        - client.users.get_accounts() → .accounts (list of Account)
+        - Account.id is the Tinkoff account_id
+        - client.operations.get_portfolio(account_id=...) → PortfolioResponse
+        - PortfolioResponse has .positions (list[PortfolioPosition]) and
+          .total_amount_currencies (Money). Money has .units + .nano.
+        """
         self._rate_limit_acquire()
         try:
-            from tinkoff.invest import Client
-        except ImportError:
-            logger.warning("tinkoff SDK not installed — returning mock portfolio")
-            return PortfolioSnapshot(
-                account_id=self._account_id,
-                cash=Decimal("100000.00"),
-                positions=[],
-                timestamp=datetime.utcnow(),
-            )
+            from t_tech.invest import Client
 
-        try:
             with Client(self._token) as client:
-                acc = client.users.get_accounts().accounts
+                acc_response = client.users.get_accounts()
                 ops = None
-                for a in acc:
+                for a in acc_response.accounts:
                     if a.id == self._account_id:
                         ops = a
                         break
                 if ops is None:
                     raise BrokerError(f"account {self._account_id} not found")
                 portfolio = client.operations.get_portfolio(account_id=self._account_id)
-                positions = [
-                    Position(
-                        ticker=p.ticker,
-                        quantity=Decimal(str(p.quantity)),
-                        avg_price=Decimal(str(p.average_position_price.value)),
-                    )
-                    for p in portfolio.positions
-                ]
+                positions = []
+                if getattr(portfolio, "positions", None):
+                    for p in portfolio.positions:
+                        # average_position_price is a Quotation (.units + .nano)
+                        # OR a legacy Money-like object (.value float) depending
+                        # on SDK/mock version. Handle both.
+                        avg_price_q = getattr(p, "average_position_price", None) or getattr(
+                            p, "average_buy_price", None
+                        )
+                        if avg_price_q is None:
+                            avg_price = Decimal("0")
+                        elif hasattr(avg_price_q, "units") and hasattr(avg_price_q, "nano"):
+                            avg_price = Decimal(str(getattr(avg_price_q, "units", 0))) + Decimal(
+                                str(getattr(avg_price_q, "nano", 0))
+                            ) / Decimal("1000000000")
+                        else:
+                            # Legacy: value is a float-like (e.g. Money.value).
+                            try:
+                                avg_price = Decimal(str(avg_price_q.value))
+                            except (AttributeError, TypeError, ValueError):
+                                avg_price = Decimal(str(avg_price_q))
+                        positions.append(
+                            Position(
+                                ticker=getattr(p, "ticker", ""),
+                                quantity=Decimal(str(getattr(p, "quantity", 0))),
+                                avg_price=avg_price,
+                            )
+                        )
+                total_amount = getattr(portfolio, "total_amount_currencies", None) or getattr(
+                    portfolio, "total_amount", None
+                )
+                cash = Decimal("0")
+                if total_amount is not None:
+                    if hasattr(total_amount, "units") and hasattr(total_amount, "nano"):
+                        cash = Decimal(str(getattr(total_amount, "units", 0))) + Decimal(
+                            str(getattr(total_amount, "nano", 0))
+                        ) / Decimal("1000000000")
+                    else:
+                        # Legacy Money.value
+                        try:
+                            cash = Decimal(str(total_amount.value))
+                        except (AttributeError, TypeError, ValueError):
+                            cash = Decimal(str(total_amount))
                 return PortfolioSnapshot(
                     account_id=self._account_id,
-                    cash=Decimal(str(portfolio.total_amount_currencies)),
+                    cash=cash,
                     positions=positions,
                     timestamp=datetime.utcnow(),
                 )
@@ -177,48 +211,55 @@ class TinkoffAccount(BrokerAccount):
         # RiskGate approved. Submit to broker.
         self._rate_limit_acquire()
         try:
-            from tinkoff.invest import Client
-        except ImportError:
-            logger.warning("tinkoff SDK not installed — returning mock SUBMITTED")
-            return OrderStatus.SUBMITTED
+            from t_tech.invest import (
+                Client,
+                OrderDirection,
+                OrderType,
+                Quotation,
+            )
 
-        try:
+            direction = (
+                OrderDirection.ORDER_DIRECTION_BUY
+                if order.side == OrderSide.BUY
+                else OrderDirection.ORDER_DIRECTION_SELL
+            )
             with Client(self._token) as client:
                 figi = self._ticker_to_figi(client, order.ticker)
-                direction = (
-                    client.orders.OrderDirection.ORDER_DIRECTION_BUY
-                    if order.side == OrderSide.BUY
-                    else client.orders.OrderDirection.ORDER_DIRECTION_SELL
-                )
                 if isinstance(order, MarketOrder):
                     resp = client.orders.post_order(
                         figi=figi,
                         quantity=int(order.quantity),
                         account_id=self._account_id,
                         direction=direction,
-                        order_type=client.orders.OrderType.ORDER_TYPE_MARKET,
+                        order_type=OrderType.ORDER_TYPE_MARKET,
                     )
                 else:
+                    # Limit order — wrap price into Quotation
+                    price_q = Quotation(
+                        units=int(order.price),
+                        nano=int((order.price - int(order.price)) * 1_000_000_000),
+                    )
                     resp = client.orders.post_order(
                         figi=figi,
                         quantity=int(order.quantity),
-                        price=order.price,
+                        price=price_q,
                         account_id=self._account_id,
                         direction=direction,
-                        order_type=client.orders.OrderType.ORDER_TYPE_LIMIT,
+                        order_type=OrderType.ORDER_TYPE_LIMIT,
                     )
-                return self._map_status(resp.execution_report_status)
+                # PostOrderResponse.execution_report_status is OrderExecutionReportStatus
+                # enum (real SDK) or a plain string (legacy/test mocks). Handle both.
+                ers = resp.execution_report_status
+                raw_name: str = getattr(ers, "name", None) or str(ers)
+                return self._map_status(raw_name)
         except Exception as e:
             raise BrokerError(f"Tinkoff order submit failed: {e}") from e
 
     def cancel_order(self, order_id: str) -> OrderStatus:
         self._rate_limit_acquire()
         try:
-            from tinkoff.invest import Client
-        except ImportError:
-            logger.warning("tinkoff SDK not installed — returning mock CANCELLED")
-            return OrderStatus.CANCELLED
-        try:
+            from t_tech.invest import Client
+
             with Client(self._token) as client:
                 client.orders.cancel_order(account_id=self._account_id, order_id=order_id)
                 return OrderStatus.CANCELLED
@@ -227,11 +268,15 @@ class TinkoffAccount(BrokerAccount):
 
     @staticmethod
     def _ticker_to_figi(client: Any, ticker: str) -> str:
-        """Map ticker to FIGI via Tinkoff instruments API."""
+        """Map ticker to FIGI via Tinkoff instruments API.
+
+        Accepts both TQBR (stocks) and TQOB (bonds) class codes so the
+        same helper works for the OFZ bond universe.
+        """
         try:
-            instruments = client.instruments.find_instrument(query=ticker).instruments
-            for inst in instruments:
-                if inst.ticker == ticker and inst.class_code == "TQBR":
+            response = client.instruments.find_instrument(query=ticker)
+            for inst in response.instruments:
+                if inst.ticker == ticker and inst.class_code in ("TQBR", "TQOB"):
                     return str(inst.figi)
         except Exception:
             pass
@@ -239,6 +284,7 @@ class TinkoffAccount(BrokerAccount):
 
     @staticmethod
     def _map_status(raw: str) -> OrderStatus:
+        # raw is OrderExecutionReportStatus enum name (e.g. "EXECUTION_REPORT_STATUS_FILL")
         mapping: dict[str, OrderStatus] = {
             "EXECUTION_REPORT_STATUS_FILL": OrderStatus.FILLED,
             "EXECUTION_REPORT_STATUS_PARTIALLYFILL": OrderStatus.FILLED,
