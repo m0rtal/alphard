@@ -22,6 +22,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Bot code (with correct ownership before USER switch)
 COPY --chown=alphard:alphard src/ ./src/
+COPY --chown=alphard:alphard scripts/ ./scripts/
 COPY --chown=alphard:alphard docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh && \
     mkdir -p /app/logs && chown -R alphard:alphard /app

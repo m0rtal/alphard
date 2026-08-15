@@ -32,10 +32,8 @@ services:
     image: ghcr.io/m0rtal/alphard:latest
     container_name: alphard-bot
     restart: unless-stopped
-    command: >
-      sh -c "apt-get update && apt-get install -y --no-install-recommends curl git &&
-             pip install --no-cache-dir pydantic pytest pytest-cov &&
-             python -c 'import time; print(\"alphard-bot heartbeat\", flush=True); time.sleep(3600)'"
+    env_file:
+      - .env
     environment:
       ENV: ${ENV:-production}
       TINKOFF_SANDBOX_TOKEN: ${TINKOFF_SANDBOX_TOKEN:?TINKOFF_SANDBOX_TOKEN required}
