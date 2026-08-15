@@ -49,7 +49,7 @@ jobs:
 
       - name: Run tests with coverage (incl. Postgres integration)
         run: |
-          pytest --cov=src --cov-fail-under=85 --cov-report=term-missing
+          pytest --cov=src --cov-fail-under=95 --cov-report=term-missing
 
       - name: Upload coverage to Codecov
         if: github.event_name == 'push'
