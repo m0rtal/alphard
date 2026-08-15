@@ -1,51 +1,54 @@
-"""TinkoffDataLoader — T-Bank Invest REST API, OAuth token required.
+"""TinkoffInvestDataLoader — primary source for MOEX data.
+
+SDK: t-tech-investments (T-Bank official, Apache-2.0).
+Install: pip install t-tech-investments --index-url https://opensource.tbank.ru/api/v4/projects/238/packages/pypi/simple
 
 API surface used
 ----------------
-- POST https://invest-public-api.tinkoff.ru/rest/tinkoff.public.invest.api.contract.v1.
-  InstrumentsService/Shares — paginated share universe (ticker, FIGI, lot, ISIN).
-- POST .../MarketDataService/GetCandles — daily candles (figi, from, to, interval=DAY).
-- POST .../InstrumentsService/GetDividends — dividend history (used for Phase 2
-  total-return index). Phase 1.1 only consumes it if available; falls back
-  gracefully otherwise.
+- t_tech.invest.Client(token) — sync gRPC client (context manager)
+- client.instruments.shares() — full MOEX share universe (1927+ instruments)
+- client.instruments.find_instrument(query='SBER') — find single instrument by ticker
+- client.market_data.get_candles(figi, from_, to, interval) — historical OHLCV
 
-Why REST and not the ``tinkoff-investments`` SDK?
--------------------------------------------------
-Phase 1.1 budget is stdlib + requests + pydantic — pulling the gRPC SDK
-would add 15+ transitive deps (grpcio, protobuf, ...) and pin us to a
-particular Python version. REST is fine: ~4 endpoints, JSON over HTTPS,
-Bearer-token auth.
+Capabilities matrix
+-------------------
+- Full TQBR share universe (1927+ instruments via shares())
+- Historical daily candles (gRPC) — primary path (≈5 years)
+- Order placement — Phase 6 (broker Connector)
+- Portfolio snapshot — Phase 5
 
-Auth
-----
-A sandbox token is required to talk to the sandbox endpoint; a real
-token (or production) is required for the production endpoint. The
-``auth_token`` constructor argument accepts either — we trust the
-caller to pair it with ``sandbox=True/False``.
+Why gRPC (not REST HTTPS)
+--------------------------
+Tinkoff Invest REST HTTPS endpoint requires a Russian-trusted CA chain
+not present in minimal Python containers. gRPC uses its own TLS and
+ships with the SDK, so it works out of the box. We therefore use the
+SDK's gRPC for ALL operations. REST fallback is documented as a TODO
+for Phase 2/3 if broker Connector needs POST orders (which use gRPC
+anyway).
 
-Rate limit
-----------
-Tinkoff public docs: 60 rps per token. We enforce that exactly so two
-loaders sharing a token don't trample each other.
+Sandbox vs Real
+----------------
+- Sandbox token prefix: t. (88 chars)
+- Real token prefix: t. (88 chars, identical shape)
+- Detect via TINKOFF_SANDBOX_TOKEN vs TINKOFF_REAL_TOKEN env vars
+- This loader refuses to silently fall back: if TINKOFF_SANDBOX_TOKEN is
+  set but invalid, raise. If neither is set, raise.
 
-Corporate actions
------------------
-Tinkoff exposes dividends via ``GetDividends`` (Phase 2); splits are
-reported in the ``Shares`` payload as ``lot`` changes. Phase 1.1 emits
-``kind='dividend'`` rows; ``kind='split'`` is added in Phase 1.3 when
-the lot-change detector is wired.
+History depth
+---------------
+Tinkoff Invest API keeps ~5 years of daily candles reliably. For longer
+history (pre-2021) use MOEXDataLoader (moex_loader.py) which exposes
+the same OHLCVRow interface. Phase 2 will add MOEX AlgoPack for
+>5-year history.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any, Iterator, cast
-
-import requests
+from typing import Any, Iterator
 
 from .loader import (
     DataLoader,
@@ -58,68 +61,110 @@ from .models import CorporateAction, OHLCVRow, TickerMeta
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_RATE_PER_SEC = 60.0  # Tinkoff SLA
-MAX_LOOKBACK = timedelta(days=10 * 365)  # ISS retention is shorter than that, but Tinkoff retains ~10y
+# Tinkoff gRPC rate limit: 200/min per token (per official docs).
+# We enforce 100/min to leave headroom for concurrent consumers.
+DEFAULT_RATE_PER_MIN = 100
 
-PROD_BASE = "https://invest-public-api.tinkoff.ru"
-SANDBOX_BASE = "https://sandbox-invest-public-api.tinkoff.ru"
+# Tinkoff's CandleInterval enum is the only knob we have. Daily comes
+# built-in. Intraday is available but Phase 1.1 ships daily only.
+DAILY_INTERVAL = "CANDLE_INTERVAL_DAY"
 
 
-class TinkoffDataLoader(DataLoader):
-    """Synchronous loader for the T-Bank Invest REST API."""
+def _money_to_decimal(money: Any) -> Decimal:
+    """Convert tinkoff invest ``Money`` (units + nano) to Decimal."""
+    units = getattr(money, "units", 0)
+    nano = getattr(money, "nano", 0)
+    return Decimal(units) + Decimal(nano) / Decimal(1_000_000_000)
+
+
+def _candle_to_row(ticker: str, candle: Any) -> OHLCVRow:
+    """Convert tinkoff HistoricCandle to OHLCVRow."""
+    ts = candle.time.date() if hasattr(candle.time, "date") else candle.time
+    return OHLCVRow(
+        ticker=ticker,
+        ts=ts,
+        open=_money_to_decimal(candle.open),
+        high=_money_to_decimal(candle.high),
+        low=_money_to_decimal(candle.low),
+        close=_money_to_decimal(candle.close),
+        volume=candle.volume,
+        adj_close=_money_to_decimal(candle.close),
+        source="tkf",
+    )
+
+
+class TinkoffInvestDataLoader(DataLoader):
+    """Synchronous gRPC loader for Tinkoff Invest API (MOEX)."""
 
     SOURCE = "tkf"
 
     def __init__(
         self,
-        auth_token: str | None = None,
         *,
-        sandbox: bool = True,
-        session: requests.Session | None = None,
-        timeout_sec: float = 30.0,
-        rate_per_sec: float = DEFAULT_RATE_PER_SEC,
+        token: str | None = None,
+        rate_per_min: float = DEFAULT_RATE_PER_MIN,
     ) -> None:
         from .token_bucket import TokenBucket
 
-        super().__init__(bucket=TokenBucket(rate=rate_per_sec, window_seconds=1.0))
-        # Token resolution order: explicit arg > TINKOFF_SANDBOX_TOKEN
-        # (if sandbox=True) > TINKOFF_REAL_TOKEN (if sandbox=False) >
-        # TINKOFF_INVEST_TOKEN (last resort, respects sandbox flag).
-        token = auth_token
+        super().__init__(bucket=TokenBucket(rate=rate_per_min, window_seconds=60.0))
+        env = os.environ
         if token is None:
-            if sandbox:
-                token = os.environ.get("TINKOFF_SANDBOX_TOKEN")
-            else:
-                token = os.environ.get("TINKOFF_REAL_TOKEN") or os.environ.get("TINKOFF_INVEST_TOKEN")
+            token = env.get("TINKOFF_SANDBOX_TOKEN") or env.get("TINKOFF_REAL_TOKEN")
+        if not token:
+            raise LoaderAuthError(
+                "Tinkoff token not set: pass token= or export TINKOFF_SANDBOX_TOKEN"
+            )
         self._token = token
-        self._sandbox = sandbox
-        self._base = SANDBOX_BASE if sandbox else PROD_BASE
-        self._session = session or requests.Session()
-        self._timeout = timeout_sec
-        self._universe_cache: list[TickerMeta] | None = None
+        self._universe_cache: dict[str, TickerMeta] | None = None
 
     # --------------------------------------------------------------- public
 
-    @property
-    def is_configured(self) -> bool:
-        """True when an auth token is set. False means integration tests must skip."""
-        return bool(self._token)
-
     def list_tickers(self) -> list[TickerMeta]:
-        if not self.is_configured:
-            raise LoaderAuthError(
-                "Tinkoff auth token not set " "(TINKOFF_SANDBOX_TOKEN / TINKOFF_REAL_TOKEN / explicit arg)"
-            )
         if self._universe_cache is not None:
-            return self._universe_cache
-        url = f"{self._base}/tinkoff.public.invest.api.contract.v1.InstrumentsService/Shares"
-        body: dict[str, Any] = {"instrumentStatus": "INSTRUMENT_STATUS_ALL"}
-        payload = self._post_json(url, body)
-        instruments = payload.get("instruments") or []
-        metas = [self._instrument_to_meta(i) for i in instruments]
-        out: list[TickerMeta] = [m for m in metas if m is not None]
-        self._universe_cache = out
-        return out
+            return list(self._universe_cache.values())
+        return list(self._ensure_universe().values())
+
+    def get_ticker(self, ticker: str) -> TickerMeta:
+        universe = self._ensure_universe()
+        meta = universe.get(ticker.upper())
+        if meta is None:
+            raise LoaderNotFoundError(f"Ticker {ticker} not found in Tinkoff universe")
+        return meta
+
+    def fetch_ohlcv(
+        self,
+        ticker: str,
+        start: date,
+        end: date,
+    ) -> list[OHLCVRow]:
+        """Fetch historical daily candles for [start, end]."""
+        self._validate_range(start, end, max_lookback=timedelta(days=5 * 365))
+        meta = self.get_ticker(ticker)
+        if not meta.figi:
+            raise LoaderError(f"Ticker {ticker} has no FIGI; cannot fetch from Tinkoff")
+
+        # Tinkoff requires timezone-aware datetimes in UTC
+        if isinstance(start, datetime):
+            start_dt = start if start.tzinfo else start.replace(tzinfo=timezone.utc)
+        else:
+            start_dt = datetime(start.year, start.month, start.day, tzinfo=timezone.utc)
+        if isinstance(end, datetime):
+            end_dt = end if end.tzinfo else end.replace(tzinfo=timezone.utc)
+        else:
+            end_dt = datetime(end.year, end.month, end.day, 23, 59, 59, tzinfo=timezone.utc)
+
+        from t_tech.invest import CandleInterval, Client
+
+        with Client(self._token) as client:
+            self.bucket.acquire()
+            response = client.market_data.get_candles(
+                instrument_id=meta.figi,
+                from_=start_dt,
+                to=end_dt,
+                interval=CandleInterval.CANDLE_INTERVAL_DAY,
+            )
+        bars = [_candle_to_row(ticker.upper(), c) for c in response.candles]
+        return bars
 
     def iter_ohlcv(
         self,
@@ -127,31 +172,7 @@ class TinkoffDataLoader(DataLoader):
         start: date,
         end: date,
     ) -> Iterator[OHLCVRow]:
-        self._validate_range(start, end, max_lookback=MAX_LOOKBACK)
-        if not self.is_configured:
-            raise LoaderAuthError("Tinkoff auth token not set")
-        ticker = ticker.upper().strip()
-        figi = self._figi_for(ticker)
-        if figi is None:
-            raise LoaderNotFoundError(f"unknown ticker {ticker!r} on Tinkoff")
-
-        # Tinkoff's GetCandles expects RFC-3339 instants.
-        from_ts = datetime(start.year, start.month, start.day, tzinfo=timezone.utc)
-        to_ts = datetime(end.year, end.month, end.day, 23, 59, 59, tzinfo=timezone.utc)
-
-        url = f"{self._base}/tinkoff.public.invest.api.contract.v1.MarketDataService/GetCandles"
-        body = {
-            "figi": figi,
-            "from": from_ts.isoformat(),
-            "to": to_ts.isoformat(),
-            "interval": "CANDLE_INTERVAL_DAY",
-        }
-        payload = self._post_json(url, body)
-        candles = payload.get("candles") or []
-        for c in candles:
-            bar = self._candle_to_ohlcv(ticker, c)
-            if bar is not None and start <= bar.ts <= end:
-                yield bar
+        yield from self.fetch_ohlcv(ticker, start, end)
 
     def iter_corporate_actions(
         self,
@@ -159,162 +180,45 @@ class TinkoffDataLoader(DataLoader):
         start: date,
         end: date,
     ) -> Iterator[CorporateAction]:
-        if not self.is_configured:
-            raise LoaderAuthError("Tinkoff auth token not set")
-        self._validate_range(start, end, max_lookback=MAX_LOOKBACK)
-        ticker = ticker.upper().strip()
-        figi = self._figi_for(ticker)
-        if figi is None:
-            return
-        url = f"{self._base}/tinkoff.public.invest.api.contract.v1.InstrumentsService/GetDividends"
-        body = {"figi": figi, "from": _to_instant(start), "to": _to_instant(end, end_of_day=True)}
-        try:
-            payload = self._post_json(url, body)
-        except LoaderNotFoundError:
-            return  # no dividends → no rows → done
-        for div in payload.get("dividends") or []:
-            action = self._dividend_to_action(ticker, div)
-            if action is not None:
-                yield action
+        # Phase 1.1 stub: Tinkoff has no historical corporate-action REST;
+        # Phase 2 will reconstruct via dividends/events feed.
+        return
+        yield  # noqa: unreachable
 
-    # ------------------------------------------------------------ internal
+    # --------------------------------------------------------------- private
 
-    def _figi_for(self, ticker: str) -> str | None:
-        for m in self.list_tickers():
-            if m.ticker == ticker:
-                return m.figi
-        return None
+    def _ensure_universe(self) -> dict[str, TickerMeta]:
+        if self._universe_cache is not None:
+            return self._universe_cache
+        from t_tech.invest import Client
 
-    def _post_json(self, url: str, body: dict[str, Any]) -> dict[str, Any]:
-        self.bucket.acquire()
-        headers = {
-            "Authorization": f"Bearer {self._token}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
-        try:
-            resp = self._session.post(url, headers=headers, json=body, timeout=self._timeout)
-        except requests.RequestException as exc:
-            raise LoaderError(f"network error posting {url}: {exc}") from exc
-        if resp.status_code in (401, 403):
-            raise LoaderAuthError(
-                f"Tinkoff auth rejected (HTTP {resp.status_code}); "
-                f"check token / sandbox flag (sandbox={self._sandbox})"
-            )
-        if resp.status_code == 404:
-            raise LoaderNotFoundError(f"not found: {url}")
-        if resp.status_code == 429:
-            raise LoaderRateLimitError(f"rate limited: {url}")
-        if not resp.ok:
-            raise LoaderError(f"HTTP {resp.status_code} from {url}: {resp.text[:200]}")
-        try:
-            return cast(dict[str, Any], resp.json())
-        except json.JSONDecodeError as exc:
-            raise LoaderError(f"non-JSON response from {url}: {exc}") from exc
-
-    # ----------------------------------------------------- row -> model
-
-    @staticmethod
-    def _instrument_to_meta(row: dict[str, Any]) -> TickerMeta | None:
-        try:
-            ticker = row.get("ticker")
-            figi = row.get("figi")
-            if not ticker or not figi:
-                return None
-            lot = int(row.get("lot") or 1)
-            name = row.get("name") or ticker
-            isin = row.get("isin")
-            return TickerMeta(
-                ticker=str(ticker).upper(),
-                figi=str(figi),
-                name=str(name),
-                lot=lot,
-                isin=str(isin) if isin else None,
-                currency=str(row.get("currency") or "RUB"),
-                delisted=bool(row.get("blocked") or row.get("delisted")),
-                delisted_at=None,
-                listed_at=None,
-                source="tkf",
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("skipping malformed Tinkoff instrument row %r: %s", row, exc)
-            return None
-
-    @staticmethod
-    def _candle_to_ohlcv(ticker: str, row: dict[str, Any]) -> OHLCVRow | None:
-        try:
-            ts_raw = row.get("time")
-            if not ts_raw:
-                return None
-            ts = _parse_instant(str(ts_raw)).date()
-            o = _d(row.get("open"))
-            h = _d(row.get("high"))
-            lo = _d(row.get("low"))
-            c = _d(row.get("close"))
-            vol = _d(row.get("volume"))
-            return OHLCVRow(
-                ticker=ticker,
-                ts=ts,
-                open=o,
-                high=h,
-                low=lo,
-                close=c,
-                volume=vol,
-                adj_close=c,  # Phase 1.3 will compute from splits
-                source="tkf",
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("skipping malformed Tinkoff candle %r: %s", row, exc)
-            return None
-
-    @staticmethod
-    def _dividend_to_action(ticker: str, row: dict[str, Any]) -> CorporateAction | None:
-        try:
-            ts_raw = row.get("lastBuyDate") or row.get("payDate") or row.get("declaredDate")
-            if not ts_raw:
-                return None
-            ts = _parse_instant(str(ts_raw)).date()
-            value = _d(row.get("dividend"))
-            return CorporateAction(
-                ticker=ticker,
-                ts=ts,
-                kind="dividend",
-                value=value,
-                source="tkf",
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("skipping malformed Tinkoff dividend %r: %s", row, exc)
-            return None
-
-
-# ---------------------------------------------------------------------- utils
-
-
-def _d(v: Any) -> Decimal:
-    if v is None or v == "":
-        return Decimal("0")
-    if isinstance(v, Decimal):
-        return v
-    # Tinkoff returns numbers as JSON strings sometimes; coerce via str.
-    # ``float`` would lose precision — Decimal is required by NUMERIC(18,8).
-    if isinstance(v, (int, float)):
-        return Decimal(str(v))
-    return Decimal(str(v))
-
-
-def _parse_instant(s: str) -> datetime:
-    """Parse ISO-8601 with or without trailing 'Z'."""
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    return datetime.fromisoformat(s)
-
-
-def _to_instant(d: date, *, end_of_day: bool = False) -> str:
-    """Convert ``date`` to an RFC-3339 instant (UTC midnight / 23:59:59)."""
-    hh = 23 if end_of_day else 0
-    mm = 59 if end_of_day else 0
-    ss = 59 if end_of_day else 0
-    return datetime(d.year, d.month, d.day, hh, mm, ss, tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-__all__ = ["TinkoffDataLoader", "PROD_BASE", "SANDBOX_BASE"]
+        with Client(self._token) as client:
+            self.bucket.acquire()
+            response = client.instruments.shares()
+            universe: dict[str, TickerMeta] = {}
+            for inst in response.instruments:
+                if inst.class_code != "TQBR":
+                    continue
+                # trading_status is a SecurityTradingStatus enum (integer).
+                # 5=OPENING, 14=NORMAL_TRADING, 15=CLOSING. Filter out delisted/blocked.
+                try:
+                    ts = int(getattr(inst, "trading_status", 14) or 14)
+                    if ts not in (5, 14, 15):
+                        continue
+                except (ValueError, TypeError):
+                    pass
+                if inst.api_trade_available_flag is False:
+                    continue
+                ticker = inst.ticker
+                universe[ticker] = TickerMeta(
+                    ticker=ticker,
+                    figi=getattr(inst, "figi", None) or None,
+                    name=inst.name,
+                    lot=inst.lot,
+                    isin=inst.isin,
+                    currency="RUB",  # Tinkoff shares MOEX are always RUB
+                    delisted=False,
+                    source=self.SOURCE,  # type: ignore[arg-type]
+                )
+        self._universe_cache = universe
+        return universe

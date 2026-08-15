@@ -47,7 +47,7 @@ from .loader import (
 from .moex_loader import MOEXDataLoader
 from .models import CorporateAction, OHLCVRow, TickerMeta
 from .store import DataStore, StoreError
-from .tinkoff_loader import TinkoffDataLoader
+from .tinkoff_loader import TinkoffInvestDataLoader as TinkoffDataLoader
 from .token_bucket import RateLimitError, TokenBucket
 
 __all__ = [
