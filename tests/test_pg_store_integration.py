@@ -170,7 +170,16 @@ class TestOHLCVCRUD:
         assert rows[0].close == Decimal("105.00")
         assert rows[0].volume == Decimal("1000000")
 
-    def test_upsert_replaces_existing(self, pg_store):
+    def test_upsert_preserves_first_value(self, pg_store):
+        """Upsert on (ticker, ts) does NOT overwrite OHLCV — first source wins.
+
+        Documented behaviour in pg_store.upsert_ohlcv: when a (ticker, ts)
+        row already exists, the existing OHLCV values are preserved (first
+        source wins); only covered_by_* flags are OR'd in.
+
+        To force a NEW bar value, the caller must delete the row first.
+        This test pins that intentional invariant.
+        """
         meta = TickerMeta(
             ticker="PG_REPL",
             name="Replace Co",
@@ -188,8 +197,8 @@ class TestOHLCVCRUD:
             close=Decimal("105"),
             volume=Decimal("1000"),
             adj_close=Decimal("105"),
-            primary_source="manual",
-            covered_by_tkf=False,
+            primary_source="tkf",
+            covered_by_tkf=True,
             covered_by_moex=False,
         )
         row2 = OHLCVRow(
@@ -201,15 +210,20 @@ class TestOHLCVCRUD:
             close=Decimal("210"),
             volume=Decimal("2000"),
             adj_close=Decimal("210"),
-            primary_source="manual",
+            primary_source="moex",
             covered_by_tkf=False,
-            covered_by_moex=False,
+            covered_by_moex=True,
         )
         pg_store.upsert_ohlcv([row1])
         pg_store.upsert_ohlcv([row2])
         rows = pg_store.query_ohlcv("PG_REPL", date(2026, 8, 1), date(2026, 8, 31))
-        assert len(rows) == 1  # replaced, not duplicated
-        assert rows[0].close == Decimal("210")
+        assert len(rows) == 1  # one row per (ticker, ts), not duplicated
+        # First-source-wins: row1's OHLCV preserved
+        assert rows[0].close == Decimal("105")
+        assert rows[0].volume == Decimal("1000")
+        # BUT covered_by_* flags OR'd — both sources now confirmed
+        assert rows[0].covered_by_tkf is True
+        assert rows[0].covered_by_moex is True
 
     def test_query_outside_range_empty(self, pg_store):
         rows = pg_store.query_ohlcv("PG_OHLCV", date(2099, 1, 1), date(2099, 12, 31))
