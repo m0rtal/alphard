@@ -29,26 +29,45 @@ logger = logging.getLogger("alphard.daily_sync")
 
 # Top 20 MOEX TQBR by ADV (June 2026 estimate). Phase 1.1 bootstrap.
 LIQUID_UNIVERSE = [
-    "SBER", "GAZP", "LKOH", "GMKN", "NVTK",
-    "ROSN", "TATN", "MGNT", "MOEX", "ALRS",
-    "MTSS", "SNGS", "NLMK", "CHMF", "YDEX",
-    "OZON", "VKCO", "SBERP", "BANE", "BSPB",
+    "SBER",
+    "GAZP",
+    "LKOH",
+    "GMKN",
+    "NVTK",
+    "ROSN",
+    "TATN",
+    "MGNT",
+    "MOEX",
+    "ALRS",
+    "MTSS",
+    "SNGS",
+    "NLMK",
+    "CHMF",
+    "YDEX",
+    "OZON",
+    "VKCO",
+    "SBERP",
+    "BANE",
+    "BSPB",
 ]
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--days", type=int, default=5,
-                        help="Pull last N days (default 5, includes weekends)")
-    parser.add_argument("--backfill", type=int, default=0,
-                        help="If > 0, pull N days for the full universe (one-time backfill)")
-    parser.add_argument("--universe", nargs="*", default=None,
-                        help="Ticker list (default: top 20 MOEX liquid)")
-    parser.add_argument("--dsn", default=os.environ.get("ALPHARD_PG_DSN"),
-                        help="Postgres DSN (falls back to $ALPHARD_PG_DSN)")
-    parser.add_argument("--source", default="tkf",
-                        choices=["tkf", "moex"],
-                        help="Primary source: tkf (Tinkoff, default) or moex (MOEX ISS)")
+    parser.add_argument("--days", type=int, default=5, help="Pull last N days (default 5, includes weekends)")
+    parser.add_argument(
+        "--backfill", type=int, default=0, help="If > 0, pull N days for the full universe (one-time backfill)"
+    )
+    parser.add_argument("--universe", nargs="*", default=None, help="Ticker list (default: top 20 MOEX liquid)")
+    parser.add_argument(
+        "--dsn", default=os.environ.get("ALPHARD_PG_DSN"), help="Postgres DSN (falls back to $ALPHARD_PG_DSN)"
+    )
+    parser.add_argument(
+        "--source",
+        default="tkf",
+        choices=["tkf", "moex"],
+        help="Primary source: tkf (Tinkoff, default) or moex (MOEX ISS)",
+    )
     args = parser.parse_args()
 
     if not args.dsn:
@@ -56,8 +75,7 @@ def main() -> int:
         return 1
 
     os.environ["ALPHARD_PG_DSN"] = args.dsn
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s [%(levelname)s] %(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
     if args.backfill > 0:
         end = date.today()
@@ -79,6 +97,7 @@ def main() -> int:
             return 2
     else:
         from src.data.moex_loader import MOEXDataLoader
+
         loader = MOEXDataLoader()
 
     store = PostgresDataStore()
