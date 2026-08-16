@@ -329,10 +329,17 @@ class TestConnectionLifecycle:
         )
         s._connect()
         cur = fake_conn_cls.last.cursors[0]
-        # BUGFIX (C-1): search_path is now passed as a parameterized query,
-        # so the SQL is "SET search_path TO %s" and the value lives in params.
-        assert any("SET search_path TO %s" in sql for sql, _ in cur.calls)
-        assert any(params == ("alphard_test, public",) for _, params in cur.calls)
+        # BUGFIX (C-1): search_path can't use %s placeholders (Postgres
+        # raises SyntaxError for SET). It's validated against _IDENTIFIER_RE
+        # in __init__, then interpolated via f-string (provably safe).
+        assert any(sql == "SET search_path TO alphard_test, public" for sql, _ in cur.calls)
+
+    def test_connect_rejects_unsafe_search_path(self, fake_conn_cls: Any) -> None:
+        # Defence-in-depth: anything outside [a-z_][a-z0-9_]*, with optional
+        # comma-separated segments, must be rejected at construction time
+        # to keep the f-string inside _connect() provably SQL-safe.
+        with pytest.raises(ValueError, match="invalid search_path"):
+            PostgresDataStore(dsn="host=h dbname=d user=u", search_path="public; DROP TABLE x")
 
     def test_connect_no_search_path_skips_set(self, fake_conn_cls: Any) -> None:
         s = PostgresDataStore(dsn="host=h dbname=d user=u")

@@ -83,9 +83,12 @@ class PostgresDataStore(DataStore):
             self._conn = self._psycopg.connect(self._dsn, autocommit=True)
             if self._search_path:
                 with self._conn.cursor() as cur:
-                    # Parameterized: search_path was already validated against
-                    # _IDENTIFIER_RE in __init__, so %s is safe.
-                    cur.execute("SET search_path TO %s", (self._search_path,))
+                    # SET search_path cannot use %s placeholders (Postgres
+                    # raises SyntaxError). search_path was already validated
+                    # against _IDENTIFIER_RE in __init__, so f-string is
+                    # provably safe — only identifiers matching
+                    # [a-z_][a-z0-9_]*(, [a-z_][a-z0-9_]*)* are accepted.
+                    cur.execute(f"SET search_path TO {self._search_path}")
 
     def close(self) -> None:
         if self._conn is not None and not self._conn.closed:
