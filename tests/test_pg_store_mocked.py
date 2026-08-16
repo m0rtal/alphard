@@ -769,7 +769,7 @@ class TestQueryOHLCV:
     def test_query_short_row_defaults(self) -> None:
         """A row with 8 columns parses into OHLCVRow."""
         row = ("SBER", date(2026, 8, 14), "100", "110", "95", "105", "1000", "105")
-        o = _row_to_ohlcv(row)
+        _ = _row_to_ohlcv(row)
 
 
 # ---------------------------------------------------------------------------

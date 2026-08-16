@@ -41,13 +41,13 @@ from src.data.tinkoff_md_loader import (
 # ---------------------------------------------------------------------------
 
 
-def _minute(ts_iso: str, o: str, c: str, h: str, l: str, v: int) -> dict:
+def _minute(ts_iso: str, o: str, c: str, h: str, lo: str, v: int) -> dict:
     return {
         "ts": datetime.fromisoformat(ts_iso.replace("Z", "+00:00")).astimezone(timezone.utc),
         "open": Decimal(o),
         "close": Decimal(c),
         "high": Decimal(h),
-        "low": Decimal(l),
+        "low": Decimal(lo),
         "volume": v,
     }
 

@@ -54,9 +54,9 @@ import os
 import time
 import zipfile
 from collections import defaultdict
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
-from typing import Iterable, Iterator
+from typing import Iterator
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
