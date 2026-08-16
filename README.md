@@ -6,11 +6,16 @@
 
 Автономный multi-agent trading bot на MOEX/Tinkoff. Apache-2.0, self-hosted, Docker-only.
 
-> **Статус: Phase 1.2 closed, Phase 2 pending.** Data Agent работает end-to-end
-> через Tinkoff Invest gRPC (1516 SPBXM + 150 TQBR). Risk Agent enforce 5 fail-safe
-> лимитов. **Бот НЕ торгует на реальные деньги** — `LIVE_TRADING=false` hardlock
-> в `src/broker/tinkoff_account.py`. Real sandbox order placement ещё не выполнен
-> (Phase 1.4). Quant Agent, Macro Agent, ML pipeline — Phase 2+.
+> **Статус: Phase 1.3 closed, Phase 2 pending.** Data Agent работает end-to-end
+> через Tinkoff Invest (gRPC для live candles + history-data endpoint для
+> backfill). Universe **динамический** — собирается на этапе бэкфила без
+> фильтра по `trading_status` (TQBR + SPBXM + TQOB + TQCB + TQTE), а на этапе
+> торгов сужается по реальной доступности (`qualifier_flags`, листинг).
+> Текущий снапшот: см. `SELECT COUNT(*) FROM ticker_universe` в Postgres.
+> Risk Agent enforce 5 fail-safe лимитов. **Бот НЕ торгует на реальные деньги**
+> — `LIVE_TRADING=false` hardlock в `src/broker/tinkoff_account.py`.
+> Real sandbox order placement ещё не выполнен (Phase 1.4).
+> Quant Agent, Macro Agent, ML pipeline — Phase 2+.
 
 ## Что это
 
@@ -29,7 +34,7 @@ Alphard — автономный multi-agent trading system:
 
 | Agent | Phase | Status |
 |---|---|---|
-| Data | 1.2 | ✅ Tinkoff gRPC + MOEX ISS, 270k+ bars |
+| Data | 1.3 | ✅ Tinkoff (gRPC + history-data) + MOEX ISS, 2.6M+ bars |
 | Risk | 1.1 | ✅ 35 tests, 97% coverage, 5 fail-safe limits |
 | Quality | 1.2 | ✅ 3 уровня (CRITICAL/HIGH/MEDIUM/LOW) |
 | Broker | 1.3 | ✅ TinkoffAccount, sandbox switch, LIVE_TRADING=false |
@@ -70,9 +75,10 @@ docker compose logs -f alphard-bot
 ```
 
 ```bash
-# Запуск бэкфилла (полный universe, 5y OHLCV):
-docker exec alphard-bot python3 scripts/backfill_spbxm_universe.py
-# 1516 SPBXM × 5y ≈ 75 мин при 100 req/min
+# Запуск бэкфилла (полный universe, 5y OHLCV — TQBR+SPBXM+TQOB+TQCB+TQTE):
+docker exec alphard-bot python3 scripts/backfill_history_md.py
+# Текущий снапшот universe: см. SELECT COUNT(*) FROM ticker_universe;
+# Объём и время выполнения зависят от рыночной ситуации.
 ```
 
 > **One compose file. Anywhere.** `docker-compose.yaml` — single source of truth
@@ -109,16 +115,18 @@ alphard/
 │   ├── coordinator.py          # Data→Quality→Risk→Broker pipeline
 │   └── _types.py
 ├── tests/
-│   ├── test_pg_store_integration.py   # 271 passed, 89.37% coverage
+│   ├── test_pg_store_integration.py   # integration tests (run against real Postgres)
 │   ├── test_risk_gate.py
 │   ├── test_coordinator.py
 │   ├── test_tinkoff_grpc.py
 │   ├── test_broker_connector.py
-│   └── test_quality/
+│   ├── test_token_bucket.py           # Concurrency safety for rate-limited APIs
+│   └── test_tinkoff_md_loader.py      # MD archive (history-data) parsing
 ├── scripts/
 │   ├── daily_sync.py                  # Cron 19:00 MSK Mon-Fri
-│   ├── backfill_spbxm_universe.py     # Full SPBXM/TQBR backfill
-│   ├── backfill_full_universe.py
+│   ├── backfill_history_md.py         # Full universe via Tinkoff history-data
+│   ├── backfill_full_universe.py      # Combined MOEX+Tinkoff backfill
+│   ├── backfill_spbxm_universe.py     # SPBXM-only (legacy entrypoint)
 │   ├── ci_local.sh
 │   └── backfill_delisted_via_tinkoff.py
 ├── .dockerignore

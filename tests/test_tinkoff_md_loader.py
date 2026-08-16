@@ -440,6 +440,8 @@ class TestUniverse:
         ]
         with patch("src.data.tinkoff_loader.TinkoffInvestDataLoader") as mock_grpc:
             mock_grpc.return_value.list_shares_all.side_effect = [fake_tqbr, fake_spbxm, [], [], [], [], []]
+            mock_grpc.return_value.list_bonds.return_value = []
+            mock_grpc.return_value.list_etfs.return_value = []
             metas = loader.list_tickers_with_figi()
         assert len(metas) == 2
         tickers = {m.ticker for m in metas}
@@ -455,6 +457,51 @@ class TestUniverse:
         with patch("src.data.tinkoff_loader.TinkoffInvestDataLoader") as mock_grpc:
             # TQBR fails, SPBXM succeeds.
             mock_grpc.return_value.list_shares_all.side_effect = [RuntimeError("rate"), good, [], [], [], [], []]
+            mock_grpc.return_value.list_bonds.return_value = []
+            mock_grpc.return_value.list_etfs.return_value = []
             metas = loader.list_tickers_with_figi()
         assert len(metas) == 1
         assert metas[0].ticker == "SBER"
+
+    def test_list_tickers_includes_bonds_and_etfs(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Bonds (TQOB/TQCB) and ETFs (TQTE) must be merged into the universe
+        on the backfill path — no client-side filter on asset type."""
+        monkeypatch.setenv("TINKOFF_SANDBOX_TOKEN", "fake-token-1234567890")
+        from src.data.token_bucket import TokenBucket
+
+        loader = TinkoffInvestMDDataLoader(bucket=TokenBucket(rate=1000.0, window_seconds=1.0))
+
+        fake_share = [
+            TickerMeta(ticker="SBER", figi="BBG004730N88", class_code="TQBR", name="Sber", lot=1, source="tkf")
+        ]
+        fake_bond = [
+            TickerMeta(ticker="RU000A0ZZZ", figi="BBG00BOND001", class_code="TQOB", name="OFZ", lot=1, source="tkf")
+        ]
+        fake_etf = [
+            TickerMeta(ticker="FXUS", figi="BBG00ETF001", class_code="TQTE", name="FinEx US", lot=1, source="tkf")
+        ]
+        with patch("src.data.tinkoff_loader.TinkoffInvestDataLoader") as mock_grpc:
+            mock_grpc.return_value.list_shares_all.side_effect = [fake_share, [], [], [], [], [], []]
+            mock_grpc.return_value.list_bonds.return_value = fake_bond
+            mock_grpc.return_value.list_etfs.return_value = fake_etf
+            metas = loader.list_tickers_with_figi()
+        tickers = {m.ticker for m in metas}
+        assert tickers == {"SBER", "RU000A0ZZZ", "FXUS"}
+
+    def test_list_tickers_continues_when_bonds_or_etfs_fail(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """If list_bonds() / list_etfs() raise, shares must still come through."""
+        monkeypatch.setenv("TINKOFF_SANDBOX_TOKEN", "fake-token-1234567890")
+        from src.data.token_bucket import TokenBucket
+
+        loader = TinkoffInvestMDDataLoader(bucket=TokenBucket(rate=1000.0, window_seconds=1.0))
+
+        fake_share = [
+            TickerMeta(ticker="SBER", figi="BBG004730N88", class_code="TQBR", name="Sber", lot=1, source="tkf")
+        ]
+        with patch("src.data.tinkoff_loader.TinkoffInvestDataLoader") as mock_grpc:
+            mock_grpc.return_value.list_shares_all.side_effect = [fake_share, [], [], [], [], [], []]
+            mock_grpc.return_value.list_bonds.side_effect = RuntimeError("rate limit")
+            mock_grpc.return_value.list_etfs.side_effect = RuntimeError("auth")
+            metas = loader.list_tickers_with_figi()
+        tickers = {m.ticker for m in metas}
+        assert tickers == {"SBER"}

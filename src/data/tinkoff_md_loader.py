@@ -233,31 +233,30 @@ class TinkoffInvestMDDataLoader(DataLoader):
     # ---- universe -------------------------------------------------------
 
     def list_tickers(self) -> list[TickerMeta]:
-        """Universe = every share Tinkoff exposes, regardless of class_code.
+        """Universe = everything Tinkoff exposes, regardless of class_code or
+        asset type. No client-side filter on trading_status — delisted/suspended
+        tickers still have a FIGI and the MD archive honours it (200 + zip for
+        years before delisting).
 
-        We pull the broker-side ``list_shares_all`` per class_code (TQBR,
-        SPBXM, TQBS, TQDE, ...). The union covers ≈1927 Russian shares
-        + 1516 SPBX US/foreign names + other boards. NO client-side
-        filter on trading_status — delisted tickers still have a FIGI
-        and the MD archive honours it (returns 200 + zip for the years
-        before delisting).
+        We pull the broker-side ``list_shares_all`` per class_code for shares,
+        ``list_bonds`` for TQOB/TQCB, and ``list_etfs`` for TQTE. The union
+        covers ~1927 Russian shares + 1516 SPBX US/foreign names + minor
+        boards (TQBS/TQDE/TQNO/TQLV/TQPI) + ~1601 OFZ + corporate bonds
+        + MOEX ETFs. Caller-side ``figi`` filter drops rows without a
+        archive handle.
 
-        For Phase 1.1 we keep this lean: shares only. Bonds/ETFs have
-        shorter history windows and are not the Phase 1.1 priority.
-
-        Note: ``figi`` may be ``None`` if the gRPC cache returns a row
-        without one — caller must drop such entries before issuing
-        archive requests.
+        No filter on universe size or class — that's the backfill policy.
         """
         from .tinkoff_loader import TinkoffInvestDataLoader
 
         grpc_loader = TinkoffInvestDataLoader(token=self._token)
-        # Class codes to harvest: broker-side full universe, no client filter.
+        # Shares: full universe across all boards, no client filter.
         # TQBR = MOEX main board Russian shares (incl. delisted/suspended).
         # SPBXM = SPB Exchange US/foreign shares.
         # TQBS/TQDE/TQNO/TQLV/TQPI = MOEX minor boards.
         target_classes = ("TQBR", "SPBXM", "TQBS", "TQDE", "TQNO", "TQLV", "TQPI")
         seen: dict[str, TickerMeta] = {}
+        # 1) Shares per class_code.
         for cls in target_classes:
             try:
                 metas = grpc_loader.list_shares_all(class_code=cls)
@@ -267,6 +266,20 @@ class TinkoffInvestMDDataLoader(DataLoader):
             for m in metas:
                 if m.figi and m.ticker not in seen:
                     seen[m.ticker] = m
+        # 2) Bonds (TQOB OFZ + TQCB corporate/muni).
+        try:
+            for m in grpc_loader.list_bonds():
+                if m.figi and m.ticker not in seen:
+                    seen[m.ticker] = m
+        except Exception as e:  # noqa: BLE001
+            logger.warning("list_bonds() failed: %s", e)
+        # 3) ETFs (TQTE).
+        try:
+            for m in grpc_loader.list_etfs():
+                if m.figi and m.ticker not in seen:
+                    seen[m.ticker] = m
+        except Exception as e:  # noqa: BLE001
+            logger.warning("list_etfs() failed: %s", e)
         return list(seen.values())
 
     def list_tickers_with_figi(self) -> list[TickerMeta]:
