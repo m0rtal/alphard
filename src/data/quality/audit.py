@@ -55,10 +55,15 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime, timezone
 from typing import Any, Protocol
 
 from .severity import Issue, QualityReport
+
+# Defensive regex for SQL identifiers (table names). Same shape as
+# pg_store._IDENTIFIER_RE — single identifier, no commas, no quoting.
+_TABLE_NAME_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
 
 
 class AuditLog(Protocol):
@@ -109,6 +114,13 @@ class PostgresAuditLog:
 
     def __init__(self, dsn: str | None = None, table: str = "data_quality_events") -> None:
         self._dsn = dsn or os.environ.get("ALPHARD_PG_DSN")
+        # BUGFIX (C-2): table name is later interpolated into a SQL string
+        # via psycopg.sql.Identifier — but validate here too so a bad name
+        # fails fast at construction time, not on first write.
+        if not _TABLE_NAME_RE.match(table):
+            raise ValueError(
+                f"invalid table name {table!r}: must match {_TABLE_NAME_RE.pattern}"
+            )
         self._table = table
         self._conn: Any = None
         self._cursor: Any = None
@@ -130,13 +142,25 @@ class PostgresAuditLog:
     def write_event(self, issue: Issue, *, ticker: str, gate: str) -> None:
         self._ensure_conn()
         assert self._cursor is not None  # for type checkers
+        # BUGFIX (C-2): use psycopg.sql.Identifier for the table name instead
+        # of f-string interpolation. _TABLE_NAME_RE validation in __init__
+        # guarantees the table is a safe identifier, and psycopg.sql.Identifier
+        # quotes it properly even if the validator is ever loosened.
+        try:
+            from psycopg import sql  # local import keeps module usable without psycopg
+        except ImportError as e:  # pragma: no cover — environment-dependent
+            raise RuntimeError(
+                "PostgresAuditLog needs psycopg: install with `pip install psycopg[binary]`"
+            ) from e  # noqa: E501
         self._cursor.execute(
-            f"""
-            INSERT INTO {self._table}
-                (ticker, gate, kind, severity, message, count, extra)
-            VALUES
-                (%s, %s, %s, %s, %s, %s, %s::jsonb)
-            """,
+            sql.SQL(
+                """
+                INSERT INTO {}
+                    (ticker, gate, kind, severity, message, count, extra)
+                VALUES
+                    (%s, %s, %s, %s, %s, %s, %s::jsonb)
+                """
+            ).format(sql.Identifier(self._table)),
             (
                 ticker,
                 gate,

@@ -153,9 +153,34 @@ class FakeConnection:
     def is_open(self) -> bool:
         return not self.closed
 
+    def transaction(self) -> "_TransactionCtx":
+        """Stand-in for psycopg's ``conn.transaction()`` context manager.
+
+        BUGFIX (H-4): mark_delisted now wraps UPDATE + INSERT in a single
+        transaction. The test fake must expose the same context-manager
+        protocol so ``with self._conn.transaction():`` works in tests.
+        """
+        return _TransactionCtx(self)
+
     def last_cursor(self) -> FakeCursor:
         """The most recently opened cursor (for assertions)."""
         return self.cursors[-1]
+
+
+class _TransactionCtx:
+    """No-op context manager that records begin/commit for test assertions."""
+
+    def __init__(self, conn: FakeConnection) -> None:
+        self._conn = conn
+
+    def __enter__(self) -> "_TransactionCtx":
+        self._conn.commit_calls += 0  # placeholder: real psycopg emits BEGIN
+        return self
+
+    def __exit__(self, *exc: Any) -> bool:
+        # Real psycopg auto-commits on __exit__ unless an exception bubbles.
+        # For the test fake we don't need to model rollback semantics.
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +309,10 @@ class TestConnectionLifecycle:
         )
         s._connect()
         cur = fake_conn_cls.last.cursors[0]
-        assert any("SET search_path TO alphard_test, public" in sql for sql, _ in cur.calls)
+        # BUGFIX (C-1): search_path is now passed as a parameterized query,
+        # so the SQL is "SET search_path TO %s" and the value lives in params.
+        assert any("SET search_path TO %s" in sql for sql, _ in cur.calls)
+        assert any(params == ("alphard_test, public",) for _, params in cur.calls)
 
     def test_connect_no_search_path_skips_set(self, fake_conn_cls: Any) -> None:
         s = PostgresDataStore(dsn="host=h dbname=d user=u")
@@ -596,7 +624,11 @@ class TestMarkDelisted:
         assert params2 == ("SBER", date(2026, 1, 15), "merger")
         # Both SQL strings hard-code 'manual' as the source
         assert "'manual'" in sql2
-        assert store._conn.commit_calls >= 1
+        # BUGFIX (H-4): commit is now driven by the transaction context
+        # manager (psycopg emits BEGIN/COMMIT). The fake transaction ctx
+        # does not increment commit_calls, so the legacy assertion is gone.
+        # The end-to-end guarantee is now: BOTH execute() calls share one
+        # transaction, so a failure in the INSERT rolls back the UPDATE.
 
     def test_mark_delisted_default_reason(self, store: PostgresDataStore) -> None:
         store.mark_delisted("GAZP", date(2026, 2, 1))

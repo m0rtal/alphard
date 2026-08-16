@@ -92,20 +92,26 @@ class TokenBucket:
             return (1.0 - self._tokens) / rate_per_sec
 
     def acquire(self, now: float | None = None) -> None:
-        """Block until one token is available."""
-        delay = self.wait_time(now=now)
-        if delay > 0:
-            # Sleep on the wall clock, not monotonic, since we already
-            # measured in monotonic.
-            time.sleep(delay)
+        """Block until one token is available.
+
+        BUGFIX (C-5): previous implementation did ``delay = wait_time(); sleep; grab``,
+        which races under concurrency — another thread can drain the bucket
+        during the sleep, leaving this caller to raise ``RateLimitError``
+        even though it just slept. The fix: a tight retry-loop where
+        ``sleep`` happens OUTSIDE the lock so other threads can also refill.
+        """
         assert self._lock is not None
-        with self._lock:
-            t = now if now is not None else time.monotonic()
-            self._refill_locked(t)
-            if self._tokens < 1.0:
-                # Defensive — should be impossible after the sleep.
-                raise RateLimitError("token bucket drained during acquire")
-            self._tokens -= 1.0
+        rate_per_sec = self.rate / self.window_seconds
+        while True:
+            with self._lock:
+                t = now if now is not None else time.monotonic()
+                self._refill_locked(t)
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                delay = (1.0 - self._tokens) / rate_per_sec
+            # Sleep OUTSIDE the lock so other threads can refill / claim.
+            time.sleep(delay)
 
     def acquire_nowait(self, now: float | None = None) -> None:
         """Take a token or raise ``RateLimitError`` immediately."""

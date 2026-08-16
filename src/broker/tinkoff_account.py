@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Optional
 
@@ -85,7 +85,10 @@ class TinkoffAccount(BrokerAccount):
 
         intent = TradeIntent(
             symbol=order.ticker,
-            side="buy" if order.side.value.lower() == "sell" else order.side.value.lower(),
+            # BUGFIX (C-4): the previous expression
+            #   "buy" if order.side.value.lower() == "sell" else order.side.value.lower()
+            # silently inverted SELL → BUY. Pass the side through as-is.
+            side=order.side.value.lower(),
             quantity=order.quantity,
             price=price,
         )
@@ -169,7 +172,7 @@ class TinkoffAccount(BrokerAccount):
                     account_id=self._account_id,
                     cash=cash,
                     positions=positions,
-                    timestamp=datetime.utcnow(),
+                    timestamp=datetime.now(timezone.utc),
                 )
         except Exception as e:
             raise BrokerError(f"Tinkoff portfolio fetch failed: {e}") from e

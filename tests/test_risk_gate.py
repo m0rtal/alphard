@@ -378,9 +378,20 @@ class TestFailSafe:
             TradeIntent(symbol="   ", side="buy", quantity=Decimal("1"), price=Decimal("1"))
 
     def test_fail_safe_invalid_side(self, limits: RiskLimits, base_state: PortfolioState) -> None:
-        """'sell' is not supported in the skeleton -> ValidationError."""
-        with pytest.raises(ValidationError):
-            TradeIntent(symbol="SBER", side="sell", quantity=Decimal("1"), price=Decimal("1"))
+        """Both 'buy' and 'sell' are now accepted (BUGFIX C-4). Other values
+        (e.g. 'short', 'hold', '') still fail at the model layer."""
+        # Accepted sides
+        for ok_side in ("buy", "sell", "BUY", "SELL"):
+            intent = TradeIntent(
+                symbol="SBER", side=ok_side, quantity=Decimal("1"), price=Decimal("1")
+            )
+            assert intent.side == ok_side.lower()
+        # Rejected sides
+        for bad_side in ("short", "hold", "cover"):
+            with pytest.raises(ValidationError):
+                TradeIntent(
+                    symbol="SBER", side=bad_side, quantity=Decimal("1"), price=Decimal("1")
+                )
 
     def test_fail_safe_negative_quantity(self, limits: RiskLimits, base_state: PortfolioState) -> None:  # noqa: E501
         """Negative quantity is rejected at the model layer (fail-safe)."""

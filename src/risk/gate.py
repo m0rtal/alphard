@@ -91,10 +91,12 @@ class TradeIntent(BaseModel):
     @classmethod
     def _validate_side(cls, v: str) -> str:
         v_norm = v.strip().lower()
-        # Skeleton: only 'buy' is meaningfully wired. Anything else is rejected
-        # at the validation layer (fail-safe).
-        if v_norm not in {"buy"}:
-            raise ValueError(f"side must be 'buy' in skeleton (got {v!r})")
+        # BUGFIX (C-4): allow both "buy" and "sell". The previous whitelist of
+        # only {"buy"} masked the broker-side SELL→BUY inversion — by the time
+        # an inverted "buy" hit this validator, the damage was done. With the
+        # broker fix in place, we now let both sides through to RiskGate.
+        if v_norm not in {"buy", "sell"}:
+            raise ValueError(f"side must be 'buy' or 'sell' (got {v!r})")
         return v_norm
 
     @property

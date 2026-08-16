@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from datetime import date
 from typing import Any
 
@@ -30,6 +31,11 @@ from .models import CorporateAction, OHLCVRow, TickerMeta
 from .store import DataStore, StoreError
 
 logger = logging.getLogger(__name__)
+
+# Defensive regex for SQL identifiers (search_path schema names, table names).
+# Allows only safe characters: lowercase letters, digits, underscores.
+# Must start with a letter or underscore.
+_IDENTIFIER_RE = re.compile(r"^[a-z_][a-z0-9_]*(?:\s*,\s*[a-z_][a-z0-9_]*)*$")
 
 
 class PostgresDataStore(DataStore):
@@ -58,6 +64,13 @@ class PostgresDataStore(DataStore):
         self._schema_sql_path = schema_sql_path or os.path.join(os.path.dirname(__file__), "schema.sql")  # noqa: E501
         # Optional: keep a custom search_path on every (re)connect.
         # Used by tests to isolate against an alphard_test schema.
+        # Validate that search_path only contains safe identifier(s) to
+        # prevent SQL injection even if it ever comes from an untrusted
+        # source (test fixture, future config loader).
+        if search_path is not None and not _IDENTIFIER_RE.match(search_path):
+            raise ValueError(
+                f"invalid search_path {search_path!r}: must match {_IDENTIFIER_RE.pattern}"
+            )
         self._search_path = search_path
         # Imported lazily so the rest of the package works without psycopg.
         import psycopg
@@ -72,7 +85,9 @@ class PostgresDataStore(DataStore):
             self._conn = self._psycopg.connect(self._dsn, autocommit=True)
             if self._search_path:
                 with self._conn.cursor() as cur:
-                    cur.execute(f"SET search_path TO {self._search_path}")
+                    # Parameterized: search_path was already validated against
+                    # _IDENTIFIER_RE in __init__, so %s is safe.
+                    cur.execute("SET search_path TO %s", (self._search_path,))
 
     def close(self) -> None:
         if self._conn is not None and not self._conn.closed:
@@ -153,19 +168,22 @@ class PostgresDataStore(DataStore):
         return out
 
     def mark_delisted(self, ticker: str, at: date, *, reason: str = "") -> None:
+        # BUGFIX (H-4): autocommit=True on connect means each execute() commits
+        # independently. Wrap UPDATE + INSERT in a single transaction so they
+        # either both succeed or both roll back — state stays in sync.
         self._connect()
-        with self._conn.cursor() as cur:
-            cur.execute(
-                "UPDATE ticker_universe SET delisted = TRUE, delisted_at = %s, "
-                "updated_at = NOW() WHERE ticker = %s",  # noqa: E501
-                (at, ticker),
-            )
-            cur.execute(
-                "INSERT INTO delisting_log (ticker, delisted_at, reason, source) "
-                "VALUES (%s, %s, %s, 'manual')",  # noqa: E501
-                (ticker, at, reason),
-            )
-        self._conn.commit()
+        with self._conn.transaction():
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE ticker_universe SET delisted = TRUE, delisted_at = %s, "
+                    "updated_at = NOW() WHERE ticker = %s",  # noqa: E501
+                    (at, ticker),
+                )
+                cur.execute(
+                    "INSERT INTO delisting_log (ticker, delisted_at, reason, source) "
+                    "VALUES (%s, %s, %s, 'manual')",  # noqa: E501
+                    (ticker, at, reason),
+                )
 
     # ---------------------------------------------------------- OHLCV
 

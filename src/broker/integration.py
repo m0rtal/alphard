@@ -76,7 +76,9 @@ class OrderFlow:
         state = self._portfolio_to_state(portfolio)
         intent = TradeIntent(
             symbol=symbol.upper(),
-            side="buy" if side.value.lower() == "sell" else side.value.lower(),
+            # BUGFIX (C-4): pass side through unchanged. The previous expression
+            # silently inverted SELL → BUY.
+            side=side.value.lower(),
             quantity=quantity,
             price=Decimal("1"),  # proxy; real fetch from market data
         )
