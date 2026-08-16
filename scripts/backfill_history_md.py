@@ -43,6 +43,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import signal
 import sys
 import time
 import threading
@@ -63,9 +64,18 @@ logger = logging.getLogger("alphard.backfill_history_md")
 
 
 class _LoaderTimeout(Exception):
-    """Raised by the per-ticker deadline watchdog when the wall-clock
-    deadline is exceeded. Injected asynchronously into the main thread
-    via ``PyThreadState_SetAsyncExc``."""
+    """Raised when the per-ticker deadline is exceeded. The
+    ``_alarm_handler`` at module level raises this from SIGALRM so
+    the main thread exits ``iter_ohlcv`` cleanly without relying on
+    ctypes thread injection (which only works when the watchdog can
+    capture the main thread id at function entry)."""
+
+
+def _alarm_handler(signum: int, frame: object) -> None:
+    """Convert SIGALRM into a clean ``_LoaderTimeout`` so the
+    ``except _LoaderTimeout`` branch in ``_backfill_one`` catches it
+    and the main loop records the failure cleanly."""
+    raise _LoaderTimeout()
 
 
 # Circuit breaker: how many consecutive ticker failures before we abort
@@ -133,26 +143,37 @@ def _backfill_one(
     """
     deadline = time.monotonic() + _TICKER_DEADLINE_SECONDS
     timed_out = threading.Event()
+    # Capture the main thread id at function entry — PyThreadState_SetAsyncExc
+    # takes a target thread id, and the watchdog thread's own id is NOT the
+    # main thread. If we captured in the watchdog closure, we'd inject an
+    # exception into the watchdog itself (which would be cleared by
+    # timed_out.set() and produce silent failure).
+    main_thread_id = threading.get_ident()
+
+    # Belt-and-suspenders: signal.alarm runs in the main thread on
+    # POSIX, fires SIGALRM after ``_TICKER_DEADLINE_SECONDS`` and is
+    # caught by _alarm_handler. The ctypes thread injection below is
+    # the primary mechanism; this is the safety net.
+    _sigalrm_supported = hasattr(signal, "SIGALRM")
+    _prev_alarm = signal.alarm(0) if _sigalrm_supported else 0
+    if _sigalrm_supported:
+        signal.signal(signal.SIGALRM, _alarm_handler)
+        signal.alarm(_TICKER_DEADLINE_SECONDS)
 
     def _deadline_watchdog() -> None:
         while not timed_out.is_set():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 logger.warning(
-                    f"[{ticker_idx}/{total}] {ticker}: deadline "
-                    f"{_TICKER_DEADLINE_SECONDS}s exceeded, aborting"
+                    f"[{ticker_idx}/{total}] {ticker}: deadline " f"{_TICKER_DEADLINE_SECONDS}s exceeded, aborting"
                 )
-                # Inject exception into the main thread via ctypes.
+                # Inject exception into the MAIN thread via ctypes.
                 # CPython GIL + PyThreadState_SetAsyncExc is the standard
                 # pattern for thread-safe timeout enforcement.
                 import ctypes
 
-                thread_id = ctypes.c_long(threading.get_ident())
                 code = ctypes.py_object(_LoaderTimeout)
-                for tid in (threading.get_ident(),):
-                    ctypes.pythonapi.PyThreadState_SetAsyncExc(
-                        ctypes.c_long(tid), code
-                    )
+                ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_long(main_thread_id), code)
                 timed_out.set()
                 return
             time.sleep(min(5.0, max(1.0, remaining / 4)))
@@ -168,9 +189,7 @@ def _backfill_one(
         for b in loader.iter_ohlcv(ticker, start, end):
             now = time.monotonic()
             if now - last_heartbeat >= 30.0:
-                logger.info(
-                    f"[{ticker_idx}/{total}] {ticker} STREAM elapsed={now - ticker_started:.0f}s"
-                )
+                logger.info(f"[{ticker_idx}/{total}] {ticker} STREAM elapsed={now - ticker_started:.0f}s")
                 last_heartbeat = now
             rows.append(b)
         if not rows:
@@ -188,6 +207,10 @@ def _backfill_one(
         return {"fetched": 0, "written": -1}
     finally:
         timed_out.set()  # tell watchdog to exit
+        if _sigalrm_supported:
+            signal.alarm(0)  # cancel any pending SIGALRM
+            if _prev_alarm:
+                signal.alarm(_prev_alarm)  # restore prior alarm
 
 
 def main() -> int:
@@ -250,7 +273,13 @@ def main() -> int:
                 continue
 
             stats = _backfill_one(
-                loader, store, ticker, start, end, ticker_idx=i, total=len(tickers),
+                loader,
+                store,
+                ticker,
+                start,
+                end,
+                ticker_idx=i,
+                total=len(tickers),
             )
             total_fetched += max(stats["fetched"], 0)
             total_written += max(stats["written"], 0)
