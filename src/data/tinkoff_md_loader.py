@@ -56,7 +56,7 @@ import zipfile
 from collections import defaultdict
 from datetime import date, datetime, timezone
 from decimal import Decimal
-from typing import Iterator
+from typing import Any, Iterator
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -113,7 +113,7 @@ _DOWNLOAD_TIMEOUT = 60
 # ---------------------------------------------------------------------------
 
 
-def aggregate_minutes_to_daily(rows: list[dict]) -> list[dict]:
+def aggregate_minutes_to_daily(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Group minute bars by trading date and produce daily OHLCV.
 
     Input schema (one dict per minute bar)::
@@ -147,12 +147,12 @@ def aggregate_minutes_to_daily(rows: list[dict]) -> list[dict]:
     """
     if not rows:
         return []
-    by_day: dict[date, list[dict]] = defaultdict(list)
+    by_day: dict[date, list[dict[str, Any]]] = defaultdict(list)
     for r in rows:
         ts = r["ts"]
         d = ts.date() if isinstance(ts, datetime) else ts
         by_day[d].append(r)
-    daily: list[dict] = []
+    daily: list[dict[str, Any]] = []
     for d in sorted(by_day.keys()):
         bars = by_day[d]
         if not bars:
@@ -299,7 +299,7 @@ class TinkoffInvestMDDataLoader(DataLoader):
                     raise LoaderRateLimitError(f"Tinkoff MD archive rate-limited for {figi}/{year}")
                 if status >= 500:
                     raise LoaderError(f"Tinkoff MD archive HTTP {status} for {figi}/{year}")
-                body = resp.read()
+                body: bytes = resp.read()
         except HTTPError as e:
             if e.code == 404:
                 self._archive_cache[cache_key] = None
@@ -317,7 +317,7 @@ class TinkoffInvestMDDataLoader(DataLoader):
         self._archive_cache[cache_key] = body
         return body
 
-    def parse_archive(self, zip_bytes: bytes) -> list[dict]:
+    def parse_archive(self, zip_bytes: bytes) -> list[dict[str, Any]]:
         """Parse one ZIP archive into a flat list of minute-bar dicts.
 
         Returns
@@ -333,7 +333,7 @@ class TinkoffInvestMDDataLoader(DataLoader):
             Malformed CSV or ZIP — bubble up; caller treats as
             per-archive failure.
         """
-        out: list[dict] = []
+        out: list[dict[str, Any]] = []
         try:
             with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
                 for name in zf.namelist():
@@ -398,17 +398,17 @@ class TinkoffInvestMDDataLoader(DataLoader):
             raise LoaderNotFoundError(f"TinkoffInvestMDDataLoader: no FIGI for ticker {ticker!r}")
         figi = meta.figi
         # Aggregate per year, then yield only the bars in the window.
-        per_year: dict[date, dict] = {}
+        per_year: dict[date, dict[str, Any]] = {}
         for year in range(max(self._min_year, start.year), end.year + 1):
             zip_bytes = self.download_year(figi, year)
             if zip_bytes is None:
                 continue
             minutes = self.parse_archive(zip_bytes)
-            for d in aggregate_minutes_to_daily(minutes):
-                per_year[d["ts"]] = d
-        for d in sorted(per_day := per_year):
-            # Re-bind to satisfy type-checker about per_year[date] vs per_year's mutable default.
-            _ = per_day
+            for daily_bar in aggregate_minutes_to_daily(minutes):
+                d_ts = daily_bar["ts"]
+                assert isinstance(d_ts, date)
+                per_year[d_ts] = daily_bar
+        for d in sorted(per_year):
             daily = per_year[d]
             if daily["ts"] < start or daily["ts"] > end:
                 continue
