@@ -232,6 +232,11 @@ class TinkoffInvestMDDataLoader(DataLoader):
 
     # ---- universe -------------------------------------------------------
 
+    # Cache the broker-side universe for the lifetime of this loader. The
+    # universe is constant across a backfill run; we don't want to re-fetch
+    # it once per ticker (would issue ~14k gRPC calls for 1971 tickers).
+    _universe_cache: list[TickerMeta] | None = None
+
     def list_tickers(self) -> list[TickerMeta]:
         """Universe = everything Tinkoff exposes, regardless of class_code or
         asset type. No client-side filter on trading_status — delisted/suspended
@@ -245,8 +250,14 @@ class TinkoffInvestMDDataLoader(DataLoader):
         + MOEX ETFs. Caller-side ``figi`` filter drops rows without a
         archive handle.
 
+        Result is cached after the first call. The cache is invalidated on
+        :class:`TinkoffInvestMDDataLoader` re-construction, which is the
+        natural lifetime for a backfill run.
+
         No filter on universe size or class — that's the backfill policy.
         """
+        if self._universe_cache is not None:
+            return self._universe_cache
         from .tinkoff_loader import TinkoffInvestDataLoader
 
         grpc_loader = TinkoffInvestDataLoader(token=self._token)
@@ -280,7 +291,8 @@ class TinkoffInvestMDDataLoader(DataLoader):
                     seen[m.ticker] = m
         except Exception as e:  # noqa: BLE001
             logger.warning("list_etfs() failed: %s", e)
-        return list(seen.values())
+        self._universe_cache = list(seen.values())
+        return self._universe_cache
 
     def list_tickers_with_figi(self) -> list[TickerMeta]:
         """Same as ``list_tickers`` but drops entries with missing FIGI."""

@@ -45,6 +45,7 @@ import logging
 import os
 import sys
 import time
+import threading
 from datetime import date
 
 # Make alphard.src importable when run from /app in container.
@@ -59,6 +60,26 @@ from src.data.tinkoff_md_loader import (  # noqa: E402
 from typing import Any  # noqa: E402
 
 logger = logging.getLogger("alphard.backfill_history_md")
+
+
+class _LoaderTimeout(Exception):
+    """Raised by the per-ticker deadline watchdog when the wall-clock
+    deadline is exceeded. Injected asynchronously into the main thread
+    via ``PyThreadState_SetAsyncExc``."""
+
+
+# Circuit breaker: how many consecutive ticker failures before we abort
+# the whole run. Catches systematic issues (rate-limit ban, MD endpoint
+# outage, parse bug) without burning hours on a doomed loop.
+_CIRCUIT_BREAKER_THRESHOLD = 5
+
+# Hard per-ticker deadline. If _backfill_one() doesn't return within this
+# many seconds, the heartbeating watchdog inside it raises _LoaderTimeout
+# and the run moves on to the next ticker. SBER + 9 years of minute bars
+# fits in ~30s; foreign ETFs over the IB bridge can take 90s on a bad
+# day. 180s gives enough headroom without letting a single stuck ticker
+# starve the whole run.
+_TICKER_DEADLINE_SECONDS = 180
 
 
 def _resolve_universe(
@@ -98,26 +119,75 @@ def _backfill_one(
     ticker: str,
     start: date,
     end: date,
+    ticker_idx: int = 0,
+    total: int = 0,
 ) -> dict[str, int]:
-    """Download + aggregate + upsert one ticker. Returns stats."""
+    """Download + aggregate + upsert one ticker. Returns stats.
+
+    Hard deadline: each ticker has ``_TICKER_DEADLINE_SECONDS`` wall-clock
+    seconds. A background thread monitors the elapsed time and raises
+    ``LoaderTimeout`` via an injected exception if we miss the deadline —
+    the main thread catches it and returns ``{"fetched": 0, "written": -1}``
+    so the caller can record the failure and move on. A heartbeat line
+    is emitted every 30/60s so the operator can see where the time goes.
+    """
+    deadline = time.monotonic() + _TICKER_DEADLINE_SECONDS
+    timed_out = threading.Event()
+
+    def _deadline_watchdog() -> None:
+        while not timed_out.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning(
+                    f"[{ticker_idx}/{total}] {ticker}: deadline "
+                    f"{_TICKER_DEADLINE_SECONDS}s exceeded, aborting"
+                )
+                # Inject exception into the main thread via ctypes.
+                # CPython GIL + PyThreadState_SetAsyncExc is the standard
+                # pattern for thread-safe timeout enforcement.
+                import ctypes
+
+                thread_id = ctypes.c_long(threading.get_ident())
+                code = ctypes.py_object(_LoaderTimeout)
+                for tid in (threading.get_ident(),):
+                    ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                        ctypes.c_long(tid), code
+                    )
+                timed_out.set()
+                return
+            time.sleep(min(5.0, max(1.0, remaining / 4)))
+
+    watchdog = threading.Thread(target=_deadline_watchdog, daemon=True, name=f"wd-{ticker}")
+    watchdog.start()
+    ticker_started = time.monotonic()
+    last_heartbeat = ticker_started
     try:
-        # Lazy materialise so we can log totals and pass through
-        # OHLCVRow's own validation (low<=open<=high etc).
         from src.data.models import OHLCVRow as _OHLCV
 
         rows: list[Any] = []
         for b in loader.iter_ohlcv(ticker, start, end):
+            now = time.monotonic()
+            if now - last_heartbeat >= 30.0:
+                logger.info(
+                    f"[{ticker_idx}/{total}] {ticker} STREAM elapsed={now - ticker_started:.0f}s"
+                )
+                last_heartbeat = now
             rows.append(b)
         if not rows:
             return {"fetched": 0, "written": 0}
-        # Upsert. ``backfill_with_dedup`` would skip already-covered
-        # rows but for the MD archive we always upsert (idempotent on
-        # PK). Keep it simple.
+        if last_heartbeat == ticker_started:
+            logger.info(
+                f"[{ticker_idx}/{total}] {ticker} fetched={len(rows)} in {time.monotonic() - ticker_started:.0f}s"
+            )
         written = store.upsert_ohlcv(rows)
         return {"fetched": len(rows), "written": written}
+    except _LoaderTimeout:
+        return {"fetched": 0, "written": -1}
     except Exception as exc:
         logger.error(f"{ticker}: {exc}")
         return {"fetched": 0, "written": -1}
+    finally:
+        timed_out.set()  # tell watchdog to exit
 
 
 def main() -> int:
@@ -171,17 +241,24 @@ def main() -> int:
         tickers = _resolve_universe(loader, args.classes, args.limit)
         logger.info(f"=== Tinkoff MD backfill: {len(tickers)} tickers, {start} → {end} ===")
 
+        circuit_breaker_streak = 0
         for i, ticker in enumerate(tickers, start=1):
             if not args.force and _is_complete(store, ticker, args.min_bars):
                 logger.info(f"{i}/{len(tickers)} {ticker}: skip (complete)")
                 skipped_complete += 1
+                circuit_breaker_streak = 0
                 continue
 
-            stats = _backfill_one(loader, store, ticker, start, end)
+            stats = _backfill_one(
+                loader, store, ticker, start, end, ticker_idx=i, total=len(tickers),
+            )
             total_fetched += max(stats["fetched"], 0)
             total_written += max(stats["written"], 0)
             if stats["written"] < 0:
                 errors.append((ticker, "error"))
+                circuit_breaker_streak += 1
+            else:
+                circuit_breaker_streak = 0
 
             if stats["fetched"]:
                 logger.info(f"{i}/{len(tickers)} {ticker}: " f"fetched={stats['fetched']} written={stats['written']}")
@@ -190,6 +267,18 @@ def main() -> int:
 
             if args.batch_sleep > 0:
                 time.sleep(args.batch_sleep)
+
+            # Circuit breaker: if N consecutive tickers fail, abort the
+            # run. This catches systematic issues (rate-limit ban, MD
+            # endpoint outage, parse bug) without burning hours on a
+            # doomed loop.
+            if circuit_breaker_streak >= _CIRCUIT_BREAKER_THRESHOLD:
+                logger.error(
+                    f"Circuit breaker tripped: {circuit_breaker_streak} "
+                    f"consecutive ticker failures. Aborting run. "
+                    f"Investigate upstream MD endpoint."
+                )
+                return 3
     finally:
         store.close()
 
