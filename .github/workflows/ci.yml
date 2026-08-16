@@ -80,7 +80,9 @@ jobs:
           pip install flake8 mypy
 
       - name: Black formatting check
-        run: black --check src/ tests/
+        run: |
+          pip install --quiet 'black==24.10.0'
+          black --check src/ tests/
 
       - name: Flake8
         run: flake8 src/ tests/ --max-line-length=120 --extend-ignore=E203,W503
