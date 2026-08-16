@@ -86,7 +86,19 @@ def main() -> int:
     )
     parser.add_argument("--batch-sleep", type=float, default=0, help="Sleep between tickers (rate-limit)")  # noqa: E501
     parser.add_argument("--quality-gate", action="store_true", help="Run Ingestion Gate before upsert")  # noqa: E501
-    parser.add_argument("--max-tickers", type=int, default=0, help="Limit number of tickers (0=all)")  # noqa: E501
+    parser.add_argument("--max-tickers", type=int, default=0, help="Limit number of tickers (0/all)")  # noqa: E501
+    parser.add_argument(
+        "--min-bars", type=int, default=1300,
+        help="If MD-backfill loader is selected, skip tickers with >= N bars already.",  # noqa: E501
+    )
+    parser.add_argument(
+        "--prefer-md-backfill", action="store_true",
+        help="Use TinkoffInvestMDDataLoader (history-data ZIPs aggregated to daily) "
+             "for tickers short on history, then gRPC for the rest. "
+             "This is the production path; the default 'tkf' source remains "
+             "the gRPC-only path for incremental updates.",
+    )
+
     args = parser.parse_args()
 
     if not args.dsn:
@@ -146,6 +158,18 @@ def main() -> int:
 
     store = PostgresDataStore()
 
+    # Lazy MD loader: only created if --prefer-md-backfill is on.
+    md_loader: Any = None
+    if args.prefer_md_backfill:
+        try:
+            from src.data.tinkoff_md_loader import TinkoffInvestMDDataLoader
+
+            md_loader = TinkoffInvestMDDataLoader()
+            logger.info("MD backfill loader enabled (TinkoffInvestMDDataLoader)")
+        except Exception as e:
+            logger.error(f"MD loader init failed (falling back to gRPC): {e}")
+            md_loader = None
+
     # Resolve TickerMeta once
     try:
         meta_cache = {t.ticker: t for t in loader.list_tickers()}
@@ -171,6 +195,25 @@ def main() -> int:
                 )
 
             try:
+                # MD-backfill path: if the ticker has < min_bars daily
+                # rows in DB AND the MD loader is enabled, fill the gap
+                # with the archive BEFORE incremental gRPC.
+                used_md = False
+                if (
+                    md_loader is not None
+                    and store.count_ohlcv(symbol) < args.min_bars
+                ):
+                    md_start = date(2018, 1, 1)
+                    md_end = end
+                    md_bars = list(md_loader.iter_ohlcv(symbol, md_start, md_end))
+                    if md_bars:
+                        store.upsert_ohlcv(md_bars)
+                        logger.info(
+                            f"{i}/{len(symbols)} {symbol}: "
+                            f"MD backfill +{len(md_bars)} bars (archive 2018→{md_end.year})"
+                        )
+                        used_md = True
+
                 if args.source == "tkf":
                     bars = loader.fetch_ohlcv(symbol, start, end)
                 else:
