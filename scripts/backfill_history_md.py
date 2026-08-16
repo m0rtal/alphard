@@ -132,14 +132,31 @@ def _backfill_one(
     ticker_idx: int = 0,
     total: int = 0,
 ) -> dict[str, int]:
-    """Download + aggregate + upsert one ticker. Returns stats.
+    """Download + aggregate - upsert one ticker. Returns stats.
 
-    Hard deadline: each ticker has ``_TICKER_DEADLINE_SECONDS`` wall-clock
-    seconds. A background thread monitors the elapsed time and raises
-    ``LoaderTimeout`` via an injected exception if we miss the deadline —
-    the main thread catches it and returns ``{"fetched": 0, "written": -1}``
-    so the caller can record the failure and move on. A heartbeat line
-    is emitted every 30/60s so the operator can see where the time goes.
+    Two deadline mechanisms work together to bound per-ticker work:
+
+    1. ``signal.alarm(_TICKER_DEADLINE_SECONDS)`` schedules a SIGALRM
+       on the main thread (POSIX). The handler raises ``_LoaderTimeout``
+       which propagates up to the ``except _LoaderTimeout`` clause.
+       Caveat: SIGALRM only fires at Python bytecode boundaries, so
+       it does NOT interrupt long-running C code such as
+       ``zipfile.ZipFile.read()`` or ``pandas`` resample. The alarm
+       fires as soon as control returns to Python.
+    2. A background watchdog thread fires ``PyThreadState_SetAsyncExc``
+       against the main thread id captured at function entry. This
+       works only when the main thread is in Python code; same
+       C-extension caveat applies.
+
+    For tickers whose zip is unusually large (multi-100MB minute
+    archives for SPBXM ETFs), neither mechanism can interrupt the
+    inflate. The watchdog thread still logs the deadline exceedance
+    and the parent process gets a clear "deadline exceeded" line in
+    the log so the operator can intervene manually if needed.
+
+    A heartbeat line is emitted every 30s inside ``iter_ohlcv`` so
+    the operator can see where the time is going when the ticker
+    is in pure Python code (HTTP read, generator yield).
     """
     deadline = time.monotonic() + _TICKER_DEADLINE_SECONDS
     timed_out = threading.Event()
