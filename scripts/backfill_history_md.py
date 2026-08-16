@@ -24,19 +24,46 @@ on a partially-complete DB inserts only the missing ``(ticker, ts)``
 rows. There is no checkpoint file; the DB itself is the source of
 truth.
 
-Run as
-------
+Run as (production)
+-------------------
+
+This script IS the primary backfill — runs inside the deployed stack
+(``alphard-bot``) and bootstraps the OHLCV universe end-to-end.
+
 ::
 
-    python scripts/backfill_history_md.py              # full universe
-    python scripts/backfill_history_md.py --limit 50  # smoke run
-    python scripts/backfill_history_md.py --classes SPBXM TQBR
+    # Primary: pull everything Tinkoff exposes (no figi.txt — universe
+    # comes from list_shares_all / list_bonds / list_etfs gRPC).
+    # Resume-safe: re-running picks up where the DB left off.
+    python scripts/backfill_history_md.py
+
+    # Smoke run, first 50 tickers only:
+    python scripts/backfill_history_md.py --limit 50
+
+    # If you ever need a single class (rare — production uses no filter):
+    python scripts/backfill_history_md.py --classes SPBXM
+
+When the DB has >= ``--min-bars`` daily bars for every ticker in the
+universe, the script exits 0. Cron then runs ``daily_sync.py`` to
+keep the last few days fresh via the broker gRPC (not the archive
+endpoint).
 
 ENV
 ---
 - ``$TINKOFF_SANDBOX_TOKEN`` or ``$TINKOFF_REAL_TOKEN`` (required)
 - ``$ALPHARD_PG_DSN`` (required)
 - ``$HTTP_PROXY`` (optional — Tinkoff public API is reachable directly)
+
+Why this is primary over figi.txt
+---------------------------------
+``investAPI/src/marketdata/figi.txt`` ships with a hardcoded list of
+~2817 FIGI captured at repo time. That list is **stale** — delisted
+tickers stay in it forever and new listings only appear at the next
+release. This script pulls the live universe from Tinkoff's gRPC
+``InstrumentsService`` every run, so the universe is always current.
+The history-data endpoint (``invest-public-api.tinkoff.ru``) and the
+aggregation to daily bars are otherwise identical to the upstream
+``download_md.sh`` reference script.
 """
 from __future__ import annotations
 
