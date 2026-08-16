@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Tests](https://github.com/m0rtal/alphard/actions/workflows/ci.yml/badge.svg)](https://github.com/m0rtal/alphard/actions/workflows/ci.yml)
-[![Coverage](https://img.shields.io/badge/coverage-89%25-yellow.svg)](https://github.com/m0rtal/alphard)
+[![Coverage](https://img.shields.io/badge/coverage-95%25-green.svg)](https://github.com/m0rtal/alphard)
 
 Автономный multi-agent trading bot на MOEX/Tinkoff. Apache-2.0, self-hosted, Docker-only.
 

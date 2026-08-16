@@ -272,6 +272,26 @@ class TestInit:
         s = PostgresDataStore(dsn="host=h dbname=d user=u")
         assert s._search_path is None
 
+    def test_search_path_rejects_sql_injection(self, fake_conn_cls: Any) -> None:
+        """BUGFIX (C-1) + (M-9): reject anything that isn't a safe identifier
+        list at construction time, before _connect() ever runs."""
+        for bad in (
+            "public; DROP TABLE users--",
+            "sch'ema",
+            "schema name with space",
+            "1leading_digit",
+            "schema.with.dots",
+        ):
+            with pytest.raises(ValueError, match="invalid search_path"):
+                PostgresDataStore(dsn="host=h dbname=d user=u", search_path=bad)
+
+    def test_search_path_accepts_multi_identifier_list(self, fake_conn_cls: Any) -> None:
+        s = PostgresDataStore(
+            dsn="host=h dbname=d user=u",
+            search_path="alphard_test, public, another_schema",
+        )
+        assert s._search_path == "alphard_test, public, another_schema"
+
     def test_custom_schema_sql_path(self, fake_conn_cls: Any) -> None:
         s = PostgresDataStore(
             dsn="host=h dbname=d user=u",

@@ -21,7 +21,7 @@ import logging
 import os
 import sys
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import psycopg
 from src.data.models import OHLCVRow, TickerMeta
@@ -93,7 +93,7 @@ def _log_progress(
 ) -> None:
     """Structured per-ticker progress log line for `tail -f` monitoring."""
     msg = {
-        "ts": datetime.utcnow().isoformat(),
+        "ts": datetime.now(timezone.utc).isoformat(),
         "ticker": ticker,
         "bars": bars,
         "elapsed_sec": round(elapsed, 2),

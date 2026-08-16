@@ -63,7 +63,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import Any
@@ -122,7 +122,7 @@ class PipelineResult:
     risk_violations: tuple[str, ...]
     broker_status: str | None  # None when LIVE_TRADING=false (refused before broker)
     audit_log_id: int | None
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     @property
     def decided(self) -> bool:

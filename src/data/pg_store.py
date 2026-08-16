@@ -68,9 +68,7 @@ class PostgresDataStore(DataStore):
         # prevent SQL injection even if it ever comes from an untrusted
         # source (test fixture, future config loader).
         if search_path is not None and not _IDENTIFIER_RE.match(search_path):
-            raise ValueError(
-                f"invalid search_path {search_path!r}: must match {_IDENTIFIER_RE.pattern}"
-            )
+            raise ValueError(f"invalid search_path {search_path!r}: must match {_IDENTIFIER_RE.pattern}")
         self._search_path = search_path
         # Imported lazily so the rest of the package works without psycopg.
         import psycopg

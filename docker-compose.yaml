@@ -42,9 +42,9 @@ services:
       TINKOFF_REAL_TOKEN: ${TINKOFF_REAL_TOKEN:-}
       TINKOFF_ACCOUNT_ID: ${TINKOFF_ACCOUNT_ID:-}
       POSTGRES_USER: ${POSTGRES_USER:-alphard}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}
       POSTGRES_DB: ${POSTGRES_DB:-alphard}
-      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD required}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       LOG_DIR: ${LOG_DIR:-/app/logs}
       RISK_MAX_DD_PCT: ${RISK_MAX_DD_PCT:-10}
@@ -60,6 +60,11 @@ services:
       - /mnt/appdata/alphard/logs:/app/logs
     networks:
       - alphard-net
+    # BUGFIX (H-7): wait for postgres to be healthy before starting the bot,
+    # otherwise the first store.count_ohlcv() crashes with connection refused.
+    depends_on:
+      postgres:
+        condition: service_healthy
     deploy:
       resources:
         limits:
@@ -74,7 +79,9 @@ services:
       - "com.centurylinklabs.watchtower.enable=true"
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-alphard}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      # BUGFIX (H-8): fail-fast on missing password instead of starting
+      # Postgres with an empty root password (which then allows empty auth).
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}
       POSTGRES_DB: ${POSTGRES_DB:-alphard}
     volumes:
       - /mnt/appdata/alphard/postgres:/var/lib/postgresql/data
@@ -93,7 +100,8 @@ services:
     restart: unless-stopped
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
-    command: redis-server --requirepass ${REDIS_PASSWORD}
+    # BUGFIX (H-8): fail-fast on missing redis password.
+    command: redis-server --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD required}
     volumes:
       - /mnt/appdata/alphard/redis:/data
     healthcheck:

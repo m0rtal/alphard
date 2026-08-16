@@ -332,6 +332,16 @@ class TinkoffInvestMDDataLoader(DataLoader):
         self._archive_cache[cache_key] = body
         return body
 
+    # Maximum total uncompressed size accepted from one Tinkoff MD archive.
+    # The largest legitimate year-archive is well under 100 MB; 500 MB leaves
+    # plenty of headroom while still preventing a multi-GB inflated zip-bomb
+    # from OOM-killing the worker. (H-2 fix.)
+    _MAX_UNCOMPRESSED_BYTES = 500 * 1024 * 1024  # 500 MB
+
+    # Maximum inflate ratio per file. A normal CSVs compresses ~5-20x; anything
+    # past 100x is a zip-bomb red flag. (H-2 fix.)
+    _MAX_INFLATE_RATIO = 100
+
     def parse_archive(self, zip_bytes: bytes) -> list[dict[str, Any]]:
         """Parse one ZIP archive into a flat list of minute-bar dicts.
 
@@ -346,11 +356,33 @@ class TinkoffInvestMDDataLoader(DataLoader):
         ------
         LoaderError
             Malformed CSV or ZIP — bubble up; caller treats as
-            per-archive failure.
+            per-archive failure. Also raised for zip-bomb attempts
+            (total uncompressed size > 500 MB OR per-file inflate ratio
+            > 100x).
         """
         out: list[dict[str, Any]] = []
         try:
             with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+                # BUGFIX (H-2): zip-bomb protection — cap total uncompressed
+                # size and per-file inflate ratio BEFORE extracting anything.
+                infos = zf.infolist()
+                total_uncompressed = sum(i.file_size for i in infos)
+                if total_uncompressed > self._MAX_UNCOMPRESSED_BYTES:
+                    raise LoaderError(
+                        f"ZIP exceeds max uncompressed size: "
+                        f"{total_uncompressed} > {self._MAX_UNCOMPRESSED_BYTES} bytes"
+                    )
+                for info in infos:
+                    # compress_size can be 0 for stored (uncompressed) entries;
+                    # skip the ratio check for those.
+                    if info.compress_size > 0:
+                        ratio = info.file_size / info.compress_size
+                        if ratio > self._MAX_INFLATE_RATIO:
+                            raise LoaderError(
+                                f"ZIP bomb suspected: entry {info.filename!r} "
+                                f"inflates {ratio:.0f}x "
+                                f"({info.compress_size} → {info.file_size})"
+                            )
                 for name in zf.namelist():
                     if not name.endswith(".csv"):
                         continue
@@ -400,6 +432,12 @@ class TinkoffInvestMDDataLoader(DataLoader):
         - 404 (no data) is treated as an empty window — caller sees
           zero bars and decides whether to skip or alert.
         - Pagination happens per-year internally.
+        - BUGFIX (H-1): the previous implementation materialized all
+          years of minute-bars into ``per_year`` BEFORE yielding the
+          first OHLCVRow — the caller could not interrupt iteration
+          to skip a year it didn't need. We now stream: for each year
+          we download, parse, aggregate, and yield matching daily
+          bars immediately. Memory is O(1 year) instead of O(years).
         """
         if start > end:
             return
@@ -412,8 +450,10 @@ class TinkoffInvestMDDataLoader(DataLoader):
         if meta is None or not meta.figi:
             raise LoaderNotFoundError(f"TinkoffInvestMDDataLoader: no FIGI for ticker {ticker!r}")
         figi = meta.figi
-        # Aggregate per year, then yield only the bars in the window.
-        per_year: dict[date, dict[str, Any]] = {}
+        # Stream: for each year, download → parse → aggregate → yield.
+        # The yielded daily bars are already in-window-filtered, so the
+        # caller gets O(1 year) memory and the first OHLCVRow is ready
+        # as soon as the first year's archive is parsed.
         for year in range(max(self._min_year, start.year), end.year + 1):
             zip_bytes = self.download_year(figi, year)
             if zip_bytes is None:
@@ -422,21 +462,18 @@ class TinkoffInvestMDDataLoader(DataLoader):
             for daily_bar in aggregate_minutes_to_daily(minutes):
                 d_ts = daily_bar["ts"]
                 assert isinstance(d_ts, date)
-                per_year[d_ts] = daily_bar
-        for d in sorted(per_year):
-            daily = per_year[d]
-            if daily["ts"] < start or daily["ts"] > end:
-                continue
-            yield OHLCVRow(
-                ticker=ticker.upper(),
-                ts=daily["ts"],
-                open=daily["open"],
-                high=daily["high"],
-                low=daily["low"],
-                close=daily["close"],
-                volume=Decimal(int(daily["volume"])),
-                adj_close=daily["close"],
-            )
+                if d_ts < start or d_ts > end:
+                    continue
+                yield OHLCVRow(
+                    ticker=ticker.upper(),
+                    ts=d_ts,
+                    open=daily_bar["open"],
+                    high=daily_bar["high"],
+                    low=daily_bar["low"],
+                    close=daily_bar["close"],
+                    volume=Decimal(int(daily_bar["volume"])),
+                    adj_close=daily_bar["close"],
+                )
 
     def iter_corporate_actions(
         self,

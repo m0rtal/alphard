@@ -682,6 +682,27 @@ class TestAudit:
             if old is not None:
                 os.environ["ALPHARD_PG_DSN"] = old
 
+    def test_postgres_table_name_rejects_sql_injection(self) -> None:
+        """BUGFIX (C-2): reject anything that isn't a safe identifier
+        at construction time."""
+        from src.data.quality.audit import PostgresAuditLog
+
+        for bad in (
+            "data_quality_events; DROP TABLE users--",
+            "table'with'quotes",
+            "Schema.With.Dots",
+            "1leading_digit",
+            "",
+        ):
+            with pytest.raises(ValueError, match="invalid table name"):
+                PostgresAuditLog(dsn="postgresql://x", table=bad)
+
+    def test_postgres_table_name_accepts_valid_identifier(self) -> None:
+        from src.data.quality.audit import PostgresAuditLog
+
+        sink = PostgresAuditLog(dsn="postgresql://x", table="custom_table_42")
+        assert sink._table == "custom_table_42"
+
 
 class TestCLI:
     def _write_csv(self, path: str, rows: list[Bar]) -> None:

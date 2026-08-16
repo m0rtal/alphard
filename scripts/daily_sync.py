@@ -183,6 +183,7 @@ def main() -> int:
 
     total_bars = 0
     errors = []
+    md_used_count = 0  # BUGFIX (H-6): track how many tickers went through MD archive
 
     try:
         from src.data.models import TickerMeta as _TickerMeta
@@ -213,6 +214,10 @@ def main() -> int:
                             f"MD backfill +{len(md_bars)} bars (archive 2018→{md_end.year})"
                         )
                         used_md = True
+                # BUGFIX (H-6): log when MD was used so the summary shows
+                # how many tickers actually went through the archive path.
+                if used_md:
+                    md_used_count += 1
 
                 if args.source == "tkf":
                     bars = loader.fetch_ohlcv(symbol, start, end)
@@ -225,44 +230,11 @@ def main() -> int:
 
                 store.upsert_ticker(meta)
 
-                # Adapt loader output to OHLCVRow.
-                # PK is (ticker, ts); source flags no longer needed.
-                adapted: list[Any] = []
-                for b in bars:
-                    if isinstance(b, dict):
-                        from src.data.models import OHLCVRow as _OHLCV
-
-                        adapted.append(
-                            _OHLCV(
-                                ticker=b.get("ticker", symbol),
-                                ts=b["ts"],
-                                open=b["open"],
-                                high=b["high"],
-                                low=b["low"],
-                                close=b["close"],
-                                volume=b["volume"],
-                                adj_close=b.get("adj_close", b["close"]),
-                            )
-                        )
-                    elif hasattr(b, "primary_source"):
-                        # Old shape with primary_source — strip the deprecated fields.
-                        from src.data.models import OHLCVRow as _OHLCV
-
-                        adapted.append(
-                            _OHLCV(
-                                ticker=b.ticker,
-                                ts=b.ts,
-                                open=b.open,
-                                high=b.high,
-                                low=b.low,
-                                close=b.close,
-                                volume=b.volume,
-                                adj_close=b.adj_close,
-                            )
-                        )
-                    else:
-                        # Native OHLCVRow — pass through.
-                        adapted.append(b)
+                # BUGFIX (H-5): removed the dead `adapted` block that
+                # rebuilt OHLCVRow from dicts. `bars` is already a list
+                # of native OHLCVRow objects (Tinkoff loader + MD loader
+                # both return OHLCVRow), so passing them straight to
+                # ``store.upsert_ohlcv(bars)`` is correct.
 
                 if args.quality_gate and args.source == "tkf":
                     from src.data.quality.ingestion_gate import check_ingestion, IngestionParams, Bar  # noqa: E501
@@ -311,7 +283,10 @@ def main() -> int:
     finally:
         store.close()
 
-    logger.info(f"=== DONE: {total_bars} bars written, {len(errors)} errors ===")
+    logger.info(
+        f"=== DONE: {total_bars} bars written, {len(errors)} errors, "
+        f"md_archive_used={md_used_count} tickers ==="
+    )
     return 0 if not errors else 2
 
 

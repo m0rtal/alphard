@@ -198,6 +198,40 @@ class TestArchiveParsing:
         with pytest.raises(LoaderError):
             loader.parse_archive(b"not a zip file")
 
+    def test_rejects_zip_bomb_total_size(self) -> None:
+        """BUGFIX (H-2): total uncompressed size over the cap must raise.
+
+        We can't actually allocate 500 MB in CI, but we can override the
+        class attribute to a tiny limit and verify the guard fires.
+        """
+        loader = TinkoffInvestMDDataLoader.__new__(TinkoffInvestMDDataLoader)
+        loader._MAX_UNCOMPRESSED_BYTES = 10  # tiny cap
+        loader._MAX_INFLATE_RATIO = 100
+        # _make_zip produces a multi-byte archive; 10 bytes is well below.
+        z = _make_zip([("2024-01-01T07:00:00Z", "100", "101", "102", "99", "1000")])
+        with pytest.raises(LoaderError, match="exceeds max uncompressed size"):
+            loader.parse_archive(z)
+
+    def test_rejects_zip_bomb_inflate_ratio(self) -> None:
+        """BUGFIX (H-2): per-file inflate ratio over the cap must raise."""
+        loader = TinkoffInvestMDDataLoader.__new__(TinkoffInvestMDDataLoader)
+        loader._MAX_UNCOMPRESSED_BYTES = 100 * 1024 * 1024  # 100 MB
+        loader._MAX_INFLATE_RATIO = 5  # tiny ratio cap
+        # Hand-build a ZIP whose single CSV compresses better than 5x —
+        # uses 1000 highly-compressible zero-rows to push inflate ratio up.
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+            with zf.open("20240101.csv", mode="w") as fh:
+                text = io.TextIOWrapper(fh, encoding="utf-8", newline="")
+                w = csv.writer(text, delimiter=";")
+                for _ in range(1000):
+                    w.writerow(["BBG004730N88"] + ["0"] * 6)
+                text.flush()
+                text.detach()
+        z = buf.getvalue()
+        with pytest.raises(LoaderError, match="ZIP bomb suspected"):
+            loader.parse_archive(z)
+
 
 # ---------------------------------------------------------------------------
 # Download (HTTP mocked)

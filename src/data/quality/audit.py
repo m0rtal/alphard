@@ -118,9 +118,7 @@ class PostgresAuditLog:
         # via psycopg.sql.Identifier — but validate here too so a bad name
         # fails fast at construction time, not on first write.
         if not _TABLE_NAME_RE.match(table):
-            raise ValueError(
-                f"invalid table name {table!r}: must match {_TABLE_NAME_RE.pattern}"
-            )
+            raise ValueError(f"invalid table name {table!r}: must match {_TABLE_NAME_RE.pattern}")
         self._table = table
         self._conn: Any = None
         self._cursor: Any = None

@@ -11,7 +11,7 @@ where each slice_batch has cumulative_pct + start_at + end_at.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 
@@ -59,7 +59,7 @@ class OrderSlicer:
         Returns at least 1 chunk. Empty if parent_qty fits in single chunk.
         """
         if start_at is None:
-            start_at = datetime.utcnow()
+            start_at = datetime.now(timezone.utc)
 
         chunks = []
 

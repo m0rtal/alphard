@@ -29,14 +29,18 @@ import argparse
 import os
 import sys
 from datetime import date, timedelta
+from urllib.parse import quote
 
 # Ensure /app is on sys.path so src.* imports work inside the container
 sys.path.insert(0, "/app")
 
-# Ensure DSN is set for PostgresDataStore (token-gate)
+# Ensure DSN is set for PostgresDataStore (token-gate).
+# BUGFIX (H-9): URL-escape the password (and user) so special characters
+# like '@', ':', '/', '?' don't break the DSN. Without this, a password
+# containing '@' would silently route the connection to the wrong host.
 if not os.environ.get("ALPHARD_PG_DSN"):
-    pg_user = os.environ.get("POSTGRES_USER", "alphard")
-    pg_pwd = os.environ.get("POSTGRES_PASSWORD", "")
+    pg_user = quote(os.environ.get("POSTGRES_USER", "alphard"), safe="")
+    pg_pwd = quote(os.environ.get("POSTGRES_PASSWORD", ""), safe="")
     pg_host = os.environ.get("POSTGRES_HOST", "alphard-postgres")
     pg_db = os.environ.get("POSTGRES_DB", "alphard")
     os.environ["ALPHARD_PG_DSN"] = f"postgresql://{pg_user}:{pg_pwd}@{pg_host}:5432/{pg_db}"
