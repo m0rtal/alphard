@@ -233,13 +233,14 @@ class TinkoffInvestMDDataLoader(DataLoader):
     # ---- universe -------------------------------------------------------
 
     def list_tickers(self) -> list[TickerMeta]:
-        """Universe = every instrument Tinkoff has in its share catalog.
+        """Universe = every share Tinkoff exposes, regardless of class_code.
 
-        Delegates to the gRPC ``TinkoffInvestDataLoader.list_tickers``
-        (which already calls ``instruments.shares()`` once and caches).
-        The MD loader does NOT need to re-download the universe — it
-        just needs the ``(ticker -> figi)`` map, which the gRPC loader
-        exposes.
+        We pull the broker-side ``list_shares_all`` per class_code (TQBR,
+        SPBXM, TQBS, TQDE, ...). The union covers ≈1927 Russian shares
+        + 1516 SPBX US/foreign names + other boards. NO client-side
+        filter on trading_status — delisted tickers still have a FIGI
+        and the MD archive honours it (returns 200 + zip for the years
+        before delisting).
 
         For Phase 1.1 we keep this lean: shares only. Bonds/ETFs have
         shorter history windows and are not the Phase 1.1 priority.
@@ -248,11 +249,25 @@ class TinkoffInvestMDDataLoader(DataLoader):
         without one — caller must drop such entries before issuing
         archive requests.
         """
-        # Lazy import to avoid hard dependency when only gRPC loader is
-        # wired (e.g. in some tests).
         from .tinkoff_loader import TinkoffInvestDataLoader
 
-        return TinkoffInvestDataLoader(token=self._token).list_tickers()
+        grpc_loader = TinkoffInvestDataLoader(token=self._token)
+        # Class codes to harvest: broker-side full universe, no client filter.
+        # TQBR = MOEX main board Russian shares (incl. delisted/suspended).
+        # SPBXM = SPB Exchange US/foreign shares.
+        # TQBS/TQDE/TQNO/TQLV/TQPI = MOEX minor boards.
+        target_classes = ("TQBR", "SPBXM", "TQBS", "TQDE", "TQNO", "TQLV", "TQPI")
+        seen: dict[str, TickerMeta] = {}
+        for cls in target_classes:
+            try:
+                metas = grpc_loader.list_shares_all(class_code=cls)
+            except Exception as e:  # noqa: BLE001 — broker may rate-limit one class
+                logger.warning("list_shares_all(%s) failed: %s", cls, e)
+                continue
+            for m in metas:
+                if m.figi and m.ticker not in seen:
+                    seen[m.ticker] = m
+        return list(seen.values())
 
     def list_tickers_with_figi(self) -> list[TickerMeta]:
         """Same as ``list_tickers`` but drops entries with missing FIGI."""

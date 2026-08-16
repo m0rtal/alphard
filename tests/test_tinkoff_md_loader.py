@@ -391,18 +391,36 @@ class TestIterOHLCV:
 
 
 class TestUniverse:
-    def test_list_tickers_delegates_to_grpc_loader(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_list_tickers_harvests_all_class_codes(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("TINKOFF_SANDBOX_TOKEN", "fake-token-1234567890")
         from src.data.token_bucket import TokenBucket
 
         loader = TinkoffInvestMDDataLoader(bucket=TokenBucket(rate=1000.0, window_seconds=1.0))
 
-        fake_meta = TickerMeta(ticker="SBER", figi="BBG004730N88", name="Sber", lot=1, source="tkf")
+        fake_tqbr = [
+            TickerMeta(ticker="SBER", figi="BBG004730N88", class_code="TQBR", name="Sber", lot=1, source="tkf"),
+            TickerMeta(ticker="NODELIST", figi=None, class_code="TQBR", name="X", lot=1, source="tkf"),
+        ]
+        fake_spbxm = [
+            TickerMeta(ticker="AAPL", figi="BBG000B9XRY4", class_code="SPBXM", name="Apple", lot=1, source="tkf"),
+        ]
         with patch("src.data.tinkoff_loader.TinkoffInvestDataLoader") as mock_grpc:
-            mock_grpc.return_value.list_tickers.return_value = [
-                fake_meta,
-                TickerMeta(ticker="NONFIGI", figi=None, name="X", lot=1, source="tkf"),
-            ]
+            mock_grpc.return_value.list_shares_all.side_effect = [fake_tqbr, fake_spbxm, [], [], [], [], []]
+            metas = loader.list_tickers_with_figi()
+        assert len(metas) == 2
+        tickers = {m.ticker for m in metas}
+        assert tickers == {"SBER", "AAPL"}
+
+    def test_list_tickers_continues_on_class_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("TINKOFF_SANDBOX_TOKEN", "fake-token-1234567890")
+        from src.data.token_bucket import TokenBucket
+
+        loader = TinkoffInvestMDDataLoader(bucket=TokenBucket(rate=1000.0, window_seconds=1.0))
+
+        good = [TickerMeta(ticker="SBER", figi="BBG004730N88", class_code="TQBR", name="Sber", lot=1, source="tkf")]
+        with patch("src.data.tinkoff_loader.TinkoffInvestDataLoader") as mock_grpc:
+            # TQBR fails, SPBXM succeeds.
+            mock_grpc.return_value.list_shares_all.side_effect = [RuntimeError("rate"), good, [], [], [], [], []]
             metas = loader.list_tickers_with_figi()
         assert len(metas) == 1
         assert metas[0].ticker == "SBER"
