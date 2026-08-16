@@ -9,6 +9,7 @@ stack, not unit tests.
 from __future__ import annotations
 
 from datetime import date
+from typing import Any
 from unittest.mock import MagicMock
 
 
@@ -111,7 +112,7 @@ def test_backfill_one_returns_negative_on_timeout() -> None:
     loader = MagicMock()
     store = MagicMock()
 
-    def _fake_iter(_ticker, _start, _end):
+    def _fake_iter(_ticker: str, _start: date, _end: date) -> Any:
         raise bh._LoaderTimeout("deadline exceeded")
         yield  # pragma: no cover — generator marker
 
