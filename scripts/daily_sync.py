@@ -88,15 +88,18 @@ def main() -> int:
     parser.add_argument("--quality-gate", action="store_true", help="Run Ingestion Gate before upsert")  # noqa: E501
     parser.add_argument("--max-tickers", type=int, default=0, help="Limit number of tickers (0/all)")  # noqa: E501
     parser.add_argument(
-        "--min-bars", type=int, default=1300,
+        "--min-bars",
+        type=int,
+        default=1300,
         help="If MD-backfill loader is selected, skip tickers with >= N bars already.",  # noqa: E501
     )
     parser.add_argument(
-        "--prefer-md-backfill", action="store_true",
+        "--prefer-md-backfill",
+        action="store_true",
         help="Use TinkoffInvestMDDataLoader (history-data ZIPs aggregated to daily) "
-             "for tickers short on history, then gRPC for the rest. "
-             "This is the production path; the default 'tkf' source remains "
-             "the gRPC-only path for incremental updates.",
+        "for tickers short on history, then gRPC for the rest. "
+        "This is the production path; the default 'tkf' source remains "
+        "the gRPC-only path for incremental updates.",
     )
 
     args = parser.parse_args()
@@ -199,10 +202,7 @@ def main() -> int:
                 # rows in DB AND the MD loader is enabled, fill the gap
                 # with the archive BEFORE incremental gRPC.
                 used_md = False
-                if (
-                    md_loader is not None
-                    and store.count_ohlcv(symbol) < args.min_bars
-                ):
+                if md_loader is not None and store.count_ohlcv(symbol) < args.min_bars:
                     md_start = date(2018, 1, 1)
                     md_end = end
                     md_bars = list(md_loader.iter_ohlcv(symbol, md_start, md_end))
@@ -231,6 +231,7 @@ def main() -> int:
                 for b in bars:
                     if isinstance(b, dict):
                         from src.data.models import OHLCVRow as _OHLCV
+
                         adapted.append(
                             _OHLCV(
                                 ticker=b.get("ticker", symbol),

@@ -78,11 +78,11 @@ class TestAggregator:
         out = aggregate_minutes_to_daily(rows)
         assert len(out) == 1
         d = out[0]
-        assert d["open"] == Decimal("100")    # first.open
-        assert d["close"] == Decimal("102")   # last.close
-        assert d["high"] == Decimal("104")    # max of all highs
-        assert d["low"] == Decimal("98")      # min of all lows
-        assert d["volume"] == 600             # sum
+        assert d["open"] == Decimal("100")  # first.open
+        assert d["close"] == Decimal("102")  # last.close
+        assert d["high"] == Decimal("104")  # max of all highs
+        assert d["low"] == Decimal("98")  # min of all lows
+        assert d["volume"] == 600  # sum
 
     def test_splits_by_date(self) -> None:
         rows = [
@@ -103,8 +103,8 @@ class TestAggregator:
             _minute("2024-03-15T07:00:00Z", "100", "101", "101", "100", "100"),
         ]
         out = aggregate_minutes_to_daily(rows)
-        assert out[0]["open"] == Decimal("100")    # first after sort
-        assert out[0]["close"] == Decimal("102")   # last after sort
+        assert out[0]["open"] == Decimal("100")  # first after sort
+        assert out[0]["close"] == Decimal("102")  # last after sort
 
 
 # ---------------------------------------------------------------------------
@@ -170,10 +170,12 @@ def _make_zip(minute_rows: list[tuple[str, str, str, str, str, int]]) -> bytes:
 
 class TestArchiveParsing:
     def test_parses_valid_archive(self) -> None:
-        z = _make_zip([
-            ("2024-01-01T07:00:00Z", "100", "101", "102", "99", "1000"),
-            ("2024-01-01T07:01:00Z", "101", "102", "103", "100", "500"),
-        ])
+        z = _make_zip(
+            [
+                ("2024-01-01T07:00:00Z", "100", "101", "102", "99", "1000"),
+                ("2024-01-01T07:01:00Z", "101", "102", "103", "100", "500"),
+            ]
+        )
         loader = TinkoffInvestMDDataLoader.__new__(TinkoffInvestMDDataLoader)
         out = loader.parse_archive(z)
         assert len(out) == 2
@@ -236,8 +238,7 @@ class TestDownload:
 
     def test_404_caches_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
         loader = self._loader(monkeypatch)
-        with patch("src.data.tinkoff_md_loader.urlopen",
-                   side_effect=_urlopen_side_effect(404)):
+        with patch("src.data.tinkoff_md_loader.urlopen", side_effect=_urlopen_side_effect(404)):
             result = loader.download_year("BBG004730N88", 2024)
             assert result is None
             assert loader._archive_cache[("BBG004730N88", 2024)] is None
@@ -249,8 +250,7 @@ class TestDownload:
     def test_200_caches_bytes(self, monkeypatch: pytest.MonkeyPatch) -> None:
         loader = self._loader(monkeypatch)
         body = b"fake-zip-bytes"
-        with patch("src.data.tinkoff_md_loader.urlopen",
-                   side_effect=_urlopen_side_effect(200, body)):
+        with patch("src.data.tinkoff_md_loader.urlopen", side_effect=_urlopen_side_effect(200, body)):
             r = loader.download_year("BBG004730N88", 2024)
             assert r == body
             r2 = loader.download_year("BBG004730N88", 2024)
@@ -258,22 +258,19 @@ class TestDownload:
 
     def test_401_maps_to_auth_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         loader = self._loader(monkeypatch)
-        with patch("src.data.tinkoff_md_loader.urlopen",
-                   side_effect=_urlopen_side_effect(401)):
+        with patch("src.data.tinkoff_md_loader.urlopen", side_effect=_urlopen_side_effect(401)):
             with pytest.raises(LoaderAuthError):
                 loader.download_year("BBG004730N88", 2024)
 
     def test_429_maps_to_rate_limit_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         loader = self._loader(monkeypatch)
-        with patch("src.data.tinkoff_md_loader.urlopen",
-                   side_effect=_urlopen_side_effect(429)):
+        with patch("src.data.tinkoff_md_loader.urlopen", side_effect=_urlopen_side_effect(429)):
             with pytest.raises(LoaderRateLimitError):
                 loader.download_year("BBG004730N88", 2024)
 
     def test_500_maps_to_loader_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         loader = self._loader(monkeypatch)
-        with patch("src.data.tinkoff_md_loader.urlopen",
-                   side_effect=_urlopen_side_effect(503)):
+        with patch("src.data.tinkoff_md_loader.urlopen", side_effect=_urlopen_side_effect(503)):
             with pytest.raises(LoaderError):
                 loader.download_year("BBG004730N88", 2024)
 
@@ -317,14 +314,18 @@ class TestIterOHLCV:
         self._stub_universe(loader, "SBER")
 
         # Two yearly archives, each a one-day ZIP.
-        z_2024 = _make_zip([
-            ("2024-01-01T07:00:00Z", "100", "101", "102", "99", "100"),
-            ("2024-01-01T07:01:00Z", "101", "102", "103", "100", "200"),
-        ])
-        z_2025 = _make_zip([
-            ("2025-06-15T07:00:00Z", "300", "302", "305", "298", "700"),
-            ("2025-06-15T07:01:00Z", "302", "303", "304", "300", "300"),
-        ])
+        z_2024 = _make_zip(
+            [
+                ("2024-01-01T07:00:00Z", "100", "101", "102", "99", "100"),
+                ("2024-01-01T07:01:00Z", "101", "102", "103", "100", "200"),
+            ]
+        )
+        z_2025 = _make_zip(
+            [
+                ("2025-06-15T07:00:00Z", "300", "302", "305", "298", "700"),
+                ("2025-06-15T07:01:00Z", "302", "303", "304", "300", "300"),
+            ]
+        )
 
         def fake_download(figi: str, year: int) -> bytes | None:
             if year == 2024:
@@ -334,9 +335,7 @@ class TestIterOHLCV:
             return None
 
         with patch.object(loader, "download_year", side_effect=fake_download):
-            bars = list(loader.iter_ohlcv(
-                "SBER", date(2024, 1, 1), date(2025, 12, 31)
-            ))
+            bars = list(loader.iter_ohlcv("SBER", date(2024, 1, 1), date(2025, 12, 31)))
         assert len(bars) == 2
         b0 = bars[0]
         assert b0.ticker == "SBER"
@@ -369,14 +368,14 @@ class TestIterOHLCV:
     def test_window_filters_inside_year(self, monkeypatch: pytest.MonkeyPatch) -> None:
         loader = self._loader(monkeypatch)
         self._stub_universe(loader, "SBER")
-        z = _make_zip([
-            ("2024-01-01T07:00:00Z", "100", "101", "102", "99", "100"),
-            ("2024-12-31T07:00:00Z", "500", "510", "520", "490", "5000"),
-        ])
+        z = _make_zip(
+            [
+                ("2024-01-01T07:00:00Z", "100", "101", "102", "99", "100"),
+                ("2024-12-31T07:00:00Z", "500", "510", "520", "490", "5000"),
+            ]
+        )
         with patch.object(loader, "download_year", return_value=z):
-            bars = list(loader.iter_ohlcv(
-                "SBER", date(2024, 6, 1), date(2024, 6, 30)
-            ))
+            bars = list(loader.iter_ohlcv("SBER", date(2024, 6, 1), date(2024, 6, 30)))
         # 2024-01-01 and 2024-12-31 are both outside the window -> 0 bars.
         assert bars == []
 
@@ -395,11 +394,10 @@ class TestUniverse:
     def test_list_tickers_delegates_to_grpc_loader(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("TINKOFF_SANDBOX_TOKEN", "fake-token-1234567890")
         from src.data.token_bucket import TokenBucket
+
         loader = TinkoffInvestMDDataLoader(bucket=TokenBucket(rate=1000.0, window_seconds=1.0))
 
-        fake_meta = TickerMeta(
-            ticker="SBER", figi="BBG004730N88", name="Sber", lot=1, source="tkf"
-        )
+        fake_meta = TickerMeta(ticker="SBER", figi="BBG004730N88", name="Sber", lot=1, source="tkf")
         with patch("src.data.tinkoff_loader.TinkoffInvestDataLoader") as mock_grpc:
             mock_grpc.return_value.list_tickers.return_value = [
                 fake_meta,

@@ -220,14 +220,11 @@ class TinkoffInvestMDDataLoader(DataLoader):
                 "$TINKOFF_SANDBOX_TOKEN / $TINKOFF_REAL_TOKEN"
             )
         if len(self._token) < 16:
-            raise LoaderAuthError(
-                "TinkoffInvestMDDataLoader: token looks malformed (length < 16)"
-            )
+            raise LoaderAuthError("TinkoffInvestMDDataLoader: token looks malformed (length < 16)")
         self._min_year = int(min_year)
         if self._min_year < 2017:
             raise LoaderError(
-                f"TinkoffInvestMDDataLoader: min_year {self._min_year} "
-                "below Tinkoff archive minimum (2017)"
+                f"TinkoffInvestMDDataLoader: min_year {self._min_year} " "below Tinkoff archive minimum (2017)"
             )
         # Per-year ZIP cache: (figi, year) -> bytes. Empty cache on
         # construction; tests assert clean state.
@@ -295,44 +292,28 @@ class TinkoffInvestMDDataLoader(DataLoader):
                     self._archive_cache[cache_key] = None
                     return None
                 if status in (401, 403):
-                    raise LoaderAuthError(
-                        f"Tinkoff MD archive auth failed (HTTP {status}) for {figi}/{year}"
-                    )
+                    raise LoaderAuthError(f"Tinkoff MD archive auth failed (HTTP {status}) for {figi}/{year}")
                 if status == 429:
                     # Per official script: sleep 5s and bubble up.
                     time.sleep(5.0)
-                    raise LoaderRateLimitError(
-                        f"Tinkoff MD archive rate-limited for {figi}/{year}"
-                    )
+                    raise LoaderRateLimitError(f"Tinkoff MD archive rate-limited for {figi}/{year}")
                 if status >= 500:
-                    raise LoaderError(
-                        f"Tinkoff MD archive HTTP {status} for {figi}/{year}"
-                    )
+                    raise LoaderError(f"Tinkoff MD archive HTTP {status} for {figi}/{year}")
                 body = resp.read()
         except HTTPError as e:
             if e.code == 404:
                 self._archive_cache[cache_key] = None
                 return None
             if e.code in (401, 403):
-                raise LoaderAuthError(
-                    f"Tinkoff MD archive auth failed (HTTP {e.code}) for {figi}/{year}"
-                ) from e
+                raise LoaderAuthError(f"Tinkoff MD archive auth failed (HTTP {e.code}) for {figi}/{year}") from e
             if e.code == 429:
                 time.sleep(5.0)
-                raise LoaderRateLimitError(
-                    f"Tinkoff MD archive rate-limited for {figi}/{year}"
-                ) from e
+                raise LoaderRateLimitError(f"Tinkoff MD archive rate-limited for {figi}/{year}") from e
             if e.code >= 500:
-                raise LoaderError(
-                    f"Tinkoff MD archive HTTP {e.code} for {figi}/{year}"
-                ) from e
-            raise LoaderError(
-                f"Tinkoff MD archive HTTP {e.code} for {figi}/{year}"
-            ) from e
+                raise LoaderError(f"Tinkoff MD archive HTTP {e.code} for {figi}/{year}") from e
+            raise LoaderError(f"Tinkoff MD archive HTTP {e.code} for {figi}/{year}") from e
         except URLError as e:
-            raise LoaderError(
-                f"Tinkoff MD archive network error for {figi}/{year}: {e}"
-            ) from e
+            raise LoaderError(f"Tinkoff MD archive network error for {figi}/{year}: {e}") from e
         self._archive_cache[cache_key] = body
         return body
 
@@ -367,9 +348,7 @@ class TinkoffInvestMDDataLoader(DataLoader):
                             try:
                                 ts_str = row[1]
                                 # Tinkoff format: 2020-01-06T07:00:00Z
-                                ts = datetime.fromisoformat(
-                                    ts_str.replace("Z", "+00:00")
-                                ).astimezone(timezone.utc)
+                                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).astimezone(timezone.utc)
                                 out.append(
                                     {
                                         "ts": ts,

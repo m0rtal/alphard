@@ -79,9 +79,7 @@ def _resolve_universe(
     if limit > 0:
         metas = metas[:limit]
     tickers = [m.ticker for m in metas]
-    logger.info(
-        f"Universe: {len(tickers)} tickers (classes={classes or 'ALL'}, limit={limit})"
-    )
+    logger.info(f"Universe: {len(tickers)} tickers (classes={classes or 'ALL'}, limit={limit})")
     return tickers
 
 
@@ -125,26 +123,26 @@ def _backfill_one(
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--start-year", type=int, default=2018,
+        "--start-year",
+        type=int,
+        default=2018,
         help="Earliest year to backfill (default 2018). Below 2018 returns 404.",
     )
     parser.add_argument(
-        "--end-year", type=int, default=date.today().year,
+        "--end-year",
+        type=int,
+        default=date.today().year,
         help="Latest year to backfill (default = current year).",
     )
-    parser.add_argument("--classes", nargs="*", default=None,
-                        help="Filter universe by class_code (e.g. SPBXM TQBR).")
-    parser.add_argument("--limit", type=int, default=0,
-                        help="Cap universe size for smoke runs (0 = no cap).")
-    parser.add_argument("--min-bars", type=int, default=1300,
-                        help="Min daily bars per ticker to consider backfill complete.")
+    parser.add_argument("--classes", nargs="*", default=None, help="Filter universe by class_code (e.g. SPBXM TQBR).")
+    parser.add_argument("--limit", type=int, default=0, help="Cap universe size for smoke runs (0 = no cap).")
+    parser.add_argument(
+        "--min-bars", type=int, default=1300, help="Min daily bars per ticker to consider backfill complete."
+    )
     parser.add_argument("--dsn", default=os.environ.get("ALPHARD_PG_DSN"))
-    parser.add_argument("--token", default=None,
-                        help="Override $TINKOFF_SANDBOX_TOKEN/$TINKOFF_REAL_TOKEN.")
-    parser.add_argument("--batch-sleep", type=float, default=0.0,
-                        help="Sleep between tickers (rate-limit cushion).")
-    parser.add_argument("--force", action="store_true",
-                        help="Re-fetch even if ticker already has min-bars.")
+    parser.add_argument("--token", default=None, help="Override $TINKOFF_SANDBOX_TOKEN/$TINKOFF_REAL_TOKEN.")
+    parser.add_argument("--batch-sleep", type=float, default=0.0, help="Sleep between tickers (rate-limit cushion).")
+    parser.add_argument("--force", action="store_true", help="Re-fetch even if ticker already has min-bars.")
     args = parser.parse_args()
 
     if not args.dsn:
@@ -171,9 +169,7 @@ def main() -> int:
 
     try:
         tickers = _resolve_universe(loader, args.classes, args.limit)
-        logger.info(
-            f"=== Tinkoff MD backfill: {len(tickers)} tickers, {start} → {end} ==="
-        )
+        logger.info(f"=== Tinkoff MD backfill: {len(tickers)} tickers, {start} → {end} ===")
 
         for i, ticker in enumerate(tickers, start=1):
             if not args.force and _is_complete(store, ticker, args.min_bars):
@@ -188,10 +184,7 @@ def main() -> int:
                 errors.append((ticker, "error"))
 
             if stats["fetched"]:
-                logger.info(
-                    f"{i}/{len(tickers)} {ticker}: "
-                    f"fetched={stats['fetched']} written={stats['written']}"
-                )
+                logger.info(f"{i}/{len(tickers)} {ticker}: " f"fetched={stats['fetched']} written={stats['written']}")
             else:
                 logger.info(f"{i}/{len(tickers)} {ticker}: no data in window")
 
