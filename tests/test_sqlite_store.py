@@ -30,6 +30,7 @@ from src.data.sqlite_store import (
     SCHEMA_SQL,
 )
 
+
 @pytest.fixture(scope="module")
 def mock_connection_factory() -> Type[sqlite3.Connection]:
     """
@@ -46,6 +47,7 @@ def mock_connection_factory() -> Type[sqlite3.Connection]:
 
     return factory
 
+
 @pytest.fixture(scope="function")
 def sqlite_store(mock_connection_factory) -> InMemorySQLiteStore:
     """Fixture that creates and tears down a fresh InMemorySQLiteStore for each test."""
@@ -56,6 +58,7 @@ def sqlite_store(mock_connection_factory) -> InMemorySQLiteStore:
     # but we still call close() to simulate resource clean up
     # within the function scope to satisfy the contract.
     store.close()
+
 
 # Sample data for tests
 @pytest.fixture
@@ -87,6 +90,7 @@ def sample_metas() -> list[TickerMeta]:
         ),
     ]
 
+
 @pytest.fixture
 def sample_ohlcv_rows() -> list[OHLCVRow]:
     return [
@@ -112,6 +116,7 @@ def sample_ohlcv_rows() -> list[OHLCVRow]:
         ),
     ]
 
+
 @pytest.fixture
 def sample_actions() -> list[CorporateAction]:
     return [
@@ -124,9 +129,11 @@ def sample_actions() -> list[CorporateAction]:
         )
     ]
 
+
 # ==============================================================================
 # 1. Ticker Management (CRUD)
 # ==============================================================================
+
 
 class TestTickerUniverse:
     def test_upsert_tickers_new(self, sqlite_store: InMemorySQLiteStore, sample_metas: list[TickerMeta]):
@@ -189,9 +196,11 @@ class TestTickerUniverse:
         assert "GAZP" not in names  # DELISTED
         assert "SBER" in names  # NOT delisted
 
+
 # ==============================================================================
 # 2. OHLCV Storage and Query
 # ==============================================================================
+
 
 class TestOhlcvStorageAndQuery:
     def test_upsert_ohlcv_insert_new(self, sqlite_store: InMemorySQLiteStore, sample_ohlcv_rows: list[OHLCVRow]):
@@ -265,9 +274,11 @@ class TestOhlcvStorageAndQuery:
         # Check if the raised exception is wrapped in StoreError
         assert isinstance(exc_info.value, Exception)
 
+
 # ==============================================================================
 # 3. Corporate Actions Storage and Query
 # ==============================================================================
+
 
 class TestCorporateActionStorage:
     def test_upsert_actions_unique_key(self, sqlite_store: InMemorySQLiteStore, sample_actions: list[CorporateAction]):
@@ -294,9 +305,11 @@ class TestCorporateActionStorage:
         actions = sqlite_store.query_corporate_actions("UNKNOWN", date(2000, 1, 1), date(2000, 1, 2))
         assert actions == []
 
+
 # ==============================================================================
 # 4. Diagnostic Tests
 # ==============================================================================
+
 
 class TestCountOhlcv:
     def test_count_ohlcv_none_ticker(self, sqlite_store: InMemorySQLiteStore, sample_ohlcv_rows: list[OHLCVRow]):

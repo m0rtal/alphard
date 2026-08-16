@@ -14,6 +14,7 @@ import pytest
 
 from src.data import LoaderAuthError, TickerMeta, TinkoffDataLoader
 
+
 class TestTinkoffDataLoader:
     def test_missing_token_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("TINKOFF_SANDBOX_TOKEN", raising=False)
@@ -243,6 +244,7 @@ class TestTinkoffDataLoader:
             loader.list_etfs()
             loader.list_etfs()
         assert mock_client.instruments.etfs.call_count == 1
+
 
 class TestTinkoffLoaderCoverage:
     """Additional tests to push coverage of tinkoff_loader.py above 95%."""

@@ -47,6 +47,7 @@ from src.data.store import StoreError
 # Fake connection
 # ---------------------------------------------------------------------------
 
+
 class FakeCursor:
     """Minimal psycopg cursor stand-in.
 
@@ -104,6 +105,7 @@ class FakeCursor:
     def close(self) -> None:
         self.closed = True
 
+
 class FakeConnection:
     """Minimal psycopg connection stand-in.
 
@@ -155,9 +157,11 @@ class FakeConnection:
         """The most recently opened cursor (for assertions)."""
         return self.cursors[-1]
 
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 class _ConnFactory:
     """Callable ``connect`` stand-in that records every issued connection.
@@ -182,6 +186,7 @@ class _ConnFactory:
     def first(self) -> FakeConnection:
         return self.instances[0]
 
+
 @pytest.fixture
 def fake_conn_cls() -> Any:
     """Patch psycopg.connect to return a FakeConnection factory.
@@ -192,6 +197,7 @@ def fake_conn_cls() -> Any:
     factory = _ConnFactory()
     with patch("psycopg.connect", side_effect=factory):
         yield factory
+
 
 @pytest.fixture
 def store(fake_conn_cls: Any) -> PostgresDataStore:
@@ -204,9 +210,11 @@ def store(fake_conn_cls: Any) -> PostgresDataStore:
     s._conn = fake_conn_cls.last
     return s
 
+
 # ---------------------------------------------------------------------------
 # __init__
 # ---------------------------------------------------------------------------
+
 
 class TestInit:
     def test_dsn_from_arg(self, fake_conn_cls: Any) -> None:
@@ -252,9 +260,11 @@ class TestInit:
         # Default path sits in the package directory (src/data/).
         assert s._schema_sql_path.endswith(os.path.join("src", "data", "schema.sql"))
 
+
 # ---------------------------------------------------------------------------
 # _connect / close / context manager
 # ---------------------------------------------------------------------------
+
 
 class TestConnectionLifecycle:
     def test_connect_lazy(self, fake_conn_cls: Any) -> None:
@@ -336,9 +346,11 @@ class TestConnectionLifecycle:
             pass
         assert fake_conn_cls.last.closed is True
 
+
 # ---------------------------------------------------------------------------
 # init_schema
 # ---------------------------------------------------------------------------
+
 
 class TestInitSchema:
     def test_init_schema_executes_file_and_commits(
@@ -359,9 +371,11 @@ class TestInitSchema:
         assert cur.calls[0][0] == "CREATE TABLE foo (id INT);"
         assert fake_conn_cls.last.commit_calls == 1
 
+
 # ---------------------------------------------------------------------------
 # upsert_ticker / upsert_tickers / list_tickers
 # ---------------------------------------------------------------------------
+
 
 def _meta(
     ticker: str = "SBER",
@@ -383,6 +397,7 @@ def _meta(
         delisted_at=delisted_at,
         listed_at=listed_at,
     )
+
 
 class TestTickerCRUD:
     def test_upsert_ticker_single_delegates_to_batch(self, store: PostgresDataStore) -> None:
@@ -562,9 +577,11 @@ class TestTickerCRUD:
         assert out[0].delisted is True
         assert out[0].delisted_at == date(2025, 1, 1)
 
+
 # ---------------------------------------------------------------------------
 # mark_delisted
 # ---------------------------------------------------------------------------
+
 
 class TestMarkDelisted:
     def test_mark_delisted(self, store: PostgresDataStore) -> None:
@@ -587,9 +604,11 @@ class TestMarkDelisted:
         # reason defaults to ""
         assert cur.calls[1][1] == ("GAZP", date(2026, 2, 1), "")
 
+
 # ---------------------------------------------------------------------------
 # OHLCV: upsert / query / dedup / migrate
 # ---------------------------------------------------------------------------
+
 
 def _bar(
     ticker: str = "SBER",
@@ -606,6 +625,7 @@ def _bar(
         volume=Decimal("1000000"),
         adj_close=Decimal(close),
     )
+
 
 class TestUpsertOHLCV:
     def test_empty_returns_zero(self, store: PostgresDataStore) -> None:
@@ -637,6 +657,7 @@ class TestUpsertOHLCV:
         cur = store._conn.last_cursor()
         _, params = cur.executemany_calls[0]
         assert len(params[0]) == 8
+
 
 class TestBackfillWithDedup:
     def test_empty_returns_zero_zero(self, store: PostgresDataStore) -> None:
@@ -685,6 +706,7 @@ class TestBackfillWithDedup:
         result = store.backfill_with_dedup([_bar()], source="moex")
         assert result["inserted"] == 1
 
+
 class TestMigrateDeduplicate:
     def test_returns_rowcount(self, store: PostgresDataStore) -> None:
         store._conn.next_rowcount.append(7)
@@ -701,6 +723,7 @@ class TestMigrateDeduplicate:
     def test_returns_zero_when_no_dups(self, store: PostgresDataStore) -> None:
         store._conn.next_rowcount.append(0)
         assert store.migrate_deduplicate() == 0
+
 
 class TestQueryOHLCV:
     def test_query_without_source(self, store: PostgresDataStore) -> None:
@@ -748,9 +771,11 @@ class TestQueryOHLCV:
         row = ("SBER", date(2026, 8, 14), "100", "110", "95", "105", "1000", "105")
         o = _row_to_ohlcv(row)
 
+
 # ---------------------------------------------------------------------------
 # Corporate actions
 # ---------------------------------------------------------------------------
+
 
 class TestCorporateActions:
     def test_upsert_empty(self, store: PostgresDataStore) -> None:
@@ -801,9 +826,11 @@ class TestCorporateActions:
         assert rows[0].value == Decimal("12.50")
         assert rows[1].source == "moex"
 
+
 # ---------------------------------------------------------------------------
 # count_ohlcv
 # ---------------------------------------------------------------------------
+
 
 class TestCountOHLCV:
     def test_with_ticker(self, store: PostgresDataStore) -> None:
@@ -829,9 +856,11 @@ class TestCountOHLCV:
         n = store.count_ohlcv(ticker=None)
         assert n == 0
 
+
 # ---------------------------------------------------------------------------
 # Pure converters
 # ---------------------------------------------------------------------------
+
 
 class TestRowConverters:
     def test_row_to_ticker_full_row(self) -> None:
@@ -955,9 +984,11 @@ class TestRowConverters:
         assert a.value == Decimal("12.50")
         assert a.source == "tkf"
 
+
 # ---------------------------------------------------------------------------
 # Lazy import: psycopg is imported in __init__ only.
 # ---------------------------------------------------------------------------
+
 
 class TestPsycopgImport:
     def test_psycopg_attribute_bound(self, fake_conn_cls: Any) -> None:

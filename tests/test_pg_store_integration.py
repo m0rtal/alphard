@@ -23,6 +23,7 @@ from src.data.pg_store import PostgresDataStore
 DSN = os.environ.get("ALPHARD_PG_DSN")
 SKIP_REASON = "ALPHARD_PG_DSN not set; skipping integration test"
 
+
 @pytest.fixture(scope="module")
 def pg_store():
     """Skip if no DSN. Otherwise create isolated test schema.
@@ -53,6 +54,7 @@ def pg_store():
             pass
         store.close()
 
+
 class TestPostgresDataStoreInit:
     def test_connection_succeeds(self, pg_store):
         assert pg_store._conn is not None
@@ -71,6 +73,7 @@ class TestPostgresDataStoreInit:
         assert "ohlcv_daily" in tables
         assert "corporate_actions" in tables
         # news_embedding skipped (Phase 3+)
+
 
 class TestTickerCRUD:
     def test_upsert_and_list_roundtrip(self, pg_store):
@@ -137,6 +140,7 @@ class TestTickerCRUD:
         pg_store.mark_delisted("PG_MARK", date(2026, 8, 14), reason="test")
         listed = pg_store.list_tickers(include_delisted=False)
         assert not any(m.ticker == "PG_MARK" for m in listed)
+
 
 class TestOHLCVCRUD:
     def test_upsert_and_query_roundtrip(self, pg_store):
@@ -242,6 +246,7 @@ class TestOHLCVCRUD:
         pg_store.upsert_ohlcv(rows)
         assert pg_store.count_ohlcv("PG_COUNT") == 5
 
+
 class TestErrorPaths:
     def test_invalid_dsn_raises(self, monkeypatch):
         from src.data.store import StoreError
@@ -257,6 +262,7 @@ class TestErrorPaths:
         pg_store.close()
         pg_store.close()  # should not raise
 
+
 class TestContextManager:
     def test_context_manager_returns_store(self, pg_store):
         """__enter__ / __exit__ exercise the lazy-connect + close paths."""
@@ -265,6 +271,7 @@ class TestContextManager:
             assert s._conn is not None
         # __exit__ calls close() → _conn reset to None
         assert pg_store._conn is None
+
 
 class TestCorporateActions:
     def test_upsert_and_query_roundtrip(self, pg_store):
@@ -324,6 +331,7 @@ class TestCorporateActions:
         assert len(rows) == 1
         assert rows[0].value == Decimal("3")  # latest write wins
 
+
 class TestMigrateDeduplicate:
     def test_deduplicate_no_op_when_no_duplicates(self, pg_store):
         """migrate_deduplicate returns 0 when no duplicates exist (steady-state).
@@ -353,6 +361,7 @@ class TestMigrateDeduplicate:
         deleted = pg_store.migrate_deduplicate()
         assert deleted == 0
         assert pg_store.count_ohlcv("PG_DEDUP_CL") == 1
+
 
 class TestOHLCVQueryVariants:
     def test_query_ohlcv_filters_by_source(self, pg_store):
@@ -433,6 +442,7 @@ class TestOHLCVQueryVariants:
         # Lowercase query should still match (SQL does UPPER)
         rows = pg_store.query_ohlcv("pg_upper", date(2026, 8, 1), date(2026, 8, 31))
         assert len(rows) == 1
+
 
 class TestConnectionLifecycle:
     def test_connect_idempotent(self, pg_store):

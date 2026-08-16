@@ -45,6 +45,7 @@ from src.data.models import TICKER_REGEX
 # 1. pydantic models
 # ===========================================================================
 
+
 class TestOHLCVRow:
     def test_minimal_valid(self) -> None:
         row = OHLCVRow(
@@ -177,6 +178,7 @@ class TestCorporateAction:
                 source="moex",
             )
 
+
 class TestTickerMeta:
     def test_minimal(self) -> None:
         tm = TickerMeta(
@@ -210,9 +212,11 @@ class TestTickerMeta:
         assert tm.delisted is True
         assert tm.delisted_at == date(2024, 1, 1)
 
+
 # ===========================================================================
 # 2. TokenBucket
 # ===========================================================================
+
 
 class TestTokenBucket:
     def test_initial_full(self) -> None:
@@ -280,9 +284,11 @@ class TestTokenBucket:
         t2.join()
         assert sum(results) == 100
 
+
 # ===========================================================================
 # 3. DataLoader ABC contract
 # ===========================================================================
+
 
 class FakeLoader(DataLoader):
     """In-memory loader used to exercise the ABC contract."""
@@ -314,6 +320,7 @@ class FakeLoader(DataLoader):
         for a in self._actions.get(ticker.upper(), []):
             if start <= a.ts <= end:
                 yield a
+
 
 class TestDataLoaderABC:
     def test_load_ohlcv_materialises(self) -> None:
@@ -349,9 +356,11 @@ class TestDataLoaderABC:
         # attribute exists and is a string.
         assert isinstance(_ABC.SOURCE, str)
 
+
 # ===========================================================================
 # 4. MOEXDataLoader (HTTP mocked)
 # ===========================================================================
+
 
 class _FakeResponse:
     def __init__(self, json_payload: dict[str, Any], status_code: int = 200) -> None:
@@ -362,6 +371,7 @@ class _FakeResponse:
 
     def json(self) -> dict[str, Any]:
         return self._payload
+
 
 class _FakeSession:
     """Minimal stand-in for requests.Session that records calls."""
@@ -382,6 +392,7 @@ class _FakeSession:
             raise AssertionError("no handler configured for " + url)
         return self._handlers.pop(0)
 
+
 def _candles_block(rows: list[list[Any]]) -> dict[str, Any]:
     return {
         "candles": {
@@ -390,6 +401,7 @@ def _candles_block(rows: list[list[Any]]) -> dict[str, Any]:
         }
     }
 
+
 def _ticker_block(rows: list[list[Any]]) -> dict[str, Any]:
     return {
         "securities": {
@@ -397,6 +409,7 @@ def _ticker_block(rows: list[list[Any]]) -> dict[str, Any]:
             "data": rows,
         }
     }
+
 
 class TestMOEXDataLoader:
     def _loader(self, handlers: list[Any]) -> tuple[MOEXDataLoader, _FakeSession]:
@@ -564,28 +577,35 @@ class TestMOEXDataLoader:
         bars = list(loader.iter_ohlcv("SBER", date(2026, 8, 1), date(2026, 8, 1)))
         assert len(bars) >= 1
 
+
 # ===========================================================================
 # 5. TinkoffDataLoader
 # ===========================================================================
 
+
 def _tinkoff_instruments(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return {"instruments": rows}
+
 
 def _tinkoff_candles(candles: list[dict[str, Any]]) -> dict[str, Any]:
     return {"candles": candles}
 
+
 def _tinkoff_dividends(divs: list[dict[str, Any]]) -> dict[str, Any]:
     return {"dividends": divs}
+
 
 # ===========================================================================
 # 6. DataStore contract (SQLite impl)
 # ===========================================================================
+
 
 @pytest.fixture
 def sqlite_store() -> Iterator[InMemorySQLiteStore]:
     s = InMemorySQLiteStore()
     yield s
     s.close()
+
 
 def _meta(ticker: str, **kw: Any) -> TickerMeta:
     defaults: dict[str, Any] = {
@@ -596,6 +616,7 @@ def _meta(ticker: str, **kw: Any) -> TickerMeta:
     }
     defaults.update(kw)
     return TickerMeta(**defaults)
+
 
 def _row(ticker: str, ts: date, **kw: Any) -> OHLCVRow:
     """Build a valid OHLCV row. ``close`` and ``open`` define the band;
@@ -623,6 +644,7 @@ def _row(ticker: str, ts: date, **kw: Any) -> OHLCVRow:
     if "low" not in kw:
         defaults["low"] = min(defaults["open"], defaults["close"])
     return OHLCVRow(**defaults)
+
 
 class TestDataStoreContract:
     def test_upsert_then_list(self, sqlite_store: InMemorySQLiteStore) -> None:
@@ -717,9 +739,11 @@ class TestDataStoreContract:
         out = sqlite_store.query_ohlcv("SBER", date(2026, 8, 1), date(2026, 8, 1))
         assert out[0].ticker == "SBER"
 
+
 # ===========================================================================
 # 7. property-based (hypothesis) roundtrip
 # ===========================================================================
+
 
 @settings(max_examples=50, deadline=None)
 @given(
@@ -753,6 +777,7 @@ def test_ohlcv_roundtrip_property(dates: list[date]) -> None:
         assert len(out) == len(dates)
     finally:
         sqlite_store.close()
+
 
 @settings(max_examples=50, deadline=None)
 @given(
@@ -788,6 +813,7 @@ def test_ticker_regex_property(ticker: str) -> None:
             volume=Decimal("0"),
             adj_close=Decimal("1"),
         )
+
 
 @settings(max_examples=30, deadline=None)
 @given(
