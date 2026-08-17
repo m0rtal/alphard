@@ -1245,6 +1245,7 @@ class TestSyncUniverseDelisted:
         """Multiple tickers → one executemany call."""
         store = self._make_store(rowcount=3)
         from datetime import date
+
         dates = {
             "SBER": (date(2007, 7, 20), None),
             "AMEZ": (date(2004, 7, 19), date(2020, 12, 30)),
@@ -1259,6 +1260,7 @@ class TestSyncUniverseDelisted:
     def test_sync_universe_delisted_passes_correct_params(self) -> None:
         """Each row's (listed_at, delisted_at, ticker) maps to the SQL."""
         from datetime import date
+
         store = self._make_store(rowcount=1)
         dates = {"SBER": (date(2007, 7, 20), None)}
         PostgresDataStore.sync_universe_delisted(store, dates)
@@ -1274,6 +1276,7 @@ class TestSyncUniverseDelisted:
     def test_sync_universe_delisted_uppercases_ticker(self) -> None:
         """Tickers are uppercased before write — matches the rest of pg_store."""
         from datetime import date
+
         store = self._make_store(rowcount=1)
         dates = {"sber": (date(2007, 7, 20), None)}
         PostgresDataStore.sync_universe_delisted(store, dates)
@@ -1292,6 +1295,7 @@ class TestSyncUniverseDelisted:
     def test_sync_universe_delisted_delegated_none_is_kept(self) -> None:
         """delisted_at=None → SQL NULL is passed through (no replacement)."""
         from datetime import date
+
         store = self._make_store(rowcount=1)
         dates = {"GAZP": (date(1996, 1, 1), None)}
         PostgresDataStore.sync_universe_delisted(store, dates)
@@ -1303,6 +1307,7 @@ class TestSyncUniverseDelisted:
     def test_sync_universe_delisted_returns_int(self) -> None:
         """psycopg may return rowcount as int or str; we coerce to int."""
         from datetime import date
+
         store = self._make_store(rowcount="2")
         dates = {"SBER": (date(2007, 7, 20), None)}
         result = PostgresDataStore.sync_universe_delisted(store, dates)
