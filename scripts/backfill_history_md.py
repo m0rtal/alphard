@@ -215,7 +215,8 @@ def _is_complete(
     """
     # Fast path: classic count threshold. Most "complete" tickers hit
     # this on the first call.
-    if store.count_ohlcv(ticker=ticker) >= min_bars:
+    count = store.count_ohlcv(ticker=ticker)
+    if count >= min_bars:
         return True
     # Slow path: age-aware check. Falls back to False on missing
     # metadata — we can't reason about completion without it, better
