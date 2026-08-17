@@ -1,4 +1,5 @@
 """Data-quality module: validators, gates, cross-source checks."""
+
 from src.data.quality.validate import (
     Issue,
     Severity,
