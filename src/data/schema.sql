@@ -39,11 +39,22 @@ CREATE TABLE IF NOT EXISTS ticker_universe (
     delisted_at  DATE,
     listed_at    DATE,
     source       VARCHAR(8) NOT NULL,
+    -- Backfill-completion flag: TRUE when the data-agent has pulled
+    -- the expected bar count for this ticker's listed_at..today|
+    -- delisted_at range (see scripts/backfill_history_md._HALTS_PCT
+    -- and the formula). ML and backtest layers filter on this to
+    -- avoid training on partial history.
+    backfill_complete BOOLEAN NOT NULL DEFAULT FALSE,
+    backfill_complete_at TIMESTAMPTZ,
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_ticker_universe_delisted
     ON ticker_universe (delisted);
+
+CREATE INDEX IF NOT EXISTS idx_ticker_universe_backfill_complete
+    ON ticker_universe (backfill_complete);
+
 
 CREATE INDEX IF NOT EXISTS idx_ticker_universe_figi
     ON ticker_universe (figi) WHERE figi IS NOT NULL;

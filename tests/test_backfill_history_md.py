@@ -281,3 +281,33 @@ def test_ticker_deadline_is_reasonable() -> None:
     ticker (a few seconds) but low enough that one stuck ticker can't
     starve the whole run overnight."""
     assert 60 <= bh._TICKER_DEADLINE_SECONDS <= 600
+
+
+# ---------------------------------------------------------------------------
+# _set_complete_flag — flag-flip helper called inside the main loop
+# ---------------------------------------------------------------------------
+
+
+def test_set_complete_flag_true_calls_store() -> None:
+    store = MagicMock()
+    bh._set_complete_flag(store, "SBER", complete=True)
+    store.mark_backfill_complete.assert_called_once_with("SBER", complete=True)
+
+
+def test_set_complete_flag_false_calls_store() -> None:
+    store = MagicMock()
+    bh._set_complete_flag(store, "FAIL", complete=False)
+    store.mark_backfill_complete.assert_called_once_with("FAIL", complete=False)
+
+
+def test_set_complete_flag_swallows_pg_errors() -> None:
+    """If the flag flip fails (e.g. transient DB), the backfill loop
+    must not crash — the bars are the primary deliverable, the flag is
+    metadata that can be re-flipped on the next run."""
+    import logging  # noqa: F401
+
+    store = MagicMock()
+    store.mark_backfill_complete.side_effect = RuntimeError("connection lost")
+    # Must not raise.
+    bh._set_complete_flag(store, "SBER", complete=True)
+    store.mark_backfill_complete.assert_called_once()

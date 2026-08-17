@@ -1131,3 +1131,87 @@ class TestDateRangeHelpers:
         store = self._store(None)
         result = PostgresDataStore.ticker_meta(store, "ORPHAN")
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# backfill_complete flag — the per-ticker gate ML/training reads
+# ---------------------------------------------------------------------------
+
+
+class TestBackfillCompleteFlag:
+    """The flag is a per-ticker gate: ML queries filter on it. These
+    tests pin the behavioural contract: write path sets True/False
+    correctly, read path returns the right thing for missing tickers.
+    """
+
+    def _store(self, fetchone_returns: Any) -> Any:
+        store = MagicMock()
+        cursor = MagicMock()
+        cursor.__enter__.return_value = cursor
+        cursor.fetchone.return_value = fetchone_returns
+        cursor_cm = MagicMock()
+        cursor_cm.__enter__.return_value = cursor
+        cursor_cm.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cursor_cm
+        store._conn = conn
+        store._connect = MagicMock()
+        return store
+
+    def test_mark_complete_updates_flag(self) -> None:
+        """mark_backfill_complete(True) issues the right UPDATE."""
+        store = self._store(None)
+        PostgresDataStore.mark_backfill_complete(store, "SBER", complete=True)
+        # Check that the SQL was called with the right args
+        cur = store._conn.cursor().__enter__()
+        assert cur.execute.called
+        # First arg is the SQL, second is the params tuple
+        call_args = cur.execute.call_args
+        assert "UPDATE ticker_universe" in call_args[0][0]
+        assert "backfill_complete = TRUE" in call_args[0][0]
+        assert "backfill_complete_at = NOW()" in call_args[0][0]
+        assert call_args[0][1] == ("SBER",)
+
+    def test_mark_incomplete_clears_flag(self) -> None:
+        """mark_backfill_complete(False) sets FALSE and NULLs the timestamp."""
+        store = self._store(None)
+        PostgresDataStore.mark_backfill_complete(store, "FAIL", complete=False)
+        cur = store._conn.cursor().__enter__()
+        call_args = cur.execute.call_args
+        assert "backfill_complete = FALSE" in call_args[0][0]
+        assert "backfill_complete_at = NULL" in call_args[0][0]
+        assert call_args[0][1] == ("FAIL",)
+
+    def test_mark_complete_commits(self) -> None:
+        """The method must commit (otherwise the flag never reaches ML)."""
+        store = self._store(None)
+        PostgresDataStore.mark_backfill_complete(store, "SBER", complete=True)
+        assert store._conn.commit.called
+
+    def test_is_complete_returns_true(self) -> None:
+        store = self._store((True,))
+        assert PostgresDataStore.is_backfill_complete(store, "SBER") is True
+
+    def test_is_complete_returns_false(self) -> None:
+        store = self._store((False,))
+        assert PostgresDataStore.is_backfill_complete(store, "X") is False
+
+    def test_is_complete_returns_false_for_missing_ticker(self) -> None:
+        """Ticker not in universe → not complete by default."""
+        store = self._store(None)
+        assert PostgresDataStore.is_backfill_complete(store, "GHOST") is False
+
+    def test_complete_tickers_lists_only_true(self) -> None:
+        store = self._store(None)
+        store._conn.cursor.return_value.__enter__.return_value.fetchall.return_value = [
+            ("SBER",),
+            ("GAZP",),
+        ]
+        result = PostgresDataStore.backfill_complete_tickers(store)
+        assert result == ["SBER", "GAZP"]
+
+    def test_complete_tickers_empty_universe(self) -> None:
+        store = self._store(None)
+        store._conn.cursor.return_value.__enter__.return_value.fetchall.return_value = []
+        result = PostgresDataStore.backfill_complete_tickers(store)
+        assert result == []

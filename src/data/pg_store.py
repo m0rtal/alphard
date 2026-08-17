@@ -386,6 +386,69 @@ class PostgresDataStore(DataStore):
             row = cur.fetchone()
             return row if row else None
 
+    def mark_backfill_complete(
+        self,
+        ticker: str,
+        complete: bool = True,
+    ) -> None:
+        """Flip the ``backfill_complete`` flag for ``ticker``.
+
+        ``True`` = the data-agent has all bars it can pull for this
+        ticker. ML and backtest layers filter on this flag to avoid
+        silently training on partial history.
+
+        ``False`` = explicitly re-open the ticker for retries. Used
+        when a future run discovers the previously-marked-complete
+        ticker has stale data (e.g. an upstream archive gap fix
+        adds a year that wasn't there yesterday).
+        """
+        self._connect()
+        with self._conn.cursor() as cur:
+            if complete:
+                cur.execute(
+                    """
+                    UPDATE ticker_universe
+                       SET backfill_complete = TRUE,
+                           backfill_complete_at = NOW(),
+                           updated_at = NOW()
+                     WHERE ticker = %s
+                    """,
+                    (ticker.upper(),),
+                )
+            else:
+                cur.execute(
+                    """
+                    UPDATE ticker_universe
+                       SET backfill_complete = FALSE,
+                           backfill_complete_at = NULL,
+                           updated_at = NOW()
+                     WHERE ticker = %s
+                    """,
+                    (ticker.upper(),),
+                )
+            self._conn.commit()
+
+    def backfill_complete_tickers(self) -> list[str]:
+        """Universe tickers marked backfill_complete = TRUE. Useful for
+        ML feature builders: ``SELECT * FROM ohlcv_daily WHERE ticker IN
+        (...)`` to skip the partial-history ones.
+        """
+        self._connect()
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT ticker FROM ticker_universe WHERE backfill_complete = TRUE ORDER BY ticker")
+            return [r[0] for r in cur.fetchall()]
+
+    def is_backfill_complete(self, ticker: str) -> bool:
+        """Check the flag without reading all bars. Cheap, no aggregates."""
+        self._connect()
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT backfill_complete FROM ticker_universe WHERE ticker = %s",
+                (ticker.upper(),),
+            )
+            row = cur.fetchone()
+            return bool(row[0]) if row else False
+
 
 def _row_to_ticker(r: Any) -> TickerMeta:
     return TickerMeta(

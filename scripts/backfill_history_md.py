@@ -149,6 +149,17 @@ _CIRCUIT_BREAKER_THRESHOLD = 5
 _TICKER_DEADLINE_SECONDS = 180
 
 
+def _set_complete_flag(store: PostgresDataStore, ticker: str, complete: bool) -> None:
+    """Flip the per-ticker backfill_complete flag. Catches any pg_store
+    exception so a flag-flip failure can't crash the backfill loop — the
+    flag is metadata, the bars are the primary deliverable.
+    """
+    try:
+        store.mark_backfill_complete(ticker, complete=complete)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"Could not set backfill_complete={complete} for {ticker}: {exc}")
+
+
 def _resolve_universe(
     loader: FallbackDataLoader,
     classes: list[str] | None,
@@ -466,6 +477,10 @@ def main() -> int:
             if not args.force and _is_complete(store, ticker, args.min_bars):
                 logger.info(f"{i}/{len(tickers)} {ticker}: skip (complete)")
                 skipped_complete += 1
+                # Make sure the flag reflects reality. If a previous run
+                # marked the ticker complete but DB bars were wiped, the
+                # flag is stale. Re-flip it now (idempotent, cheap).
+                _set_complete_flag(store, ticker, True)
                 circuit_breaker_streak = 0
                 continue
 
@@ -483,8 +498,14 @@ def main() -> int:
             if stats["written"] < 0:
                 errors.append((ticker, "error"))
                 circuit_breaker_streak += 1
+                # Don't unmark the flag if we already marked it (would
+                # lose state). Just leave it as-is.
             else:
                 circuit_breaker_streak = 0
+                # Re-check completion after the fresh pull. If the
+                # expected_bars formula now passes, flip the flag on.
+                if _is_complete(store, ticker, args.min_bars):
+                    _set_complete_flag(store, ticker, True)
 
             if stats["fetched"]:
                 logger.info(f"{i}/{len(tickers)} {ticker}: " f"fetched={stats['fetched']} written={stats['written']}")
