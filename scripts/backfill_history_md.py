@@ -24,6 +24,24 @@ on a partially-complete DB inserts only the missing ``(ticker, ts)``
 rows. There is no checkpoint file; the DB itself is the source of
 truth.
 
+Data-quality gate (primary decision input)
+------------------------------------------
+The DB is the primary signal for trade decisions — silent garbage
+in means silent garbage out. Every fresh batch runs through
+``src.data.quality.validate`` before the upsert:
+
+  - **CRITICAL** (high<low, negative volume, non-positive price)
+    rejects the entire ticker batch for this run. The caller logs
+    the rejection and moves on. Repeat offenders accumulate in
+    the warning summary and surface in ``scripts/validate_ohlcv.py``.
+  - **WARNING** (daily return > 50%, calendar gap > 14 days)
+    is logged but does not block. The operator investigates
+    periodically.
+
+Series-level checks (50% return, long gaps) protect against
+un-accommodated stock splits, missing archives, and silent
+delistings.
+
 Run as (production)
 -------------------
 
@@ -81,10 +99,7 @@ sys.path.insert(0, "/app")
 sys.path.insert(0, "/app/src")
 
 from src.data.pg_store import PostgresDataStore  # noqa: E402
-from src.data.tinkoff_md_loader import (  # noqa: E402
-    TinkoffInvestMDDataLoader,
-    aggregate_minutes_to_daily,
-)
+from src.data.tinkoff_md_loader import TinkoffInvestMDDataLoader  # noqa: E402
 from typing import Any  # noqa: E402
 
 logger = logging.getLogger("alphard.backfill_history_md")
@@ -227,7 +242,6 @@ def _backfill_one(
     ticker_started = time.monotonic()
     last_heartbeat = ticker_started
     try:
-        from src.data.models import OHLCVRow as _OHLCV
 
         rows: list[Any] = []
         for b in loader.iter_ohlcv(ticker, start, end):
@@ -242,6 +256,37 @@ def _backfill_one(
             logger.info(
                 f"[{ticker_idx}/{total}] {ticker} fetched={len(rows)} in {time.monotonic() - ticker_started:.0f}s"
             )
+
+        # Data-quality gate: never write structurally invalid bars into
+        # Postgres — this DB is the primary decision input for the
+        # trading bot. CRITICAL issues reject the whole batch.
+        from src.data.quality import (
+            blocking,
+            summarize,
+            validate_bar,
+            validate_series,
+        )
+
+        bar_issues = []
+        for r in rows:
+            bar_issues.extend(validate_bar(r))
+        bar_blocking = blocking(bar_issues)
+        if bar_blocking:
+            counts = summarize(bar_issues)
+            logger.error(
+                f"[{ticker_idx}/{total}] {ticker}: rejected {len(bar_blocking)} "
+                f"CRITICAL bar(s) (counts={counts}); skipping upsert"
+            )
+            return {"fetched": len(rows), "written": 0}
+
+        # Series-level checks (returns > 50%, long gaps) — WARN, don't block.
+        series_issues = validate_series(rows)
+        if series_issues:
+            counts = summarize(series_issues)
+            logger.warning(
+                f"[{ticker_idx}/{total}] {ticker}: {len(series_issues)} " f"quality WARNINGS (counts={counts})"
+            )
+
         written = store.upsert_ohlcv(rows)
         return {"fetched": len(rows), "written": written}
     except _LoaderTimeout:
