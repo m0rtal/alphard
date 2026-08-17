@@ -30,7 +30,7 @@ import os
 from datetime import date
 from decimal import Decimal
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -1056,3 +1056,78 @@ class TestPsycopgImport:
         # And it must be the real psycopg module (or whatever it was patched
         # to) — we just check it's callable for ``connect``.
         assert hasattr(s._psycopg, "connect")
+
+
+# ---------------------------------------------------------------------------
+# earliest_ts / latest_ts / ticker_meta — used by age-aware backfill
+# completion check in scripts/backfill_history_md.py
+# ---------------------------------------------------------------------------
+
+
+class TestDateRangeHelpers:
+    """Mocked-cursor tests for the new range helpers. The actual SQL
+    is exercised in test_pg_store_integration.py when ALPHARD_PG_DSN
+    is set; here we verify the row-mapping logic + None handling.
+
+    We use a plain MagicMock (no spec) and override the bound methods
+    that the SUT calls — PostgresDataStore methods reference
+    ``self._conn.cursor().fetchone()`` which is a real call chain;
+    patching the chain with a single MagicMock that returns a fixed
+    row tuple is enough.
+    """
+
+    def _store(self, row: Any) -> Any:
+        """Build a store whose ``_conn.cursor().fetchone()`` returns ``row``.
+
+        ``row`` may be ``None`` (no rows), a tuple, or any value the
+        caller wants fetchone() to return.
+        """
+        store = MagicMock()
+        cursor = MagicMock()
+        cursor.__enter__.return_value = cursor
+        cursor.fetchone.return_value = row
+        cursor_cm = MagicMock()
+        cursor_cm.__enter__.return_value = cursor
+        cursor_cm.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cursor_cm
+        store._conn = conn
+        store._connect = MagicMock()
+        return store
+
+    def test_earliest_ts_returns_date(self) -> None:
+        store = self._store((date(2018, 3, 15),))
+        result = PostgresDataStore.earliest_ts(store, "SBER")
+        assert result == date(2018, 3, 15)
+
+    def test_earliest_ts_returns_none_when_no_rows(self) -> None:
+        store = self._store(None)
+        result = PostgresDataStore.earliest_ts(store, "EMPTY")
+        assert result is None
+
+    def test_latest_ts_returns_date(self) -> None:
+        store = self._store((date(2026, 8, 17),))
+        result = PostgresDataStore.latest_ts(store, "SBER")
+        assert result == date(2026, 8, 17)
+
+    def test_latest_ts_returns_none_when_no_rows(self) -> None:
+        store = self._store(None)
+        result = PostgresDataStore.latest_ts(store, "EMPTY")
+        assert result is None
+
+    def test_ticker_meta_returns_tuple_for_delisted(self) -> None:
+        store = self._store((date(2020, 1, 1), date(2025, 6, 1)))
+        result = PostgresDataStore.ticker_meta(store, "DELISTED")
+        assert result == (date(2020, 1, 1), date(2025, 6, 1))
+
+    def test_ticker_meta_returns_tuple_for_live(self) -> None:
+        store = self._store((date(2024, 3, 1), None))
+        result = PostgresDataStore.ticker_meta(store, "LIVE")
+        listed_at, delisted_at = result
+        assert listed_at == date(2024, 3, 1)
+        assert delisted_at is None
+
+    def test_ticker_meta_returns_none_for_missing(self) -> None:
+        store = self._store(None)
+        result = PostgresDataStore.ticker_meta(store, "ORPHAN")
+        assert result is None

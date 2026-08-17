@@ -348,6 +348,44 @@ class PostgresDataStore(DataStore):
                 cur.execute("SELECT COUNT(*) FROM ohlcv_daily")
             return int(cur.fetchone()[0])
 
+    def earliest_ts(self, ticker: str) -> date | None:
+        """Earliest stored bar for ``ticker``, or None if no rows."""
+        self._connect()
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT MIN(ts) FROM ohlcv_daily WHERE ticker = %s",
+                (ticker.upper(),),
+            )
+            row = cur.fetchone()
+            return row[0] if row and row[0] is not None else None
+
+    def latest_ts(self, ticker: str) -> date | None:
+        """Latest stored bar for ``ticker``, or None if no rows."""
+        self._connect()
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT MAX(ts) FROM ohlcv_daily WHERE ticker = %s",
+                (ticker.upper(),),
+            )
+            row = cur.fetchone()
+            return row[0] if row and row[0] is not None else None
+
+    def ticker_meta(self, ticker: str) -> Any:
+        """Universe row for ``ticker``: ``(listed_at, delisted_at)`` or None.
+
+        Used by the backfill to compute the earliest date we can reach
+        for this ticker (delisted ticker = back to delisted_at; live
+        ticker = back to listed_at or MIN_YEAR).
+        """
+        self._connect()
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT listed_at, delisted_at FROM ticker_universe WHERE ticker = %s",
+                (ticker.upper(),),
+            )
+            row = cur.fetchone()
+            return row if row else None
+
 
 def _row_to_ticker(r: Any) -> TickerMeta:
     return TickerMeta(

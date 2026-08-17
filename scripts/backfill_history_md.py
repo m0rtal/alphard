@@ -92,7 +92,7 @@ import signal
 import sys
 import time
 import threading
-from datetime import date
+from datetime import date, timedelta
 
 # Make alphard.src importable when run from /app in container.
 sys.path.insert(0, "/app")
@@ -159,13 +159,91 @@ def _resolve_universe(
     return tickers
 
 
+# Trading days per calendar year on MOEX. ~252 sessions/year is the
+# standard accounting convention (excludes weekends + holidays).
+_TRADING_DAYS_PER_YEAR = 252
+
+# Tolerance for the earliest-side check: stored MIN(ts) is allowed to
+# be up to this many days after the universe's earliest pullable date
+# before we declare the ticker incomplete. Covers archive endpoints
+# that truncate the first week of a year or miss the first IPO session.
+_EARLIEST_TOLERANCE_DAYS = 90
+
+# Earliest year Tinkoff's history-data archive goes back to. Pre-2018
+# data requires a paid source (AlgoPack, etc.).
+MIN_YEAR = 2018
+
+
+def _earliest_expected_ts(
+    meta: tuple[date | None, date | None] | None,
+) -> date:
+    """Earliest date the universe says we can reach for this ticker.
+
+    - If ``delisted_at`` is set, only history up to that date is meaningful
+      (and pullable). We still want to back to MIN_YEAR for the delisted
+      ticker so backtests see the full history.
+    - If ``listed_at`` is set and the ticker is still live, history starts
+      from listed_at (or MIN_YEAR, whichever is later).
+
+    Tickers without ``listed_at`` (rare — some delisted/legacy entries)
+    fall back to MIN_YEAR.
+    """
+    listed_at, _delisted_at = meta if meta else (None, None)
+    if listed_at:
+        earliest_listed = date(listed_at.year, 1, 1)
+        return max(earliest_listed, date(MIN_YEAR, 1, 1))
+    return date(MIN_YEAR, 1, 1)
+
+
 def _is_complete(
     store: PostgresDataStore,
     ticker: str,
     min_bars: int,
 ) -> bool:
-    """Backfill complete if ticker has >= ``min_bars`` daily bars already."""
-    return store.count_ohlcv(ticker=ticker) >= min_bars
+    """Age-aware backfill-completion check.
+
+    A ticker is "complete" when the earliest stored bar reaches back to
+    the earliest date the universe says we can pull. This avoids the
+    trap where a freshly-listed ticker (which physically cannot have
+    ``min_bars`` daily bars yet) is skipped forever and the run
+    never converges.
+
+    We still honour the old ``min_bars`` shortcut: if a ticker already
+    has more than ``min_bars`` rows, treat it as complete without
+    fetching universe metadata — this keeps the hot path cheap for
+    the 99% of tickers that already have full history.
+    """
+    # Fast path: classic count threshold. Most "complete" tickers hit
+    # this on the first call.
+    if store.count_ohlcv(ticker=ticker) >= min_bars:
+        return True
+    # Slow path: age-aware check. Falls back to False on missing
+    # metadata — we can't reason about completion without it, better
+    # to re-pull than to skip a ticker we don't understand.
+    meta = store.ticker_meta(ticker)
+    if meta is None:
+        return False
+    earliest_expected = _earliest_expected_ts(meta)
+    earliest_stored = store.earliest_ts(ticker)
+    latest_stored = store.latest_ts(ticker)
+    if earliest_stored is None or latest_stored is None:
+        return False
+    # Earliest side: stored back to within EARLIEST_TOLERANCE_DAYS of
+    # expected. Archive endpoints sometimes truncate the first week of
+    # a year or miss the first IPO session.
+    if earliest_stored > earliest_expected + timedelta(days=_EARLIEST_TOLERANCE_DAYS):
+        return False
+    # Latest side: stored up to today (or delisted_at for delisted).
+    # 7-day grace covers weekend/holiday skew + cron not running for
+    # a few days.
+    _, delisted_at = meta
+    if delisted_at:
+        last_expected = min(delisted_at, date.today())
+    else:
+        last_expected = date.today()
+    if latest_stored < last_expected - timedelta(days=7):
+        return False
+    return True
 
 
 def _backfill_one(
