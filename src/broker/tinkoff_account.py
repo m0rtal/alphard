@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
+
 import time
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -33,6 +34,31 @@ logger = logging.getLogger("alphard.broker.tinkoff")
 
 class BrokerError(RuntimeError):
     """Technical failure from Tinkoff SDK."""
+
+
+def _assert_not_live_trading(action: str, ticker: str = "") -> bool:
+    """Phase 1 hard no-trade gate. Returns True if trading is allowed.
+
+    This is the single source of truth for the LIVE_TRADING=false
+    constraint. Every code path that could place a real order MUST
+    call this before they touch the broker — not just place_order(),
+    so that any future entry point (e.g. a background-driven dry-run,
+    a coordinator flow, a manual CLI command) inherits the same
+    guarantee.
+
+    The check is env-driven so it works for sandbox, CI, and
+    production alike. We refuse by default (LIVE_TRADING!="true")
+    — the operator must explicitly opt-in to live trading for
+    each fresh process.
+    """
+    if os.environ.get("LIVE_TRADING", "false").lower() == "true":
+        return True
+    logger.warning(
+        "LIVE_TRADING=false — refusing %s%s (Phase 1 hard no-trade)",
+        action,
+        f" for {ticker}" if ticker else "",
+    )
+    return False
 
 
 class TinkoffAccount(BrokerAccount):
@@ -188,13 +214,7 @@ class TinkoffAccount(BrokerAccount):
         This is a hard guarantee for Phase 1: real token may be present
         but no orders are placed regardless of RiskGate.
         """
-        import os
-
-        if os.environ.get("LIVE_TRADING", "false").lower() != "true":
-            logger.warning(
-                "LIVE_TRADING=false — refusing order for %s (Phase 1 hard no-trade)",
-                order.ticker,
-            )
+        if not _assert_not_live_trading("LIVE_TRADING=false — refusing order", order.ticker):
             return OrderStatus.REJECTED
         if self._risk_gate is None:
             logger.warning("RiskGate not configured — rejecting all orders (fail-safe)")

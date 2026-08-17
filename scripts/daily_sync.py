@@ -9,6 +9,14 @@ Used by cron. Idempotent: upsert on (ticker, ts, source) PK.
 
 Universe (Phase 1.1): top 20 liquid MOEX TQBR shares — bootstrap for
 the cross-sectional ML pipeline. Phase 3 will expand to full MOEX.
+
+Side effect on success: ``daily_sync`` re-runs the same completion
+formula that ``backfill_history_md`` uses and flips
+``ticker_universe.backfill_complete = TRUE`` for any ticker that
+now satisfies it. This is what tells the ML/training layer the
+ticker is safe to consume. Same logic lives in
+``scripts/backfill_history_md._is_complete`` — we re-import it
+rather than duplicate.
 """
 from __future__ import annotations
 
@@ -272,6 +280,19 @@ def main() -> int:
 
                 logger.info(f"{i}/{len(symbols)} {symbol}: {written} bars")
                 total_bars += written
+
+                # Mark complete if daily-sync topped the ticker up to
+                # the expected history range. The same formula the
+                # backfill uses, so the two pieces of code agree on
+                # what "complete" means. Idempotent: flipping an
+                # already-TRUE flag is a no-op.
+                try:
+                    from scripts.backfill_history_md import _is_complete
+
+                    if _is_complete(store, symbol, args.min_bars):
+                        store.mark_backfill_complete(symbol, complete=True)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(f"could not flip backfill_complete for {symbol}: {exc}")
 
                 if args.batch_sleep > 0:
                     import time

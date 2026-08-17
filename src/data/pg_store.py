@@ -428,6 +428,46 @@ class PostgresDataStore(DataStore):
                 )
             self._conn.commit()
 
+    def sync_universe_delisted(
+        self,
+        delisted_dates: dict[str, tuple["date | None", "date | None"]],
+    ) -> int:
+        """Bulk-update ``listed_at`` and ``delisted_at`` from MOEX ISS.
+
+        Uses a single multi-row UPSERT so a universe-wide sync is one
+        round trip. Returns the number of rows written. Tickers that
+        don't appear in ``delisted_dates`` are left alone.
+
+        Idempotent: re-running with the same dict is a no-op.
+        """
+
+        rows: list[tuple[str, object, object]] = []
+        for ticker, (listed_at, delisted_at) in delisted_dates.items():
+            # Map NULL dates to NULL in SQL (not None sentinel).
+            rows.append(
+                (
+                    ticker.upper(),
+                    listed_at,  # may be None
+                    delisted_at,  # may be None
+                )
+            )
+        if not rows:
+            return 0
+        self._connect()
+        with self._conn.cursor() as cur:
+            cur.executemany(
+                """
+                UPDATE ticker_universe
+                   SET listed_at   = COALESCE(%s, listed_at),
+                       delisted_at = %s,
+                       updated_at  = NOW()
+                 WHERE ticker = %s
+                """,
+                [(la, da, t) for t, la, da in rows],
+            )
+            self._conn.commit()
+            return int(cur.rowcount)
+
     def backfill_complete_tickers(self) -> list[str]:
         """Universe tickers marked backfill_complete = TRUE. Useful for
         ML feature builders: ``SELECT * FROM ohlcv_daily WHERE ticker IN
