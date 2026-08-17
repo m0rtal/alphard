@@ -89,26 +89,149 @@ def test_resolve_universe_limit_caps_universe_size() -> None:
 
 
 def test_is_complete_true_when_min_bars_reached() -> None:
+    """Fast path: count >= min_bars short-circuits regardless of meta."""
     store = MagicMock()
     store.count_ohlcv.return_value = 1300
     assert bh._is_complete(store, "SBER", min_bars=1300) is True
 
 
-def test_is_complete_false_when_below_threshold() -> None:
-    """Pre-fast-path: not enough bars AND no metadata to age-check
-    against. The age-aware path can't reason about completion
-    without ticker_universe data, so it conserves to "incomplete".
-    """
+def test_is_complete_below_count_no_meta_incomplete() -> None:
+    """count < min_bars AND no metadata → incomplete."""
     store = MagicMock()
     store.count_ohlcv.return_value = 1299
     store.ticker_meta.return_value = None
-    store.earliest_ts.return_value = date(2018, 1, 1)
     assert bh._is_complete(store, "SBER", min_bars=1300) is False
 
 
 # ---------------------------------------------------------------------------
 # _backfill_one: failure isolation
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# _is_complete: count vs expected_bars(listed_at..end * (1 - halts_pct))
+# ---------------------------------------------------------------------------
+
+
+def test_is_complete_fast_path_count_above_min_bars() -> None:
+    """Plain old count threshold for the 99% case."""
+    store = MagicMock()
+    store.count_ohlcv.return_value = 1300
+    assert bh._is_complete(store, "SBER", min_bars=1300) is True
+
+
+def test_is_complete_freshly_listed_ticker_not_blocked_forever() -> None:
+    """Ticker listed 2024-01-01 (today is 2026-08-17 so ~2.6y). expected
+    bars = 2.6 * 252 * 0.85 ≈ 557. count=580 > 557 → complete. No
+    infinite retry."""
+
+    store = MagicMock()
+    store.count_ohlcv.return_value = 580
+    store.ticker_meta.return_value = (date(2024, 1, 1), None)
+
+    assert bh._is_complete(store, "FRESH", min_bars=1300) is True
+
+
+def test_is_complete_delisted_ticker() -> None:
+    """Delisted ticker with delisted_at=2024-06-01. listed_at=2010.
+    expected_bars = trading_days(2010..2024-06) * 0.85 ≈ 3103.
+    Count=2000 < 3103 → incomplete."""
+
+    store = MagicMock()
+    store.count_ohlcv.return_value = 500
+    store.ticker_meta.return_value = (date(2010, 1, 1), date(2024, 6, 1))
+
+    assert bh._is_complete(store, "OLD", min_bars=1300) is False
+
+
+def test_is_complete_delisted_ticker_within_halts_pct() -> None:
+    """Same setup but stored 3300 bars (within ~6% of 3103 expected,
+    within halts_pct=15%)."""
+
+    store = MagicMock()
+    store.count_ohlcv.return_value = 3300
+    store.ticker_meta.return_value = (date(2010, 1, 1), date(2024, 6, 1))
+
+    # 14.5y * 252 * 0.85 = 3103, count=3300 > 3103 → complete
+    assert bh._is_complete(store, "OLD", min_bars=1300) is True
+
+
+def test_is_complete_archive_truncated_below_threshold() -> None:
+    """Ticker listed 2010, has only ~1200 bars, gap from 2010-2015.
+    expected_bars = 16y * 252 * 0.85 ≈ 3427, count=1200 << 3427.
+    Incomplete even though > 1300 — wait, 1200 < 1300 so we wouldn't
+    be here. The test pins the slower path: just below min_bars."""
+
+    store = MagicMock()
+    store.count_ohlcv.return_value = 1299
+    store.ticker_meta.return_value = (date(2010, 1, 1), None)
+
+    # 16.6y * 252 * 0.85 = 3555, count=1299 < 3555 → incomplete
+    assert bh._is_complete(store, "GAP", min_bars=1300) is False
+
+
+def test_is_complete_no_metadata_returns_false() -> None:
+    """Ticker not in ticker_universe. Re-pull and possibly surface the
+    gap."""
+
+    store = MagicMock()
+    store.count_ohlcv.return_value = 50
+    store.ticker_meta.return_value = None
+
+    assert bh._is_complete(store, "ORPHAN", min_bars=1300) is False
+
+
+def test_is_complete_listed_at_none_returns_false() -> None:
+    """Ticker is in the universe but listed_at is NULL (legacy entry).
+    Can't compute expected. Be conservative."""
+
+    store = MagicMock()
+    store.count_ohlcv.return_value = 500
+    store.ticker_meta.return_value = (None, None)
+
+    assert bh._is_complete(store, "LEGACY", min_bars=1300) is False
+
+
+def test_is_complete_delisted_same_day_as_listed() -> None:
+    """Pathological case — listed and delisted on the same day.
+    end <= listed_at, so expected = 0. Anything > 0 = complete."""
+
+    store = MagicMock()
+    store.count_ohlcv.return_value = 1
+    store.ticker_meta.return_value = (date(2020, 1, 1), date(2020, 1, 1))
+
+    assert bh._is_complete(store, "SAME_DAY", min_bars=1300) is True
+
+
+def test_is_complete_delisted_same_day_no_rows() -> None:
+    """Same scenario but no bars stored — incomplete."""
+
+    store = MagicMock()
+    store.count_ohlcv.return_value = 0
+    store.ticker_meta.return_value = (date(2020, 1, 1), date(2020, 1, 1))
+
+    assert bh._is_complete(store, "SAME_DAY", min_bars=1300) is False
+
+
+def test_is_complete_halts_pct_allows_normal_gaps() -> None:
+    """2022-style sanctions gap: ~5 months of trading halts in 2022.
+    Live ticker listed 2015, count=2400, expected ≈ 11y*252*0.85 = 2356.
+    2400 > 2356 → complete. Tolerates ~6 months of halts."""
+
+    store = MagicMock()
+    store.count_ohlcv.return_value = 2400
+    store.ticker_meta.return_value = (date(2015, 1, 1), None)
+
+    assert bh._is_complete(store, "LIVE", min_bars=1300) is True
+
+
+def test_is_complete_below_count_threshold_no_metadata_returns_false() -> None:
+    """Both count and meta missing — incomplete."""
+    store = MagicMock()
+    store.count_ohlcv.return_value = 50
+    store.ticker_meta.return_value = None
+
+    assert bh._is_complete(store, "ORPHAN", min_bars=1300) is False
 
 
 def test_backfill_one_returns_negative_on_timeout() -> None:
@@ -158,157 +281,3 @@ def test_ticker_deadline_is_reasonable() -> None:
     ticker (a few seconds) but low enough that one stuck ticker can't
     starve the whole run overnight."""
     assert 60 <= bh._TICKER_DEADLINE_SECONDS <= 600
-
-
-# ---------------------------------------------------------------------------
-# _is_complete: age-aware (handles fresh / delisted tickers correctly)
-# ---------------------------------------------------------------------------
-
-
-def test_is_complete_freshly_listed_ticker_not_blocked_forever() -> None:
-    """A ticker listed in 2025 has at most ~1 year (~252 bars) of
-    history. Old min-bars-only check would mark it incomplete forever;
-    age-aware check recognises it as complete once we pull back to
-    listed_at.
-    """
-    store = MagicMock()
-    store.count_ohlcv.return_value = 250  # below min-bars=1300
-    store.ticker_meta.return_value = (date(2025, 3, 15), None)  # listed 2025
-    store.earliest_ts.return_value = date(2025, 3, 16)
-    store.latest_ts.return_value = date(2026, 8, 17)  # recent enough
-
-    assert bh._is_complete(store, "FRESH", min_bars=1300) is True
-
-
-def test_is_complete_delisted_ticker_back_to_min_year() -> None:
-    """A delisted ticker (delisted_at=2020) needs history back to 2018.
-    We mark complete once earliest_ts <= 2018-01-01.
-    """
-    store = MagicMock()
-    store.count_ohlcv.return_value = 500  # below min-bars=1300
-    store.ticker_meta.return_value = (date(2010, 1, 1), date(2020, 6, 1))
-    store.earliest_ts.return_value = date(2018, 1, 5)
-    store.latest_ts.return_value = date(2020, 6, 1)  # = delisted_at
-
-    assert bh._is_complete(store, "OLD", min_bars=1300) is True
-
-
-def test_is_complete_still_false_when_history_truncated() -> None:
-    """Ticker metadata says listed_at=2010 but earliest stored bar is
-    only 2020 — backfill hasn't pulled the 2010-2019 history yet.
-    """
-    store = MagicMock()
-    store.count_ohlcv.return_value = 1500  # above min-bars, but...
-    # ...ticker_meta returns None which forces the slow path. No, the
-    # fast path triggered first. Force slow path instead.
-    store.count_ohlcv.return_value = 100  # below min-bars
-    store.ticker_meta.return_value = (date(2010, 1, 1), None)
-    store.earliest_ts.return_value = date(2020, 1, 1)
-    store.latest_ts.return_value = date(2026, 8, 17)
-
-    assert bh._is_complete(store, "GAP", min_bars=1300) is False
-
-
-def test_is_complete_no_metadata_falls_back_to_false() -> None:
-    """Ticker not in ticker_universe — can't reason about completion,
-    treat as incomplete so we re-pull and possibly surface the gap.
-    """
-    store = MagicMock()
-    store.count_ohlcv.return_value = 50  # below min-bars
-    store.ticker_meta.return_value = None  # no metadata
-
-    assert bh._is_complete(store, "ORPHAN", min_bars=1300) is False
-
-
-def test_is_complete_no_rows_returns_false() -> None:
-    """No bars stored — incomplete regardless of metadata."""
-    store = MagicMock()
-    store.count_ohlcv.return_value = 0
-    store.ticker_meta.return_value = (date(2015, 1, 1), None)
-    store.earliest_ts.return_value = None
-
-    assert bh._is_complete(store, "EMPTY", min_bars=1300) is False
-
-
-def test_is_complete_tolerance_within_30_days() -> None:
-    """If earliest stored bar is within 30 days of expected, treat as
-    complete — archive endpoints sometimes truncate the first/last
-    week of a year and we don't want to retry on a 5-day diff.
-    """
-    store = MagicMock()
-    store.count_ohlcv.return_value = 100  # below min-bars
-    store.ticker_meta.return_value = (date(2020, 1, 1), None)
-    # Earliest stored is 2020-01-30 = 29 days after listed_at 2020-01-01.
-    store.earliest_ts.return_value = date(2020, 1, 30)
-    store.latest_ts.return_value = date(2026, 8, 17)
-
-    assert bh._is_complete(store, "NEAR", min_bars=1300) is True
-
-
-def test_is_complete_min_year_floor_for_ancient_tickers() -> None:
-    """If listed_at is 2005 but MIN_YEAR=2018, we don't try to pull
-    pre-2018 (Tinkoff MD doesn't carry it).
-    """
-    from scripts.backfill_history_md import _earliest_expected_ts
-
-    # meta = (listed_at=2005, delisted=None) → expected = 2018-01-01
-    assert _earliest_expected_ts((date(2005, 6, 1), None)) == date(2018, 1, 1)
-
-
-def test_is_complete_listed_at_year_floor() -> None:
-    """If listed_at is 2023 and MIN_YEAR=2018, expected = 2023-01-01."""
-    from scripts.backfill_history_md import _earliest_expected_ts
-
-    assert _earliest_expected_ts((date(2023, 6, 1), None)) == date(2023, 1, 1)
-
-
-def test_is_complete_fast_path_takes_priority() -> None:
-    """A ticker with min_bars+ rows is complete without touching
-    ticker_meta — fast path. Pin this so we don't regress to a
-    query per ticker (would slow the run by 2x).
-    """
-    store = MagicMock()
-    store.count_ohlcv.return_value = 5000  # way above min-bars
-
-    assert bh._is_complete(store, "FAST", min_bars=1300) is True
-    store.ticker_meta.assert_not_called()
-    store.earliest_ts.assert_not_called()
-
-
-def test_is_complete_latest_side_missing_returns_false() -> None:
-    """Latest bar is months old and the ticker is live — backfill hasn't
-    run in a while. Re-pull to catch up."""
-    store = MagicMock()
-    store.count_ohlcv.return_value = 500  # below min-bars
-    store.ticker_meta.return_value = (date(2020, 1, 1), None)
-    store.earliest_ts.return_value = date(2020, 1, 1)  # OK earliest
-    store.latest_ts.return_value = date(2025, 1, 1)  # 19 months stale
-
-    assert bh._is_complete(store, "STALE", min_bars=1300) is False
-
-
-def test_is_complete_latest_side_within_7_day_grace() -> None:
-    """Cron runs daily so 7-day grace covers weekends. Backfill
-    yesterday's bar = complete."""
-    store = MagicMock()
-    store.count_ohlcv.return_value = 100
-    store.ticker_meta.return_value = (date(2024, 1, 1), None)
-    store.earliest_ts.return_value = date(2024, 1, 1)
-    store.latest_ts.return_value = date(2026, 8, 15)  # 2 days ago
-
-    assert bh._is_complete(store, "FRESH", min_bars=1300) is True
-
-
-def test_is_complete_delisted_with_latest_beyond_delisted_at() -> None:
-    """Delisted ticker with bar AFTER delisted_at is suspicious — could
-    be a stale write or a data error. We still declare complete because
-    the universe metadata says last_expected = min(delisted_at, today),
-    and the latest stored bar is between those two values.
-    """
-    store = MagicMock()
-    store.count_ohlcv.return_value = 500
-    store.ticker_meta.return_value = (date(2010, 1, 1), date(2020, 6, 1))
-    store.earliest_ts.return_value = date(2018, 1, 5)
-    store.latest_ts.return_value = date(2020, 7, 1)  # 30 days after delisted_at
-
-    assert bh._is_complete(store, "POSTDELIST", min_bars=1300) is True

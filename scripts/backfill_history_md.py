@@ -13,9 +13,21 @@ Workflow
 
 When backfill is "complete"
 --------------------------
-Complete = the DB has >= ``--min-bars`` (default 1300) daily bars for
-every ticker in the resolved universe. Once complete the script exits
-0 — the cron'd ``daily_sync.py`` takes over for incremental updates.
+Complete for a ticker when **stored bar count >= expected bar count**
+for the date range we can possibly cover for it::
+
+    expected_bars = trading_days(listed_at, today|delisted_at) * (1 - _HALTS_PCT)
+
+    trading_days = calendar_days * 252 / 365.25   (no holiday calendar)
+    _HALTS_PCT   = 0.15                            (15% slack: 2022 sanctions gap, etc.)
+
+Fast path: if ``count >= --min-bars`` (1300), short-circuits. Catches
+~99% of "complete" tickers (live, delisted or fresh) without
+touching universe metadata.
+
+Once every ticker in the universe is complete, the script exits 0
+and the cron'd ``daily_sync.py`` takes over for incremental updates
+via broker gRPC.
 
 Recovery on restart
 -------------------
@@ -92,7 +104,7 @@ import signal
 import sys
 import time
 import threading
-from datetime import date, timedelta
+from datetime import date
 
 # Make alphard.src importable when run from /app in container.
 sys.path.insert(0, "/app")
@@ -163,11 +175,12 @@ def _resolve_universe(
 # standard accounting convention (excludes weekends + holidays).
 _TRADING_DAYS_PER_YEAR = 252
 
-# Tolerance for the earliest-side check: stored MIN(ts) is allowed to
-# be up to this many days after the universe's earliest pullable date
-# before we declare the ticker incomplete. Covers archive endpoints
-# that truncate the first week of a year or miss the first IPO session.
-_EARLIEST_TOLERANCE_DAYS = 90
+# Fraction of trading days a "complete" ticker is allowed to be
+# missing without being flagged as incomplete. Covers normal
+# exchange halts, delisting days, and major disruption events
+# (2022 sanctions gap, etc.). 15% is well above the worst
+# historical Russian-market disruption.
+_HALTS_PCT = 0.15
 
 # Earliest year Tinkoff's history-data archive goes back to. Pre-2018
 # data requires a paid source (AlgoPack, etc.).
@@ -200,51 +213,58 @@ def _is_complete(
     ticker: str,
     min_bars: int,
 ) -> bool:
-    """Age-aware backfill-completion check.
+    """Honest backfill-completion check.
 
-    A ticker is "complete" when the earliest stored bar reaches back to
-    the earliest date the universe says we can pull. This avoids the
-    trap where a freshly-listed ticker (which physically cannot have
-    ``min_bars`` daily bars yet) is skipped forever and the run
-    never converges.
+    A ticker is "complete" when its stored bar count reaches the
+    *expected* bar count for the date range we can possibly cover
+    for it, with a configurable trading-halt allowance.
 
-    We still honour the old ``min_bars`` shortcut: if a ticker already
-    has more than ``min_bars`` rows, treat it as complete without
-    fetching universe metadata — this keeps the hot path cheap for
-    the 99% of tickers that already have full history.
+    Formula:
+        expected_bars = trading_days(listed_at, today) * (1 - _HALTS_PCT)
+        complete iff count_ohlcv(ticker) >= expected_bars
+
+    ``trading_days`` counts calendar days minus weekends (no
+    holiday calendar — adding a Russian holidays library would
+    cost more than the precision buys). For delisted tickers the
+    range is ``listed_at..delisted_at``.
+
+    ``_HALTS_PCT`` is the fraction of trading days we *don't* expect
+    to have bars for, even on a "complete" ticker. Covers normal
+    exchange halts, delisting days, 2022-style sanctions gaps, etc.
+    Set to ``0.15`` (15%) which is well above historical Russian
+    market disruption levels.
+
+    Tickers without listed_at metadata fall back to the legacy
+    ``min_bars`` check (best-effort for legacy data).
+
+    No need for separate earliest/latest/tolerance side checks — the
+    one formula naturally handles fresh tickers (low expected
+    count, low required count), delisted tickers (narrow range,
+    modest count), live tickers (full range, count >= min_bars
+    anyway), and trading-halt-affected tickers (15% margin).
     """
-    # Fast path: classic count threshold. Most "complete" tickers hit
-    # this on the first call.
     count = store.count_ohlcv(ticker=ticker)
     if count >= min_bars:
         return True
-    # Slow path: age-aware check. Falls back to False on missing
-    # metadata — we can't reason about completion without it, better
-    # to re-pull than to skip a ticker we don't understand.
     meta = store.ticker_meta(ticker)
     if meta is None:
+        # No metadata = legacy data without universe entry. Best we
+        # can do is the legacy min_bars threshold, which already
+        # failed above. Treat as incomplete so we re-pull.
         return False
-    earliest_expected = _earliest_expected_ts(meta)
-    earliest_stored = store.earliest_ts(ticker)
-    latest_stored = store.latest_ts(ticker)
-    if earliest_stored is None or latest_stored is None:
+    listed_at, delisted_at = meta
+    if listed_at is None:
+        # Ticker is in the universe but listed_at unknown — can't
+        # compute expected. Be conservative.
         return False
-    # Earliest side: stored back to within EARLIEST_TOLERANCE_DAYS of
-    # expected. Archive endpoints sometimes truncate the first week of
-    # a year or miss the first IPO session.
-    if earliest_stored > earliest_expected + timedelta(days=_EARLIEST_TOLERANCE_DAYS):
-        return False
-    # Latest side: stored up to today (or delisted_at for delisted).
-    # 7-day grace covers weekend/holiday skew + cron not running for
-    # a few days.
-    _, delisted_at = meta
-    if delisted_at:
-        last_expected = min(delisted_at, date.today())
-    else:
-        last_expected = date.today()
-    if latest_stored < last_expected - timedelta(days=7):
-        return False
-    return True
+    end = delisted_at if delisted_at else date.today()
+    if end <= listed_at:
+        # Delisted the same day it listed (or before). Nothing to pull.
+        return count > 0
+    calendar_days = (end - listed_at).days
+    trading_days = int(calendar_days * _TRADING_DAYS_PER_YEAR / 365.25)
+    expected_bars = int(trading_days * (1.0 - _HALTS_PCT))
+    return count >= expected_bars
 
 
 def _backfill_one(
