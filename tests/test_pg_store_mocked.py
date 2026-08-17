@@ -1215,3 +1215,96 @@ class TestBackfillCompleteFlag:
         store._conn.cursor.return_value.__enter__.return_value.fetchall.return_value = []
         result = PostgresDataStore.backfill_complete_tickers(store)
         assert result == []
+
+
+# ---------------------------------------------------------------------------
+# sync_universe_delisted — multi-row bulk UPSERT for delist dates
+# ---------------------------------------------------------------------------
+
+
+class TestSyncUniverseDelisted:
+    """The delist sync writes ``listed_at`` / ``delisted_at`` to the
+    ticker_universe table. Tested via a mock cursor; verifies the
+    SQL parameters and that cur.rowcount is returned as int.
+    """
+
+    def _make_store(self, rowcount: int = 1) -> MagicMock:
+        store = MagicMock()
+        cursor = MagicMock()
+        cursor.rowcount = rowcount
+        cursor_cm = MagicMock()
+        cursor_cm.__enter__.return_value = cursor
+        cursor_cm.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cursor_cm
+        store._conn = conn
+        store._connect = MagicMock()
+        return store
+
+    def test_sync_universe_delisted_runs_executemany(self) -> None:
+        """Multiple tickers → one executemany call."""
+        store = self._make_store(rowcount=3)
+        from datetime import date
+        dates = {
+            "SBER": (date(2007, 7, 20), None),
+            "AMEZ": (date(2004, 7, 19), date(2020, 12, 30)),
+            "GAZP": (date(1996, 1, 1), None),
+        }
+        result = PostgresDataStore.sync_universe_delisted(store, dates)
+        assert result == 3
+        cursor = store._conn.cursor.return_value.__enter__.return_value
+        cursor.executemany.assert_called_once()
+        cursor.execute.assert_not_called()
+
+    def test_sync_universe_delisted_passes_correct_params(self) -> None:
+        """Each row's (listed_at, delisted_at, ticker) maps to the SQL."""
+        from datetime import date
+        store = self._make_store(rowcount=1)
+        dates = {"SBER": (date(2007, 7, 20), None)}
+        PostgresDataStore.sync_universe_delisted(store, dates)
+        cursor = store._conn.cursor.return_value.__enter__.return_value
+        call = cursor.executemany.call_args
+        sql, params = call[0]
+        assert "UPDATE ticker_universe" in sql
+        assert "COALESCE" in sql
+        assert "delisted_at" in sql
+        # params is list of tuples (listed_at, delisted_at, ticker)
+        assert params == [(date(2007, 7, 20), None, "SBER")]
+
+    def test_sync_universe_delisted_uppercases_ticker(self) -> None:
+        """Tickers are uppercased before write — matches the rest of pg_store."""
+        from datetime import date
+        store = self._make_store(rowcount=1)
+        dates = {"sber": (date(2007, 7, 20), None)}
+        PostgresDataStore.sync_universe_delisted(store, dates)
+        cursor = store._conn.cursor.return_value.__enter__.return_value
+        params = cursor.executemany.call_args[0][1]
+        assert params[0][2] == "SBER"
+
+    def test_sync_universe_delisted_empty_dict_returns_zero(self) -> None:
+        """No work to do → return 0 without opening a cursor."""
+        store = self._make_store()
+        result = PostgresDataStore.sync_universe_delisted(store, {})
+        assert result == 0
+        # _connect was never called
+        store._connect.assert_not_called()
+
+    def test_sync_universe_delisted_delegated_none_is_kept(self) -> None:
+        """delisted_at=None → SQL NULL is passed through (no replacement)."""
+        from datetime import date
+        store = self._make_store(rowcount=1)
+        dates = {"GAZP": (date(1996, 1, 1), None)}
+        PostgresDataStore.sync_universe_delisted(store, dates)
+        cursor = store._conn.cursor.return_value.__enter__.return_value
+        params = cursor.executemany.call_args[0][1]
+        # active ticker: delisted_at None
+        assert params[0][1] is None
+
+    def test_sync_universe_delisted_returns_int(self) -> None:
+        """psycopg may return rowcount as int or str; we coerce to int."""
+        from datetime import date
+        store = self._make_store(rowcount="2")
+        dates = {"SBER": (date(2007, 7, 20), None)}
+        result = PostgresDataStore.sync_universe_delisted(store, dates)
+        assert result == 2
+        assert isinstance(result, int)
