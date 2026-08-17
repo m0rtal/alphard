@@ -1,5 +1,4 @@
 name: CI
-# 2026-08-17: trigger CI
 
 on:
   push:
