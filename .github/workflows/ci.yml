@@ -1,4 +1,5 @@
 name: CI
+# 2026-08-17: trigger CI
 
 on:
   push:
@@ -103,3 +104,4 @@ jobs:
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
