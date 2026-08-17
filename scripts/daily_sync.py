@@ -284,8 +284,7 @@ def main() -> int:
         store.close()
 
     logger.info(
-        f"=== DONE: {total_bars} bars written, {len(errors)} errors, "
-        f"md_archive_used={md_used_count} tickers ==="
+        f"=== DONE: {total_bars} bars written, {len(errors)} errors, " f"md_archive_used={md_used_count} tickers ==="
     )
     return 0 if not errors else 2
 

@@ -35,7 +35,7 @@ def test_resolve_universe_no_class_filter_returns_everything() -> None:
     fake_etfs = [MagicMock(ticker="FXUS", class_code="TQTE")]
 
     loader = MagicMock()
-    loader.list_tickers_with_figi.return_value = fake_tqbr + fake_spbxm + fake_bonds + fake_etfs
+    loader.list_tickers.return_value = fake_tqbr + fake_spbxm + fake_bonds + fake_etfs
 
     out = bh._resolve_universe(loader, classes=None, limit=0)
 
@@ -49,7 +49,7 @@ def test_resolve_universe_class_filter_case_insensitive() -> None:
         MagicMock(ticker="AAPL", class_code="SPBXM"),
     ]
     loader = MagicMock()
-    loader.list_tickers_with_figi.return_value = fake
+    loader.list_tickers.return_value = fake
 
     upper = bh._resolve_universe(loader, classes=["TQBR"], limit=0)
     lower = bh._resolve_universe(loader, classes=["tqbr"], limit=0)
@@ -66,7 +66,7 @@ def test_resolve_universe_class_all_string_does_not_match() -> None:
     """
     fake = [MagicMock(ticker="SBER", class_code="TQBR")]
     loader = MagicMock()
-    loader.list_tickers_with_figi.return_value = fake
+    loader.list_tickers.return_value = fake
 
     out = bh._resolve_universe(loader, classes=["ALL"], limit=0)
 
@@ -76,7 +76,7 @@ def test_resolve_universe_class_all_string_does_not_match() -> None:
 def test_resolve_universe_limit_caps_universe_size() -> None:
     fake = [MagicMock(ticker=f"T{i}", class_code="TQBR") for i in range(10)]
     loader = MagicMock()
-    loader.list_tickers_with_figi.return_value = fake
+    loader.list_tickers.return_value = fake
 
     out = bh._resolve_universe(loader, classes=None, limit=3)
 

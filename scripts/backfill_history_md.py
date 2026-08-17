@@ -100,6 +100,9 @@ sys.path.insert(0, "/app/src")
 
 from src.data.pg_store import PostgresDataStore  # noqa: E402
 from src.data.tinkoff_md_loader import TinkoffInvestMDDataLoader  # noqa: E402
+from src.data.tinkoff_loader import TinkoffInvestDataLoader  # noqa: E402
+from src.data.moex_loader import MOEXDataLoader  # noqa: E402
+from src.data.fallback_loader import FallbackDataLoader  # noqa: E402
 from typing import Any  # noqa: E402
 
 logger = logging.getLogger("alphard.backfill_history_md")
@@ -135,7 +138,7 @@ _TICKER_DEADLINE_SECONDS = 180
 
 
 def _resolve_universe(
-    loader: TinkoffInvestMDDataLoader,
+    loader: FallbackDataLoader,
     classes: list[str] | None,
     limit: int,
 ) -> list[str]:
@@ -145,7 +148,7 @@ def _resolve_universe(
     Empty ``classes`` = all classes. ``limit`` caps the universe size
     for smoke runs.
     """
-    metas = loader.list_tickers_with_figi()
+    metas = loader.list_tickers()
     if classes:
         classes_upper = {c.upper() for c in classes}
         metas = [m for m in metas if (m.class_code or "").upper() in classes_upper]
@@ -166,7 +169,7 @@ def _is_complete(
 
 
 def _backfill_one(
-    loader: TinkoffInvestMDDataLoader,
+    loader: FallbackDataLoader,
     store: PostgresDataStore,
     ticker: str,
     start: date,
@@ -337,7 +340,13 @@ def main() -> int:
     end = date(args.end_year, 12, 31)
 
     try:
-        loader = TinkoffInvestMDDataLoader(token=args.token)
+        # Fallback chain: Tinkoff MD (history-data) → Tinkoff gRPC (broker
+        # GetCandles) → MOEX ISS. All three wrap behind one iterator.
+        loader = FallbackDataLoader(
+            tinkoff_md=TinkoffInvestMDDataLoader(token=args.token),
+            tinkoff_grpc=TinkoffInvestDataLoader(),
+            moex_iss=MOEXDataLoader(),
+        )
     except Exception as e:
         logger.error(f"Loader init failed: {e}")
         return 2
@@ -351,7 +360,7 @@ def main() -> int:
 
     try:
         tickers = _resolve_universe(loader, args.classes, args.limit)
-        logger.info(f"=== Tinkoff MD backfill: {len(tickers)} tickers, {start} → {end} ===")
+        logger.info(f"=== Backfill (fallback chain md → grpc → moex): {len(tickers)} tickers, {start} → {end} ===")
 
         circuit_breaker_streak = 0
         for i, ticker in enumerate(tickers, start=1):
@@ -401,9 +410,17 @@ def main() -> int:
         store.close()
 
     elapsed = time.monotonic() - started
+    fb = loader.stats if isinstance(loader, FallbackDataLoader) else None
+    fb_summary = ""
+    if fb:
+        fb_summary = " | ".join(
+            f"{src}={fb[src]['ok']}/{fb[src]['fallback']}/{fb[src]['error']}"
+            for src in ("tinkoff_md", "tinkoff_grpc", "moex_iss")
+        )
     logger.info(
         f"=== DONE in {elapsed:.0f}s: fetched={total_fetched} "
-        f"written={total_written} skipped={skipped_complete} errors={len(errors)} ==="
+        f"written={total_written} skipped={skipped_complete} errors={len(errors)} "
+        f"| sources [ok/fallback/err]: {fb_summary} ==="
     )
     return 0 if not errors else 2
 

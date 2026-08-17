@@ -120,10 +120,7 @@ def backfill(
     # Filter to those that exist in Tinkoff universe
     tickers_to_backfill = [t for t in missing if t in universe_meta]
     skipped_no_meta = [t for t in missing if t not in universe_meta]
-    logger.info(
-        f"In Tinkoff universe: {len(tickers_to_backfill)}; "
-        f"no meta (skip): {len(skipped_no_meta)}"
-    )
+    logger.info(f"In Tinkoff universe: {len(tickers_to_backfill)}; " f"no meta (skip): {len(skipped_no_meta)}")
 
     if max_tickers > 0:
         tickers_to_backfill = tickers_to_backfill[:max_tickers]
@@ -150,18 +147,14 @@ def backfill(
             elif not bars:
                 stats["no_data"] += 1
             elapsed = time.time() - t0
-            logger.info(
-                f"PROGRESS {i}/{stats['universe_total']} {ticker} "
-                f"bars={len(bars)} elapsed={elapsed:.2f}s"
-            )
+            logger.info(f"PROGRESS {i}/{stats['universe_total']} {ticker} " f"bars={len(bars)} elapsed={elapsed:.2f}s")
         except Exception as exc:
             stats["errors"] += 1
             msg = str(exc).lower()
             if "rate" in msg or "limit" in msg:
                 stats["rate_limited"] += 1
             logger.warning(
-                f"PROGRESS {i}/{stats['universe_total']} {ticker} "
-                f"ERROR {type(exc).__name__}: {str(exc)[:120]}"
+                f"PROGRESS {i}/{stats['universe_total']} {ticker} " f"ERROR {type(exc).__name__}: {str(exc)[:120]}"
             )
         # Progress every 50
         if i % 50 == 0:
