@@ -108,6 +108,14 @@ if [ "${DISABLE_BACKFILL:-false}" != "true" ]; then
     # Real auth probe: SELECT 1 + INSERT _auth_probe. Must succeed before
     # we let backfill start — backfill without working writes = hours of
     # wasted compute, AND silent loss of newbars history.
+    #
+    # Note: `|| true` swallows python's exit-code, then we capture it
+    # explicitly via $?. Without `|| true`, `set -e` would abort the
+    # script the moment auth_probe() returns False, never printing the
+    # failure message. The cron job (check_db_health.py) and the
+    # backfill_history_md.py pre-run guard cover the same check — this
+    # entrypoint guard is the LAST chance to surface auth drift, so
+    # it must be noisy.
     AUTH_RESULT=$(python -c "
 import os, sys
 sys.path.insert(0, 'src')
@@ -116,10 +124,10 @@ s = PostgresDataStore()
 ok = s.auth_probe(source='entrypoint_smoke')
 print('OK' if ok else 'BROKEN')
 sys.exit(0 if ok else 1)
-" 2>&1)
+" 2>&1) || AUTH_RESULT="$AUTH_RESULT (python exited non-zero)"
     AUTH_EXIT=$?
 
-    if [ $AUTH_EXIT -ne 0 ]; then
+    if [ $AUTH_EXIT -ne 0 ] || [ "$AUTH_RESULT" != "OK" ]; then
         echo "AUTH PROBE FAILED: backfill would silently write to nowhere." >&2
         echo "Probe error: ${AUTH_RESULT}" >&2
         echo "Aborting container start to prevent silent backfill failure." >&2
