@@ -102,6 +102,74 @@ class PostgresDataStore(DataStore):
     def __exit__(self, *exc: Any) -> None:
         self.close()
 
+    # ---------------------------------------------------------- auth probe
+    # (Phase 1.6 H-9: detect silent auth drift after redeploy)
+
+    def auth_probe(self, source: str = "auth_probe") -> bool:
+        """Verify the bot's DB credentials are real, not just readable.
+
+        ``pg_isready`` returns success even when scram-hashed passwords in
+        pg_authid are stale (e.g. the volume was preserved across a redeploy
+        that rotated POSTGRES_PASSWORD). pg_isready only checks that the
+        socket is open and the process responds, not that *our* credentials
+        authenticate us.
+
+        ``auth_probe`` instead does a real round-trip:
+
+          1. SELECT 1 -- confirms SELECT works under our role.
+          2. INSERT _auth_probe ... ON CONFLICT DO UPDATE -- confirms we
+             have write access to a known table.
+
+        Both must succeed for the probe to return True. Any psycopg error
+        (auth failure, connection lost, permission denied) returns False.
+
+        This is intentionally read/write — the failure mode we are
+        protecting against is "connect succeeds, reads work, writes
+        silently fail or hit a permission error". A pure SELECT probe
+        would miss that.
+
+        Parameters
+        ----------
+        source:
+            Free-form label written to _auth_probe.source. Used to
+            distinguish entrypoint-smoke from backfill-pre-run from
+            healthcheck in logs.
+
+        Returns
+        -------
+        bool
+            True if both probe statements succeeded; False on any error.
+
+        Side effects
+        ------------
+        Updates one row in _auth_probe (id=1). Idempotent.
+        """
+        try:
+            self._connect()
+            with self._conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+                cur.execute(
+                    """
+                    INSERT INTO _auth_probe (id, probed_at, source)
+                    VALUES (1, NOW(), %s)
+                    ON CONFLICT (id) DO UPDATE
+                        SET probed_at = NOW(), source = EXCLUDED.source
+                    """,
+                    (source,),
+                )
+            self._conn.commit()
+            return True
+        except Exception as exc:  # noqa: BLE001 — auth probe must never raise
+            # Log at WARNING (visible in default stack) but never raise —
+            # callers (entrypoint smoke, backfill pre-run) decide what to do.
+            logger.warning(
+                "PostgresDataStore.auth_probe failed: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+            return False
+
     # ---------------------------------------------------------- schema
 
     def init_schema(self) -> None:
@@ -373,6 +441,20 @@ class PostgresDataStore(DataStore):
                 "SELECT MAX(ts) FROM ohlcv_daily WHERE ticker = %s",
                 (ticker.upper(),),
             )
+            row = cur.fetchone()
+            return row[0] if row and row[0] is not None else None
+
+    def latest_ts_overall(self) -> date | None:
+        """Latest bar across the entire ``ohlcv_daily`` table, or None.
+
+        Used by ``scripts/check_data_freshness.py`` to detect silent
+        data-feed stalls: the cron job (or daily_sync) is running but
+        no new rows are being written. Returns None if the table is
+        empty (legitimate pre-launch state) or on a connection error.
+        """
+        self._connect()
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT MAX(ts) FROM ohlcv_daily")
             row = cur.fetchone()
             return row[0] if row and row[0] is not None else None
 

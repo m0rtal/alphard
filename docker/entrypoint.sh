@@ -55,7 +55,78 @@ fi
 #
 # The backfill script is idempotent (skip-complete on every restart) so
 # restarting the container only resumes from where it left off.
+#
+# BUGFIX (H-9): before launching backfill we do a real auth probe against
+# the postgres container. pg_isready in the compose healthcheck does NOT
+# verify our credentials — only that the socket is open. Without this
+# smoke test, a stale scram hash in pg_authid (volume-preserved across
+# redeploys while POSTGRES_PASSWORD env was rotated) would let the bot
+# start, then backfill would silently log "no data in window" for every
+# ticker without writing anything. We hit this in production 2026-08-18.
+#
+# We also enforce a stable DSN password by hashing the current password
+# to a fingerprint file on first successful probe; on subsequent restarts,
+# if the fingerprint diverges from the live password, the operator is
+# warned to re-init the postgres volume (or run ALTER USER) before the
+# stack can safely pass writes.
 if [ "${DISABLE_BACKFILL:-false}" != "true" ]; then
+    echo "Auth-probing postgres before launching backfill..."
+
+    # Wait up to 60s for the database to be reachable on TCP. We do this
+    # before auth_probe because psycopg.OperationalError("connection
+    # refused") vs auth drift look the same to the bot.
+    for i in $(seq 1 30); do
+        if python -c "import socket,sys; s=socket.socket(); s.settimeout(1); s.connect(('alphard-postgres', 5432)); s.close(); sys.exit(0)" 2>/dev/null; then
+            break
+        fi
+        sleep 2
+    done
+
+    # Detect password drift: if a fingerprint exists from a prior run
+    # and the current DSN password differs, alert loudly. The fingerprint
+    # is computed by scripts/check_db_password.py (not yet in repo) or
+    # simply captured here as a sha256 of the password component.
+    if [ -n "${ALPHARD_PG_DSN:-}" ]; then
+        DSN_PW=$(echo "$ALPHARD_PG_DSN" | sed -n 's|.*://[^:]*:\([^@]*\)@.*|\1|p')
+        if [ -n "$DSN_PW" ]; then
+            NEW_FP=$(printf '%s' "$DSN_PW" | sha256sum | cut -d' ' -f1)
+            OLD_FP_FILE=/tmp/alphard-dsn-fp
+            if [ -f "$OLD_FP_FILE" ]; then
+                OLD_FP=$(cat "$OLD_FP_FILE")
+                if [ "$NEW_FP" != "$OLD_FP" ]; then
+                    echo "WARNING: ALPHARD_PG_DSN password changed since last boot." >&2
+                    echo "  Old fingerprint: $OLD_FP" >&2
+                    echo "  New fingerprint: $NEW_FP" >&2
+                    echo "  If postgres volume was preserved across this rotation, run:" >&2
+                    echo "  ALTER USER alphard PASSWORD '$(echo "$DSN_PW" | sed "s/'/''/g")' in the postgres container, OR wipe the volume to re-init." >&2
+                fi
+            fi
+            printf '%s' "$NEW_FP" > "$OLD_FP_FILE"
+        fi
+    fi
+
+    # Real auth probe: SELECT 1 + INSERT _auth_probe. Must succeed before
+    # we let backfill start — backfill without working writes = hours of
+    # wasted compute, AND silent loss of newbars history.
+    AUTH_RESULT=$(python -c "
+import os, sys
+sys.path.insert(0, 'src')
+from data.pg_store import PostgresDataStore
+s = PostgresDataStore()
+ok = s.auth_probe(source='entrypoint_smoke')
+print('OK' if ok else 'BROKEN')
+sys.exit(0 if ok else 1)
+" 2>&1)
+    AUTH_EXIT=$?
+
+    if [ $AUTH_EXIT -ne 0 ]; then
+        echo "AUTH PROBE FAILED: backfill would silently write to nowhere." >&2
+        echo "Probe error: ${AUTH_RESULT}" >&2
+        echo "Aborting container start to prevent silent backfill failure." >&2
+        exit 1
+    fi
+    echo "  postgres auth OK"
+
     echo "Launching backfill_history_md as background service..."
     BACKFILL_LOG="${BACKFILL_LOG:-/app/logs/backfill_history_md.log}"
     # Run in background; redirect output; use setsid so backfill survives

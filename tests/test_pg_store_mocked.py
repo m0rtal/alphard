@@ -1134,6 +1134,138 @@ class TestDateRangeHelpers:
 
 
 # ---------------------------------------------------------------------------
+# auth_probe — Phase 1.6 H-9: detect silent auth drift after redeploy
+# ---------------------------------------------------------------------------
+
+
+class TestAuthProbe:
+    """``PostgresDataStore.auth_probe`` returns True iff both SELECT 1
+    and INSERT ... ON CONFLICT DO UPDATE on ``_auth_probe`` succeed.
+
+    Why this test exists: pg_isready reports healthy even when the
+    volume's pg_authid holds a scram hash of an older POSTGRES_PASSWORD.
+    A real probe must actually try a write under the bot's credentials.
+    """
+
+    def _store_with_real_cursor(self) -> tuple[Any, FakeCursor]:
+        """Build a store whose ``_conn.cursor()`` returns a FakeCursor
+        so we can record the SQL the probe issues."""
+        s = PostgresDataStore(dsn="host=h dbname=d user=u")
+        # In tests we have a real (non-mocked) connection. Replace it
+        # with a MagicMock that returns a FakeCursor so the probe's
+        # ``with self._conn.cursor() as cur:`` context manager works.
+        # auth_probe calls self._connect() which would try to
+        # psycopg.connect() — suppress that with a MagicMock.
+        cur = FakeCursor(conn=MagicMock())
+        cur_cm = MagicMock()
+        cur_cm.__enter__.return_value = cur
+        cur_cm.__exit__.return_value = False
+        s._conn = MagicMock()
+        s._conn.cursor.return_value = cur_cm
+        s._connect = MagicMock()  # type: ignore[assignment]
+        return s, cur
+
+    def test_auth_probe_returns_true_on_success(self) -> None:
+        s, cur = self._store_with_real_cursor()
+        cur._fetchone_queue = [(1,)]  # SELECT 1 → one row
+        assert s.auth_probe() is True
+        # _connect was called once.
+        s._connect.assert_called_once()
+        # Probe issued SELECT 1 and INSERT ... ON CONFLICT.
+        sqls = [c[0] for c in cur.calls]
+        assert any("SELECT 1" in sql for sql in sqls)
+        assert any("INSERT INTO _auth_probe" in sql for sql in sqls)
+        # Both statements must use ON CONFLICT to keep the row stable.
+        assert any("ON CONFLICT (id) DO UPDATE" in sql for sql in sqls)
+        # commit was called so the probe row is durable across the
+        # rest of the bot's lifetime.
+        assert s._conn.commit.called
+
+    def test_auth_probe_writes_source_label(self) -> None:
+        """The ``source`` column is set from the ``source`` kwarg so we
+        can distinguish entrypoint-smoke from backfill-pre-run from
+        cron-healthcheck in the DB."""
+        s, cur = self._store_with_real_cursor()
+        cur._fetchone_queue = [(1,)]
+        s.auth_probe(source="entrypoint_smoke")
+        insert_call = [c for c in cur.calls if "INSERT INTO _auth_probe" in c[0]]
+        assert len(insert_call) == 1
+        # params is a 1-tuple containing the source string
+        assert insert_call[0][1] == ("entrypoint_smoke",)
+
+    def test_auth_probe_returns_false_on_select_failure(self) -> None:
+        """If the very first SELECT 1 fails (e.g. password wrong),
+        auth_probe returns False and does NOT try the INSERT — there
+        is no point writing if the read path is broken."""
+        s, cur = self._store_with_real_cursor()
+        # Make SELECT 1 raise — simulate psycopg.OperationalError.
+        cur.execute = MagicMock(side_effect=RuntimeError("auth failed"))
+        assert s.auth_probe() is False
+
+    def test_auth_probe_returns_false_on_insert_failure(self) -> None:
+        """If SELECT works but INSERT fails (e.g. permissions, table
+        missing), auth_probe returns False. This is the case we hit
+        in production 2026-08-18: pg_isready OK, SELECT 1 OK, but
+        INSERT raised permission error and the bot silently wrote
+        nothing. The probe prevents that."""
+        s, cur = self._store_with_real_cursor()
+        cur._fetchone_queue = [(1,)]
+        # Override execute to raise on the INSERT, not on SELECT.
+        original = cur.execute
+
+        def selective_raise(sql: str, params: Any = None) -> None:
+            if "INSERT" in sql:
+                raise RuntimeError("permission denied for table _auth_probe")
+            return original(sql, params)
+
+        cur.execute = MagicMock(side_effect=selective_raise)
+        assert s.auth_probe() is False
+
+    def test_auth_probe_does_not_raise(self) -> None:
+        """Even if every single thing goes wrong (connect fails,
+        cursor fails, etc.), auth_probe must return False, not raise.
+
+        The entrypoint smoke test and the backfill pre-run depend on
+        a boolean return — if auth_probe raised, both would abort the
+        bot for the wrong reason (uncaught exception in start-up)."""
+        s = PostgresDataStore(dsn="host=h dbname=d user=u")
+        s._connect = MagicMock(side_effect=RuntimeError("connect failed"))
+        # No exception should escape.
+        assert s.auth_probe() is False
+
+
+# ---------------------------------------------------------------------------
+# latest_ts_overall — used by data-freshness check
+# ---------------------------------------------------------------------------
+
+
+class TestLatestTsOverall:
+    """Returns the max(ts) across all rows in ohlcv_daily, or None."""
+
+    def _store(self, row: Any) -> Any:
+        store = MagicMock()
+        cursor = MagicMock()
+        cursor.__enter__.return_value = cursor
+        cursor.fetchone.return_value = row
+        cursor_cm = MagicMock()
+        cursor_cm.__enter__.return_value = cursor
+        cursor_cm.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cursor_cm
+        store._conn = conn
+        store._connect = MagicMock()
+        return store
+
+    def test_returns_date(self) -> None:
+        store = self._store((date(2026, 8, 17),))
+        assert PostgresDataStore.latest_ts_overall(store) == date(2026, 8, 17)
+
+    def test_returns_none_when_empty(self) -> None:
+        store = self._store(None)
+        assert PostgresDataStore.latest_ts_overall(store) is None
+
+
+# ---------------------------------------------------------------------------
 # backfill_complete flag — the per-ticker gate ML/training reads
 # ---------------------------------------------------------------------------
 

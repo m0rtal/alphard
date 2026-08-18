@@ -86,8 +86,15 @@ services:
     volumes:
       - /mnt/appdata/alphard/postgres:/var/lib/postgresql/data
       - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      # BUGFIX (H-9): bind-mount the real-auth healthcheck script.
+      # The default pg_isready check returns healthy even when pg_authid
+      # holds stale scram hashes from a previous deploy (production bug
+      # 2026-08-18). psql -U $USER -c 'SELECT 1' does a full auth
+      # round-trip under our credentials so a real credential mismatch
+      # surfaces as container=unhealthy → depends_on blocks the bot.
+      - ./docker/postgres/healthcheck.sh:/usr/local/bin/alphard-pg-healthcheck.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-alphard}"]
+      test: ["CMD-SHELL", "/usr/local/bin/alphard-pg-healthcheck.sh"]
       interval: 10s
       timeout: 5s
       retries: 5

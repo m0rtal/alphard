@@ -60,8 +60,37 @@ CREATE INDEX IF NOT EXISTS idx_ticker_universe_figi
     ON ticker_universe (figi) WHERE figi IS NOT NULL;
 
 -- ---------------------------------------------------------------------------
--- ohlcv_daily  (PK = ticker, ts)
+-- _auth_probe  (Phase 1.6 H-9: detect silent auth drift after redeploy)
 -- ---------------------------------------------------------------------------
+-- One-row table used by PostgresDataStore.auth_probe() and by the bot
+-- entrypoint smoke test. The probe performs INSERT ... ON CONFLICT DO
+-- UPDATE to verify the connection can BOTH read AND write, not just
+-- SELECT 1 (which pg_isready -- but does NOT -- verifies). If this
+-- table does not exist yet, init_schema() will create it on the next
+-- bot startup. If it does, the probe is non-destructive.
+--
+-- Why not in docker/postgres/init.sql? init.sql only runs on first
+-- `initdb` (empty data dir). On a volume that has been preserved
+-- across redeploys, init.sql is NEVER executed — which is exactly the
+-- case we want to detect. Putting the probe in src/data/schema.sql
+-- (which init_schema() applies on every bot start) means the probe
+-- always works, regardless of volume history.
+CREATE TABLE IF NOT EXISTS _auth_probe (
+    id         SMALLINT PRIMARY KEY,
+    probed_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    source     VARCHAR(32) NOT NULL
+);
+
+-- Seed the single probe row. The probe is INSERT ... ON CONFLICT DO
+-- UPDATE so the row must already exist for the probe to be non-destructive.
+INSERT INTO _auth_probe (id, probed_at, source)
+    VALUES (1, NOW(), 'schema_init')
+    ON CONFLICT (id) DO NOTHING;
+
+
+-- ---------------------------------------------------------------------------
+-- ohlcv_daily  (PK = ticker, ts)
+-- -----------------------------------------------------------------------------
 -- Each (ticker, ts) is stored ONCE. Source provenance is not tracked at row
 -- level — observability (logs, decision_log) is sufficient for Phase 2+.
 CREATE TABLE IF NOT EXISTS ohlcv_daily (

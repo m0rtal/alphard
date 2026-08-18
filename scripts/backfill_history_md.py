@@ -476,6 +476,39 @@ def main() -> int:
         return 2
 
     store = PostgresDataStore()
+
+    # BUGFIX (H-9): verify the bot's DB credentials actually work before
+    # wasting hours on a backfill that silently writes to nowhere. We hit
+    # this in production 2026-08-18: pg_isready reported healthy, SELECT
+    # worked, but INSERT raised permission error and 268 "no-data"
+    # tickers were the symptom. auth_probe() does SELECT 1 + INSERT
+    # ON CONFLICT and returns False on any error. If False, we exit
+    # loudly (return 1) so the cron operator sees it in the journal.
+    # The same _auth_probe table is checked by scripts/check_db_health.py
+    # in scheduled cron, so a probe failure here is the first signal —
+    # the cron job's persistent failure is the second.
+    if not store.auth_probe(source="backfill_pre_run"):
+        logger.error(
+            "AUTH PROBE FAILED: cannot SELECT+INSERT into postgres. "
+            "Backfill would silently fail to write. Aborting run. "
+            "Run scripts/check_db_health.py for detail or check /app/logs/health.log."
+        )
+        store.close()
+        return 1
+
+    # BUGFIX (H-9): ticker_universe SELECT verifies that the bot has
+    # the privileges to actually read the universe it is about to
+    # backfill. postgres may have a broken GRANT setup that lets the bot
+    # SELECT from _auth_probe (which it owns) but not from
+    # ticker_universe (which is owned by the initial superuser).
+    try:
+        universe_count = store.list_tickers(include_delisted=True)
+        logger.info(f"Universe table reachable, {len(universe_count)} tickers")
+    except Exception as exc:
+        logger.error(f"UNIVERSE QUERY FAILED: cannot SELECT from ticker_universe: " f"{type(exc).__name__}: {exc}")
+        store.close()
+        return 1
+
     started = time.monotonic()
     total_fetched = 0
     total_written = 0
