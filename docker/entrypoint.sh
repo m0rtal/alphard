@@ -45,6 +45,33 @@ if [ -z "${TINKOFF_SANDBOX_TOKEN:-}" ] && [ -z "${TINKOFF_REAL_TOKEN:-}" ]; then
     echo "WARNING: ALLOW_NO_BROKER=true — running Phase 0 stub without broker connectivity."
 fi
 
+# S-H6: launch backfill_history_md.py as a supervisor-managed background
+# service within this container. Backfill must run inside the same process
+# tree as the broker connection so it can read TINKOFF_* from the env we
+# sourced above. A previous run kept backfill outside the entrypoint tree
+# (manual docker exec), which meant env vars were never inherited and
+# backfill failed silently with "no token" errors. Running it here, as a
+# background service, makes backfill automatic on every container start.
+#
+# The backfill script is idempotent (skip-complete on every restart) so
+# restarting the container only resumes from where it left off.
+if [ "${DISABLE_BACKFILL:-false}" != "true" ]; then
+    echo "Launching backfill_history_md as background service..."
+    BACKFILL_LOG="${BACKFILL_LOG:-/app/logs/backfill_history_md.log}"
+    # Run in background; redirect output; use setsid so backfill survives
+    # any signal sent to this entrypoint. PID goes to a file so health
+    # checks / debug exec can find it.
+    setsid python3 scripts/backfill_history_md.py \
+        --classes TQBR TQOB TQCB TQTE \
+        --limit 3254 \
+        --start-year 2018 \
+        --min-bars 1300 \
+        >>"${BACKFILL_LOG}" 2>&1 &
+    BACKFILL_PID=$!
+    echo "  backfill PID=${BACKFILL_PID}, log=${BACKFILL_LOG}"
+    echo "${BACKFILL_PID}" > /var/run/alphard-backfill.pid
+fi
+
 # Health endpoint simple version (Phase 0)
 # TODO: replace with FastAPI app in Phase 1
 # Пока запускаем main loop (Phase 1+)

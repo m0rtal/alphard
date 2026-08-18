@@ -5,7 +5,7 @@ WORKDIR /app
 # Pre-create /run/secrets so bind-mount of an env file at
 # /run/secrets/alphard.env works on any Docker version (some create
 # the parent as a directory when it does not exist).
-RUN mkdir -p /run/secrets && chmod 755 /run/secrets
+RUN mkdir -p /run/secrets && chmod 755 /run/secrets && mkdir -p /var/run
 
 # System dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
