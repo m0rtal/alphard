@@ -296,7 +296,9 @@ def test_ticker_deadline_is_reasonable() -> None:
     """The per-ticker deadline must be high enough to fit the median
     ticker (a few seconds) but low enough that one stuck ticker can't
     starve the whole run overnight."""
-    assert 30 <= bh._TICKER_DEADLINE_SECONDS <= 600  # 2026-08-18: lowered to 30s after live cluster observed 180s timeout on every Tinkoff MD archive call from .107
+    assert (
+        30 <= bh._TICKER_DEADLINE_SECONDS <= 600
+    )  # 2026-08-18: lowered to 30s after live cluster observed 180s timeout on every Tinkoff MD archive call from .107
 
 
 # ---------------------------------------------------------------------------
