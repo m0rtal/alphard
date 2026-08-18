@@ -147,7 +147,14 @@ _CIRCUIT_BREAKER_THRESHOLD = 5
 # fits in ~30s; foreign ETFs over the IB bridge can take 90s on a bad
 # day. 180s gives enough headroom without letting a single stuck ticker
 # starve the whole run.
-_TICKER_DEADLINE_SECONDS = 180
+_TICKER_DEADLINE_SECONDS = 30  # 2026-08-18: lowered from 180s. Live cluster
+# observed that on .107 every Tinkoff MD archive call timed out at
+# 180s (TLS handshake works, but HTTP body transfer stalls ~120s+),
+# so the previous 180s deadline was effectively 180s × N tickers of
+# dead wait. With the Russian Trusted Root CA installed, TLS no
+# longer fails — but the body stall is a separate network issue
+# that the deadline should not pretend to solve. 30s gives honest
+# failures fast so the next source can take over.
 
 
 def _set_complete_flag(store: PostgresDataStore, ticker: str, complete: bool) -> None:
