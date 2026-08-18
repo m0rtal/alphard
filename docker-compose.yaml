@@ -65,6 +65,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      pg-init:
+        condition: service_completed_successfully
     deploy:
       resources:
         limits:
@@ -118,6 +120,51 @@ services:
       retries: 5
     networks:
       - alphard-net
+
+  # BUGFIX (Phase 1.6 audit): init_postgres.sh runs as a one-shot
+  # service after postgres becomes healthy. It applies the
+  # 192.168.0.0/16 trust line to pg_hba.conf so any client from the
+  # internal subnet can authenticate without a password match.
+  # Idempotent (skips if the line already exists).
+  pg-init:
+    image: alpine:3.20
+    container_name: alphard-pg-init
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        apk add --no-cache postgresql-client bash >/dev/null
+        # Wait for postgres to accept connections.
+        until PGPASSWORD="$$POSTGRES_PASSWORD" psql -h alphard-postgres \
+              -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -c 'SELECT 1' >/dev/null 2>&1; do
+          echo "[pg-init] waiting for postgres..."
+          sleep 3
+        done
+        HBA=$$(PGPASSWORD="$$POSTGRES_PASSWORD" psql -h alphard-postgres -U "$$POSTGRES_USER" \
+               -d "$$POSTGRES_DB" -tAc "SHOW hba_file")
+        # Run the same logic as scripts/init_postgres.sh, but in-container
+        # (since hba_file is on the postgres container's filesystem).
+        if grep -q '192.168.0.0/16 trust' "$$HBA" 2>/dev/null; then
+          echo "[pg-init] trust line already present, skipping"
+        else
+          # Strip legacy 0.0.0.0/0 if present.
+          sed -i '/^host all all 0\.0\.0\.0\/0 trust$/d' "$$HBA" 2>/dev/null || true
+          sed -i '1i host all all 192.168.0.0/16 trust' "$$HBA"
+          PGPASSWORD="$$POSTGRES_PASSWORD" psql -h alphard-postgres -U "$$POSTGRES_USER" \
+            -d "$$POSTGRES_DB" -c 'SELECT pg_reload_conf()' >/dev/null
+          echo "[pg-init] injected 192.168.0.0/16 trust + pg_reload_conf()"
+        fi
+        echo "[pg-init] OK"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-alphard}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}
+      POSTGRES_DB: ${POSTGRES_DB:-alphard}
+    networks:
+      - alphard-net
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   prometheus:
     image: prom/prometheus:latest
@@ -176,6 +223,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      pg-init:
+        condition: service_completed_successfully
     profiles: ["scheduled"]
 
 networks:

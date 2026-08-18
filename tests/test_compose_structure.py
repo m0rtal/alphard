@@ -67,6 +67,38 @@ class TestCompose:
             "/app/logs" in str(v) for v in volumes
         ), "cron needs a writable /app/logs mount for the cron.log file"
 
+    def test_pg_init_service_exists(self) -> None:
+        """Phase 1.6 audit: init_postgres.sh must run automatically on
+        first deploy. Compose provides this via the one-shot ``pg-init``
+        service that injects the 192.168.0.0/16 trust line into
+        pg_hba.conf after postgres becomes healthy.
+        """
+        data = _load_compose()
+        services = data["services"]
+        assert "pg-init" in services, (
+            "pg-init service must exist so init_postgres.sh runs on "
+            "first deploy; without it the bot hangs on auth_probe for "
+            "clusters with a fresh volume."
+        )
+        pg_init = services["pg-init"]
+        assert pg_init.get("restart") == "no", (
+            "pg-init must be a one-shot (restart: no) — once the " "trust line is injected, the container exits."
+        )
+
+    def test_bot_depends_on_pg_init_completed(self) -> None:
+        """alphard-bot must wait for pg-init to finish before starting,
+        otherwise the first auth_probe runs before the trust line
+        is injected and silently falls back to scram auth."""
+        data = _load_compose()
+        bot = data["services"]["alphard-bot"]
+        deps = bot.get("depends_on", {})
+        assert isinstance(deps, dict)
+        assert deps.get("pg-init", {}).get("condition") == ("service_completed_successfully"), (
+            "alphard-bot.depends_on.pg-init.condition must be "
+            "service_completed_successfully so the trust line is "
+            "applied before the bot tries to connect"
+        )
+
     def test_bot_depends_on_postgres_health(self) -> None:
         data = _load_compose()
         bot = data["services"]["alphard-bot"]
