@@ -69,7 +69,7 @@ if [ "${DISABLE_BACKFILL:-false}" != "true" ]; then
         >>"${BACKFILL_LOG}" 2>&1 &
     BACKFILL_PID=$!
     echo "  backfill PID=${BACKFILL_PID}, log=${BACKFILL_LOG}"
-    echo "${BACKFILL_PID}" > /var/run/alphard-backfill.pid
+    echo "${BACKFILL_PID}" > /tmp/alphard-backfill.pid
 fi
 
 # Health endpoint simple version (Phase 0)
