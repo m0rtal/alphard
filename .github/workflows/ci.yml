@@ -51,11 +51,17 @@ jobs:
 
       - name: Make files readable for the runner user
         run: |
-          # actions/checkout@v5 sometimes leaves files mode-444 owned
-          # by a uid the runner can't chmod. Use sudo for the chmod
-          # since ubuntu-latest runners ship sudo with NOPASSWD.
-          sudo chmod -R u+rwX . || true
-          ls -la docker-compose.yaml scripts/init_postgres.sh | head -5
+          # Debug: print what we see
+          echo "--- ls -la top-level ---"
+          ls -la /root/projects/alphard 2>&1 | head -3 || true
+          echo "--- whoami ---"
+          whoami
+          echo "--- stat docker-compose.yaml ---"
+          stat /root/projects/alphard/docker-compose.yaml 2>&1 || true
+          echo "--- reading docker-compose.yaml with cat ---"
+          cat /root/projects/alphard/docker-compose.yaml 2>&1 | head -3 || echo "cat failed"
+          echo "--- reading docker-compose.yaml with python ---"
+          /opt/hostedtoolcache/Python/3.11.15/x64/bin/python3 -c "print(open('/root/projects/alphard/docker-compose.yaml').read()[:100])" 2>&1 || echo "python failed"
       - name: Run tests with coverage (incl. Postgres integration)
         run: |
           pytest --cov=src --cov-fail-under=95 --cov-report=term-missing
