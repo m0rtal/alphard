@@ -32,3 +32,5 @@ types-requests>=2.31,<3.0
 # Tinkoff Invest SDK (Phase 1.1) — Apache-2.0
 # Install: pip install t-tech-investments --index-url https://opensource.tbank.ru/api/v4/projects/238/packages/pypi/simple
 t-tech-investments>=1.49,<2.0
+
+PyYAML>=6.0
