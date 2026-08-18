@@ -29,6 +29,24 @@ RUN groupadd -r -g 1000 alphard && \
 COPY requirements.txt ./
 RUN pip install --no-cache-dir t-tech-investments --index-url https://opensource.tbank.ru/api/v4/projects/238/packages/pypi/simple
 
+# Install Russian Trusted Root CA into the system trust store so the
+# container can verify invest-public-api.tinkoff.ru TLS handshake
+# (their chain is rooted at the Russian Ministry of Digital
+# Development's CA, not in the default certifi bundle). Without
+# this, EVERY HTTPS call to Tinkoff fails with
+# CERTIFICATE_VERIFY_FAILED — silently masking as a 180s timeout
+# that drives backfill to no-data on every ticker.
+# (Phase 1.6 audit, 2026-08-18.)
+RUN T_TECH_PATH=$(pip show t-tech-investments 2>/dev/null | awk '/^Location:/{print $2}') && \
+    if [ -n "$T_TECH_PATH" ] && [ -f "$T_TECH_PATH/t_tech/invest/certs/RussianTrustedRootCA.pem" ]; then \
+        cp "$T_TECH_PATH/t_tech/invest/certs/RussianTrustedRootCA.pem" \
+           /usr/local/share/ca-certificates/tbank-root-ca.crt && \
+        update-ca-certificates && \
+        echo "OK: Russian Trusted Root CA installed"; \
+    else \
+        echo "WARN: t-tech-investments cert not found, tinkoff.ru TLS will fail"; \
+    fi
+
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Bot code (with correct ownership before USER switch)
