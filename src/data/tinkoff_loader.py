@@ -188,6 +188,9 @@ class TinkoffInvestDataLoader(DataLoader):
                 #   delisted_at stays None; delist_source.py fills it via MOEX ISS.
                 from datetime import date as _date
 
+                # Tinkoff proto emits timestamps as ``datetime`` objects
+                # (often tz-aware UTC), not as ISO strings. Normalise.
+                from datetime import datetime as _dt
                 listed_at_attr = None
                 for _attr in (
                     "first_1day_candle_date",
@@ -195,12 +198,18 @@ class TinkoffInvestDataLoader(DataLoader):
                     "ipo_date",
                 ):
                     _raw = getattr(inst, _attr, None)
-                    if _raw:
-                        try:
-                            listed_at_attr = _date.fromisoformat(_raw)
-                            break
-                        except (TypeError, ValueError):
-                            continue
+                    if _raw is None:
+                        continue
+                    try:
+                        if isinstance(_raw, _dt):
+                            listed_at_attr = _raw.date()
+                        elif isinstance(_raw, _date):
+                            listed_at_attr = _raw
+                        else:
+                            listed_at_attr = _date.fromisoformat(str(_raw)[:10])
+                        break
+                    except (TypeError, ValueError):
+                        continue
 
                 out.append(
                     TickerMeta(
