@@ -191,6 +191,7 @@ class TinkoffInvestDataLoader(DataLoader):
                 # Tinkoff proto emits timestamps as ``datetime`` objects
                 # (often tz-aware UTC), not as ISO strings. Normalise.
                 from datetime import datetime as _dt
+
                 listed_at_attr = None
                 for _attr in (
                     "first_1day_candle_date",
