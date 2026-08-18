@@ -17,21 +17,13 @@ from pathlib import Path
 import pytest
 
 
-HBA_PATH = Path("/root/projects/alphard/scripts/init_postgres.sh")
+HBA_PATH = Path(__file__).resolve().parent.parent / "scripts" / "init_postgres.sh"
 
 
 def _read_script() -> str:
-    """Read the script robustly even if it was checked out as mode-444
-    (the actions/checkout@v5 runner creates files read-only for
-    security). We chmod +r in-process and read.
-    """
-    import os
-
-    try:
-        os.chmod(HBA_PATH, 0o644)
-    except OSError:
-        # If we don't own the file, try reading anyway.
-        pass
+    """Read the script. Path is resolved via __file__ so it works
+    in any checkout layout (CI runners, fresh clones, container
+    runs)."""
     return HBA_PATH.read_text(encoding="utf-8")
 
 

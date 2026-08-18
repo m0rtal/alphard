@@ -15,33 +15,13 @@ import pytest
 yaml = pytest.importorskip("yaml")
 
 
-COMPOSE = Path("/root/projects/alphard/docker-compose.yaml")
+COMPOSE = Path(__file__).resolve().parent.parent / "docker-compose.yaml"
 
 
 def _load_compose() -> dict:
-    """Load docker-compose.yaml robustly.
-
-    CI runners (actions/checkout@v5) check out files as mode-444
-    owned by root; the runner's user can't chmod them. We try three
-    strategies in order: chmod, then raw read, then subprocess cat.
-    """
-    import os
-    import subprocess
-
-    try:
-        os.chmod(COMPOSE, 0o644)
-    except OSError:
-        pass
-    try:
-        return yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))
-    except PermissionError:
-        # Fallback: read via subprocess which can read through
-        # permission bits that the runner user can't bypass.
-        text = subprocess.run(
-            ["cat", str(COMPOSE)],
-            capture_output=True, text=True, check=True, timeout=10,
-        ).stdout
-        return yaml.safe_load(text)
+    """Load docker-compose.yaml. Resolved via __file__ so the runner user
+    doesn't need to traverse /root — works in any checkout layout."""
+    return yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))
 
 
 class TestCompose:

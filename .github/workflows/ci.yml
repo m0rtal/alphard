@@ -49,21 +49,11 @@ jobs:
           pip install -e .
           pip install pytest pytest-cov
 
-      - name: Make files readable for the runner user
-        run: |
-          # Debug: print what we see
-          echo "--- ls -la top-level ---"
-          ls -la /root/projects/alphard 2>&1 | head -3 || true
-          echo "--- whoami ---"
-          whoami
-          echo "--- stat docker-compose.yaml ---"
-          stat /root/projects/alphard/docker-compose.yaml 2>&1 || true
-          echo "--- reading docker-compose.yaml with cat ---"
-          cat /root/projects/alphard/docker-compose.yaml 2>&1 | head -3 || echo "cat failed"
-          echo "--- reading docker-compose.yaml with python ---"
-          /opt/hostedtoolcache/Python/3.11.15/x64/bin/python3 -c "print(open('/root/projects/alphard/docker-compose.yaml').read()[:100])" 2>&1 || echo "python failed"
       - name: Run tests with coverage (incl. Postgres integration)
         run: |
+          # Tests use ``Path(__file__).resolve().parent.parent`` to locate
+          # compose/init scripts, so they don't depend on the runner user
+          # being able to traverse /root — works in any checkout layout.
           pytest --cov=src --cov-fail-under=95 --cov-report=term-missing
 
       - name: Upload coverage to Codecov
