@@ -37,7 +37,7 @@ def test_resolve_universe_no_class_filter_returns_everything() -> None:
     loader = MagicMock()
     loader.list_tickers.return_value = fake_tqbr + fake_spbxm + fake_bonds + fake_etfs
 
-    out = bh._resolve_universe(loader, classes=None, limit=0)
+    out, _metas = bh._resolve_universe(loader, classes=None, limit=0)
 
     assert out == ["SBER", "GAZP", "AAPL", "RU000A0JX0J3", "FXUS"]
 
@@ -51,8 +51,8 @@ def test_resolve_universe_class_filter_case_insensitive() -> None:
     loader = MagicMock()
     loader.list_tickers.return_value = fake
 
-    upper = bh._resolve_universe(loader, classes=["TQBR"], limit=0)
-    lower = bh._resolve_universe(loader, classes=["tqbr"], limit=0)
+    upper, _ = bh._resolve_universe(loader, classes=["TQBR"], limit=0)
+    lower, _ = bh._resolve_universe(loader, classes=["tqbr"], limit=0)
 
     assert upper == lower == ["SBER"]
 
@@ -68,7 +68,7 @@ def test_resolve_universe_class_all_string_does_not_match() -> None:
     loader = MagicMock()
     loader.list_tickers.return_value = fake
 
-    out = bh._resolve_universe(loader, classes=["ALL"], limit=0)
+    out, _ = bh._resolve_universe(loader, classes=["ALL"], limit=0)
 
     assert out == []
 
@@ -78,7 +78,7 @@ def test_resolve_universe_limit_caps_universe_size() -> None:
     loader = MagicMock()
     loader.list_tickers.return_value = fake
 
-    out = bh._resolve_universe(loader, classes=None, limit=3)
+    out, _ = bh._resolve_universe(loader, classes=None, limit=3)
 
     assert len(out) == 3
 

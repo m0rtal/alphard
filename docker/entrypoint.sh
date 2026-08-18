@@ -135,14 +135,42 @@ sys.exit(0 if ok else 1)
     fi
     echo "  postgres auth OK"
 
+    # BUGFIX (2026-08-18 / Phase 1.6 audit): ensure the schema is in the
+    # expected state. On a fresh volume this is what creates tables;
+    # on a volume from an older image, the ADD COLUMN IF NOT EXISTS
+    # clauses in src/data/schema.sql add the columns that the current
+    # code expects (lot, listed_at, backfill_complete, adj_close, ...).
+    # init_schema() is idempotent and safe to run on every boot.
+    echo "Applying schema migrations..."
+    python -c "
+import sys
+sys.path.insert(0, 'src')
+from data.pg_store import PostgresDataStore
+PostgresDataStore().init_schema()
+print('schema OK')
+" || { echo "SCHEMA INIT FAILED: $?" >&2; exit 1; }
+    echo "  schema OK"
+
     echo "Launching backfill_history_md as background service..."
     BACKFILL_LOG="${BACKFILL_LOG:-/app/logs/backfill_history_md.log}"
     # Run in background; redirect output; use setsid so backfill survives
     # any signal sent to this entrypoint. PID goes to a file so health
     # checks / debug exec can find it.
+    #
+    # BUGFIX (2026-08-18 / Phase 1.6 audit): removed --classes TQBR TQOB
+    # TQCB TQTE so the backfill pulls the FULL universe (TQBR + SPBXM +
+    # TQBS + TQDE + TQNO + TQLV + TQPI + TQOB + TQCB + TQTE ≈ 5500+ tickers
+    # per Tinkoff). Per-ticker completion is decided inside the script by
+    # the age-aware _is_complete() helper, which already skips tickers
+    # whose expected bar count is satisfied. SPBXM (US tickers) is
+    # filtered inside the loader because the MD archive only covers
+    # TQBR/TQOB/TQCB/TQTE; everything else still gets pulled via
+    # gRPC + MOEX fallback. SPBXM ETL via the dedicated
+    # backfill_spbxm_universe.py one-shot is left in place for the
+    # historical 2018-only archive pulls because gRPC pagination over
+    # 1.5k SPBXM tickers is slow.
     setsid python3 scripts/backfill_history_md.py \
-        --classes TQBR TQOB TQCB TQTE \
-        --limit 3254 \
+        --limit 5500 \
         --start-year 2018 \
         --min-bars 1300 \
         >>"${BACKFILL_LOG}" 2>&1 &

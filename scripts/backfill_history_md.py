@@ -115,6 +115,7 @@ from src.data.tinkoff_md_loader import TinkoffInvestMDDataLoader  # noqa: E402
 from src.data.tinkoff_loader import TinkoffInvestDataLoader  # noqa: E402
 from src.data.moex_loader import MOEXDataLoader  # noqa: E402
 from src.data.fallback_loader import FallbackDataLoader  # noqa: E402
+from src.data.models import TickerMeta  # noqa: E402
 from typing import Any  # noqa: E402
 
 logger = logging.getLogger("alphard.backfill_history_md")
@@ -164,12 +165,19 @@ def _resolve_universe(
     loader: FallbackDataLoader,
     classes: list[str] | None,
     limit: int,
-) -> list[str]:
-    """Resolve universe -> list of tickers in stable order.
+) -> tuple[list[str], dict[str, "TickerMeta"]]:
+    """Resolve universe -> (tickers, metas_map) in stable order.
 
     ``classes`` filters by ``class_code`` (``TQBR`` / ``SPBXM`` / ...).
     Empty ``classes`` = all classes. ``limit`` caps the universe size
     for smoke runs.
+
+    Returns BOTH:
+    * ordered ticker strings (for the main backfill loop), and
+    * the metas_map keyed by ticker so the caller can upsert_tickers
+      into ticker_universe BEFORE fetching bars (BUGFIX 2026-08-18:
+      the FK on ohlcv_daily.ticker requires the row in ticker_universe
+      to exist before INSERT).
     """
     metas = loader.list_tickers()
     if classes:
@@ -178,8 +186,9 @@ def _resolve_universe(
     if limit > 0:
         metas = metas[:limit]
     tickers = [m.ticker for m in metas]
+    metas_map = {m.ticker: m for m in metas}
     logger.info(f"Universe: {len(tickers)} tickers (classes={classes or 'ALL'}, limit={limit})")
-    return tickers
+    return tickers, metas_map
 
 
 # Trading days per calendar year on MOEX. ~252 sessions/year is the
@@ -516,8 +525,23 @@ def main() -> int:
     errors: list[tuple[str, str]] = []
 
     try:
-        tickers = _resolve_universe(loader, args.classes, args.limit)
+        tickers, universe_metas_map = _resolve_universe(loader, args.classes, args.limit)
         logger.info(f"=== Backfill (fallback chain md → grpc → moex): {len(tickers)} tickers, {start} → {end} ===")
+
+        # BUGFIX (2026-08-18 / Phase 1.6 audit): upsert ticker_universe rows
+        # BEFORE we try to write any ohlcv_daily bars. The FK
+        # ``fk_ohlcv_ticker`` rejects INSERTs whose ticker is not already
+        # in ticker_universe. Without this upsert we'd see silent
+        # constraint-violation failures on every ticker.
+        # Idempotent — ON CONFLICT preserves existing rows.
+        try:
+            universe_metas: list[TickerMeta] = list(universe_metas_map.values())
+            store.upsert_tickers(universe_metas)
+            logger.info(f"Universe row state: {len(universe_metas)} tickers upserted into ticker_universe")
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"UPSERT tickers failed: {type(exc).__name__}: {exc}")
+            store.close()
+            return 1
 
         circuit_breaker_streak = 0
         for i, ticker in enumerate(tickers, start=1):

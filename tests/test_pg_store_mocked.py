@@ -1,5 +1,8 @@
 """Mocked unit tests for PostgresDataStore.
 
+from __future__ import annotations  # must come first
+
+
 Why this exists
 ---------------
 ``tests/test_pg_store_integration.py`` runs against a live Postgres and is
@@ -24,7 +27,7 @@ What's NOT mocked (pure functions): ``_row_to_ticker``, ``_row_to_ohlcv``,
 ``_row_to_action`` — these are exercised through their callers.
 """
 
-from __future__ import annotations
+from pathlib import Path
 
 import os
 from datetime import date
@@ -1501,3 +1504,37 @@ class TestUpsertTickersListedAt:
                 "ON CONFLICT DO UPDATE does not include delisted flag — "
                 "delisted/suspended tickers won't get re-flagged."
             )
+
+
+# ---------------------------------------------------------------------------
+# init_schema: schema file content + ADD COLUMN migrations
+# ---------------------------------------------------------------------------
+
+
+class TestSchemaForwardCompat:
+    """Verify the production schema.sql contains ADD COLUMN IF NOT EXISTS
+    calls so init_schema() works on tables from older images that may
+    have a different column set (the in-place schema-drift bug from
+    2026-08-18).
+    """
+
+    def test_schema_sql_has_add_column_for_known_drift(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Look up the schema.sql file the store actually loads by default.
+        monkeypatch.setenv("ALPHARD_PG_DSN", "host=test dbname=test user=test")
+        from src.data.pg_store import PostgresDataStore
+
+        s = PostgresDataStore(dsn="host=test dbname=test user=test")
+        schema_path = s._schema_sql_path
+        sql = Path(schema_path).read_text(encoding="utf-8")
+
+        # ticker_universe table is the table that drifted in 2026-08-18.
+        # The migration must use ADD COLUMN IF NOT EXISTS for the
+        # columns that were missing in the older image.
+        assert "ALTER TABLE ticker_universe ADD COLUMN IF NOT EXISTS lot" in sql
+        assert "ALTER TABLE ticker_universe ADD COLUMN IF NOT EXISTS listed_at" in sql
+        assert "ALTER TABLE ticker_universe ADD COLUMN IF NOT EXISTS backfill_complete" in sql
+        # ohlcv_daily: adj_close was added in 1.5; older images skipped it.
+        assert "ALTER TABLE ohlcv_daily ADD COLUMN IF NOT EXISTS adj_close" in sql

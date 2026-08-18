@@ -49,6 +49,18 @@ CREATE TABLE IF NOT EXISTS ticker_universe (
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Forward-compat for columns that may have been added by older images.
+-- Idempotent: ADD COLUMN IF NOT EXISTS does nothing if the column is
+-- already there. RUN 'init_schema' to apply.
+ALTER TABLE ticker_universe ADD COLUMN IF NOT EXISTS lot INTEGER;
+ALTER TABLE ticker_universe ADD COLUMN IF NOT EXISTS isin VARCHAR(12);
+ALTER TABLE ticker_universe ADD COLUMN IF NOT EXISTS class_code VARCHAR(12);
+ALTER TABLE ticker_universe ADD COLUMN IF NOT EXISTS delisted BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE ticker_universe ADD COLUMN IF NOT EXISTS delisted_at DATE;
+ALTER TABLE ticker_universe ADD COLUMN IF NOT EXISTS listed_at DATE;
+ALTER TABLE ticker_universe ADD COLUMN IF NOT EXISTS backfill_complete BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE ticker_universe ADD COLUMN IF NOT EXISTS backfill_complete_at TIMESTAMPTZ;
+
 CREATE INDEX IF NOT EXISTS idx_ticker_universe_delisted
     ON ticker_universe (delisted);
 
@@ -107,6 +119,9 @@ CREATE TABLE IF NOT EXISTS ohlcv_daily (
     CONSTRAINT fk_ohlcv_ticker FOREIGN KEY (ticker)
         REFERENCES ticker_universe(ticker) ON DELETE RESTRICT
 );
+
+-- Forward-compat for older images that may have skipped columns.
+ALTER TABLE ohlcv_daily ADD COLUMN IF NOT EXISTS adj_close NUMERIC(20, 8);
 
 CREATE INDEX IF NOT EXISTS idx_ohlcv_daily_ticker_ts
     ON ohlcv_daily (ticker, ts);
