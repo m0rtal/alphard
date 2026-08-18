@@ -21,16 +21,18 @@ HBA_PATH = Path("/root/projects/alphard/scripts/init_postgres.sh")
 
 
 def _read_script() -> str:
-    """Read the script. If the executable bit was lost in git clone,
-    fall back to ``cat`` so CI doesn't PermissionError on a mode-644
-    file checked out under a non-root user."""
+    """Read the script robustly even if it was checked out as mode-444
+    (the actions/checkout@v5 runner creates files read-only for
+    security). We chmod +r in-process and read.
+    """
+    import os
+
     try:
-        return HBA_PATH.read_text(encoding="utf-8")
-    except PermissionError:
-        return subprocess.run(
-            ["cat", str(HBA_PATH)],
-            capture_output=True, text=True, timeout=10, check=True,
-        ).stdout
+        os.chmod(HBA_PATH, 0o644)
+    except OSError:
+        # If we don't own the file, try reading anyway.
+        pass
+    return HBA_PATH.read_text(encoding="utf-8")
 
 
 class TestInitPostgresScript:

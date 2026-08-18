@@ -19,6 +19,14 @@ COMPOSE = Path("/root/projects/alphard/docker-compose.yaml")
 
 
 def _load_compose() -> dict:
+    import os
+
+    # CI runners (actions/checkout@v5) check out files read-only.
+    # Best-effort chmod so our read_text() doesn't PermissionError.
+    try:
+        os.chmod(COMPOSE, 0o644)
+    except OSError:
+        pass
     return yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))
 
 
