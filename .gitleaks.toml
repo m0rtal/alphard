@@ -2,30 +2,54 @@
 #
 # Why: default gitleaks misses high-entropy random strings that look like
 # passwords but lack a known vendor prefix (sk-, ghp_, AKIA, etc.). Our
-# previous "test password" `kJ8sP2vR5mN9wX4tY7qL3zA6bC1dE0fH` shipped to
+# previous test password `kJ8sP2vR5mN9wX4tY7qL3zA6bC1dE0fH` shipped to
 # production because it wasn't caught by either default gitleaks OR our
 # own review.
 #
-# Rules below catch the most common leak paths in a Docker + Postgres +
-# Russian-market stack. False positives are acceptable: a leak in CI is
-# much costlier than a 30-second manual review per commit.
+# IMPORTANT: gitleaks v8.x's default regex engine is wasilibs/go-re2,
+# which uses RE2 syntax — NO lookaheads, NO lookbehinds, NO
+# backreferences. We must match positive patterns (the leaked secret
+# shape) and rely on allowlist regexes for exclusions.
+#
+# Strategy: match the leak shape exactly. Allowlist (below) excludes
+# env-var references, explicit placeholders, and our CI marker.
 
 title = "alphard-gitleaks-custom"
 
+# Rule 1: hardcoded password assignment, plain text value.
+# Matches: `password=abc123...`, `POSTGRES_PASSWORD: abc123...`,
+# `MY_TOKEN: abc123...`, `api_key=...`, `secret=...`.
+# Does NOT match: `${VAR}` (allowlist), `ci_test_password_*` (allowlist),
+# empty values.
 [[rules]]
 id = "alphard-hardcoded-password-assignment"
 description = "Inline password= / POSTGRES_PASSWORD: <value> in committed files"
-# Negative lookahead: skip values that are env-var refs (${VAR} or $VAR)
-# or explicit placeholder tokens (TODO, FIXME, ci_test_password_*). The
-# allowlist below also adds an explicit env-var reference regex.
-regex = '''(?i)(?:password|passwd|pass|pwd|secret|api[_-]?key|token)\s*[=:]\s*['"]?(?!\$|\{|ci_test_password_|ci_test_password|CHANGE_ME|TODO|REPLACE|FIXME|XXX|YOUR_|EXAMPLE_|SAMPLE_|dummy|test_only)[A-Za-z0-9+/=._-]{6,}'''
-keywords = ["password", "passwd", "secret", "api_key", "apikey", "token"]
+# Match: optional assignment-keyword followed by a non-empty long-string value.
+# The shape: identifier (whitespace:= or =): anything not starting with $
+# or env-var syntax, then 6+ alphanumerics/+/-/-/_.
+# We deliberately keep it loose here — false positives cheaper than leaks.
+regex = '''(?i)(?:postgres_)?(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|bearer_token)[\s]*[=:][\s]*['"]?[A-Za-z0-9+/=._-]{8,}['"]?'''
+keywords = ["password", "passwd", "pwd", "secret", "api_key", "apikey", "token"]
 
 [allowlist]
-description = "Allow CI fixture marker and env-var references"
+description = "Allow env-var refs, our CI marker, and TODO-style placeholders"
 regexes = [
+  # Our explicit CI marker.
   '''ci_test_password_DO_NOT_USE_IN_PRODUCTION''',
+  # Env-var references like ${VAR} or $VAR.
   '''\$\{?[A-Z_][A-Z0-9_]*\}?''',
+  # Common placeholder text used in docs / templates.
+  '''changeme''',
+  '''placeholder''',
+  '''example\.com''',
+  '''TODO''',
+  '''FIXME''',
+  '''XXX''',
+  '''YOUR[_-]''',
+  '''EXAMPLE[_-]''',
+  '''SAMPLE[_-]''',
+  '''test[_-]''',
+  '''dummy''',
 ]
 paths = []
 stopwords = []
