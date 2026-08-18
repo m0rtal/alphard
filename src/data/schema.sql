@@ -122,6 +122,7 @@ CREATE TABLE IF NOT EXISTS ohlcv_daily (
 
 -- Forward-compat for older images that may have skipped columns.
 ALTER TABLE ohlcv_daily ADD COLUMN IF NOT EXISTS adj_close NUMERIC(20, 8);
+ALTER TABLE ohlcv_daily ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 
 CREATE INDEX IF NOT EXISTS idx_ohlcv_daily_ticker_ts
     ON ohlcv_daily (ticker, ts);
