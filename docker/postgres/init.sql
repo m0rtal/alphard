@@ -32,3 +32,6 @@ INSERT INTO _auth_probe (id, probed_at, source)
 -- (initdb has already granted schema usage to the user.)
 GRANT ALL PRIVILEGES ON TABLE _auth_probe TO CURRENT_USER;
 GRANT USAGE, SELECT ON SEQUENCE _auth_probe_id_seq TO CURRENT_USER;
+
+-- pg_hba.conf trust line for our subnet (mounted at /usr/local/bin/alphard-pg-healthcheck.sh + pg_hba.conf override):
+-- Run scripts/init_postgres.sh on host to add 'host all all 0.0.0.0/0 trust' to pg_hba.conf
