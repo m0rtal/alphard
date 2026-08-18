@@ -7,11 +7,18 @@ set -e
 # Portainer StackUpdate Env-parameter has a 60-char Go-unmarshal limit,
 # so we cannot pass Tinkoff tokens (64+ chars) inline. The /root/.env file
 # is bind-mounted at /run/secrets/alphard.env (see docker-compose stack).
-if [ -f "${ENV_FILE:-/run/secrets/alphard.env}" ]; then
-    set -a
-    . "${ENV_FILE:-/run/secrets/alphard.env}"
-    set +a
-fi
+# S-H5: source long-token env from file. Order: ENV_FILE override,
+# /run/secrets/alphard.env (compose secrets), /tmp/alphard.env
+# (manual cp fallback for Docker 29.x bind-mount bug that creates
+# a directory at the leaf when /run/secrets/ doesn't pre-exist).
+for ENV_FILE_CANDIDATE in     "${ENV_FILE:-}"     "/run/secrets/alphard.env"     "/run/secrets/alphard_env"     "/tmp/alphard.env"; do
+    if [ -n "${ENV_FILE_CANDIDATE}" ] && [ -f "${ENV_FILE_CANDIDATE}" ]; then
+        set -a
+        . "${ENV_FILE_CANDIDATE}"
+        set +a
+        break
+    fi
+done
 
 echo "Starting Alphard..."
 # S-H5: do NOT echo $ENV value into docker logs (it may carry secrets in
