@@ -18,7 +18,7 @@ jobs:
         image: postgres:16
         env:
           POSTGRES_USER: alphard
-          POSTGRES_PASSWORD: kJ8sP2vR5mN9wX4tY7qL3zA6bC1dE0fH
+          POSTGRES_PASSWORD: ci_test_password_DO_NOT_USE_IN_PRODUCTION
           POSTGRES_DB: alphard
         ports:
           - 5432:5432
@@ -28,7 +28,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     env:
-      ALPHARD_PG_DSN: host=localhost port=5432 dbname=alphard user=alphard password=kJ8sP2vR5mN9wX4tY7qL3zA6bC1dE0fH
+      ALPHARD_PG_DSN: host=localhost port=5432 dbname=alphard user=alphard password=ci_test_password_DO_NOT_USE_IN_PRODUCTION
     steps:
       - name: Checkout
         uses: actions/checkout@v5
