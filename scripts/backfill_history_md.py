@@ -196,6 +196,9 @@ _HALTS_PCT = 0.15
 # Earliest year Tinkoff's history-data archive goes back to. Pre-2018
 # data requires a paid source (AlgoPack, etc.).
 MIN_YEAR = 2018
+# MOEX ISS caps lookback at 1825d (~5y). When we don't have listed_at,
+# we shouldn't ask MOEX for more than it can serve.
+MOEX_MAX_LOOKBACK_DAYS = 1825
 
 
 def _earliest_expected_ts(
@@ -212,11 +215,17 @@ def _earliest_expected_ts(
     Tickers without ``listed_at`` (rare — some delisted/legacy entries)
     fall back to MIN_YEAR.
     """
+    from datetime import timedelta
+
     listed_at, _delisted_at = meta if meta else (None, None)
+    today = date.today()
+    # Cap for sources that limit lookback (MOEX ISS = 1825d).
+    lookback_floor = today - timedelta(days=MOEX_MAX_LOOKBACK_DAYS)
     if listed_at:
         earliest_listed = date(listed_at.year, 1, 1)
-        return max(earliest_listed, date(MIN_YEAR, 1, 1))
-    return date(MIN_YEAR, 1, 1)
+        return max(earliest_listed, date(MIN_YEAR, 1, 1), lookback_floor)
+    # No listed_at: be honest about what we can actually pull from MOEX.
+    return max(date(MIN_YEAR, 1, 1), lookback_floor)
 
 
 def _is_complete(
@@ -265,9 +274,14 @@ def _is_complete(
         return False
     listed_at, delisted_at = meta
     if listed_at is None:
-        # Ticker is in the universe but listed_at unknown — can't
-        # compute expected. Be conservative.
-        return False
+        # listed_at unknown. Infer it from the earliest bar in DB
+        # (best estimate of when this ticker actually started trading).
+        earliest = store.earliest_ts(ticker=ticker)
+        if earliest is None:
+            # No bars either, can't decide — treat as incomplete so
+            # backfill will populate at least one row.
+            return False
+        listed_at = earliest
     end = delisted_at if delisted_at else date.today()
     if end <= listed_at:
         # Delisted the same day it listed (or before). Nothing to pull.
@@ -474,6 +488,15 @@ def main() -> int:
 
         circuit_breaker_streak = 0
         for i, ticker in enumerate(tickers, start=1):
+            # Per-ticker effective start: clamp to source lookback limits
+            # (MOEX ISS = 1825d). Without this, we ask MOEX for 9 years of
+            # pre-listing data and get nothing back.
+            meta = store.ticker_meta(ticker)
+            effective_start = max(start, _earliest_expected_ts(meta))
+            if effective_start > end:
+                logger.info(f"{i}/{len(tickers)} {ticker}: skip " f"(effective_start {effective_start} > end {end})")
+                skipped_complete += 1
+                continue
             if not args.force and _is_complete(store, ticker, args.min_bars):
                 logger.info(f"{i}/{len(tickers)} {ticker}: skip (complete)")
                 skipped_complete += 1
@@ -488,7 +511,7 @@ def main() -> int:
                 loader,
                 store,
                 ticker,
-                start,
+                effective_start,
                 end,
                 ticker_idx=i,
                 total=len(tickers),

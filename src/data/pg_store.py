@@ -132,6 +132,12 @@ class PostgresDataStore(DataStore):
                 lot = EXCLUDED.lot,
                 isin = EXCLUDED.isin,
                 currency = EXCLUDED.currency,
+                delisted = EXCLUDED.delisted,
+                -- Preserve historical delisted_at once set (delist_source
+                -- runs separately and may have populated this before any
+                -- later re-sync). Only overwrite listed_at — it always
+                -- reflects the most recent Tinkoff listing date.
+                listed_at = EXCLUDED.listed_at,
                 source = EXCLUDED.source,
                 updated_at = NOW()
         """

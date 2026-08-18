@@ -1313,3 +1313,59 @@ class TestSyncUniverseDelisted:
         result = PostgresDataStore.sync_universe_delisted(store, dates)
         assert result == 2
         assert isinstance(result, int)
+
+
+class TestUpsertTickersListedAt:
+    """The ON CONFLICT path must propagate listed_at + delisted_at.
+
+    Regression: WUSH (a 2021 SPAC) was stuck with ``listed_at = NULL`` in
+    ``ticker_universe`` because the original ON CONFLICT clause omitted
+    listed_at / delisted_at from the UPDATE SET. After Tinkoff loader
+    started populating ``TickerMeta.listed_at`` from the broker's
+    ``ipo_date`` field, those values had no path into the DB on conflict.
+    This test pins the fix in place.
+    """
+
+    def test_upsert_conflict_clause_updates_listed_at(self, fake_conn_cls: Any) -> None:
+        with patch("psycopg.connect", fake_conn_cls):
+            store = PostgresDataStore(dsn="host=h dbname=d user=u")
+            meta1 = TickerMeta(
+                ticker="WUSH",
+                figi="BBG000000001",
+                name="Wush SPAC",
+                lot=1,
+                isin="RU000A107J37",
+                currency="RUB",
+                delisted=False,
+                listed_at=None,
+                delisted_at=None,
+                source="tkf",
+            )
+            store.upsert_tickers([meta1])
+
+            meta2 = TickerMeta(
+                ticker="WUSH",
+                figi="BBG000000001",
+                name="Wush SPAC",
+                lot=1,
+                isin="RU000A107J37",
+                currency="RUB",
+                delisted=False,
+                listed_at=date(2021, 11, 25),  # WUSH IPO date
+                delisted_at=None,
+                source="tkf",
+            )
+            store.upsert_tickers([meta2])
+
+            # upsert_tickers goes through cursors[-1] — the last created cursor
+            cur = fake_conn_cls.last.cursors[-1]
+            joined_sql = "\n".join(call[0] for call in cur.executemany_calls)
+            assert "listed_at = EXCLUDED.listed_at" in joined_sql, (
+                "ON CONFLICT DO UPDATE does not include listed_at — "
+                "TinkerMeta.listed_at will not propagate to ticker_universe "
+                "on re-sync. The WUSH bug returns."
+            )
+            assert "delisted = EXCLUDED.delisted" in joined_sql, (
+                "ON CONFLICT DO UPDATE does not include delisted flag — "
+                "delisted/suspended tickers won't get re-flagged."
+            )

@@ -181,6 +181,27 @@ class TinkoffInvestDataLoader(DataLoader):
                     or "DELISTED" in status_name
                     or "EXCLUDED" in status_name  # noqa: E501
                 )
+                # Date fields from Tinkoff Instrument:
+                # - ``first_1day_candle_date`` = first daily bar (proxy for listing)
+                # - ``ipo_date`` = IPO (may be pre-listing for some classes)
+                # - no explicit ``delisting_date`` on Instrument protobuf —
+                #   delisted_at stays None; delist_source.py fills it via MOEX ISS.
+                from datetime import date as _date
+
+                listed_at_attr = None
+                for _attr in (
+                    "first_1day_candle_date",
+                    "first_1min_candle_date",
+                    "ipo_date",
+                ):
+                    _raw = getattr(inst, _attr, None)
+                    if _raw:
+                        try:
+                            listed_at_attr = _date.fromisoformat(_raw)
+                            break
+                        except (TypeError, ValueError):
+                            continue
+
                 out.append(
                     TickerMeta(
                         ticker=inst.ticker,
@@ -191,6 +212,8 @@ class TinkoffInvestDataLoader(DataLoader):
                         currency="RUB",
                         class_code=getattr(inst, "class_code", None),
                         delisted=delisted,
+                        listed_at=listed_at_attr,
+                        delisted_at=None,  # populated by delist_source via MOEX ISS
                         source=self.SOURCE,  # type: ignore[arg-type]
                     )
                 )

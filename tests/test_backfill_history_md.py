@@ -188,8 +188,24 @@ def test_is_complete_listed_at_none_returns_false() -> None:
     store = MagicMock()
     store.count_ohlcv.return_value = 500
     store.ticker_meta.return_value = (None, None)
+    store.earliest_ts.return_value = None
 
     assert bh._is_complete(store, "LEGACY", min_bars=1300) is False
+
+
+def test_is_complete_listed_at_none_inferred_from_earliest() -> None:
+    """listed_at is NULL but we have bars — infer listing year from
+    earliest bar and judge accordingly. WUSH case: real listed 2022-12-14.
+    Expected bars for ~3.7y = ~787; with 1044 bars we are complete.
+    """
+    from datetime import date
+
+    store = MagicMock()
+    store.count_ohlcv.return_value = 1044  # WUSH actually has this many
+    store.ticker_meta.return_value = (None, None)  # listed_at NULL
+    store.earliest_ts.return_value = date(2022, 12, 14)  # inferred listing
+
+    assert bh._is_complete(store, "WUSH", min_bars=1300) is True
 
 
 def test_is_complete_delisted_same_day_as_listed() -> None:
