@@ -7,11 +7,17 @@ WORKDIR /app
 # the parent as a directory when it does not exist).
 RUN mkdir -p /run/secrets && chmod 755 /run/secrets && mkdir -p /var/run
 
-# System dependencies
+# System dependencies. ca-certificates is REQUIRED for HTTPS to
+# invest-public-api.tinkoff.ru — without it, all Tinkoff API calls
+# fail with CERTIFICATE_VERIFY_FAILED (self-signed in the chain)
+# and backfill silently falls through to no-data. (Phase 1.6 audit
+# 2026-08-18 — root cause of 268 tickers returning 0 bars.)
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
     curl \
     git \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && update-ca-certificates
 
 # Create non-root user (UID 1000) — SECURITY.md P0 #3
 # Bot trading real money MUST NOT run as root; reduces attack surface
