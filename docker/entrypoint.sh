@@ -3,6 +3,16 @@
 
 set -e
 
+# S-H5: support long-token env injection via bind-mounted file.
+# Portainer StackUpdate Env-parameter has a 60-char Go-unmarshal limit,
+# so we cannot pass Tinkoff tokens (64+ chars) inline. The /root/.env file
+# is bind-mounted at /run/secrets/alphard.env (see docker-compose stack).
+if [ -f "${ENV_FILE:-/run/secrets/alphard.env}" ]; then
+    set -a
+    . "${ENV_FILE:-/run/secrets/alphard.env}"
+    set +a
+fi
+
 echo "Starting Alphard..."
 # S-H5: do NOT echo $ENV value into docker logs (it may carry secrets in
 # misconfigured deployments). Print only the name of the active profile.
