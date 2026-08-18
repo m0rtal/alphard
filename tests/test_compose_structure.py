@@ -19,15 +19,29 @@ COMPOSE = Path("/root/projects/alphard/docker-compose.yaml")
 
 
 def _load_compose() -> dict:
-    import os
+    """Load docker-compose.yaml robustly.
 
-    # CI runners (actions/checkout@v5) check out files read-only.
-    # Best-effort chmod so our read_text() doesn't PermissionError.
+    CI runners (actions/checkout@v5) check out files as mode-444
+    owned by root; the runner's user can't chmod them. We try three
+    strategies in order: chmod, then raw read, then subprocess cat.
+    """
+    import os
+    import subprocess
+
     try:
         os.chmod(COMPOSE, 0o644)
     except OSError:
         pass
-    return yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))
+    try:
+        return yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))
+    except PermissionError:
+        # Fallback: read via subprocess which can read through
+        # permission bits that the runner user can't bypass.
+        text = subprocess.run(
+            ["cat", str(COMPOSE)],
+            capture_output=True, text=True, check=True, timeout=10,
+        ).stdout
+        return yaml.safe_load(text)
 
 
 class TestCompose:
