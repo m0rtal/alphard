@@ -494,7 +494,16 @@ class TinkoffInvestMDDataLoader(DataLoader):
             minutes = self.parse_archive(zip_bytes)
             for daily_bar in aggregate_minutes_to_daily(minutes):
                 d_ts = daily_bar["ts"]
-                assert isinstance(d_ts, date)
+                if not isinstance(d_ts, date):
+                    # Fail-secure: aggregate_minutes_to_daily() should
+                    # always return ``date`` objects. If we ever get a
+                    # datetime / string / whatever, skip the row rather
+                    # than silently propagate a malformed timestamp.
+                    logger.warning(
+                        "tinkoff_md_loader: skipping bar with non-date ts=%r",
+                        d_ts,
+                    )
+                    continue
                 if d_ts < start or d_ts > end:
                     continue
                 yield OHLCVRow(

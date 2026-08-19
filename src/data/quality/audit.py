@@ -139,7 +139,13 @@ class PostgresAuditLog:
 
     def write_event(self, issue: Issue, *, ticker: str, gate: str) -> None:
         self._ensure_conn()
-        assert self._cursor is not None  # for type checkers
+        if self._cursor is None:
+            # Defence-in-depth: _ensure_conn() should always set _cursor
+            # to a real cursor. If we get here, _ensure_conn failed in
+            # a way that left _cursor None (e.g. psycopg.connect returned
+            # successfully but cursor() failed). Treat as a hard error
+            # so the audit log never silently drops events.
+            raise RuntimeError("PostgresAuditLog._cursor is None after _ensure_conn() — " "audit log cannot write")
         # BUGFIX (C-2): use psycopg.sql.Identifier for the table name instead
         # of f-string interpolation. _TABLE_NAME_RE validation in __init__
         # guarantees the table is a safe identifier, and psycopg.sql.Identifier

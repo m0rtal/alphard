@@ -24,7 +24,7 @@ import logging
 import os
 import sys
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 
 import psycopg
 from src.data.models import TickerMeta
@@ -102,17 +102,27 @@ def backfill(
             logger.warning(f"list_shares_all({board}) failed: {exc}")
     logger.info(f"Tinkoff universe (all boards): {len(universe_meta)} tickers")
 
-    # Add bonds, ETFs
+    # Add bonds, ETFs. Issue #14 D.1: each instrument-class fetch
+    # is logged on failure so the operator sees which list is empty
+    # instead of silently treating it as "no bonds in this universe".
     try:
         for m in loader.list_bonds():
             universe_meta[m.ticker] = m
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning(
+            "loader.list_bonds() failed (treating as empty): %s: %s",
+            type(exc).__name__,
+            exc,
+        )
     try:
         for m in loader.list_etfs():
             universe_meta[m.ticker] = m
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning(
+            "loader.list_etfs() failed (treating as empty): %s: %s",
+            type(exc).__name__,
+            exc,
+        )
 
     missing = _missing_tickers(start_after=start_after)
     logger.info(f"Missing tickers (no bars in DB): {len(missing)}")

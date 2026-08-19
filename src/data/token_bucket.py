@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 class RateLimitError(Exception):
@@ -49,9 +49,9 @@ class TokenBucket:
     rate: float
     window_seconds: float = 1.0
     capacity: float | None = None
+    _lock: threading.Lock = field(default_factory=threading.Lock)
     _tokens: float = 0.0
     _last_refill: float = 0.0
-    _lock: threading.Lock | None = None
 
     def __post_init__(self) -> None:
         if self.rate <= 0:
@@ -71,7 +71,6 @@ class TokenBucket:
 
     def _refill_locked(self, now: float) -> None:
         """Add tokens proportional to elapsed time since last refill."""
-        assert self._lock is not None
         elapsed = now - self._last_refill
         if elapsed <= 0:
             return
@@ -82,7 +81,6 @@ class TokenBucket:
 
     def wait_time(self, now: float | None = None) -> float:
         """Seconds until at least one token is available. 0 if available now."""
-        assert self._lock is not None
         with self._lock:
             t = now if now is not None else time.monotonic()
             self._refill_locked(t)
@@ -100,7 +98,6 @@ class TokenBucket:
         even though it just slept. The fix: a tight retry-loop where
         ``sleep`` happens OUTSIDE the lock so other threads can also refill.
         """
-        assert self._lock is not None
         rate_per_sec = self.rate / self.window_seconds
         while True:
             with self._lock:
@@ -115,7 +112,6 @@ class TokenBucket:
 
     def acquire_nowait(self, now: float | None = None) -> None:
         """Take a token or raise ``RateLimitError`` immediately."""
-        assert self._lock is not None
         with self._lock:
             t = now if now is not None else time.monotonic()
             self._refill_locked(t)
@@ -127,7 +123,6 @@ class TokenBucket:
 
     def tokens_available(self, now: float | None = None) -> float:
         """How many tokens are currently in the bucket. Tests use this."""
-        assert self._lock is not None
         with self._lock:
             t = now if now is not None else time.monotonic()
             self._refill_locked(t)
