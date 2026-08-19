@@ -12,6 +12,7 @@ falls back to MockTinkoffClient for unit testing.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 
@@ -97,12 +98,76 @@ class TinkoffAccount(BrokerAccount):
         # Use Any locally to satisfy --strict without runtime isinstance check
         risk_gate: Any = None,  # src.risk.gate.RiskGate (typed Any to satisfy --strict)
         rate_limit_per_sec: int = 60,
+        # Issue #32: persistent peak-equity store path. If None, defaults
+        # to $ALPHARD_PEAK_STORE_DIR or /var/lib/alphard. The file is
+        # read once on construction and written on every successful
+        # _fetch_real_portfolio_state() call (monotonically non-decreasing).
+        peak_store_dir: Optional[str] = None,
     ):
         self._token = token
         self._account_id = account_id
         self._risk_gate = risk_gate
         self._rate_limit_per_sec = rate_limit_per_sec
         self._last_request_ts: list[float] = []
+        # Issue #32: peak-equity high-water mark tracker. Holds the
+        # maximum total_equity observed across this account's history so
+        # that _check_drawdown() in src/risk/gate.py can compute
+        # drawdown = (peak - current) / peak and trip the RISK_DD guard
+        # when it exceeds max_dd_pct. Without this, peak == current and
+        # drawdown is always 0% — the bug fixed here.
+        if peak_store_dir is None:
+            peak_store_dir = os.environ.get("ALPHARD_PEAK_STORE_DIR", "/var/lib/alphard")
+        self._peak_store_dir: str = peak_store_dir
+        self._peak_equity_path: str = os.path.join(peak_store_dir, f"peak_equity_{account_id}.json")
+        self._peak_equity: Decimal = self._load_peak_equity()
+
+    def _load_peak_equity(self) -> Decimal:
+        """Read the persisted peak-equity high-water mark from disk.
+
+        Returns Decimal("0") if the file does not exist (cold start)
+        or is unparseable (corrupted). A zero peak means "no history
+        yet" — the next snapshot's value will be the new peak.
+        """
+        try:
+            with open(self._peak_equity_path, "r") as fh:
+                data = json.load(fh)
+            value = Decimal(str(data.get("peak_equity", "0")))
+            if value < 0:
+                logger.warning(
+                    "Peak equity file %s has negative value %s; treating as 0",
+                    self._peak_equity_path,
+                    value,
+                )
+                return Decimal("0")
+            return value
+        except FileNotFoundError:
+            return Decimal("0")
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            logger.warning(
+                "Peak equity file %s is corrupt (%s); starting from 0",
+                self._peak_equity_path,
+                e,
+            )
+            return Decimal("0")
+
+    def _save_peak_equity(self) -> None:
+        """Persist the current peak-equity to disk (best-effort).
+
+        Write is best-effort: a failure here logs a warning but does
+        not raise. The in-memory peak is the source of truth for the
+        current process; on the next start the peak is reloaded from
+        disk. The worst case is losing one cycle of drawdown tracking.
+        """
+        try:
+            os.makedirs(self._peak_store_dir, exist_ok=True)
+            with open(self._peak_equity_path, "w") as fh:
+                json.dump({"peak_equity": str(self._peak_equity)}, fh)
+        except OSError as e:
+            logger.warning(
+                "Failed to persist peak equity to %s: %s",
+                self._peak_equity_path,
+                e,
+            )
 
     def is_sandbox(self) -> bool:
         """Sandbox if token starts with 't.' (Tinkoff convention)."""
@@ -213,15 +278,31 @@ class TinkoffAccount(BrokerAccount):
         Raises ``BrokerError`` on failure. Returns ``PortfolioState``
         populated with live values. The previous hardcoded
         ``Decimal("100000")`` is the bug we are fixing here.
+
+        Issue #32: peak_equity is now the running high-water mark read
+        from disk on construction and updated here (monotonically
+        non-decreasing per process). The RiskGate's ``_check_drawdown``
+        computes drawdown as ``(peak - current) / peak`` — with peak
+        always equal to current, the guard never trips in production,
+        even after a 20-30% drawdown. Persisting the high-water mark
+        means a single bad order in one cycle triggers the guard in the
+        next.
         """
         from src.risk.gate import PortfolioState
 
         snapshot = self.get_portfolio()
+        # Issue #32: update the high-water mark BEFORE building the
+        # snapshot so peak_equity >= total_equity (the PortfolioState
+        # invariant). Persist best-effort; an OSError here does not
+        # break the order path.
+        if snapshot.cash > self._peak_equity:
+            self._peak_equity = snapshot.cash
+            self._save_peak_equity()
         return PortfolioState(
             total_equity=snapshot.cash,  # Tinkoff returns total_amount_currencies as cash-side NAV
             cash=snapshot.cash,
             positions=[_broker_position_to_gate_position(p) for p in snapshot.positions],
-            peak_equity=snapshot.cash,  # conservative: peak equals current
+            peak_equity=self._peak_equity,
         )
 
     def get_portfolio(self) -> PortfolioSnapshot:
