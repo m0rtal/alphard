@@ -22,15 +22,22 @@ from __future__ import annotations
 import logging
 import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
 
+# Add src/ to sys.path so `import main` works whether tests run from /root
+# (local) or /__w/alphard/alphard (CI). Resolve relative to this file.
+_SRC_PATH = str(Path(__file__).resolve().parent.parent / "src")
+if _SRC_PATH not in sys.path:
+    sys.path.insert(0, _SRC_PATH)
+
+
 def _import_main():
     if "main" not in sys.modules:
-        sys.path.insert(0, "/root/projects/alphard/src")
-        import main  # type: ignore  # noqa: F401
+        import main as _alphard_main  # type: ignore  # noqa: F401
     return sys.modules["main"]
 
 

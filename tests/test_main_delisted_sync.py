@@ -17,19 +17,25 @@ the test completes in <1s.
 from __future__ import annotations
 
 import sys
-
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
 
+# Add src/ to sys.path so `import main` works whether tests run from /root
+# (local) or /__w/alphard/alphard (CI). Resolve relative to this file.
+_SRC_PATH = str(Path(__file__).resolve().parent.parent / "src")
+if _SRC_PATH not in sys.path:
+    sys.path.insert(0, _SRC_PATH)
+
+
 @pytest.fixture(autouse=True)
 def _setup():
     """Lazy import main + reset _shutdown_event between tests."""
-    sys.path.insert(0, "/root/projects/alphard/src")
     if "main" not in sys.modules:
         # noqa: F401 — only imported for side-effect of module registration
-        import main  # noqa: F401
+        import main as _alphard_main  # noqa: F401
     main = sys.modules["main"]
     main._shutdown_event.clear()
     yield main
