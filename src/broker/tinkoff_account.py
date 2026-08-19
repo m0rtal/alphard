@@ -295,15 +295,35 @@ class TinkoffAccount(BrokerAccount):
 
         Accepts both TQBR (stocks) and TQOB (bonds) class codes so the
         same helper works for the OFZ bond universe.
+
+        Issue #13 (C.1): the historical implementation had
+        ``except Exception: pass`` followed by a silent fallback
+        ``return ticker`` that sent the literal string ``"SBER"`` to
+        ``post_order``. That masked ``LoaderAuthError`` (compromised
+        token), ``ConnectionError`` (Tinkoff API down), HTTP 4xx/5xx,
+        and rate-limit responses. The order would then fail with
+        ``INVALID_ARGUMENT`` deep in the broker, after RiskGate had
+        already approved and the rate-limit token was spent.
+
+        The fix: every error path raises ``BrokerError`` with a
+        descriptive message. Operators MUST see the actual failure
+        reason (auth, network, instrument not found) in the logs.
         """
         try:
             response = client.instruments.find_instrument(query=ticker)
-            for inst in response.instruments:
-                if inst.ticker == ticker and inst.class_code in ("TQBR", "TQOB"):
-                    return str(inst.figi)
-        except Exception:
-            pass
-        return ticker
+        except Exception as exc:
+            raise BrokerError(f"instruments.find_instrument failed for {ticker}: {exc}") from exc
+        for inst in getattr(response, "instruments", []):
+            if getattr(inst, "ticker", None) == ticker and getattr(inst, "class_code", None) in ("TQBR", "TQOB"):
+                return str(inst.figi)
+        # No matching TQBR/TQOB instrument — refuse, do NOT silently
+        # return the ticker (which would then be sent as a FIGI and
+        # produce a confusing INVALID_ARGUMENT deep in the broker).
+        raise BrokerError(
+            f"ticker {ticker!r} not found in TQBR/TQOB instrument "
+            f"universe (Tinkoff returned {len(getattr(response, 'instruments', []))} "
+            f"matches, none with the right class_code)"
+        )
 
     @staticmethod
     def _map_status(raw: str) -> OrderStatus:
