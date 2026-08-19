@@ -1220,9 +1220,7 @@ class TestOrderFlow:
 
         broker = MagicMock()
         flow = OrderFlow(broker=broker, risk_gate=self._approved_gate())
-        result = flow.submit_market(
-            "SBER", OrderSide.BUY, Decimal("100"), self._portfolio()
-        )
+        result = flow.submit_market("SBER", OrderSide.BUY, Decimal("100"), self._portfolio())
         # No slices submitted; final_status is REJECTED
         assert result.slice_count == 0
         assert broker.place_order.call_count == 0
