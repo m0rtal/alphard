@@ -139,7 +139,22 @@ def _alarm_handler(signum: int, frame: object) -> None:
 # Circuit breaker: how many consecutive ticker failures before we abort
 # the whole run. Catches systematic issues (rate-limit ban, MD endpoint
 # outage, parse bug) without burning hours on a doomed loop.
-_CIRCUIT_BREAKER_THRESHOLD = 5
+#
+# DISABLED (2026-08-19, per user feedback "5 no-data подряд - ну кто
+# это выдумал? Это плохое решение"): the previous threshold of 5
+# aborted the run on legitimate no-data runs. VLHZ, KBSB, CARM,
+# DIAS, PRMD, MBNK, EUTR, KFBA are all valid "no data" outcomes
+# (delisted before MD archive, or US tickers without FIGI in
+# Tinkoff, or bonds pre-2018) and appear as no-data in succession
+# for ~10-20 tickers when sorting alphabetically by ticker. The
+# breaker triggered mid-run on a healthy network and the operator
+# had to manually restart. Replaced with a generous upper bound
+# that only fires on truly pathological patterns (e.g. 50 in a row)
+# — at that point the universe ordering has cycled and it's
+# almost certainly a code-level regression, not a no-data storm.
+# The original safeguard was correct in spirit (don't burn hours
+# on a doomed loop) but the threshold was wrong.
+_CIRCUIT_BREAKER_THRESHOLD = 50  # 2026-08-19: raised from 5 (user feedback)
 
 # Hard per-ticker deadline. If _backfill_one() doesn't return within this
 # many seconds, the heartbeating watchdog inside it raises _LoaderTimeout
