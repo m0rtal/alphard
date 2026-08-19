@@ -81,3 +81,53 @@ class TestConcurrencyRegression:
         b.acquire()  # should block ~100ms (1 token / 10 r/s) until refill
         elapsed = time.monotonic() - start
         assert elapsed >= 0.05, f"acquire() returned too fast: {elapsed}s"
+
+
+# ===========================================================================
+# Issue #14 D.2: assert self._lock is not None replaced by non-Optional field.
+# The lock is now set in __post_init__ via field(default_factory=...), so it
+# is always present. python -O cannot strip this invariant.
+# ===========================================================================
+
+
+class TestLockInvariant:
+    def test_lock_is_always_present(self) -> None:
+        """Issue #14 D.2: lock is now a non-Optional field, set in
+        __post_init__ via field(default_factory=threading.Lock). This
+        is the same invariant the historical ``assert self._lock is
+        not None`` tried to enforce, but without relying on python -O
+        preserving the assert."""
+        b = TokenBucket(rate=1, window_seconds=1)
+        assert b._lock is not None
+        assert isinstance(b._lock, type(threading.Lock()))
+
+    def test_asserts_no_longer_in_token_bucket(self) -> None:
+        """Issue #14 D.2: there are no ``assert`` statements in
+        production token_bucket code. python -O stripping them would
+        be a critical vulnerability for a rate limiter."""
+        import ast
+        import inspect
+
+        from src.data import token_bucket
+
+        source = inspect.getsource(token_bucket)
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assert):
+                # Allow the type narrowing in __post_init__ / similar
+                # if any. As of this fix, none should remain.
+                pytest.fail(f"production assert found at line {node.lineno}: " f"{ast.dump(node.test)}")
+
+    def test_audit_log_runtime_check_for_cursor(self) -> None:
+        """Issue #14 D.2: PostgresAuditLog.write_event() now raises
+        RuntimeError if _cursor is None after _ensure_conn() instead
+        of relying on an assert that python -O would strip."""
+        from src.data.quality.audit import PostgresAuditLog
+        from unittest.mock import MagicMock
+
+        log = PostgresAuditLog(table="audit_log")
+        # Force _ensure_conn to no-op so _cursor stays None.
+        log._ensure_conn = lambda: None  # type: ignore[method-assign]
+        log._conn = MagicMock()
+        with pytest.raises(RuntimeError, match="_cursor is None"):
+            log.write_event(None, ticker="SBER", gate="test")  # type: ignore[arg-type]

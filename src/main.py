@@ -260,10 +260,19 @@ def _run_daily_sync_watchdog() -> None:
         # the heartbeat still ticks and a human can investigate.
         logger.warning(f"watchdog: probe failed ({type(exc).__name__}: {exc}) — " f"skipping this cycle")
     finally:
+        # Fail-secure (issue #14 D.1): a broken ``store.close()`` MUST
+        # be logged, not silently swallowed. The historical
+        # ``except Exception: pass`` masked Postgres connection
+        # failures during shutdown, leaving operators blind to
+        # post-mortem gaps.
         try:
             store.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                "store.close() failed during shutdown: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
 
 
 def main() -> None:

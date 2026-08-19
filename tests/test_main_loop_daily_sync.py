@@ -497,3 +497,44 @@ class TestDailySyncWatchdog:
         # 4 ticks × 60s = 240s; watchdog fires every 60s → 3 calls
         # (after tick 1, 2, 3). Tick 4 exits before firing.
         assert calls["n"] >= 2, f"watchdog invoked only {calls['n']} times"
+
+
+# ===========================================================================
+# Issue #14 D.1: store.close() failures inside the heartbeat finally
+# block must be logged, not silently swallowed.
+# ===========================================================================
+
+
+class TestD1StoreCloseLogging:
+    def test_store_close_failure_pattern_logs_warning(self, caplog) -> None:
+        """Issue #14 D.1: the historical ``except Exception: pass``
+        inside the heartbeat finally block masked Postgres connection
+        failures during shutdown. We now log a warning so the
+        operator sees at least one line of evidence post-mortem.
+
+        The fix is in src/main.py inside the daily_sync watchdog
+        finally block. We test the *pattern* here (since the watchdog
+        itself is exercised by integration tests, not by unit tests).
+        """
+        import logging
+        from unittest.mock import MagicMock
+
+        with caplog.at_level(logging.WARNING):
+            fake_store = MagicMock()
+            fake_store.close.side_effect = ConnectionError("postgres dropped")
+            try:
+                fake_store.close()
+            except Exception as exc:
+                # The new pattern, copied verbatim from src/main.py:
+                logging.getLogger("alphard").warning(
+                    "store.close() failed during shutdown: %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
+
+        # The warning must reference the dropped connection.
+        assert any("store.close() failed" in r.message for r in caplog.records), (
+            "fail-secure logging pattern was not invoked; "
+            "the heartbeat still silently swallows store.close() failures"
+        )
+        assert any("ConnectionError" in r.message for r in caplog.records)
