@@ -147,14 +147,13 @@ _CIRCUIT_BREAKER_THRESHOLD = 5
 # fits in ~30s; foreign ETFs over the IB bridge can take 90s on a bad
 # day. 180s gives enough headroom without letting a single stuck ticker
 # starve the whole run.
-_TICKER_DEADLINE_SECONDS = 120  # 2026-08-19: raised from 30s. Live cluster observation
-# showed that the previous 30s deadline was too aggressive: it cut off
-# legitimate slow responses (SBER 9-year minute archive can be 40-90s
-# on a fresh connection; foreign ETFs/bonds over 60-90s). The .107
-# network stall is a separate issue — when the body stalls, SIGALRM
-# still fires at 120s and the fallback chain moves on. 120s is the
-# sweet spot: long enough for healthy large archives to finish,
-# short enough that a stuck ticker doesn't block the run.
+_TICKER_DEADLINE_SECONDS = 300  # 2026-08-19: raised from 120s to 5 minutes. User request:
+# 5 minute per-ticker deadline. Worst case 3 sources × 300s = 900s per
+# ticker (~15 min); with 3254 tickers that's ~34 days in the worst case
+# but in practice most tickers succeed on the first source in seconds.
+# The previous 120s was still cutting off large bond/ETF archives on
+# first cold download. 5 minutes gives healthy responses real room
+# to finish while still catching stalled network connections.
 
 
 def _set_complete_flag(store: PostgresDataStore, ticker: str, complete: bool) -> None:
