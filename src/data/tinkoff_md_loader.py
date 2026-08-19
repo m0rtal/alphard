@@ -105,7 +105,10 @@ DAILY_INTERVAL = "CANDLE_INTERVAL_DAY"
 DEFAULT_BUCKET_RATE = 0.5
 
 # HTTP timeout per archive download — SBER 2020 ≈ 2.2 MB, fits in 30s.
-_DOWNLOAD_TIMEOUT = 60
+_DOWNLOAD_TIMEOUT = 90  # 2026-08-19: raised from 60s. Live probe shows healthy archives complete in 0.3-0.7s.
+# Real stalls (network drop, DNS hiccup) take 60-90s; 60s was too tight
+# when the first byte arrived quickly but the body transferred slowly
+# (typical big zip in 4-5 MB/s would be 60-100s for 9-12 MB archive).
 
 
 # ---------------------------------------------------------------------------

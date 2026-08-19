@@ -147,13 +147,14 @@ _CIRCUIT_BREAKER_THRESHOLD = 5
 # fits in ~30s; foreign ETFs over the IB bridge can take 90s on a bad
 # day. 180s gives enough headroom without letting a single stuck ticker
 # starve the whole run.
-_TICKER_DEADLINE_SECONDS = 300  # 2026-08-19: raised from 120s to 5 minutes. User request:
-# 5 minute per-ticker deadline. Worst case 3 sources × 300s = 900s per
-# ticker (~15 min); with 3254 tickers that's ~34 days in the worst case
-# but in practice most tickers succeed on the first source in seconds.
-# The previous 120s was still cutting off large bond/ETF archives on
-# first cold download. 5 minutes gives healthy responses real room
-# to finish while still catching stalled network connections.
+_TICKER_DEADLINE_SECONDS = 900  # 2026-08-19: raised from 300s. Live probe proved the
+# network is healthy (SBER 2018 archive = 1.6 MB in 0.29s, 5 MB/s).
+# The previous 300s was too short for a full 9-year backfill of large
+# tickers: 9 years × 90s download_timeout = 810s + overhead. 900s
+# gives 10% headroom per ticker. Runtime cost for the full universe:
+# 3254 tickers × 900s worst case = 34 days, but healthy tickers finish
+# in seconds and the bulk of slowdowns are gRPC/MOEX fallthrough
+# after MD succeeded.
 
 
 def _set_complete_flag(store: PostgresDataStore, ticker: str, complete: bool) -> None:
