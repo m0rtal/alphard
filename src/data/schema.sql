@@ -72,6 +72,34 @@ CREATE INDEX IF NOT EXISTS idx_ticker_universe_figi
     ON ticker_universe (figi) WHERE figi IS NOT NULL;
 
 -- ---------------------------------------------------------------------------
+-- _daily_sync_health  (Phase 1.6 audit: watchdog for daemon thread crash)
+-- ---------------------------------------------------------------------------
+-- Single-row sentinel table. daily_sync.py writes last_successful_run_at
+-- after a successful run; the in-process watchdog (src.main) checks this
+-- value every 30 min and sys.exit(1) → Docker restart if the daemon
+-- hasn't fired in 26h. Without this, a daemon thread crash inside a
+-- live process would silently break the daily schedule until manual
+-- intervention. Using a sentinel table (not a log file) means the
+-- watchdog survives log rotation and container restarts that don't
+-- touch the volume.
+CREATE TABLE IF NOT EXISTS _daily_sync_health (
+    id                    SMALLINT PRIMARY KEY,
+    last_successful_run_at TIMESTAMPTZ,
+    last_run_status       VARCHAR(16),  -- 'ok' | 'failed' | 'timeout' | 'never_run'
+    last_run_bars         INTEGER,
+    last_run_tickers      INTEGER,
+    last_run_error        TEXT,
+    updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT _daily_sync_health_status_chk
+        CHECK (last_run_status IN ('ok', 'failed', 'timeout', 'never_run'))
+);
+
+INSERT INTO _daily_sync_health (id, last_successful_run_at, last_run_status, updated_at)
+    VALUES (1, NULL, 'never_run', NOW())
+    ON CONFLICT (id) DO NOTHING;
+
+
+-- ---------------------------------------------------------------------------
 -- _auth_probe  (Phase 1.6 H-9: detect silent auth drift after redeploy)
 -- ---------------------------------------------------------------------------
 -- One-row table used by PostgresDataStore.auth_probe() and by the bot

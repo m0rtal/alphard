@@ -307,6 +307,33 @@ def main() -> int:
     logger.info(
         f"=== DONE: {total_bars} bars written, {len(errors)} errors, " f"md_archive_used={md_used_count} tickers ==="
     )
+
+    # Phase 1.6 audit: stamp the watchdog sentinel so src.main's
+    # in-process watchdog can detect a stuck daily_sync daemon thread.
+    # On success: status='ok'. On non-zero exit: status='failed' with
+    # the first error message attached. timeout case is handled by the
+    # caller (subprocess.run timeout) — that path also exits non-zero
+    # and falls into the failure branch.
+    try:
+        if not errors:
+            store.record_daily_sync_run(
+                status="ok",
+                bars=total_bars,
+                tickers=len(symbols),
+            )
+        else:
+            first_err = errors[0][1] if errors else "unknown"
+            store.record_daily_sync_run(
+                status="failed",
+                bars=total_bars,
+                tickers=len(symbols) - len(errors),
+                error=f"{len(errors)} tickers failed; first: {first_err}",
+            )
+    except Exception as exc:  # noqa: BLE001
+        # Sentinel write failure must NOT mask the run result. Just log
+        # and let the run return code speak for itself.
+        logger.warning(f"could not stamp _daily_sync_health: {exc}")
+
     return 0 if not errors else 2
 
 

@@ -351,3 +351,149 @@ def test_main_joins_daemon_on_keyboard_interrupt(monkeypatch) -> None:
 
     assert joined["called"], "main() did not join the daemon thread"
     assert main_module._shutdown_event.is_set(), "main() did not set the shutdown event"
+
+
+# ---------------------------------------------------------------------------
+# Watchdog: in-process detector for stuck daily_sync daemon
+# ---------------------------------------------------------------------------
+
+
+class TestDailySyncWatchdog:
+    """The watchdog reads _daily_sync_health.last_successful_run_at and
+    forces a container restart (sys.exit(1)) if the daemon thread has
+    not fired in WATCHDOG_STALE_SECONDS. Without this, a thread that
+    crashes inside a live process leaves the bot running with no daily
+    schedule — the heartbeat keeps ticking, the container is "Up", but
+    no sync happens.
+    """
+
+    def test_constants_sane(self) -> None:
+        assert main_module.WATCHDOG_INTERVAL_SECONDS == 1800
+        assert main_module.WATCHDOG_STALE_SECONDS == 26 * 3600
+        # 26h is the trigger; the cadence (30 min) is the check
+        # frequency. Both must be positive.
+        assert main_module.WATCHDOG_INTERVAL_SECONDS > 0
+        assert main_module.WATCHDOG_STALE_SECONDS > 0
+
+    def test_watchdog_ok_recent_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A recent successful run must NOT trigger sys.exit."""
+        from datetime import datetime, timedelta, timezone
+
+        recent = datetime.now(timezone.utc) - timedelta(hours=2)
+
+        class _StubStore:
+            def last_daily_sync_run_at(self):
+                return recent
+
+            def close(self):
+                pass
+
+        # main._run_daily_sync_watchdog does `from src.data.pg_store import
+        # PostgresDataStore` inside the function body, so we patch the
+        # source module, not main.
+        import src.data.pg_store as pg_store_mod
+
+        monkeypatch.setattr(pg_store_mod, "PostgresDataStore", _StubStore)
+
+        logger = mock.MagicMock()
+        monkeypatch.setattr(
+            main_module.logging,
+            "getLogger",
+            lambda name=None: logger,
+        )
+
+        main_module._run_daily_sync_watchdog()
+
+        # No exit, no CRITICAL log.
+        assert not any("CRITICAL" in str(call) for call in logger.critical.call_args_list)
+
+    def test_watchdog_triggers_exit_on_stale(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """last_run older than threshold → sys.exit(1)."""
+        from datetime import datetime, timedelta, timezone
+
+        stale = datetime.now(timezone.utc) - timedelta(hours=30)
+
+        class _StubStore:
+            def last_daily_sync_run_at(self):
+                return stale
+
+            def close(self):
+                pass
+
+        import src.data.pg_store as pg_store_mod
+
+        monkeypatch.setattr(pg_store_mod, "PostgresDataStore", _StubStore)
+
+        logger = mock.MagicMock()
+        monkeypatch.setattr(
+            main_module.logging,
+            "getLogger",
+            lambda name=None: logger,
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            main_module._run_daily_sync_watchdog()
+
+        assert exc_info.value.code == 1
+        # The CRITICAL log must have been emitted with the right reason.
+        assert any("broken or wedged" in str(call) for call in logger.critical.call_args_list)
+
+    def test_watchdog_handles_db_error_silently(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """If the DB probe raises, the watchdog must not crash the process."""
+
+        def boom() -> None:
+            raise RuntimeError("DB connection refused")
+
+        import src.data.pg_store as pg_store_mod
+
+        monkeypatch.setattr(pg_store_mod, "PostgresDataStore", boom)
+
+        logger = mock.MagicMock()
+        monkeypatch.setattr(
+            main_module.logging,
+            "getLogger",
+            lambda name=None: logger,
+        )
+
+        # No exit. The exception is caught and logged.
+        main_module._run_daily_sync_watchdog()
+
+        assert any(
+            "watchdog" in str(call.args[0]) if call.args else "watchdog" in str(call.kwargs.get("msg", ""))
+            for call in logger.warning.call_args_list
+        )
+
+    def test_heartbeat_loop_invokes_watchdog(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """main() must call _run_daily_sync_watchdog() periodically."""
+        calls = {"n": 0}
+
+        def fake_watchdog():
+            calls["n"] += 1
+
+        monkeypatch.setattr(main_module, "_run_daily_sync_watchdog", fake_watchdog)
+        monkeypatch.setattr(main_module, "_seconds_until_next_target_hour_msk", lambda *a: 0.0)
+        monkeypatch.setattr(main_module, "_sleep_interruptible", lambda s: None)
+        monkeypatch.setattr(
+            main_module.subprocess,
+            "run",
+            lambda *a, **kw: mock.Mock(returncode=0, stdout="", stderr=""),
+        )
+        # Speed up: 60s cadence instead of 1800s.
+        monkeypatch.setattr(main_module, "WATCHDOG_INTERVAL_SECONDS", 60)
+
+        ticks = {"n": 0}
+
+        def fake_sleep(s):
+            ticks["n"] += 1
+            if ticks["n"] >= 4:  # 4 ticks → expect 3 watchdog calls
+                raise KeyboardInterrupt("stop")
+            return None
+
+        monkeypatch.setattr(main_module.time, "sleep", fake_sleep)
+
+        with pytest.raises((KeyboardInterrupt, SystemExit)):
+            main_module.main()
+
+        # 4 ticks × 60s = 240s; watchdog fires every 60s → 3 calls
+        # (after tick 1, 2, 3). Tick 4 exits before firing.
+        assert calls["n"] >= 2, f"watchdog invoked only {calls['n']} times"

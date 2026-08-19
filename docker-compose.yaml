@@ -196,37 +196,6 @@ services:
       - alphard-net
     profiles: ["observability"]
 
-  cron:
-    build:
-      context: .
-      dockerfile: docker/cron/Dockerfile
-    container_name: alphard-cron
-    restart: unless-stopped
-    labels:
-      - "com.centurylinklabs.watchtower.enable=true"
-    env_file:
-      - .env
-    environment:
-      ENV: ${ENV:-production}
-      TINKOFF_SANDBOX_TOKEN: ${TINKOFF_SANDBOX_TOKEN:?TINKOFF_SANDBOX_TOKEN required}
-      TINKOFF_REAL_TOKEN: ${TINKOFF_REAL_TOKEN:-}
-      TINKOFF_ACCOUNT_ID: ${TINKOFF_ACCOUNT_ID:-}
-      POSTGRES_USER: ${POSTGRES_USER:-alphard}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}
-      POSTGRES_DB: ${POSTGRES_DB:-alphard}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      LOG_DIR: /app/logs
-    volumes:
-      - /mnt/appdata/alphard/cron-logs:/app/logs
-    networks:
-      - alphard-net
-    depends_on:
-      postgres:
-        condition: service_healthy
-      pg-init:
-        condition: service_completed_successfully
-    profiles: ["scheduled"]
-
 networks:
   alphard-net:
     driver: bridge

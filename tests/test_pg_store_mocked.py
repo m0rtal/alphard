@@ -98,6 +98,10 @@ class FakeCursor:
     def fetchone(self) -> tuple[Any, ...] | None:
         if self._fetchone_queue:
             result = self._fetchone_queue.pop(0)
+            # Real psycopg fetchone() returns None when the result
+            # was None (SQL NULL row). Allow that through.
+            if result is None:
+                return None
             assert isinstance(result, tuple)
             return result
         return None
@@ -428,6 +432,87 @@ class TestInitSchema:
         cur = fake_conn_cls.last.cursors[0]
         assert cur.calls[0][0] == "CREATE TABLE foo (id INT);"
         assert fake_conn_cls.last.commit_calls == 1
+
+
+class TestDailySyncHealthSentinel:
+    """In-process watchdog for daily_sync daemon thread.
+
+    Tests verify the SQL contract for _daily_sync_health: the row
+    exists, the status field is constrained, and the timestamp
+    semantics are correct. The watchdog itself (in src/main.py) has
+    its own test file (test_main_loop_daily_sync.py).
+    """
+
+    def test_record_run_ok_stamps_now(self, fake_conn_cls: Any, store: PostgresDataStore) -> None:
+        store.record_daily_sync_run(status="ok", bars=42, tickers=20, error=None)
+        cur = store._conn.last_cursor()
+        sql, params = cur.calls[0]
+        # Status 'ok' should land in the SQL; error is NULL.
+        assert "INSERT INTO _daily_sync_health" in sql
+        assert "ON CONFLICT (id) DO UPDATE" in sql
+        assert params[0] == "ok"  # CASE WHEN %s = 'ok' THEN NOW() ...
+        assert params[1] == "ok"  # last_run_status
+        assert params[2] == 42  # bars
+        assert params[3] == 20  # tickers
+        assert params[4] is None  # error
+        assert store._conn.commit_calls >= 1
+
+    def test_record_run_failed_carries_error(self, fake_conn_cls: Any, store: PostgresDataStore) -> None:
+        store.record_daily_sync_run(
+            status="failed",
+            bars=0,
+            tickers=0,
+            error="Tinkoff API 500 on SBER",
+        )
+        cur = store._conn.last_cursor()
+        sql, params = cur.calls[0]
+        assert params[0] == "failed"
+        assert params[1] == "failed"
+        assert "Tinkoff API 500 on SBER" in params[4]
+
+    def test_record_run_truncates_long_error(self, fake_conn_cls: Any, store: PostgresDataStore) -> None:
+        long_err = "x" * 5000
+        store.record_daily_sync_run(status="failed", bars=0, tickers=0, error=long_err)
+        cur = store._conn.last_cursor()
+        _, params = cur.calls[0]
+        # Truncated to 2000 chars (1997 + '...')
+        assert len(params[4]) == 2000
+        assert params[4].endswith("...")
+
+    def test_record_run_ok_does_not_overwrite_previous_success(
+        self, fake_conn_cls: Any, store: PostgresDataStore
+    ) -> None:
+        """When status='failed', last_successful_run_at must NOT be touched.
+
+        Otherwise a single failure would reset the watchdog's anchor
+        and hide a long-broken daemon behind a recent failure event.
+        """
+        # Inspect the SQL: the CASE WHEN ensures we only stamp NOW()
+        # when status='ok'.
+        store.record_daily_sync_run(status="failed", bars=0, tickers=0, error="boom")
+        cur = store._conn.last_cursor()
+        sql, params = cur.calls[0]
+        # First %s is the CASE WHEN predicate; the failing path
+        # must be `last_successful_run_at` (a column reference), not NOW().
+        assert "CASE WHEN %s = 'ok' THEN NOW() ELSE last_successful_run_at END" in sql
+
+    def test_last_run_returns_timestamp(self, fake_conn_cls: Any, store: PostgresDataStore) -> None:
+        from datetime import datetime, timezone
+
+        ts = datetime(2026, 8, 19, 20, 0, 0, tzinfo=timezone.utc)
+        # Pre-load on the *connection* — cursor() will transfer to cursor.
+        fake_conn_cls.last.next_fetchone.append((ts,))
+        result = store.last_daily_sync_run_at()
+        assert result == ts
+
+    def test_last_run_returns_none_when_never_stamped(self, fake_conn_cls: Any, store: PostgresDataStore) -> None:
+        fake_conn_cls.last.next_fetchone.append((None,))
+        assert store.last_daily_sync_run_at() is None
+
+    def test_last_run_returns_none_when_no_row(self, fake_conn_cls: Any, store: PostgresDataStore) -> None:
+        # fetchone returns None when no row matched
+        fake_conn_cls.last.next_fetchone.append(None)
+        assert store.last_daily_sync_run_at() is None
 
 
 # ---------------------------------------------------------------------------
@@ -1235,37 +1320,6 @@ class TestAuthProbe:
         s._connect = MagicMock(side_effect=RuntimeError("connect failed"))
         # No exception should escape.
         assert s.auth_probe() is False
-
-
-# ---------------------------------------------------------------------------
-# latest_ts_overall — used by data-freshness check
-# ---------------------------------------------------------------------------
-
-
-class TestLatestTsOverall:
-    """Returns the max(ts) across all rows in ohlcv_daily, or None."""
-
-    def _store(self, row: Any) -> Any:
-        store = MagicMock()
-        cursor = MagicMock()
-        cursor.__enter__.return_value = cursor
-        cursor.fetchone.return_value = row
-        cursor_cm = MagicMock()
-        cursor_cm.__enter__.return_value = cursor
-        cursor_cm.__exit__.return_value = False
-        conn = MagicMock()
-        conn.cursor.return_value = cursor_cm
-        store._conn = conn
-        store._connect = MagicMock()
-        return store
-
-    def test_returns_date(self) -> None:
-        store = self._store((date(2026, 8, 17),))
-        assert PostgresDataStore.latest_ts_overall(store) == date(2026, 8, 17)
-
-    def test_returns_none_when_empty(self) -> None:
-        store = self._store(None)
-        assert PostgresDataStore.latest_ts_overall(store) is None
 
 
 # ---------------------------------------------------------------------------

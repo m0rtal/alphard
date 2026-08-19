@@ -170,6 +170,77 @@ class PostgresDataStore(DataStore):
             )
             return False
 
+    # ---------------------------------------------------------- health sentinel
+
+    def record_daily_sync_run(
+        self,
+        status: str,
+        bars: int = 0,
+        tickers: int = 0,
+        error: str | None = None,
+    ) -> None:
+        """Stamp _daily_sync_health with the outcome of a daily_sync run.
+
+        Called by daily_sync.py after every run (success or failure).
+        The watchdog in src.main reads ``last_successful_run_at`` and
+        triggers a container restart if it's older than the threshold.
+
+        Parameters
+        ----------
+        status:
+            'ok' | 'failed' | 'timeout'. Anything else is rejected by
+            the CHECK constraint; we don't want free-form strings.
+        bars, tickers:
+            Counters from the run. NULL on failure.
+        error:
+            Last error message; truncated to 2000 chars to keep the
+            row small. NULL on success.
+        """
+        self._connect()
+        if error and len(error) > 2000:
+            error = error[:1997] + "..."
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO _daily_sync_health
+                    (id, last_successful_run_at, last_run_status,
+                     last_run_bars, last_run_tickers, last_run_error, updated_at)
+                VALUES (
+                    1,
+                    CASE WHEN %s = 'ok' THEN NOW() ELSE last_successful_run_at END,
+                    %s, %s, %s, %s, NOW()
+                )
+                ON CONFLICT (id) DO UPDATE SET
+                    last_successful_run_at = CASE
+                        WHEN EXCLUDED.last_run_status = 'ok' THEN NOW()
+                        ELSE _daily_sync_health.last_successful_run_at
+                    END,
+                    last_run_status  = EXCLUDED.last_run_status,
+                    last_run_bars    = EXCLUDED.last_run_bars,
+                    last_run_tickers  = EXCLUDED.last_run_tickers,
+                    last_run_error    = EXCLUDED.last_run_error,
+                    updated_at        = NOW()
+                """,
+                (status, status, bars, tickers, error),
+            )
+        self._conn.commit()
+
+    def last_daily_sync_run_at(self) -> Any:
+        """Return ``_daily_sync_health.last_successful_run_at`` (TIMESTAMPTZ or None).
+
+        Used by the watchdog in src.main to detect a stuck daily_sync
+        daemon (e.g. daemon thread crashed inside a live process).
+        Returns None if the sentinel row has never been stamped — that
+        is the legitimate pre-first-run state, and the watchdog must
+        not trigger a restart on a fresh container before the first
+        scheduled run has had a chance to fire.
+        """
+        self._connect()
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT last_successful_run_at FROM _daily_sync_health WHERE id = 1")
+            row = cur.fetchone()
+            return row[0] if row and row[0] is not None else None
+
     # ---------------------------------------------------------- schema
 
     def init_schema(self) -> None:
@@ -441,20 +512,6 @@ class PostgresDataStore(DataStore):
                 "SELECT MAX(ts) FROM ohlcv_daily WHERE ticker = %s",
                 (ticker.upper(),),
             )
-            row = cur.fetchone()
-            return row[0] if row and row[0] is not None else None
-
-    def latest_ts_overall(self) -> date | None:
-        """Latest bar across the entire ``ohlcv_daily`` table, or None.
-
-        Used by ``scripts/check_data_freshness.py`` to detect silent
-        data-feed stalls: the cron job (or daily_sync) is running but
-        no new rows are being written. Returns None if the table is
-        empty (legitimate pre-launch state) or on a connection error.
-        """
-        self._connect()
-        with self._conn.cursor() as cur:
-            cur.execute("SELECT MAX(ts) FROM ohlcv_daily")
             row = cur.fetchone()
             return row[0] if row and row[0] is not None else None
 

@@ -43,29 +43,22 @@ class TestCompose:
         cmd = " ".join(healthcheck.get("test", []))
         assert "pg-healthcheck.sh" in cmd, f"postgres healthcheck must call our custom script; got: {cmd}"
 
-    def test_cron_service_present_when_scheduled(self) -> None:
-        """Phase 1.6 audit: daily_sync must run on a schedule, otherwise
-        the bot is a Phase 0 stub once backfill finishes."""
+    def test_no_cron_service(self) -> None:
+        """Phase 1.6 audit cleanup: cron profile is gone.
+
+        daily_sync is now an in-process daemon thread (src/main.py),
+        monitored by an in-process watchdog (_run_daily_sync_watchdog).
+        The cron profile is no longer deployed; if it ever returns, it
+        would compete with the in-process daemon for the daily_sync
+        subprocess, causing duplicate writes and timer races.
+        """
         data = _load_compose()
         services = data["services"]
-        assert "cron" in services, (
-            "cron service must exist so daily_sync + freshness + "
-            "db_health checks run automatically; without it the bot "
-            "stops updating after backfill."
+        assert "cron" not in services, (
+            "cron service must NOT exist — daily_sync is an in-process "
+            "daemon thread with an in-process watchdog, no separate "
+            "cron profile needed."
         )
-        cron = services["cron"]
-        assert cron.get("profiles") == ["scheduled"], (
-            "cron must be opt-in via `profiles: [scheduled]` so smoke " "deploys (no cron, just bot) still work"
-        )
-
-    def test_cron_mounts_logs_volume(self) -> None:
-        data = _load_compose()
-        cron = data["services"]["cron"]
-        volumes = cron.get("volumes", [])
-        # At least one bind mount pointing at the cron-logs path.
-        assert any(
-            "/app/logs" in str(v) for v in volumes
-        ), "cron needs a writable /app/logs mount for the cron.log file"
 
     def test_pg_init_service_exists(self) -> None:
         """Phase 1.6 audit: init_postgres.sh must run automatically on
