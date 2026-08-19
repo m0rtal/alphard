@@ -129,7 +129,9 @@ jobs:
 
       - name: Run pip-audit (strict)
         # Issue #16: SCA in CI catches CVE before merge.
-        # Excludes t-tech-investments (no public CVE feed).
+        # pip-audit 2.x dropped --skip-prefix; we exclude
+        # t-tech-investments via a filtered requirements file
+        # (requirements-ci.txt) since Tinkoff SDK has no public
+        # CVE feed.
         run: |
-          pip-audit --strict --requirement requirements.txt \
-            --skip-prefix "t-tech-investments"
+          pip-audit --strict --requirement requirements-ci.txt
