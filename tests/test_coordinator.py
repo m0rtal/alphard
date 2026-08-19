@@ -116,8 +116,11 @@ class TestCoordinatorFullPipeline:
         assert result.risk_allowed is False
         assert result.broker_status is None
 
-    def test_validate_raises_does_not_block_risk_check(self) -> None:
-        """If _validate raises, pipeline continues to RISK (conservative)."""
+    def test_validate_raises_blocks_pipeline(self) -> None:
+        """Issue #15 (C.1): if _validate raises, the pipeline must NOT
+        proceed to RISK or EXECUTE — unvalidated data must never reach
+        the risk gate or the broker. We now block with VALIDATE_EXCEPTION
+        and risk_allowed=False."""
         with (
             patch.object(Coordinator, "_fetch", return_value=[_bar()]),
             patch.object(Coordinator, "_validate", side_effect=RuntimeError("gate fail")),
@@ -125,8 +128,78 @@ class TestCoordinatorFullPipeline:
             patch.object(Coordinator, "_execute", return_value="REJECTED_LIVE_TRADING_FALSE"),
         ):
             result = Coordinator(_config()).run_once()
+        assert PipelineStage.RISK not in result.stages_completed
+        assert PipelineStage.EXECUTE not in result.stages_completed
+        assert result.risk_allowed is False
+        assert "VALIDATE_EXCEPTION" in result.risk_violations
+        assert result.broker_status is None
+
+    def test_risk_check_raises_blocks_broker_even_when_live_trading_true(
+        self,
+    ) -> None:
+        """Issue #15 (C.2): if _risk_check raises, the broker must NOT be
+        called even when LIVE_TRADING=true. The historical test
+        ``test_risk_check_exception_does_not_block_execute`` enshrined
+        the opposite behaviour; that test is replaced by this one."""
+        with (
+            patch.object(Coordinator, "_fetch", return_value=[_bar()]),
+            patch.object(Coordinator, "_validate", return_value=True),
+            patch.object(
+                Coordinator,
+                "_risk_check",
+                side_effect=RuntimeError("risk engine down"),
+            ),
+            patch.object(Coordinator, "_execute", return_value="FILLED") as exec_mock,
+        ):
+            result = Coordinator(_config(live_trading=True)).run_once()
+        assert PipelineStage.RISK not in result.stages_completed
+        assert PipelineStage.EXECUTE not in result.stages_completed
+        assert "RISK_EXCEPTION" in result.risk_violations
+        assert result.risk_allowed is False
+        assert result.broker_status is None
+        # Critical: _execute must NOT have been called.
+        exec_mock.assert_not_called()
+
+    def test_toctou_window_blocks_when_too_slow(self) -> None:
+        """Issue #15 (C.3): if the gap between RISK and EXECUTE exceeds
+        ``toctou_max_seconds``, the trade is blocked even when both
+        stages individually succeed. We patch ``time.monotonic`` to
+        simulate a slow downstream caller."""
+        cfg = _config(live_trading=True, toctou_max_seconds=0.050)
+
+        # First call (in RISK) returns t=100.0, second call (in TOCTOU
+        # guard) returns t=100.5 → 0.5s elapsed, > 50ms window.
+        monotonic_values = iter([100.0, 100.5])
+        with (
+            patch.object(Coordinator, "_fetch", return_value=[_bar()]),
+            patch.object(Coordinator, "_validate", return_value=True),
+            patch.object(Coordinator, "_risk_check", return_value=(True, ())),
+            patch.object(Coordinator, "_execute", return_value="FILLED") as exec_mock,
+            patch("src.coordinator.time.monotonic", side_effect=lambda: next(monotonic_values)),
+        ):
+            result = Coordinator(cfg).run_once()
         assert PipelineStage.RISK in result.stages_completed
-        assert result.risk_allowed is True
+        assert PipelineStage.EXECUTE not in result.stages_completed
+        assert "TOCTOU_STATE_STALE" in result.risk_violations
+        assert result.risk_allowed is False
+        assert result.broker_status is None
+        exec_mock.assert_not_called()
+
+    def test_toctou_window_passes_when_fast_enough(self) -> None:
+        """Issue #15 (C.3) positive case: the gap is well within the
+        window, so the trade proceeds normally."""
+        cfg = _config(live_trading=True, toctou_max_seconds=1.0)
+        monotonic_values = iter([100.0, 100.001])
+        with (
+            patch.object(Coordinator, "_fetch", return_value=[_bar()]),
+            patch.object(Coordinator, "_validate", return_value=True),
+            patch.object(Coordinator, "_risk_check", return_value=(True, ())),
+            patch.object(Coordinator, "_execute", return_value="FILLED"),
+            patch("src.coordinator.time.monotonic", side_effect=lambda: next(monotonic_values)),
+        ):
+            result = Coordinator(cfg).run_once()
+        assert result.broker_status == "FILLED"
+        assert PipelineStage.EXECUTE in result.stages_completed
 
     def test_risk_allowed_live_trading_false_blocks_at_broker(self) -> None:
         """Risk passes but LIVE_TRADING=false → broker_status REJECTED_LIVE_TRADING_FALSE."""
@@ -251,14 +324,19 @@ class TestCoordinatorValidate:
         coord = Coordinator(_config())
         assert coord._validate([]) is False
 
-    def test_validate_quality_gate_exception_returns_true(self) -> None:
-        """If quality gate itself fails, default to allow (conservative)."""
+    def test_validate_quality_gate_exception_propagates(self) -> None:
+        """Issue #15 (C.1): _validate no longer swallows exceptions. The
+        historical behaviour was `return True` on gate crash (fail-open,
+        dangerous). The new behaviour is to propagate the exception so
+        run_once() can convert it into a fail-safe VALIDATE_EXCEPTION
+        block."""
         with patch(
             "src.data.quality.ingestion_gate.check_ingestion",
             side_effect=RuntimeError("gate crash"),
         ):
             coord = Coordinator(_config())
-            assert coord._validate([_bar()]) is True
+            with pytest.raises(RuntimeError, match="gate crash"):
+                coord._validate([_bar()])
 
 
 # -----------------------------------------------------------------------------
@@ -282,35 +360,18 @@ class TestCoordinatorRiskCheck:
 
 
 # -----------------------------------------------------------------------------
-# Coordinator.run_once() — risk-gate exception path (lines 214-215)
+# Coordinator.run_once() — risk-gate exception path (issue #15)
 # -----------------------------------------------------------------------------
-
-
-class TestCoordinatorRiskException:
-    def test_risk_check_exception_does_not_block_execute(self) -> None:
-        """If _risk_check raises, run_once catches it and continues to EXECUTE.
-
-        Both risk_allowed and risk_violations remain at their pre-exception
-        defaults (False / ()), and the broker is still consulted (which then
-        refuses because live_trading=False).
-        """
-        with (
-            patch.object(Coordinator, "_fetch", return_value=[_bar()]),
-            patch.object(Coordinator, "_validate", return_value=True),
-            patch.object(
-                Coordinator,
-                "_risk_check",
-                side_effect=RuntimeError("risk engine down"),
-            ),
-        ):
-            result = Coordinator(_config(live_trading=False)).run_once()
-        assert PipelineStage.RISK not in result.stages_completed
-        assert result.risk_allowed is False
-        assert result.risk_violations == ()
-        # Broker still consulted: refused because LIVE_TRADING=False.
-        assert result.broker_status == "REJECTED_LIVE_TRADING_FALSE"
-        assert PipelineStage.EXECUTE in result.stages_completed
-        assert PipelineStage.DONE in result.stages_completed
+#
+# The historical test ``test_risk_check_exception_does_not_block_execute``
+# (formerly in TestCoordinatorRiskException) ENshrined the FAIL-OPEN
+# behaviour: it asserted that the broker was still consulted even when
+# _risk_check raised. That test is REMOVED in issue #15 — the new
+# contract is that _risk_check exceptions BLOCK the broker. The new
+# behaviour is verified by
+# ``test_risk_check_raises_blocks_broker_even_when_live_trading_true``
+# in TestCoordinatorFullPipeline above.
+# -----------------------------------------------------------------------------
 
 
 # -----------------------------------------------------------------------------

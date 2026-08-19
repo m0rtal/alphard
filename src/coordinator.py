@@ -62,6 +62,7 @@ USAGE
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -109,6 +110,12 @@ class CoordinatorConfig:
 
     # Persistence
     store_dsn: str | None = None
+
+    # Maximum wall-clock seconds between the RISK check and the broker
+    # call. Beyond this window, the portfolio state captured at risk
+    # time is considered stale and the trade is blocked. Tunable so
+    # tests can use a generous value while production uses a tight one.
+    toctou_max_seconds: float = 0.100
 
 
 @dataclass(frozen=True)
@@ -161,9 +168,37 @@ class Coordinator:
 
     def __init__(self, config: CoordinatorConfig) -> None:
         self.config = config
+        # Wall-clock captured at the end of the RISK stage. The TOCTOU
+        # guard in run_once() compares this against `time.monotonic()` to
+        # decide whether the gap since risk assessment is too wide.
+        self._risk_completed_at: float | None = None
+
+    def _validate_state_for_execute(self) -> bool:
+        """TOCTOU guard: confirm elapsed time since the RISK stage is
+        within `toctou_max_seconds`. Beyond that window, portfolio
+        state captured by the risk check is stale and the trade is
+        blocked. We use `time.monotonic()` (not `time.time()`) so that
+        clock skew / NTP corrections cannot widen the apparent window.
+        """
+        if self._risk_completed_at is None:
+            # No risk stage was completed (defensive — should not happen
+            # because run_once only calls this after a successful RISK).
+            return False
+        elapsed = time.monotonic() - self._risk_completed_at
+        return elapsed <= self.config.toctou_max_seconds
 
     def run_once(self) -> PipelineResult:
-        """Execute the pipeline once. Returns a structured result."""
+        """Execute the pipeline once. Returns a structured result.
+
+        Fail-safe contract (issue #15):
+          * If VALIDATE raises → block (do NOT proceed with unvalidated data).
+          * If RISK raises → block (do NOT call broker).
+          * If TOCTOU detected between RISK and EXECUTE → block.
+
+        Any blocked run returns a fully-formed PipelineResult with the
+        appropriate `risk_violations` marker so downstream consumers
+        (AUDIT log, alerts) can distinguish "blocked" from "no decision".
+        """
         stages: list[PipelineStage] = []
         bars_loaded = 0
         risk_allowed = False
@@ -188,39 +223,94 @@ class Coordinator:
                 audit_log_id=self._audit(stages, bars_loaded, False, ("FETCH_ERROR",), None),
             )
 
-        # Stage 2: VALIDATE — quality gate (CRITICAL → skip)
+        # Stage 2: VALIDATE — quality gate.
+        # Fail-safe: if gate RAISES, block (do NOT trust unvalidated data).
+        # If gate returns False (HIGH/CRITICAL), block. Either way,
+        # risk_allowed stays False.
         try:
             validation = self._validate(bars)
-            stages.append(PipelineStage.VALIDATE)
-            if not validation:
-                logger.warning("VALIDATE skipped %s: CRITICAL", self.config.ticker)
-                stages.append(PipelineStage.SKIPPED)
-                return PipelineResult(
-                    config=self.config,
-                    stages_completed=tuple(stages),
-                    bars_loaded=bars_loaded,
-                    risk_allowed=False,
-                    risk_violations=("VALIDATE_CRITICAL",),
-                    broker_status=None,
-                    audit_log_id=self._audit(stages, bars_loaded, False, ("VALIDATE_CRITICAL",), None),  # noqa: E501
-                )
         except Exception as exc:
             logger.error("VALIDATE failed for %s: %s", self.config.ticker, exc)
+            stages.append(PipelineStage.VALIDATE)
+            stages.append(PipelineStage.SKIPPED)
+            return PipelineResult(
+                config=self.config,
+                stages_completed=tuple(stages),
+                bars_loaded=bars_loaded,
+                risk_allowed=False,
+                risk_violations=("VALIDATE_EXCEPTION",),
+                broker_status=None,
+                audit_log_id=self._audit(stages, bars_loaded, False, ("VALIDATE_EXCEPTION",), None),
+            )
 
-        # Stage 3: RISK — gate check
+        stages.append(PipelineStage.VALIDATE)
+        if not validation:
+            logger.warning("VALIDATE skipped %s: HIGH/CRITICAL", self.config.ticker)
+            stages.append(PipelineStage.SKIPPED)
+            return PipelineResult(
+                config=self.config,
+                stages_completed=tuple(stages),
+                bars_loaded=bars_loaded,
+                risk_allowed=False,
+                risk_violations=("VALIDATE_CRITICAL",),
+                broker_status=None,
+                audit_log_id=self._audit(stages, bars_loaded, False, ("VALIDATE_CRITICAL",), None),
+            )
+
+        # Stage 3: RISK — gate check.
+        # Fail-safe: if gate RAISES, block the broker call. The previous
+        # implementation let the exception propagate past the try/except
+        # and then continued to EXECUTE — that's a fail-open bug. We now
+        # record `RISK_EXCEPTION` and short-circuit before _execute().
         try:
             risk_allowed, risk_violations = self._risk_check()
             stages.append(PipelineStage.RISK)
+            # Stamp the wall-clock at the end of the RISK stage. The TOCTOU
+            # guard below compares against this value to decide whether the
+            # portfolio state captured by the risk check is still fresh.
+            self._risk_completed_at = time.monotonic()
         except Exception as exc:
             logger.error("RISK failed for %s: %s", self.config.ticker, exc)
+            stages.append(PipelineStage.SKIPPED)
+            return PipelineResult(
+                config=self.config,
+                stages_completed=tuple(stages),
+                bars_loaded=bars_loaded,
+                risk_allowed=False,
+                risk_violations=("RISK_EXCEPTION",),
+                broker_status=None,
+                audit_log_id=self._audit(stages, bars_loaded, False, ("RISK_EXCEPTION",), None),
+            )
 
-        # Stage 4: EXECUTE — broker (only if LIVE_TRADING && risk_allowed)
+        # Stage 3.5: TOCTOU re-validation.
+        # The risk verdict was computed against the portfolio state
+        # captured `toctou_max_seconds` (or less) ago. If more time has
+        # elapsed, a fill could have arrived in the meantime, making the
+        # verdict stale. Block the trade.
+        if not self._validate_state_for_execute():
+            logger.error(
+                "TOCTOU: state stale between RISK and EXECUTE for %s (window=%ss)",
+                self.config.ticker,
+                self.config.toctou_max_seconds,
+            )
+            stages.append(PipelineStage.SKIPPED)
+            return PipelineResult(
+                config=self.config,
+                stages_completed=tuple(stages),
+                bars_loaded=bars_loaded,
+                risk_allowed=False,
+                risk_violations=("TOCTOU_STATE_STALE",),
+                broker_status=None,
+                audit_log_id=self._audit(stages, bars_loaded, False, ("TOCTOU_STATE_STALE",), None),
+            )
+
+        # Stage 4: EXECUTE — broker (only if LIVE_TRADING && risk_allowed).
         broker_status = self._execute(risk_allowed)
         if broker_status is not None:
             stages.append(PipelineStage.EXECUTE)
 
         # Stage 5: AUDIT
-        audit_log_id = self._audit(stages, bars_loaded, risk_allowed, risk_violations, broker_status)  # noqa: E501
+        audit_log_id = self._audit(stages, bars_loaded, risk_allowed, risk_violations, broker_status)
         stages.append(PipelineStage.AUDIT)
         stages.append(PipelineStage.DONE)
 
@@ -246,31 +336,36 @@ class Coordinator:
         return loader.fetch_ohlcv(self.config.ticker, start, end)
 
     def _validate(self, bars: list[Any]) -> bool:
-        """Return True if data passes quality gate (HIGH/CRITICAL → False)."""
+        """Return True if data passes quality gate (HIGH/CRITICAL → False).
+
+        Note: this method itself does NOT swallow exceptions — those
+        are caught in run_once() at the call site and converted into a
+        fail-safe `VALIDATE_EXCEPTION` block. The historical
+        implementation had `except Exception: return True` here, which
+        is fail-OPEN: a broken gate silently allowed unvalidated data
+        downstream. The check is intentionally fragile here so that
+        any gate crash becomes a loud, blocking failure upstream.
+        """
         if not bars:
             return False
-        try:
-            from src.data.quality.ingestion_gate import Bar, check_ingestion, IngestionParams
+        from src.data.quality.ingestion_gate import Bar, check_ingestion, IngestionParams
 
-            bar_list = [
-                Bar(
-                    primary_key=b.ts,
-                    open=float(b.open),
-                    high=float(b.high),
-                    low=float(b.low),
-                    close=float(b.close),
-                    volume=int(b.volume),
-                )
-                for b in bars
-            ]
-            report = check_ingestion(self.config.ticker, bar_list, params=IngestionParams())
-            worst = report.worst_severity()
-            if worst is None:
-                return True
-            return worst.value not in ("CRITICAL", "HIGH")
-        except Exception:
-            # Conservative: if gate fails, don't auto-block, let RiskGate decide
+        bar_list = [
+            Bar(
+                primary_key=b.ts,
+                open=float(b.open),
+                high=float(b.high),
+                low=float(b.low),
+                close=float(b.close),
+                volume=int(b.volume),
+            )
+            for b in bars
+        ]
+        report = check_ingestion(self.config.ticker, bar_list, params=IngestionParams())
+        worst = report.worst_severity()
+        if worst is None:
             return True
+        return worst.value not in ("CRITICAL", "HIGH")
 
     def _risk_check(self) -> tuple[bool, tuple[str, ...]]:
         from src.risk.gate import PortfolioState, RiskGate, TradeIntent
