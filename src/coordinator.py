@@ -310,7 +310,13 @@ class Coordinator:
             stages.append(PipelineStage.EXECUTE)
 
         # Stage 5: AUDIT
-        audit_log_id = self._audit(stages, bars_loaded, risk_allowed, risk_violations, broker_status)
+        audit_log_id = self._audit(
+            stages,
+            bars_loaded,
+            risk_allowed,
+            risk_violations,
+            broker_status,
+        )
         stages.append(PipelineStage.AUDIT)
         stages.append(PipelineStage.DONE)
 
