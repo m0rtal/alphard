@@ -1254,3 +1254,25 @@ class TestBrokerABC:
             timestamp=datetime.utcnow(),
         )
         assert snap.account_id == "X"
+
+    def test_broker_position_to_gate_position_conversion(self):
+        """Cover src/broker/tinkoff_account.py:43-45 (helper function).
+
+        The helper converts broker Position (dataclass with .ticker)
+        to gate Position (pydantic with .symbol). Sectors are not yet
+        mapped from Tinkoff in Phase 1, so sector=None is expected.
+        """
+        from src.broker.tinkoff_account import _broker_position_to_gate_position
+        from src.risk.gate import Position as GatePosition
+
+        broker_pos = Position(
+            ticker="SBER",
+            quantity=Decimal("100"),
+            avg_price=Decimal("250"),
+        )
+        gate_pos = _broker_position_to_gate_position(broker_pos)
+        assert isinstance(gate_pos, GatePosition)
+        assert gate_pos.symbol == "SBER"
+        assert gate_pos.quantity == Decimal("100")
+        assert gate_pos.avg_price == Decimal("250")
+        assert gate_pos.sector is None
