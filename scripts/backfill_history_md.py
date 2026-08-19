@@ -147,17 +147,22 @@ _CIRCUIT_BREAKER_THRESHOLD = 5
 # fits in ~30s; foreign ETFs over the IB bridge can take 90s on a bad
 # day. 180s gives enough headroom without letting a single stuck ticker
 # starve the whole run.
-_TICKER_DEADLINE_SECONDS = 600  # 2026-08-19: 10 minutes per user requirement ("ну можно и 10 минут, наверное")
-# Matches the MD loader's _DOWNLOAD_TIMEOUT (600s) so a single
-# network-bound archive download gets the full window per attempt
-# across the 3-source fallback chain (md → grpc → moex). Upstream
-# 9-year archives can stall intermittently for 1-15 min on .107;
-# tighter timeouts (60-120s) kill legitimate data, marking tickers
-# "no data" prematurely. 600s × 3 sources = 30 min worst case per
-# dead ticker — same order of magnitude as upstream curl with no
-# timeout. Previous 900s gave 45 min/ticker worst case (15 min × 3
-# sources) which is excessive; backfill dropped to ~45 sec/ticker
-# average on the live run, dominated by healthy-archive wait times.
+# Per-ticker hard deadline (seconds). User instruction (2026-08-19):
+# remove the per-ticker cap entirely — the bottleneck is per-archive
+# stall on .107→invest-public-api, not per-ticker aggregate. With
+# _DOWNLOAD_TIMEOUT=600s set on each individual year archive, the
+# worst case for a fully-stalled ticker is:
+#   9 years × 3 sources × 600s = 4.5 hours per dead ticker.
+# That is a lot, but circuit breaker (5 consecutive failed tickers →
+# abort the whole run) is the safety net: we never actually pay that
+# 4.5h cost because we stop after 5 failures in a row. Healthy tickers
+# (CHGZ/MAGEP/NMTP) complete in seconds.
+#
+# Set to a large but finite value to keep SIGALRM behavior sensible
+# (we still want a hard ceiling so a programming bug in a future
+# loader cannot loop a single ticker forever). 24h is enough for the
+# worst case while still being finite.
+_TICKER_DEADLINE_SECONDS = 24 * 3600  # 2026-08-19: 24h ceiling (per user: "per-ticker 600с маловато, сними этот лимит вовсе, достаточно по году")
 
 
 def _set_complete_flag(store: PostgresDataStore, ticker: str, complete: bool) -> None:
