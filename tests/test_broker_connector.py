@@ -218,15 +218,32 @@ class TestTinkoffAccount:
         # and does not leak into later tests (e.g. test_tinkoff_grpc.py).
         monkeypatch.setitem(sys.modules, "t_tech.invest", _fake)
 
+        # Issue #13: the mock Client must yield a TQBR match for SBER
+        # so that _ticker_to_figi returns a real FIGI rather than
+        # raising BrokerError. The minimal viable mock is one match.
+        _client_instance = MagicMock()
+        _inst_match = MagicMock()
+        _inst_match.ticker = "SBER"
+        _inst_match.class_code = "TQBR"
+        _inst_match.figi = "BBG004730N88"
+        _client_instance.instruments.find_instrument.return_value.instruments = [_inst_match]
+        # post_order returns a fill marker so the broker call path
+        # succeeds.
+        _resp = MagicMock()
+        _resp.execution_report_status.name = "EXECUTION_REPORT_STATUS_FILL"
+        _client_instance.orders.post_order.return_value = _resp
+        # Client(...) must be a context manager.
+        _fake.Client.return_value.__enter__ = MagicMock(return_value=_client_instance)
+        _fake.Client.return_value.__exit__ = MagicMock(return_value=False)
+
         mock_rg = MagicMock()
         from src.risk.gate import RiskDecision
 
         mock_rg.evaluate.return_value = RiskDecision(allowed=True, violations=())
         a = TinkoffAccount(token="t.x", risk_gate=mock_rg)
         order = MarketOrder(ticker="SBER", side=OrderSide.BUY, quantity=Decimal("10"))
-        # SDK not installed → returns SUBMITTED mock
         status = a.place_order(order)
-        assert status == OrderStatus.SUBMITTED
+        assert status == OrderStatus.FILLED
 
     def test_limit_order_submits(
         self,
@@ -240,6 +257,19 @@ class TestTinkoffAccount:
         # and does not leak into later tests (e.g. test_tinkoff_grpc.py).
         monkeypatch.setitem(sys.modules, "t_tech.invest", _fake)
 
+        # Issue #13: see test_risk_gate_approved_submits above.
+        _client_instance = MagicMock()
+        _inst_match = MagicMock()
+        _inst_match.ticker = "SBER"
+        _inst_match.class_code = "TQBR"
+        _inst_match.figi = "BBG004730N88"
+        _client_instance.instruments.find_instrument.return_value.instruments = [_inst_match]
+        _resp = MagicMock()
+        _resp.execution_report_status.name = "EXECUTION_REPORT_STATUS_FILL"
+        _client_instance.orders.post_order.return_value = _resp
+        _fake.Client.return_value.__enter__ = MagicMock(return_value=_client_instance)
+        _fake.Client.return_value.__exit__ = MagicMock(return_value=False)
+
         mock_rg = MagicMock()
         from src.risk.gate import RiskDecision
 
@@ -249,7 +279,7 @@ class TestTinkoffAccount:
             ticker="SBER", side=OrderSide.BUY, quantity=Decimal("10"), price=Decimal("250")
         )  # noqa: E501
         status = a.place_order(order)
-        assert status == OrderStatus.SUBMITTED
+        assert status == OrderStatus.FILLED
 
     def test_rate_limit_respects_limit(self):
         a = TinkoffAccount(token="t.x", rate_limit_per_sec=2)
@@ -410,7 +440,11 @@ class TestTinkoffAccount:
 
         # instruments returns empty (so ticker→figi returns ticker)
         inst = MagicMock()
-        inst.instruments = []
+        match = MagicMock()
+        match.ticker = "SBER"
+        match.class_code = "TQBR"
+        match.figi = "BBG004730N88"
+        inst.instruments = [match]
         mock_client.instruments.find_instrument.return_value = inst
 
         import sys
@@ -478,7 +512,11 @@ class TestTinkoffAccount:
 
         # FIGI lookup
         inst = MagicMock()
-        inst.instruments = []
+        match = MagicMock()
+        match.ticker = "SBER"
+        match.class_code = "TQBR"
+        match.figi = "BBG004730N88"
+        inst.instruments = [match]
         mock_client.instruments.find_instrument.return_value = inst
 
         # Order response
@@ -515,7 +553,11 @@ class TestTinkoffAccount:
         mock_rg.evaluate.return_value = RiskDecision(allowed=True, violations=())
 
         inst = MagicMock()
-        inst.instruments = []
+        match = MagicMock()
+        match.ticker = "SBER"
+        match.class_code = "TQBR"
+        match.figi = "BBG004730N88"
+        inst.instruments = [match]
         mock_client.instruments.find_instrument.return_value = inst
 
         resp = MagicMock()
@@ -554,7 +596,11 @@ class TestTinkoffAccount:
         mock_rg.evaluate.return_value = RiskDecision(allowed=True, violations=())
 
         inst = MagicMock()
-        inst.instruments = []
+        match = MagicMock()
+        match.ticker = "SBER"
+        match.class_code = "TQBR"
+        match.figi = "BBG004730N88"
+        inst.instruments = [match]
         mock_client.instruments.find_instrument.return_value = inst
 
         mock_client.orders.post_order.side_effect = RuntimeError("api error")
@@ -647,7 +693,11 @@ class TestTinkoffAccount:
         mock_rg.evaluate.return_value = RiskDecision(allowed=True, violations=())
 
         inst = MagicMock()
-        inst.instruments = []
+        match = MagicMock()
+        match.ticker = "SBER"
+        match.class_code = "TQBR"
+        match.figi = "BBG004730N88"
+        inst.instruments = [match]
         mock_client.instruments.find_instrument.return_value = inst
 
         resp = MagicMock()
@@ -706,22 +756,36 @@ class TestTinkoffAccount:
         with pytest.raises(BrokerError, match="cancel failed"):
             a.cancel_order("ORD-999")
 
-    def test_ticker_to_figi_fallback_on_error(self, monkeypatch):
-        mock_client_class = MagicMock()
+    def test_ticker_to_figi_raises_on_instrument_error(self, monkeypatch):
+        """Issue #13 (C.1): when find_instrument fails, _ticker_to_figi
+        MUST raise BrokerError so the operator sees the actual
+        failure (auth, network, rate-limit). The historical
+        ``test_ticker_to_figi_fallback_on_error`` asserted the
+        opposite — silent fallback to the ticker string, which
+        sent ``figi="SBER"`` to post_order and produced a confusing
+        INVALID_ARGUMENT deep in the broker."""
         mock_client = MagicMock()
-        mock_client_class.return_value.__enter__ = MagicMock(return_value=mock_client)
-        mock_client_class.return_value.__exit__ = MagicMock(return_value=False)
         mock_client.instruments.find_instrument.side_effect = RuntimeError("network")
-
-        import sys
-
-        fake_module = MagicMock()
-        fake_module.Client = mock_client_class
-        monkeypatch.setitem(sys.modules, "t_tech.invest", fake_module)
-
         a = TinkoffAccount(token="t.x")
-        figi = a._ticker_to_figi(mock_client, "SBER")
-        assert figi == "SBER"
+        with pytest.raises(BrokerError, match="find_instrument failed"):
+            a._ticker_to_figi(mock_client, "SBER")
+
+    def test_ticker_to_figi_raises_when_not_in_tqbr_tqob(self, monkeypatch):
+        """Issue #13 (C.1): when the ticker is not in TQBR/TQOB
+        (e.g. unknown ticker), _ticker_to_figi MUST raise rather
+        than silently return the ticker string."""
+        mock_client = MagicMock()
+        # Return a list of matches but none with TQBR/TQOB class.
+        match = MagicMock()
+        match.ticker = "SBER"
+        match.class_code = "OTHER"
+        match.figi = "OTHER_FIGI"
+        resp = MagicMock()
+        resp.instruments = [match]
+        mock_client.instruments.find_instrument.return_value = resp
+        a = TinkoffAccount(token="t.x")
+        with pytest.raises(BrokerError, match="not found in TQBR/TQOB"):
+            a._ticker_to_figi(mock_client, "SBER")
 
     def test_map_status_partiallyfill(self):
         s = TinkoffAccount._map_status("EXECUTION_REPORT_STATUS_PARTIALLYFILL")
