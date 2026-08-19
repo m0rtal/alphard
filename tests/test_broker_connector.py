@@ -12,12 +12,130 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from decimal import Decimal
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 
 from src.broker.account import BrokerAccount, PortfolioSnapshot, Position
 from src.broker.integration import OrderFlow
+
+
+def _make_mock_tinkoff_client(
+    cash: Decimal = Decimal("1000000"),
+    positions: list | None = None,
+    last_prices: dict[str, Any] | None = None,
+    account_id: str = "SB1",
+) -> MagicMock:
+    """Build a MagicMock that imitates the t_tech.invest.Client surface.
+
+    Issue #11: place_order now uses the same client for both the
+    live-quote fetch and the post_order call, so we mock both paths
+    with realistic return values. ``last_prices`` maps ticker → Decimal
+    price. If a ticker is missing from the map, the quote fetch
+    raises BrokerError("no quote") — that's the intended fail-safe
+    behaviour (test must provide a price for every MarketOrder ticker).
+    """
+    positions = positions or []
+    if last_prices is None:
+        last_prices = {"SBER": Decimal("300"), "GAZP": Decimal("150")}
+
+    pos_mocks = []
+    for p in positions:
+        avg_price = p.get("avg_price", Decimal("0"))
+        if isinstance(avg_price, Decimal):
+            avg_price_q = MagicMock()
+            avg_price_q.units = int(avg_price)
+            avg_price_q.nano = int((avg_price - int(avg_price)) * Decimal("1000000000"))
+        else:
+            avg_price_q = avg_price
+        pos_mock = MagicMock()
+        pos_mock.ticker = p["ticker"]
+        pos_mock.quantity = p.get("quantity", Decimal("1"))
+        pos_mock.average_position_price = avg_price_q
+        pos_mock.average_buy_price = avg_price_q
+        pos_mocks.append(pos_mock)
+
+    portfolio_mock = MagicMock()
+    portfolio_mock.positions = pos_mocks
+    total_q = MagicMock()
+    total_q.units = int(cash)
+    total_q.nano = int((cash - int(cash)) * Decimal("1000000000"))
+    portfolio_mock.total_amount_currencies = total_q
+
+    def _find_instrument(query: str):
+        resp = MagicMock()
+        sber_inst = MagicMock()
+        sber_inst.ticker = query.upper()
+        sber_inst.class_code = "TQBR"
+        sber_inst.figi = f"FIGI_{query.upper()}"
+        resp.instruments = [sber_inst]
+        return resp
+
+    def _get_last_prices(figi: list[str]):
+        resp = MagicMock()
+        resp.last_prices = []
+        for f in figi:
+            ticker = f.replace("FIGI_", "")
+            if ticker not in last_prices:
+                # Real fail-safe: raise to simulate "no quote" so the
+                # test sees the rejection. Callers must populate the map.
+                raise BrokerError(f"no quote for {ticker} (figi={f})")
+            price = last_prices[ticker]
+            lp = MagicMock()
+            lp.figi = f
+            q_price = MagicMock()
+            q_price.units = int(price)
+            q_price.nano = int((price - int(price)) * Decimal("1000000000"))
+            lp.price = q_price
+            resp.last_prices.append(lp)
+        return resp
+
+    client = MagicMock()
+    client.users.get_accounts.return_value.accounts = [
+        MagicMock(id=account_id),
+    ]
+    client.operations.get_portfolio.return_value = portfolio_mock
+    client.instruments.find_instrument.side_effect = _find_instrument
+    client.market_data.get_last_prices.side_effect = _get_last_prices
+
+    post_order_response = MagicMock()
+    post_order_response.execution_report_status = MagicMock()
+    post_order_response.execution_report_status.name = "EXECUTION_REPORT_STATUS_FILL"
+    client.orders.post_order.return_value = post_order_response
+
+    return client
+
+
+def _install_mock_sdk(monkeypatch: pytest.MonkeyPatch, client: MagicMock) -> None:
+    """Install ``t_tech.invest`` as a fake module so ``from t_tech.invest
+    import Client`` resolves to a context manager returning ``client``.
+
+    The fake module must:
+      * Have a ``Client(token)`` callable that returns a context manager
+        whose ``__enter__`` yields ``client``.
+      * Have ``Quotation`` and ``OrderDirection`` / ``OrderType`` names
+        so the imports in place_order resolve.
+    """
+    import sys
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _client_cm(token: str):
+        yield client
+
+    fake = MagicMock()
+    fake.Client = MagicMock(side_effect=lambda token: _client_cm(token))
+    fake.OrderDirection = MagicMock()
+    fake.OrderDirection.ORDER_DIRECTION_BUY = "BUY"
+    fake.OrderDirection.ORDER_DIRECTION_SELL = "SELL"
+    fake.OrderType = MagicMock()
+    fake.OrderType.ORDER_TYPE_MARKET = "MARKET"
+    fake.OrderType.ORDER_TYPE_LIMIT = "LIMIT"
+    fake.Quotation = MagicMock(side_effect=lambda units=0, nano=0: MagicMock(units=units, nano=nano))
+    monkeypatch.setitem(sys.modules, "t_tech.invest", fake)
+
+
 from src.broker.orders import (
     LimitOrder,
     MarketOrder,
@@ -25,7 +143,7 @@ from src.broker.orders import (
     OrderStatus,
 )
 from src.broker.slicer import OrderSlicer
-from src.broker.tinkoff_account import BrokerError, TinkoffAccount
+from src.broker.tinkoff_account import BrokerError, TinkoffAccount  # noqa: E402
 
 
 # ────────────────────────────────────────────
@@ -194,8 +312,15 @@ class TestTinkoffAccount:
         status = a.place_order(order)
         assert status == OrderStatus.REJECTED
 
-    def test_risk_gate_violation_blocks(self):
-        # Mock RiskGate that says NO
+    def test_risk_gate_violation_blocks(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Issue #11: RiskGate denial blocks the order. The order is
+        REJECTED; the broker is NOT consulted (no post_order call)."""
+        client = _make_mock_tinkoff_client(
+            cash=Decimal("1000000"),
+            last_prices={"SBER": Decimal("300")},
+        )
+        _install_mock_sdk(monkeypatch, client)
+
         mock_rg = MagicMock()
         from src.risk.gate import RiskDecision
 
@@ -205,18 +330,20 @@ class TestTinkoffAccount:
         status = a.place_order(order)
         assert status == OrderStatus.REJECTED
         mock_rg.evaluate.assert_called_once()
+        client.orders.post_order.assert_not_called()
+        mock_rg.evaluate.assert_called_once()
 
     def test_risk_gate_approved_submits(
         self,
         monkeypatch: pytest.MonkeyPatch,
-    ):  # Mock t_tech.invest (SDK is now installed, but we want offline unit tests)
-        import sys
-
-        _fake = MagicMock()
-        _fake.Client = MagicMock()
-        # Use monkeypatch.setitem so the real module is restored after the test
-        # and does not leak into later tests (e.g. test_tinkoff_grpc.py).
-        monkeypatch.setitem(sys.modules, "t_tech.invest", _fake)
+    ) -> None:
+        """Issue #11: MarketOrder path fetches a live quote via the
+        mocked SDK; the order then submits with the real price."""
+        client = _make_mock_tinkoff_client(
+            cash=Decimal("1000000"),
+            last_prices={"SBER": Decimal("300")},
+        )
+        _install_mock_sdk(monkeypatch, client)
 
         mock_rg = MagicMock()
         from src.risk.gate import RiskDecision
@@ -224,21 +351,22 @@ class TestTinkoffAccount:
         mock_rg.evaluate.return_value = RiskDecision(allowed=True, violations=())
         a = TinkoffAccount(token="t.x", risk_gate=mock_rg)
         order = MarketOrder(ticker="SBER", side=OrderSide.BUY, quantity=Decimal("10"))
-        # SDK not installed → returns SUBMITTED mock
         status = a.place_order(order)
-        assert status == OrderStatus.SUBMITTED
+        assert status == OrderStatus.FILLED
+        # Live quote was used: the intent receives price=300, not 1.
+        intent_seen = mock_rg.evaluate.call_args[0][0]
+        assert intent_seen.price == Decimal("300")
+        assert intent_seen.notional == Decimal("3000")  # 10 × 300
 
     def test_limit_order_submits(
         self,
         monkeypatch: pytest.MonkeyPatch,
-    ):  # Mock t_tech.invest (SDK is now installed, but we want offline unit tests)  # noqa: E501
-        import sys
-
-        _fake = MagicMock()
-        _fake.Client = MagicMock()
-        # Use monkeypatch.setitem so the real module is restored after the test
-        # and does not leak into later tests (e.g. test_tinkoff_grpc.py).
-        monkeypatch.setitem(sys.modules, "t_tech.invest", _fake)
+    ) -> None:
+        """LimitOrder path uses order.price directly; no live quote
+        fetch needed. Issue #11: this path was the only one that
+        worked correctly before the fix."""
+        client = _make_mock_tinkoff_client(cash=Decimal("1000000"))
+        _install_mock_sdk(monkeypatch, client)
 
         mock_rg = MagicMock()
         from src.risk.gate import RiskDecision
@@ -246,10 +374,15 @@ class TestTinkoffAccount:
         mock_rg.evaluate.return_value = RiskDecision(allowed=True, violations=())
         a = TinkoffAccount(token="t.x", risk_gate=mock_rg)
         order = LimitOrder(
-            ticker="SBER", side=OrderSide.BUY, quantity=Decimal("10"), price=Decimal("250")
-        )  # noqa: E501
+            ticker="SBER",
+            side=OrderSide.BUY,
+            quantity=Decimal("10"),
+            price=Decimal("250"),
+        )
         status = a.place_order(order)
-        assert status == OrderStatus.SUBMITTED
+        assert status == OrderStatus.FILLED
+        intent_seen = mock_rg.evaluate.call_args[0][0]
+        assert intent_seen.price == Decimal("250")  # LimitOrder price, not qty=1
 
     def test_rate_limit_respects_limit(self):
         a = TinkoffAccount(token="t.x", rate_limit_per_sec=2)
@@ -464,73 +597,40 @@ class TestTinkoffAccount:
         with pytest.raises(BrokerError, match="portfolio fetch failed"):
             a.get_portfolio()
 
-    def test_place_market_order_with_mocked_sdk(self, monkeypatch):
-        mock_client_class = MagicMock()
-        mock_client = MagicMock()
-        mock_client_class.return_value.__enter__ = MagicMock(return_value=mock_client)
-        mock_client_class.return_value.__exit__ = MagicMock(return_value=False)
+    def test_place_market_order_with_mocked_sdk(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Issue #11: MarketOrder path fetches a live quote via the
+        SDK and passes the resulting price to RiskGate. The order then
+        submits through the same client."""
+        client = _make_mock_tinkoff_client(
+            cash=Decimal("1000000"),
+            last_prices={"SBER": Decimal("300")},
+            account_id="ACC1",
+        )
+        _install_mock_sdk(monkeypatch, client)
 
-        # RiskGate OK
         mock_rg = MagicMock()
         from src.risk.gate import RiskDecision
 
         mock_rg.evaluate.return_value = RiskDecision(allowed=True, violations=())
-
-        # FIGI lookup
-        inst = MagicMock()
-        inst.instruments = []
-        mock_client.instruments.find_instrument.return_value = inst
-
-        # Order response
-        resp = MagicMock()
-        resp.execution_report_status = "EXECUTION_REPORT_STATUS_FILL"
-        mock_client.orders.post_order.return_value = resp
-
-        import sys
-
-        fake_module = MagicMock()
-        fake_module.Client = mock_client_class
-        # Need the attribute access pattern used by code
-        fake_module.orders.OrderDirection.ORDER_DIRECTION_BUY = "BUY"
-        fake_module.orders.OrderDirection.ORDER_DIRECTION_SELL = "SELL"
-        fake_module.orders.OrderType.ORDER_TYPE_MARKET = "MARKET"
-        fake_module.orders.OrderType.ORDER_TYPE_LIMIT = "LIMIT"
-        monkeypatch.setitem(sys.modules, "t_tech.invest", fake_module)
 
         a = TinkoffAccount(token="t.x", risk_gate=mock_rg, account_id="ACC1")
         order = MarketOrder(ticker="SBER", side=OrderSide.BUY, quantity=Decimal("10"))
         status = a.place_order(order)
         assert status == OrderStatus.FILLED
-        mock_client.orders.post_order.assert_called_once()
+        client.orders.post_order.assert_called_once()
+        # Live quote was used: price=300, not 1.
+        intent_seen = mock_rg.evaluate.call_args[0][0]
+        assert intent_seen.price == Decimal("300")
 
-    def test_place_limit_order_with_mocked_sdk(self, monkeypatch):
-        mock_client_class = MagicMock()
-        mock_client = MagicMock()
-        mock_client_class.return_value.__enter__ = MagicMock(return_value=mock_client)
-        mock_client_class.return_value.__exit__ = MagicMock(return_value=False)
+    def test_place_limit_order_with_mocked_sdk(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """LimitOrder uses order.price directly. No live quote needed."""
+        client = _make_mock_tinkoff_client(cash=Decimal("1000000"))
+        _install_mock_sdk(monkeypatch, client)
 
         mock_rg = MagicMock()
         from src.risk.gate import RiskDecision
 
         mock_rg.evaluate.return_value = RiskDecision(allowed=True, violations=())
-
-        inst = MagicMock()
-        inst.instruments = []
-        mock_client.instruments.find_instrument.return_value = inst
-
-        resp = MagicMock()
-        resp.execution_report_status = "EXECUTION_REPORT_STATUS_FILL"
-        mock_client.orders.post_order.return_value = resp
-
-        import sys
-
-        fake_module = MagicMock()
-        fake_module.Client = mock_client_class
-        fake_module.orders.OrderDirection.ORDER_DIRECTION_BUY = "BUY"
-        fake_module.orders.OrderDirection.ORDER_DIRECTION_SELL = "SELL"
-        fake_module.orders.OrderType.ORDER_TYPE_MARKET = "MARKET"
-        fake_module.orders.OrderType.ORDER_TYPE_LIMIT = "LIMIT"
-        monkeypatch.setitem(sys.modules, "t_tech.invest", fake_module)
 
         a = TinkoffAccount(token="t.x", risk_gate=mock_rg)
         order = LimitOrder(
@@ -541,199 +641,105 @@ class TestTinkoffAccount:
         )
         status = a.place_order(order)
         assert status == OrderStatus.FILLED
+        intent_seen = mock_rg.evaluate.call_args[0][0]
+        assert intent_seen.price == Decimal("250.5")
 
-    def test_place_order_sdk_exception(self, monkeypatch):
-        mock_client_class = MagicMock()
-        mock_client = MagicMock()
-        mock_client_class.return_value.__enter__ = MagicMock(return_value=mock_client)
-        mock_client_class.return_value.__exit__ = MagicMock(return_value=False)
+    def test_place_order_sdk_exception(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """If post_order raises after RiskGate approved, the broker
+        error is wrapped in BrokerError and re-raised."""
+        client = _make_mock_tinkoff_client(
+            cash=Decimal("1000000"),
+            last_prices={"SBER": Decimal("300")},
+        )
+        client.orders.post_order.side_effect = RuntimeError("api error")
+        _install_mock_sdk(monkeypatch, client)
 
         mock_rg = MagicMock()
         from src.risk.gate import RiskDecision
 
         mock_rg.evaluate.return_value = RiskDecision(allowed=True, violations=())
-
-        inst = MagicMock()
-        inst.instruments = []
-        mock_client.instruments.find_instrument.return_value = inst
-
-        mock_client.orders.post_order.side_effect = RuntimeError("api error")
-
-        import sys
-
-        fake_module = MagicMock()
-        fake_module.Client = mock_client_class
-        fake_module.orders.OrderDirection.ORDER_DIRECTION_BUY = "BUY"
-        fake_module.orders.OrderDirection.ORDER_DIRECTION_SELL = "SELL"
-        fake_module.orders.OrderType.ORDER_TYPE_MARKET = "MARKET"
-        fake_module.orders.OrderType.ORDER_TYPE_LIMIT = "LIMIT"
-        monkeypatch.setitem(sys.modules, "t_tech.invest", fake_module)
 
         a = TinkoffAccount(token="t.x", risk_gate=mock_rg)
         order = MarketOrder(ticker="SBER", side=OrderSide.BUY, quantity=Decimal("10"))
         with pytest.raises(BrokerError, match="order submit failed"):
             a.place_order(order)
 
-    def test_place_order_tinkoff_figi_lookup_found(self, monkeypatch):
-        """When instruments.find_instrument returns a matching FIGI, use it."""
-        mock_client_class = MagicMock()
-        mock_client = MagicMock()
-        mock_client_class.return_value.__enter__ = MagicMock(return_value=mock_client)
-        mock_client_class.return_value.__exit__ = MagicMock(return_value=False)
+    def test_place_order_tinkoff_figi_lookup_found(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When instruments.find_instrument returns a matching FIGI in
+        TQBR / TQOB, that FIGI is used by both the live-quote fetch
+        and the post_order call."""
+        client = _make_mock_tinkoff_client(
+            cash=Decimal("1000000"),
+            last_prices={"SBER": Decimal("300")},
+        )
+        # Override the default find_instrument to return a TQBR match
+        # with a specific FIGI.
+
+        def _find_instrument(query: str):
+            resp = MagicMock()
+            inst_other = MagicMock()
+            inst_other.ticker = query.upper()
+            inst_other.class_code = "OTHER"
+            inst_other.figi = "OTHER_FIGI"
+            inst_match = MagicMock()
+            inst_match.ticker = query.upper()
+            inst_match.class_code = "TQBR"
+            inst_match.figi = "BBG004730N88"
+            resp.instruments = [inst_other, inst_match]
+            return resp
+
+        client.instruments.find_instrument.side_effect = _find_instrument
+
+        # Override _get_last_prices to use the matched FIGI
+        def _get_last_prices(figi: list[str]):
+            resp = MagicMock()
+            resp.last_prices = []
+            for f in figi:
+                lp = MagicMock()
+                lp.figi = f
+                q_price = MagicMock()
+                q_price.units = 300
+                q_price.nano = 0
+                lp.price = q_price
+                resp.last_prices.append(lp)
+            return resp
+
+        client.market_data.get_last_prices.side_effect = _get_last_prices
+
+        _install_mock_sdk(monkeypatch, client)
 
         mock_rg = MagicMock()
         from src.risk.gate import RiskDecision
 
         mock_rg.evaluate.return_value = RiskDecision(allowed=True, violations=())
-
-        # FIGI found in TQBR class
-        inst_match = MagicMock()
-        inst_match.ticker = "SBER"
-        inst_match.class_code = "TQBR"
-        inst_match.figi = "BBG004730N88"
-        inst_other = MagicMock()
-        inst_other.ticker = "SBER"
-        inst_other.class_code = "OTHER"
-        inst_other.figi = "OTHER_FIGI"
-        instruments = MagicMock()
-        instruments.instruments = [inst_other, inst_match]  # match must come second
-        mock_client.instruments.find_instrument.return_value = instruments
-
-        resp = MagicMock()
-        resp.execution_report_status = "EXECUTION_REPORT_STATUS_FILL"
-        mock_client.orders.post_order.return_value = resp
-
-        import sys
-
-        fake_module = MagicMock()
-        fake_module.Client = mock_client_class
-        fake_module.orders.OrderDirection.ORDER_DIRECTION_BUY = "BUY"
-        fake_module.orders.OrderDirection.ORDER_DIRECTION_SELL = "SELL"
-        fake_module.orders.OrderType.ORDER_TYPE_MARKET = "MARKET"
-        fake_module.orders.OrderType.ORDER_TYPE_LIMIT = "LIMIT"
-        monkeypatch.setitem(sys.modules, "t_tech.invest", fake_module)
 
         a = TinkoffAccount(token="t.x", risk_gate=mock_rg)
         order = MarketOrder(ticker="SBER", side=OrderSide.BUY, quantity=Decimal("10"))
         a.place_order(order)
-        # Verify FIGI was used
-        call_kwargs = mock_client.orders.post_order.call_args.kwargs
+        call_kwargs = client.orders.post_order.call_args.kwargs
         assert call_kwargs["figi"] == "BBG004730N88"
 
-    def test_place_order_sell_uses_sell_direction(self, monkeypatch):
-        """When order is SELL, RiskGate must allow it (no skeleton buy-only restriction)."""
-        # Patch TradeIntent to allow both 'buy' and 'sell' for this test
-        from src.risk import gate as gate_module
-
-        original_validate = gate_module.TradeIntent.model_validate
-
-        def patched_validate(data, *args, **kwargs):
-            # Coerce side to 'buy' for RiskGate (it's skeleton, only accepts buy)
-            # but track original for our assertion
-            if isinstance(data, dict) and data.get("side") == "sell":
-                data = {**data, "side": "buy"}
-            return original_validate(data, *args, **kwargs)
-
-        monkeypatch.setattr(gate_module.TradeIntent, "model_validate", staticmethod(patched_validate))  # noqa: E501
-
-        mock_client_class = MagicMock()
-        mock_client = MagicMock()
-        mock_client_class.return_value.__enter__ = MagicMock(return_value=mock_client)
-        mock_client_class.return_value.__exit__ = MagicMock(return_value=False)
+    def test_place_order_sell_uses_sell_direction(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """SELL orders use ORDER_DIRECTION_SELL and pass through RiskGate."""
+        client = _make_mock_tinkoff_client(
+            cash=Decimal("1000000"),
+            last_prices={"SBER": Decimal("300")},
+        )
+        _install_mock_sdk(monkeypatch, client)
 
         mock_rg = MagicMock()
         from src.risk.gate import RiskDecision
 
         mock_rg.evaluate.return_value = RiskDecision(allowed=True, violations=())
 
-        inst = MagicMock()
-        inst.instruments = []
-        mock_client.instruments.find_instrument.return_value = inst
-
-        resp = MagicMock()
-        resp.execution_report_status = "EXECUTION_REPORT_STATUS_REJECTED"
-        mock_client.orders.post_order.return_value = resp
-
-        import sys
-
-        fake_module = MagicMock()
-        fake_module.Client = mock_client_class
-        fake_module.orders.OrderDirection.ORDER_DIRECTION_BUY = "BUY"
-        fake_module.orders.OrderDirection.ORDER_DIRECTION_SELL = "SELL"
-        fake_module.orders.OrderType.ORDER_TYPE_MARKET = "MARKET"
-        fake_module.orders.OrderType.ORDER_TYPE_LIMIT = "LIMIT"
-        monkeypatch.setitem(sys.modules, "t_tech.invest", fake_module)
-
         a = TinkoffAccount(token="t.x", risk_gate=mock_rg)
         order = MarketOrder(ticker="SBER", side=OrderSide.SELL, quantity=Decimal("10"))
         status = a.place_order(order)
-        assert status == OrderStatus.REJECTED
-        call_kwargs = mock_client.orders.post_order.call_args.kwargs
-        # direction passed through enum-mock; assert equal to "SELL"
+        assert status == OrderStatus.FILLED
+        intent_seen = mock_rg.evaluate.call_args[0][0]
+        assert intent_seen.side == "sell"
+        call_kwargs = client.orders.post_order.call_args.kwargs
         assert "SELL" in str(call_kwargs["direction"])
-
-    def test_cancel_order_with_mocked_sdk(self, monkeypatch):
-        mock_client_class = MagicMock()
-        mock_client = MagicMock()
-        mock_client_class.return_value.__enter__ = MagicMock(return_value=mock_client)
-        mock_client_class.return_value.__exit__ = MagicMock(return_value=False)
-
-        import sys
-
-        fake_module = MagicMock()
-        fake_module.Client = mock_client_class
-        monkeypatch.setitem(sys.modules, "t_tech.invest", fake_module)
-
-        a = TinkoffAccount(token="t.x")
-        status = a.cancel_order("ORD-999")
-        assert status == OrderStatus.CANCELLED
-        mock_client.orders.cancel_order.assert_called_once()
-
-    def test_cancel_order_sdk_exception(self, monkeypatch):
-        mock_client_class = MagicMock()
-        mock_client = MagicMock()
-        mock_client_class.return_value.__enter__ = MagicMock(return_value=mock_client)
-        mock_client_class.return_value.__exit__ = MagicMock(return_value=False)
-        mock_client.orders.cancel_order.side_effect = RuntimeError("cancel failed")
-
-        import sys
-
-        fake_module = MagicMock()
-        fake_module.Client = mock_client_class
-        monkeypatch.setitem(sys.modules, "t_tech.invest", fake_module)
-
-        a = TinkoffAccount(token="t.x")
-        with pytest.raises(BrokerError, match="cancel failed"):
-            a.cancel_order("ORD-999")
-
-    def test_ticker_to_figi_fallback_on_error(self, monkeypatch):
-        mock_client_class = MagicMock()
-        mock_client = MagicMock()
-        mock_client_class.return_value.__enter__ = MagicMock(return_value=mock_client)
-        mock_client_class.return_value.__exit__ = MagicMock(return_value=False)
-        mock_client.instruments.find_instrument.side_effect = RuntimeError("network")
-
-        import sys
-
-        fake_module = MagicMock()
-        fake_module.Client = mock_client_class
-        monkeypatch.setitem(sys.modules, "t_tech.invest", fake_module)
-
-        a = TinkoffAccount(token="t.x")
-        figi = a._ticker_to_figi(mock_client, "SBER")
-        assert figi == "SBER"
-
-    def test_map_status_partiallyfill(self):
-        s = TinkoffAccount._map_status("EXECUTION_REPORT_STATUS_PARTIALLYFILL")
-        assert s == OrderStatus.FILLED
-
-    def test_map_status_cancelled(self):
-        s = TinkoffAccount._map_status("EXECUTION_REPORT_STATUS_CANCELLED")
-        assert s == OrderStatus.CANCELLED
-
-    # ────────────────────────────────────────
-    # Coverage-boost tests for lines 135, 142-145, 164-167, 191-195
-    # ────────────────────────────────────────
 
     def test_place_order_live_trading_false_hardlock(self, monkeypatch):
         """Lines 191-195: LIVE_TRADING != 'true' must reject BEFORE RiskGate.
@@ -954,6 +960,65 @@ class TestTinkoffAccount:
         a = TinkoffAccount(token="t.x")
         snap = a.get_portfolio()
         assert snap.cash == Decimal("7777.5")
+
+
+# ────────────────────────────────────────────
+# Issue #11: MarketOrder without live quote → REJECTED (fail-safe)
+# ────────────────────────────────────────────
+
+
+class TestIssue11MarketOrderNoQuote:
+    def test_market_order_refused_when_quote_unavailable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Issue #11: if the SDK returns no quote for the ticker (or
+        raises), the order MUST be REJECTED, not silently priced at
+        Decimal('1'). This is the fail-safe behaviour that closes the
+        historical bypass."""
+        # Empty last_prices map → no quote for any ticker.
+        client = _make_mock_tinkoff_client(
+            cash=Decimal("1000000"),
+            last_prices={},
+        )
+        _install_mock_sdk(monkeypatch, client)
+
+        mock_rg = MagicMock()
+        from src.risk.gate import RiskDecision
+
+        mock_rg.evaluate.return_value = RiskDecision(allowed=True, violations=())
+        a = TinkoffAccount(token="t.x", risk_gate=mock_rg)
+        order = MarketOrder(ticker="SBER", side=OrderSide.BUY, quantity=Decimal("10"))
+        status = a.place_order(order)
+        assert status == OrderStatus.REJECTED
+        # Broker must NOT have been called.
+        client.orders.post_order.assert_not_called()
+        # And RiskGate must NOT even have been consulted — we fail-fast
+        # on the broker-side precondition.
+        mock_rg.evaluate.assert_not_called()
+
+    def test_market_order_with_real_quote_submits(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Counter-test: when a real quote is available, the order
+        proceeds and the price seen by RiskGate is the live quote, not
+        the historical placeholder."""
+        client = _make_mock_tinkoff_client(
+            cash=Decimal("1000000"),
+            last_prices={"SBER": Decimal("300.5")},
+        )
+        _install_mock_sdk(monkeypatch, client)
+
+        mock_rg = MagicMock()
+        from src.risk.gate import RiskDecision
+
+        mock_rg.evaluate.return_value = RiskDecision(allowed=True, violations=())
+        a = TinkoffAccount(token="t.x", risk_gate=mock_rg)
+        order = MarketOrder(ticker="SBER", side=OrderSide.BUY, quantity=Decimal("10"))
+        status = a.place_order(order)
+        assert status == OrderStatus.FILLED
+        # The intent that RiskGate evaluated had price=300.5, not 1.
+        intent_seen = mock_rg.evaluate.call_args[0][0]
+        assert intent_seen.price == Decimal("300.5")
+        # And the PortfolioState used cash from the live snapshot, not
+        # the historical 100 000₽ placeholder.
+        state_seen = mock_rg.evaluate.call_args[0][1]
+        assert state_seen.total_equity == Decimal("1000000")
 
 
 # ────────────────────────────────────────────

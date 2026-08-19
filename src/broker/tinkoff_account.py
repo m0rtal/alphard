@@ -32,6 +32,24 @@ from src.broker.orders import (
 logger = logging.getLogger("alphard.broker.tinkoff")
 
 
+def _broker_position_to_gate_position(broker_pos: Any) -> Any:
+    """Convert a broker ``Position`` (dataclass) to a gate ``Position`` (pydantic).
+
+    The two models have the same fields except for the symbol/ticker
+    naming difference. Sectors are not yet mapped from Tinkoff in
+    Phase 1; the gate's sector check will skip on ``sector=None``
+    until Phase 2 wires the sector map.
+    """
+    from src.risk.gate import Position as _GatePosition
+
+    return _GatePosition(
+        symbol=broker_pos.ticker,
+        quantity=broker_pos.quantity,
+        avg_price=broker_pos.avg_price,
+        sector=None,
+    )
+
+
 class BrokerError(RuntimeError):
     """Technical failure from Tinkoff SDK."""
 
@@ -101,13 +119,47 @@ class TinkoffAccount(BrokerAccount):
                 time.sleep(sleep_for)
         self._last_request_ts.append(time.time())
 
-    def _build_intent_and_state(self, order: MarketOrder | LimitOrder) -> tuple[Any, Any]:
-        """Build TradeIntent + PortfolioState for RiskGate."""
-        from src.risk.gate import PortfolioState, TradeIntent
+    def _build_intent_and_state(
+        self,
+        order: MarketOrder | LimitOrder,
+        client: Any = None,
+    ) -> tuple[Any, Any]:
+        """Build TradeIntent + PortfolioState for RiskGate.
+
+        Issue #11 (CRITICAL): the historical implementation used
+        ``Decimal("1")`` as a placeholder price for MarketOrder and
+        ``Decimal("100000")`` as a hardcoded NAV. Both silently bypassed
+        RISK_POSITION / RISK_SECTOR. The fix:
+
+        1. For ``MarketOrder``: fetch a live quote via the Tinkoff
+           ``market_data.get_last_prices`` API. If the quote is
+           unavailable (network blip, SDK exception, instrument
+           suspended), refuse the order — fail-safe. Never substitute a
+           fake price.
+        2. For ``LimitOrder``: use ``order.price`` as before.
+        3. PortfolioState: fetch real NAV via ``get_portfolio()``. If the
+           fetch fails, refuse the order — fail-safe.
+
+        The ``client`` parameter is required for MarketOrder; it is the
+        same ``Client`` instance used by the broker call so we don't
+        open a second connection per order.
+        """
+        from src.risk.gate import TradeIntent
 
         order_type = OrderType.LIMIT if isinstance(order, LimitOrder) else OrderType.MARKET
         _ = order_type  # currently unused, reserved for Phase 2
-        price = order.price if isinstance(order, LimitOrder) else Decimal("1")
+
+        if isinstance(order, MarketOrder):
+            # Fail-safe: refuse market orders when no live quote is
+            # available. The caller (``place_order``) MUST pass a
+            # connected ``client``; we open one here only if absent.
+            if client is None:
+                from t_tech.invest import Client as _Client
+
+                client = _Client(self._token)
+            price = self._fetch_live_quote_price(client, order.ticker)
+        else:
+            price = order.price
 
         intent = TradeIntent(
             symbol=order.ticker,
@@ -118,14 +170,59 @@ class TinkoffAccount(BrokerAccount):
             quantity=order.quantity,
             price=price,
         )
-        # Minimal portfolio state — production uses real fetch
-        state = PortfolioState(
-            total_equity=Decimal("100000"),
-            cash=Decimal("100000"),
-            positions=[],
-            peak_equity=Decimal("100000"),
-        )
+
+        # Real portfolio state via the broker. Failure is fail-safe:
+        # if we cannot determine current NAV, we refuse to evaluate the
+        # trade rather than guess against a fake 100 000₽ baseline.
+        state = self._fetch_real_portfolio_state()
         return intent, state
+
+    def _fetch_live_quote_price(self, client: Any, ticker: str) -> Decimal:
+        """Fetch the latest market price for a ticker via Tinkoff.
+
+        Raises ``BrokerError`` if the quote is unavailable. Never
+        returns a placeholder — the previous ``Decimal("1")``
+        placeholder is the bug we are fixing here.
+        """
+        try:
+            figi = self._ticker_to_figi(client, ticker)
+            resp = client.market_data.get_last_prices(figi=[figi])
+            for lp in getattr(resp, "last_prices", []):
+                if getattr(lp, "figi", None) == figi:
+                    q_price = getattr(lp, "price", None)
+                    # Structural check (not isinstance) so the function
+                    # works with both the real t_tech.invest.Quotation
+                    # and MagicMock test doubles.
+                    if q_price is None or not (hasattr(q_price, "units") and hasattr(q_price, "nano")):
+                        raise BrokerError(f"no usable quote for {ticker} (figi={figi})")
+                    units = int(getattr(q_price, "units", 0))
+                    nano = int(getattr(q_price, "nano", 0))
+                    price = Decimal(units) + Decimal(nano) / Decimal("1000000000")
+                    if price <= Decimal("0"):
+                        raise BrokerError(f"non-positive quote for {ticker}: {price}")
+                    return price
+            raise BrokerError(f"no quote in response for {ticker} (figi={figi})")
+        except BrokerError:
+            raise
+        except Exception as e:
+            raise BrokerError(f"live quote fetch failed for {ticker}: {e}") from e
+
+    def _fetch_real_portfolio_state(self) -> Any:
+        """Fetch real NAV/cash/positions from Tinkoff.
+
+        Raises ``BrokerError`` on failure. Returns ``PortfolioState``
+        populated with live values. The previous hardcoded
+        ``Decimal("100000")`` is the bug we are fixing here.
+        """
+        from src.risk.gate import PortfolioState
+
+        snapshot = self.get_portfolio()
+        return PortfolioState(
+            total_equity=snapshot.cash,  # Tinkoff returns total_amount_currencies as cash-side NAV
+            cash=snapshot.cash,
+            positions=[_broker_position_to_gate_position(p) for p in snapshot.positions],
+            peak_equity=snapshot.cash,  # conservative: peak equals current
+        )
 
     def get_portfolio(self) -> PortfolioSnapshot:
         """Real call to Tinkoff. Returns empty mock if SDK unavailable.
@@ -220,18 +317,10 @@ class TinkoffAccount(BrokerAccount):
             logger.warning("RiskGate not configured — rejecting all orders (fail-safe)")
             return OrderStatus.REJECTED
 
-        intent, state = self._build_intent_and_state(order)
-        decision = self._risk_gate.evaluate(intent, state)
-
-        if not decision.allowed:
-            logger.warning(
-                "RiskGate blocked order for %s: %s",
-                order.ticker,
-                decision.violations,
-            )
-            return OrderStatus.REJECTED
-
-        # RiskGate approved. Submit to broker.
+        # Issue #11: We open one Client connection and pass it through
+        # both the `_build_intent_and_state` (for live quote + portfolio
+        # fetch) and the post_order call. This avoids opening the same
+        # connection twice and keeps the rate-limit semantics consistent.
         self._rate_limit_acquire()
         try:
             from t_tech.invest import (
@@ -241,12 +330,24 @@ class TinkoffAccount(BrokerAccount):
                 Quotation,
             )
 
-            direction = (
-                OrderDirection.ORDER_DIRECTION_BUY
-                if order.side == OrderSide.BUY
-                else OrderDirection.ORDER_DIRECTION_SELL
-            )
             with Client(self._token) as client:
+                intent, state = self._build_intent_and_state(order, client=client)
+                decision = self._risk_gate.evaluate(intent, state)
+
+                if not decision.allowed:
+                    logger.warning(
+                        "RiskGate blocked order for %s: %s",
+                        order.ticker,
+                        decision.violations,
+                    )
+                    return OrderStatus.REJECTED
+
+                # RiskGate approved. Submit to broker.
+                direction = (
+                    OrderDirection.ORDER_DIRECTION_BUY
+                    if order.side == OrderSide.BUY
+                    else OrderDirection.ORDER_DIRECTION_SELL
+                )
                 figi = self._ticker_to_figi(client, order.ticker)
                 if isinstance(order, MarketOrder):
                     resp = client.orders.post_order(
@@ -275,6 +376,15 @@ class TinkoffAccount(BrokerAccount):
                 ers = resp.execution_report_status
                 raw_name: str = getattr(ers, "name", None) or str(ers)
                 return self._map_status(raw_name)
+        except BrokerError as e:
+            # Fail-safe: refuse the order if we cannot determine a real
+            # price / portfolio state. Logger logs the broker-side reason.
+            logger.error(
+                "Refusing order for %s due to broker-side precondition: %s",
+                order.ticker,
+                e,
+            )
+            return OrderStatus.REJECTED
         except Exception as e:
             raise BrokerError(f"Tinkoff order submit failed: {e}") from e
 
