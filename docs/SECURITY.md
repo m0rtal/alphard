@@ -93,7 +93,7 @@
 
 **Order validation:**
 - ✅ Risk gate hard limits (max position, DD, sector)
-- ✅ RiskGate refuse MarketOrder with placeholder price (`qty > 1 AND price == 1`) → `RISK_MARKET_ORDER_NO_QUOTE` (issue #11, PR #18)
+- ✅ RiskGate refuse MarketOrder with placeholder price (`qty > 1 AND price == 1`) → `RISK_MARKET_ORDER_NO_QUOTE` (issue #11 closed by PR #18 — fix landed in main via commit `8e8d400` after PR was closed-not-merged; original PR #18 was bypass-merged to avoid duplicate commit)
 - ✅ RiskGate pydantic v2 with `extra="forbid"` — no silent ALLOWED=true with violations
 - ✅ TOCTOU guard `Coordinator._validate_state_for_execute()` ≤ 100ms via `time.monotonic()` (issue #15, PR #17)
 - 📅 Phase 2+: tradeable tickers whitelist, daily volume cap (см. issue #26)
