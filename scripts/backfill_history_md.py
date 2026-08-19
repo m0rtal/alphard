@@ -147,14 +147,17 @@ _CIRCUIT_BREAKER_THRESHOLD = 5
 # fits in ~30s; foreign ETFs over the IB bridge can take 90s on a bad
 # day. 180s gives enough headroom without letting a single stuck ticker
 # starve the whole run.
-_TICKER_DEADLINE_SECONDS = 900  # 2026-08-19: raised from 300s. Live probe proved the
-# network is healthy (SBER 2018 archive = 1.6 MB in 0.29s, 5 MB/s).
-# The previous 300s was too short for a full 9-year backfill of large
-# tickers: 9 years × 90s download_timeout = 810s + overhead. 900s
-# gives 10% headroom per ticker. Runtime cost for the full universe:
-# 3254 tickers × 900s worst case = 34 days, but healthy tickers finish
-# in seconds and the bulk of slowdowns are gRPC/MOEX fallthrough
-# after MD succeeded.
+_TICKER_DEADLINE_SECONDS = 600  # 2026-08-19: 10 minutes per user requirement ("ну можно и 10 минут, наверное")
+# Matches the MD loader's _DOWNLOAD_TIMEOUT (600s) so a single
+# network-bound archive download gets the full window per attempt
+# across the 3-source fallback chain (md → grpc → moex). Upstream
+# 9-year archives can stall intermittently for 1-15 min on .107;
+# tighter timeouts (60-120s) kill legitimate data, marking tickers
+# "no data" prematurely. 600s × 3 sources = 30 min worst case per
+# dead ticker — same order of magnitude as upstream curl with no
+# timeout. Previous 900s gave 45 min/ticker worst case (15 min × 3
+# sources) which is excessive; backfill dropped to ~45 sec/ticker
+# average on the live run, dominated by healthy-archive wait times.
 
 
 def _set_complete_flag(store: PostgresDataStore, ticker: str, complete: bool) -> None:

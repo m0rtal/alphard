@@ -104,11 +104,16 @@ DAILY_INTERVAL = "CANDLE_INTERVAL_DAY"
 # script will slow itself down via the backoff path. Keep it <= 30/min.
 DEFAULT_BUCKET_RATE = 0.5
 
-# HTTP timeout per archive download — SBER 2020 ≈ 2.2 MB, fits in 30s.
-_DOWNLOAD_TIMEOUT = 90  # 2026-08-19: raised from 60s. Live probe shows healthy archives complete in 0.3-0.7s.
-# Real stalls (network drop, DNS hiccup) take 60-90s; 60s was too tight
-# when the first byte arrived quickly but the body transferred slowly
-# (typical big zip in 4-5 MB/s would be 60-100s for 9-12 MB archive).
+# HTTP timeout per archive download — user-requested 10 minutes (600s).
+# On .107→invest-public-api.tinkoff.ru the network is healthy in
+# patches but stalls intermittently at variable points (1-15 min)
+# per archive. 9-year archive ranges hit this worst — full body
+# transfer for big tickers takes 60-90s in good windows, several
+# minutes in bad ones. 600s gives a single slow archive a fair
+# chance without turning per-ticker into an unbounded hang; the
+# per-ticker deadline (also 600s) bounds the worst case per
+# ticker regardless of how many fallbacks it triggers.
+_DOWNLOAD_TIMEOUT = 600  # 2026-08-19: 10 minutes per user requirement ("ну можно и 10 минут, наверное")
 
 
 # ---------------------------------------------------------------------------
