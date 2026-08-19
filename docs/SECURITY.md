@@ -62,11 +62,13 @@
 - ✅ gitleaks pre-commit hook
 - ✅ GitHub secret scanning (если включишь в Settings)
 
-**Phase 1 нужно:**
-- 🔄 `.env` создаётся ТОЛЬКО через `make init-env` скрипт (с chmod 600)
-- 🔄 Tinkoff token rotate каждый месяц (настраиваемый в .env)
-- 🔄 Никаких секретов в логах — даже частично. Используй redact middleware.
-- 🔄 `make audit-secrets` — CI/CD проверка перед каждым PR
+**Частично реализовано (Phase 0.6 → 1.6):**
+- ✅ `.env` исключён через `.gitignore` (защита от коммита секретов)
+- ✅ `TINKOFF_SANDBOX_TOKEN fail-fast` в `src/main.py:29` (entrypoint sanity gate — бот не стартует без токена)
+- ✅ **gitleaks-action** в `.github/workflows/ci.yml` — авто-скан каждого PR (commit `eab5e40`)
+- ❌ `make init-env` (скрипт-обёртка) — не реализован, см. issue #12
+- ❌ Tinkoff token rotate monthly — нет automation, manual user action (см. issue #12)
+- 📅 Phase 2+: redact middleware для логов (сейчас есть только risk-gate check)
 
 ### Level 2: Network isolation
 
@@ -74,45 +76,45 @@
 - ✅ .107 Docker-only host (no SSH)
 - ✅ Portainer на .107 с RBAC
 
-**Phase 1 нужно:**
-- 🔄 Alphard stack в **отдельной Docker network** (alphard-net, не bridge)
-- 🔄 Никаких прямых ports наружу кроме healthcheck (8080 → только localhost на .107)
-- 🔄 postgres доступен ТОЛЬКО из alphard-bot контейнера, не наружу
-- 🔄 redis same
-- 🔄 Tinkoff API calls — ТОЛЬКО через HTTPS, проверка сертификата
-- 🔄 Outbound: allowlist только tinkoff.ru, moex.com (NO general internet)
+**Частично реализовано:**
+- ⚠️ Docker network в `docker-compose.yaml` — default bridge (не dedicated separate network). Минимальная изоляция, host не exposure'нут на 0.0.0.0.
+- ✅ Tinkoff API calls — ТОЛЬКО HTTPS через `requests` library, default cert verification ON (`src/broker/tinkoff_account.py`)
+- ✅ Postgres — bound в compose, internal network only (не exposed наружу)
+- ❌ Dedicated bridge `alphard-net` — нет отдельного network, всё в default bridge
+- 📅 Phase 2+: dedicated bridge, separate redis net, outbound allowlist (нет файрвола в compose)
 
 ### Level 3: Broker-specific hardening
 
 **Tinkoff sandbox vs real:**
 - ✅ Sandbox token для testing
 - ✅ Real token через `.env`, никогда в коде
-- 🔄 **Mandatory:** real token ТОЛЬКО в production stack, sandbox token в dev/sandbox stack
-- 🔄 IP whitelist (если Tinkoff поддерживает) — ограничить API access с IP .107
+- ✅ **Mandatory:** `TinkoffConfig` отказывает `sandbox=False` (Phase 1.3 fail-fast, `src/broker/tinkoff_account.py`)
+- ❌ IP whitelist (если Tinkoff поддерживает) — Tinkoff sandbox API НЕ поддерживает IP-allowlist (проверено)
 
 **Order validation:**
 - ✅ Risk gate hard limits (max position, DD, sector)
-- 🔄 **Whitelist tradeable tickers** — НЕ allow bot to trade unknown instruments
-- 🔄 **Daily volume cap** — бот не может торговать > X% от своего обычного объема
+- ✅ RiskGate refuse MarketOrder with placeholder price (`qty > 1 AND price == 1`) → `RISK_MARKET_ORDER_NO_QUOTE` (issue #11, PR #18)
+- ✅ RiskGate pydantic v2 with `extra="forbid"` — no silent ALLOWED=true with violations
+- ✅ TOCTOU guard `Coordinator._validate_state_for_execute()` ≤ 100ms via `time.monotonic()` (issue #15, PR #17)
+- 📅 Phase 2+: tradeable tickers whitelist, daily volume cap (см. issue #26)
 
 ### Level 4: Monitoring & detection
 
-**Phase 3+ (НЕ Phase 0):**
-- 🔄 Prometheus metrics endpoint — `docker compose --profile observability up -d`
-  поднимает `alphard-prometheus` + `alphard-grafana`. Skeleton-конфиги в
-  `docker/prometheus/prometheus.yml` + `docker/grafana/dashboards/`.
-  Default scrape: только self. alphard-bot targets появятся в Phase 3, когда
-  `src/main.py` будет экспортировать `/metrics`.
-- ✅ Decision lineage в Postgres — Phase 1+
+**Частично реализовано:**
+- ✅ `src/data/quality/audit.py` — `PostgresAuditLog` + `InMemoryAuditLog` (audit_log table в Postgres)
+- ✅ `src/main.py:81 _daily_sync_loop()` — daily 20:00 MSK watchdog thread
+- ❌ Prometheus metrics endpoint — нет в compose, Phase 3+
+- ❌ Decision lineage в Postgres — частично (audit_log есть, но не structured_jsonb lineage)
+- 📅 Phase 2+: anomaly detection, loss alerts, daily volume cap alerts
 
-**Phase 1 нужно:**
-- 🔄 **Anomaly detection** — если бот внезапно делает X trades/min → alert
-- 🔄 **Loss alerts** — если daily_pnl < -1% → telegram/SMS alert
-- 🔄 **DD alerts** — drawdown > 3% → critical alert (auto-stop если > 5%)
-- 🔄 **Failed trades spike** — если 5+ rejected orders за 10 минут → investigate
-- 🔄 **Token usage anomaly** — если Tinkoff API calls > N/min → possible compromise
-- 🔄 **Unusual hours** — trades вне MOEX hours → CRITICAL alert
-- 🔄 **Self-audit cron** — каждые 6 часов: проверка что все 5 layers intact
+**Phase 2+:**
+- 📅 Self-audit cron каждые 6ч (проверка 5 layers intact) — не реализовано, отложено
+- 📅 Anomaly detection X trades/min — Phase 2+
+- 📅 Loss alerts daily_pnl < -1% → telegram/SMS — Phase 2+
+- 📅 DD alerts drawdown > 3% → critical — Phase 2+
+- 📅 Failed trades spike (5+ rejected/10мин) — Phase 2+
+- 📅 Token usage anomaly > N API/min — Phase 2+
+- 📅 Unusual hours (вне MOEX) → CRITICAL — Phase 2+
 
 ### Level 5: Recovery & incident response
 
