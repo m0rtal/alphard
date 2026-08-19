@@ -162,7 +162,9 @@ _CIRCUIT_BREAKER_THRESHOLD = 5
 # (we still want a hard ceiling so a programming bug in a future
 # loader cannot loop a single ticker forever). 24h is enough for the
 # worst case while still being finite.
-_TICKER_DEADLINE_SECONDS = 24 * 3600  # 2026-08-19: 24h ceiling (per user: "per-ticker 600с маловато, сними этот лимит вовсе, достаточно по году")
+_TICKER_DEADLINE_SECONDS = (
+    24 * 3600
+)  # 2026-08-19: 24h ceiling (per user: "per-ticker 600с маловато, сними этот лимит вовсе, достаточно по году")
 
 
 def _set_complete_flag(store: PostgresDataStore, ticker: str, complete: bool) -> None:
