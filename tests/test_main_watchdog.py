@@ -27,7 +27,6 @@ from unittest.mock import MagicMock
 
 import pytest
 
-
 # Add src/ to sys.path so `import main` works whether tests run from /root
 # (local) or /__w/alphard/alphard (CI). Resolve relative to this file.
 _SRC_PATH = str(Path(__file__).resolve().parent.parent / "src")
