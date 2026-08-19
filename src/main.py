@@ -39,9 +39,30 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timedelta, timezone
+
+MSK_TZ = timezone(timedelta(hours=3))  # MOEX closes 18:40 MSK; sync at 20:00 MSK to capture it.
+
 
 DAILY_SYNC_INTERVAL_SECONDS = 3600  # Phase 1.6: user requirement — sync must always run.
 DAILY_SYNC_SUBPROCESS_TIMEOUT = 600  # 10 min hard cap per sync; longer = kill.
+
+
+def _seconds_until_next_target_hour_msk(target_hour: int, target_minute: int) -> float:
+    """How many seconds until the next target_hour:target_minute MSK.
+
+    Phase 1.6 requirement: daily_sync must run AFTER MOEX closes its daily
+    candle (18:40 MSK). We schedule for 20:00 MSK = 80 minutes after close,
+    giving Tinkoff plenty of time to ingest and expose the closed bar.
+
+    If target is already past today, schedule for tomorrow.
+    """
+    now_msk = datetime.now(MSK_TZ)
+    target = now_msk.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
+    if target <= now_msk:
+        target = target + timedelta(days=1)
+    delta = target - now_msk
+    return max(0.0, delta.total_seconds())
 
 
 _shutdown_event = threading.Event()  # Phase 1.6: signals daemon threads to exit
@@ -63,11 +84,21 @@ def _daily_sync_loop() -> None:
     - 24 daily-sync runs / day is wasteful (each ~30s for top 20). Hourly
       keeps the universe warm without burning gRPC rate-limit tokens.
 
-    Shutdown contract: main() sets `_shutdown_event` and exits the process.
-    The daemon polls the event between iterations and on KeyboardInterrupt;
-    either signal causes a clean return.
+    Schedule (Phase 1.6 user requirement):
+    - First sync waits until the next 20:00 MSK (after MOEX close at 18:40).
+    - Subsequent syncs repeat every 24h, anchored to MSK wall-clock time.
+    - On any launch, the daemon sleeps to the next target, not "right now" —
+      a container started at 12:00 must NOT immediately sync (would race
+      the still-open candle).
     """
     logger = logging.getLogger("alphard.daily_sync")
+
+    sync_hour_msk = 20
+    sync_minute_msk = 0
+    seconds_to_first = _seconds_until_next_target_hour_msk(sync_hour_msk, sync_minute_msk)
+    logger.info(f"daily_sync scheduled: next run at 20:00 MSK " f"(in {seconds_to_first / 3600:.1f}h)")
+    _sleep_interruptible(seconds_to_first)
+
     while not _shutdown_event.is_set():
         logger.info("Triggering daily_sync subprocess (--days 5)")
         try:
@@ -88,16 +119,32 @@ def _daily_sync_loop() -> None:
             logger.warning(f"daily_sync timeout after {DAILY_SYNC_SUBPROCESS_TIMEOUT}s; " "subprocess killed")
         except Exception as exc:  # noqa: BLE001 — never kill the heartbeat
             logger.error(f"daily_sync unexpected error: {exc}")
-        # Sleep in short slices so shutdown is responsive.
-        for _ in range(DAILY_SYNC_INTERVAL_SECONDS):
-            if _shutdown_event.is_set():
-                logger.info("daily_sync daemon received shutdown signal, exiting")
-                return
-            try:
-                time.sleep(1)
-            except KeyboardInterrupt:
-                logger.info("daily_sync daemon sleep interrupted, exiting")
-                return
+        # Wait 24h to the next 20:00 MSK. We don't recompute via
+        # _seconds_until_next_target_hour_msk here because if the sync
+        # itself took 30 minutes (subprocess timeout path) the math
+        # would shift. We anchor on 24h-since-last-fire, which keeps the
+        # rhythm roughly daily even if a run drags.
+        if _shutdown_event.is_set():
+            logger.info("daily_sync daemon received shutdown signal, exiting")
+            return
+        _sleep_interruptible(24 * 3600)
+
+
+def _sleep_interruptible(seconds: float) -> None:
+    """Sleep up to `seconds`, but wake up immediately on shutdown_event.
+
+    Replaces naked time.sleep() so Ctrl-C / daemon shutdown actually does
+    something useful. Polls every 1s — cheap enough for daemon workloads.
+    """
+    end = time.monotonic() + seconds
+    while not _shutdown_event.is_set():
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            return
+        try:
+            time.sleep(min(1.0, remaining))
+        except KeyboardInterrupt:
+            return
 
 
 def main() -> None:
