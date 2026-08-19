@@ -306,10 +306,14 @@ class TestCoordinatorFetch:
             bars = coord._fetch()
 
         assert len(bars) == 1
-        # Verify 2-day window (not 1825-day default)
+        # Verify fetch_ohlcv was called with start/end dates derived from
+        # CoordinatorConfig.fetch_lookback_days (issue #26: previously this
+        # was hardcoded to timedelta(days=2), which left only ~3 bars
+        # reaching VALIDATE. The test now verifies that the Coordinator
+        # delegates to the configured lookback rather than overriding it.)
         call_args = mock_instance.fetch_ohlcv.call_args
         args = call_args.args  # positional (ticker, start, end)
-        assert args[2] - args[1] == timedelta(days=2)
+        assert args[2] - args[1] == timedelta(days=1825)  # default 5*365
 
 
 # -----------------------------------------------------------------------------

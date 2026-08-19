@@ -172,6 +172,12 @@ class Coordinator:
         # guard in run_once() compares this against `time.monotonic()` to
         # decide whether the gap since risk assessment is too wide.
         self._risk_completed_at: float | None = None
+        # Issue #26: build a single RiskGate instance and share it with
+        # the broker so order placement doesn't fail with `risk_gate is
+        # None`. The gate is stateless (RiskLimits are deterministic), so
+        # constructing it once per Coordinator is safe.
+        from src.risk.gate import RiskGate
+        self._gate = RiskGate(limits=self.config.risk_limits)
 
     def _validate_state_for_execute(self) -> bool:
         """TOCTOU guard: confirm elapsed time since the RISK stage is
@@ -332,13 +338,14 @@ class Coordinator:
 
     def _fetch(self) -> list[Any]:
         from src.data.tinkoff_loader import TinkoffInvestDataLoader
+        from datetime import timedelta
 
         loader = TinkoffInvestDataLoader()
         end = date.today()
-        # Single-day range — we only need 1 bar to evaluate the intent
-        from datetime import timedelta
-
-        start = end - timedelta(days=2)
+        # Issue #26: respect CoordinatorConfig.fetch_lookback_days (default 5*365).
+        # Hardcoded timedelta(days=2) previously left only ~3 bars reaching VALIDATE,
+        # which made the gate block on insufficient_history_rows.
+        start = end - timedelta(days=self.config.fetch_lookback_days)
         return loader.fetch_ohlcv(self.config.ticker, start, end)
 
     def _validate(self, bars: list[Any]) -> bool:
@@ -374,9 +381,12 @@ class Coordinator:
         return worst.value not in ("CRITICAL", "HIGH")
 
     def _risk_check(self) -> tuple[bool, tuple[str, ...]]:
-        from src.risk.gate import PortfolioState, RiskGate, TradeIntent
+        from src.risk.gate import PortfolioState, TradeIntent
 
-        gate = RiskGate(limits=self.config.risk_limits)
+        # Issue #26: reuse the gate created in __init__ so the same
+        # RiskLimits are applied to both the gate stage and the broker
+        # stage. Previously each stage constructed its own gate, which
+        # caused drift if the config changed between stages.
         intent = TradeIntent(
             symbol=self.config.ticker,
             side=self.config.side.value,
@@ -389,7 +399,7 @@ class Coordinator:
             positions=[],
             peak_equity=self.config.portfolio_peak,
         )
-        decision = gate.evaluate(intent, state)
+        decision = self._gate.evaluate(intent, state)
         return decision.allowed, decision.violations
 
     def _execute(self, risk_allowed: bool) -> str | None:
@@ -408,7 +418,9 @@ class Coordinator:
             from src.broker.tinkoff_account import TinkoffAccount
             from src.broker.orders import MarketOrder, OrderSide
 
-            account = TinkoffAccount.from_env()  # type: ignore[attr-defined]
+            # Issue #26: pass the already-built RiskGate into TinkoffAccount
+            # so the broker-level fail-safe check has a real gate, not None.
+            account = TinkoffAccount.from_env(risk_gate=self._gate)  # type: ignore[attr-defined]
             order = MarketOrder(
                 ticker=self.config.ticker,
                 side=OrderSide.BUY if self.config.side == CoordinatorSide.BUY else OrderSide.SELL,
