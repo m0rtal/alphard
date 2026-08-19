@@ -45,7 +45,7 @@ source = ["src"]
 omit = [
     "*/tests/*",
     "*/__init__.py",
-    "src/main.py",  # Phase 0 stub, not production code
+    "src/main.py",  # Phase 0 entrypoint; covered by integration smoke + main process, not unit tests
 ]
 
 [tool.coverage.report]

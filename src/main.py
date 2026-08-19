@@ -47,6 +47,12 @@ MSK_TZ = timezone(timedelta(hours=3))  # MOEX closes 18:40 MSK; sync at 20:00 MS
 DAILY_SYNC_INTERVAL_SECONDS = 3600  # Phase 1.6: user requirement — sync must always run.
 DAILY_SYNC_SUBPROCESS_TIMEOUT = 600  # 10 min hard cap per sync; longer = kill.
 
+# Phase 2.7: delisted_at weekly cron. Backfills delisted_at via Tinkoff gRPC
+# market_data.get_candles, running on a weekly cadence (delisted events are
+# slow-moving). Mirrors daily_sync structure: subprocess + sentinel + watchdog.
+DELISTED_SYNC_CADENCE_SECONDS = 7 * 24 * 3600  # 7 days between runs.
+DELISTED_SYNC_SUBPROCESS_TIMEOUT = 2400  # 40 min hard cap; larger window than daily.
+
 # Phase 1.6 audit: in-process watchdog for the daily_sync daemon thread.
 # A thread that crashes inside a live process leaves no signal — heartbeat
 # keeps ticking, container stays "Up", but the daily schedule is silently
@@ -138,6 +144,61 @@ def _daily_sync_loop() -> None:
             logger.info("daily_sync daemon received shutdown signal, exiting")
             return
         _sleep_interruptible(24 * 3600)
+
+
+def _delisted_sync_loop() -> None:
+    """Run scripts/backfill_delisted_via_tinkoff.py weekly.
+
+    Phase 2.7: pulls delisted_at via Tinkoff gRPC market_data.get_candles
+    chunks. Backfills universe rows where class_code IS NULL OR delisted=True
+    AND ohlcv_daily is empty. Runs on a 7-day cadence (delisted events are
+    slow-moving).
+
+    Why subprocess instead of in-process call?
+    - backfill_delisted_via_tinkoff.py walks the universe ticker-by-ticker and
+      runs 1-year chunks per ticker. Long-running, blocking, allocates Tinkoff
+      gRPC connections. In-process call would starve the heartbeat.
+    - Subprocess crash MUST NOT kill the heartbeat. Process boundary = circuit
+      breaker. Same rationale as daily_sync.
+
+    Schedule (Phase 2.7):
+    - First run waits 24h after launch (let daily_sync settle first).
+    - Subsequent runs repeat every 7 days. Anchored on 7d-since-last-fire.
+    - On any launch, the daemon sleeps before the first run.
+    """
+    logger = logging.getLogger("alphard.delisted_sync")
+
+    # Wait 24h before first run: daily_sync gets priority, delisted is weekly.
+    logger.info(
+        f"delisted_sync scheduled: first run in 24h, "
+        f"then every {DELISTED_SYNC_CADENCE_SECONDS / 3600 / 24:.0f} days"
+    )
+    _sleep_interruptible(24 * 3600)
+
+    while not _shutdown_event.is_set():
+        logger.info("Triggering delisted_sync subprocess")
+        try:
+            r = subprocess.run(
+                ["python", "scripts/backfill_delisted_via_tinkoff.py"],
+                capture_output=True,
+                text=True,
+                timeout=DELISTED_SYNC_SUBPROCESS_TIMEOUT,
+                cwd="/app",
+            )
+            if r.returncode == 0:
+                tail = r.stdout[-500:] if r.stdout else ""
+                logger.info(f"delisted_sync OK rc={r.returncode}: {tail!r}")
+            else:
+                tail = (r.stderr or "")[-500:]
+                logger.warning(f"delisted_sync FAILED rc={r.returncode}: {tail!r}")
+        except subprocess.TimeoutExpired:
+            logger.warning(f"delisted_sync timeout after {DELISTED_SYNC_SUBPROCESS_TIMEOUT}s; " "subprocess killed")
+        except Exception as exc:  # noqa: BLE001 — never kill the heartbeat
+            logger.error(f"delisted_sync unexpected error: {exc}")
+        if _shutdown_event.is_set():
+            logger.info("delisted_sync daemon received shutdown signal, exiting")
+            return
+        _sleep_interruptible(DELISTED_SYNC_CADENCE_SECONDS)
 
 
 def _sleep_interruptible(seconds: float) -> None:
@@ -303,6 +364,15 @@ def main() -> None:
 
     logger.info("daily-sync daemon started")
 
+    # Phase 2.7: weekly delisted_at cron. Same daemon pattern as daily_sync:
+    # subprocess + sentinel-able. First run waits 24h after launch.
+    delisted_thread = threading.Thread(target=_delisted_sync_loop, daemon=True, name="alphard-delisted-sync")
+    delisted_thread.start()
+    logger.info(
+        f"delisted-sync daemon started (cadence={DELISTED_SYNC_CADENCE_SECONDS / 3600 / 24:.0f}d, "
+        f"subprocess_timeout={DELISTED_SYNC_SUBPROCESS_TIMEOUT}s)"
+    )
+
     # Watchdog: checks the _daily_sync_health sentinel every 30 min. If
     # last_successful_run_at is older than WATCHDOG_STALE_SECONDS (26h),
     # the daily_sync daemon thread has either crashed or is wedged, and
@@ -330,6 +400,9 @@ def main() -> None:
         sync_thread.join(timeout=10)
         if sync_thread.is_alive():
             logger.warning("daily-sync daemon did not exit within 10s")
+        delisted_thread.join(timeout=10)
+        if delisted_thread.is_alive():
+            logger.warning("delisted-sync daemon did not exit within 10s")
         sys.exit(0)
 
 
