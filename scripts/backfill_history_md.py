@@ -219,6 +219,8 @@ MOEX_MAX_LOOKBACK_DAYS = 1825
 
 def _earliest_expected_ts(
     meta: tuple[date | None, date | None] | None,
+    *,
+    moex_clamped: bool = True,
 ) -> date:
     """Earliest date the universe says we can reach for this ticker.
 
@@ -230,17 +232,27 @@ def _earliest_expected_ts(
 
     Tickers without ``listed_at`` (rare — some delisted/legacy entries)
     fall back to MIN_YEAR.
+
+    The ``moex_clamped`` flag controls whether the 1825-day MOEX ISS
+    lookback cap applies. The primary MD loader (Tinkoff history-data
+    archive) has no such cap and pulls yearly ZIPs back to MIN_YEAR,
+    so we want full history when the MD loader is active. The cap
+    only matters when MOEX ISS is the fallback.
     """
     from datetime import timedelta
 
     listed_at, _delisted_at = meta if meta else (None, None)
     today = date.today()
-    # Cap for sources that limit lookback (MOEX ISS = 1825d).
-    lookback_floor = today - timedelta(days=MOEX_MAX_LOOKBACK_DAYS)
+    if moex_clamped:
+        # Cap for sources that limit lookback (MOEX ISS = 1825d).
+        lookback_floor = today - timedelta(days=MOEX_MAX_LOOKBACK_DAYS)
+    else:
+        # Tinkoff MD archive has no lookback cap — go back to MIN_YEAR.
+        lookback_floor = date(MIN_YEAR, 1, 1)
     if listed_at:
         earliest_listed = date(listed_at.year, 1, 1)
         return max(earliest_listed, date(MIN_YEAR, 1, 1), lookback_floor)
-    # No listed_at: be honest about what we can actually pull from MOEX.
+    # No listed_at: be honest about what we can actually pull.
     return max(date(MIN_YEAR, 1, 1), lookback_floor)
 
 
@@ -279,15 +291,18 @@ def _is_complete(
     modest count), live tickers (full range, count >= min_bars
     anyway), and trading-halt-affected tickers (15% margin).
     """
+    # No fast-path min_bars short-circuit: full history must be
+    # backfilled. The MD loader covers 9 years back to MIN_YEAR=2018;
+    # a ticker that's been listed since 2014 must be pulled to 2018,
+    # not just to the last 1300 bars. trading_days() formula already
+    # encodes the full range for both live and delisted tickers.
     count = store.count_ohlcv(ticker=ticker)
-    if count >= min_bars:
-        return True
     meta = store.ticker_meta(ticker)
     if meta is None:
         # No metadata = legacy data without universe entry. Best we
         # can do is the legacy min_bars threshold, which already
         # failed above. Treat as incomplete so we re-pull.
-        return False
+        return count >= min_bars
     listed_at, delisted_at = meta
     if listed_at is None:
         # listed_at unknown. Infer it from the earliest bar in DB
@@ -556,7 +571,12 @@ def main() -> int:
             # (MOEX ISS = 1825d). Without this, we ask MOEX for 9 years of
             # pre-listing data and get nothing back.
             meta = store.ticker_meta(ticker)
-            effective_start = max(start, _earliest_expected_ts(meta))
+            # Primary loader is Tinkoff MD archive (yearly ZIPs back to
+            # MIN_YEAR, no 1825d cap). The cap only applies if we ever
+            # fall back to MOEX ISS as the only source — handled inside
+            # the fallback chain. Pass moex_clamped=False so we pull
+            # the full available history.
+            effective_start = max(start, _earliest_expected_ts(meta, moex_clamped=False))
             if effective_start > end:
                 logger.info(f"{i}/{len(tickers)} {ticker}: skip " f"(effective_start {effective_start} > end {end})")
                 skipped_complete += 1

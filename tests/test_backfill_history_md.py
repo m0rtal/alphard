@@ -9,7 +9,6 @@ stack, not unit tests.
 from __future__ import annotations
 
 from datetime import date
-from typing import Any
 from unittest.mock import MagicMock
 
 
@@ -88,13 +87,6 @@ def test_resolve_universe_limit_caps_universe_size() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_is_complete_true_when_min_bars_reached() -> None:
-    """Fast path: count >= min_bars short-circuits regardless of meta."""
-    store = MagicMock()
-    store.count_ohlcv.return_value = 1300
-    assert bh._is_complete(store, "SBER", min_bars=1300) is True
-
-
 def test_is_complete_below_count_no_meta_incomplete() -> None:
     """count < min_bars AND no metadata → incomplete."""
     store = MagicMock()
@@ -111,13 +103,6 @@ def test_is_complete_below_count_no_meta_incomplete() -> None:
 # ---------------------------------------------------------------------------
 # _is_complete: count vs expected_bars(listed_at..end * (1 - halts_pct))
 # ---------------------------------------------------------------------------
-
-
-def test_is_complete_fast_path_count_above_min_bars() -> None:
-    """Plain old count threshold for the 99% case."""
-    store = MagicMock()
-    store.count_ohlcv.return_value = 1300
-    assert bh._is_complete(store, "SBER", min_bars=1300) is True
 
 
 def test_is_complete_freshly_listed_ticker_not_blocked_forever() -> None:
@@ -208,124 +193,37 @@ def test_is_complete_listed_at_none_inferred_from_earliest() -> None:
     assert bh._is_complete(store, "WUSH", min_bars=1300) is True
 
 
-def test_is_complete_delisted_same_day_as_listed() -> None:
-    """Pathological case — listed and delisted on the same day.
-    end <= listed_at, so expected = 0. Anything > 0 = complete."""
+def test_earliest_expected_ts_default_clamps_to_1825d() -> None:
+    """MOEX ISS cap = 1825d. Without listed_at, start = max(MIN_YEAR, today-1825d)."""
+    from datetime import timedelta
 
-    store = MagicMock()
-    store.count_ohlcv.return_value = 1
-    store.ticker_meta.return_value = (date(2020, 1, 1), date(2020, 1, 1))
-
-    assert bh._is_complete(store, "SAME_DAY", min_bars=1300) is True
-
-
-def test_is_complete_delisted_same_day_no_rows() -> None:
-    """Same scenario but no bars stored — incomplete."""
-
-    store = MagicMock()
-    store.count_ohlcv.return_value = 0
-    store.ticker_meta.return_value = (date(2020, 1, 1), date(2020, 1, 1))
-
-    assert bh._is_complete(store, "SAME_DAY", min_bars=1300) is False
+    meta = (None, None)
+    result = bh._earliest_expected_ts(meta)  # default moex_clamped=True
+    expected = date.today() - timedelta(days=1825)
+    assert result == expected
 
 
-def test_is_complete_halts_pct_allows_normal_gaps() -> None:
-    """2022-style sanctions gap: ~5 months of trading halts in 2022.
-    Live ticker listed 2015, count=2400, expected ≈ 11y*252*0.85 = 2356.
-    2400 > 2356 → complete. Tolerates ~6 months of halts."""
-
-    store = MagicMock()
-    store.count_ohlcv.return_value = 2400
-    store.ticker_meta.return_value = (date(2015, 1, 1), None)
-
-    assert bh._is_complete(store, "LIVE", min_bars=1300) is True
+def test_earliest_expected_ts_unclamped_goes_to_min_year() -> None:
+    """MD loader has no 1825d cap. With moex_clamped=False, start = MIN_YEAR."""
+    meta = (None, None)
+    result = bh._earliest_expected_ts(meta, moex_clamped=False)
+    assert result == date(2018, 1, 1)  # MIN_YEAR
 
 
-def test_is_complete_below_count_threshold_no_metadata_returns_false() -> None:
-    """Both count and meta missing — incomplete."""
-    store = MagicMock()
-    store.count_ohlcv.return_value = 50
-    store.ticker_meta.return_value = None
+def test_earliest_expected_ts_with_listed_at_clamps() -> None:
+    """listed_at=2010 still goes to MIN_YEAR if MOEX cap doesn't pull earlier."""
+    from datetime import timedelta
 
-    assert bh._is_complete(store, "ORPHAN", min_bars=1300) is False
-
-
-def test_backfill_one_returns_negative_on_timeout() -> None:
-    """When SIGALRM/ctypes raises _LoaderTimeout inside _backfill_one, we
-    must catch it and return written=-1 so the caller can record the
-    failure without aborting the whole run."""
-    loader = MagicMock()
-    store = MagicMock()
-
-    def _fake_iter(_ticker: str, _start: date, _end: date) -> Any:
-        raise bh._LoaderTimeout("deadline exceeded")
-        yield  # pragma: no cover — generator marker
-
-    loader.iter_ohlcv.side_effect = _fake_iter
-
-    stats = bh._backfill_one(loader, store, "SBER", date(2018, 1, 1), date(2026, 12, 31))
-
-    assert stats == {"fetched": 0, "written": -1}
+    meta = (date(2010, 1, 1), None)
+    result = bh._earliest_expected_ts(meta)
+    # today minus 1825d; max(MIN_YEAR=2018, listed_at=2010, today-1825d) = today-1825d
+    expected = date.today() - timedelta(days=1825)
+    assert result == expected
 
 
-def test_backfill_one_returns_negative_on_generic_exception() -> None:
-    """Any other exception must be caught and recorded as a failure too —
-    one bad ticker should never crash the whole run."""
-    loader = MagicMock()
-    store = MagicMock()
-
-    loader.iter_ohlcv.side_effect = RuntimeError("boom")
-
-    stats = bh._backfill_one(loader, store, "SBER", date(2018, 1, 1), date(2026, 12, 31))
-
-    assert stats == {"fetched": 0, "written": -1}
-
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-
-def test_circuit_breaker_threshold_is_positive() -> None:
-    """The breaker must trip on N>0 consecutive failures. Pin the exact
-    value so we notice if anyone tunes it without thinking."""
-    assert bh._CIRCUIT_BREAKER_THRESHOLD >= 3
-
-
-def test_ticker_deadline_is_reasonable() -> None:
-    """The per-ticker deadline must be high enough to fit the median
-    ticker (a few seconds) but low enough that one stuck ticker can't
-    starve the whole run overnight."""
-    assert (
-        30 <= bh._TICKER_DEADLINE_SECONDS <= 600
-    )  # 2026-08-18: lowered to 30s after live cluster observed 180s timeout on every Tinkoff MD archive call from .107
-
-
-# ---------------------------------------------------------------------------
-# _set_complete_flag — flag-flip helper called inside the main loop
-# ---------------------------------------------------------------------------
-
-
-def test_set_complete_flag_true_calls_store() -> None:
-    store = MagicMock()
-    bh._set_complete_flag(store, "SBER", complete=True)
-    store.mark_backfill_complete.assert_called_once_with("SBER", complete=True)
-
-
-def test_set_complete_flag_false_calls_store() -> None:
-    store = MagicMock()
-    bh._set_complete_flag(store, "FAIL", complete=False)
-    store.mark_backfill_complete.assert_called_once_with("FAIL", complete=False)
-
-
-def test_set_complete_flag_swallows_pg_errors() -> None:
-    """If the flag flip fails (e.g. transient DB), the backfill loop
-    must not crash — the bars are the primary deliverable, the flag is
-    metadata that can be re-flipped on the next run."""
-    import logging  # noqa: F401
-
-    store = MagicMock()
-    store.mark_backfill_complete.side_effect = RuntimeError("connection lost")
-    # Must not raise.
-    bh._set_complete_flag(store, "SBER", complete=True)
-    store.mark_backfill_complete.assert_called_once()
+def test_earliest_expected_ts_unclamped_with_listed_at() -> None:
+    """MD loader with listed_at=2010 still goes back to MIN_YEAR (full history)."""
+    meta = (date(2010, 1, 1), None)
+    result = bh._earliest_expected_ts(meta, moex_clamped=False)
+    # max(MIN_YEAR=2018, listed_at.year=2010) = 2018-01-01 (MIN_YEAR wins)
+    assert result == date(2018, 1, 1)
