@@ -69,6 +69,8 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any
 
+from src.risk.gate import PortfolioState, RiskGate, TradeIntent
+
 logger = logging.getLogger("alphard.coordinator")
 
 
@@ -176,7 +178,6 @@ class Coordinator:
         # the broker so order placement doesn't fail with `risk_gate is
         # None`. The gate is stateless (RiskLimits are deterministic), so
         # constructing it once per Coordinator is safe.
-        from src.risk.gate import RiskGate
         self._gate = RiskGate(limits=self.config.risk_limits)
 
     def _validate_state_for_execute(self) -> bool:
@@ -381,8 +382,6 @@ class Coordinator:
         return worst.value not in ("CRITICAL", "HIGH")
 
     def _risk_check(self) -> tuple[bool, tuple[str, ...]]:
-        from src.risk.gate import PortfolioState, TradeIntent
-
         # Issue #26: reuse the gate created in __init__ so the same
         # RiskLimits are applied to both the gate stage and the broker
         # stage. Previously each stage constructed its own gate, which
