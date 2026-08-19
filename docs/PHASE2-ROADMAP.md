@@ -50,9 +50,25 @@ This gate exists by design — it is a Phase 1 guarantee, not a bug.
 
 ### 2.2 — Macro Agent
 
-**What:** Daily CBR rate, IMOEX index, USD/RUB regime detection.
-**Inputs:** MOEX ISS CBR endpoint + CETS USD/RUB daily.
-**Outputs:** Regime label `risk_on | neutral | risk_off`, modifies Coordinator risk budget by ±20%.
+**What:** Daily CBR rate, USD/RUB, IMOEX regime detection → modifies Coordinator risk budget.
+
+**Inputs (all MOEX ISS, no paid vendor):**
+- CBR key rate — `/engines/currency/markets/selt/...` (1×/день после заседания ЦБ)
+- USD/RUB — `CETS` секция, daily candles
+- IMOEX index — `/iss/engines/stock/markets/shares/indices/MOEX.csv`
+
+**NOT in Phase 2 Macro scope** (deferred Phase 3+):
+- Brent/oil — needs paid vendor (Argus, Platts); outside MOEX ISS
+- CPI / GDP / PMI — quarterly/monthly with 1-2 month lag; useless for daily regime
+- Anything minute-resolution — Macro is daily, not intraday (matches user's "daily+ only" preference)
+
+**Regime classifier (deterministic, not ML):**
+- `risk_off` if CBR > 15% OR IMOEX drawdown > 20% over 60d
+- `risk_on_reduced` if USD/RUB Δ > 5% over 5d
+- else `neutral`
+
+**Output:** regime label + risk budget multiplier [0.5, 1.0] passed to Coordinator stage 0.
+
 **Why Phase 2:** Single-feature regime is a clean unit test; multi-factor requires 6+ months of history.
 
 ### 2.3 — Coordinator wired to all agents (Phase 5.2 in audit)
@@ -86,12 +102,18 @@ This gate exists by design — it is a Phase 1 guarantee, not a bug.
 **Metrics:** backfill bars/sec, daily_sync duration, auth_probe success rate, ohlcv_daily count, broker reconnect count.
 **Why Phase 2:** Need 4 weeks of operation before metrics are stable; Phase 2 is the natural deploy window.
 
-### 2.8 — Daily backup (Postgres)
+### 2.8 — Daily backup (Postgres OHLCV data)
 
 **What:** `pg_dump alphard` → `/backup/alphard_YYYY-MM-DD.sql.gz` daily at 02:00 MSK.
 **Retention:** 7 daily, 4 weekly, 6 monthly.
 **Restore:** already in RUNBOOK.md §"Восстановление из daily backup".
-**Why Phase 2:** Single-host backup target is fine for 1-bot deployment; off-host (S3/B2) is Phase 3.
+
+**Why Phase 2 even though GitHub backs up code:**
+GitHub `git clone` recovers: src/, scripts/, tests/, docs/, CI config, Dockerfiles.
+GitHub does NOT recover: OHLCV data (2.6M+ bars), `.env` (secrets), Postgres volume.
+The OHLCV backfill took hours of Tinkoff MD downloads; if `.107` dies, that history is gone without `pg_dump` snapshots. Daily backup covers the **data single-point-of-failure**, not the source code (which GitHub already covers).
+
+**Deferred to Phase 3+:** Off-host backup (S3/B2) — single-host NAS `/backup/` is fine until we have multi-host or DR requirements.
 
 ### 2.9 — Self-audit cron (6h)
 
@@ -145,9 +167,9 @@ When Phase 2.1-2.3 land, these unblock and graduate from "deferred" to "in scope
 
 ## Open questions for user
 
-1. **Sandbox vs real-account first run?** — Phase 1.4 plan assumes sandbox end-to-end → 7-day soak → flip `LIVE_TRADING=true` on real account. If you want sandbox-only for the foreseeable future, Phase 1.4 = done after the 7-day soak and Phase 2 starts.
-2. **Macro Agent data vendor** — MOEX ISS CBR is free but updates 1× per business day; do you want minute-resolution from Tinkoff CETS instead?
-3. **Backup target** — `/backup/` on `.107` (local NAS) or S3-compatible (cheaper at scale, requires keys)?
+1. ✅ **Sandbox vs real-account first run** — sandbox-first (user confirmed 2026-08-19). Phase 1.4 = sandbox end-to-end → 7-day soak → flip `LIVE_TRADING=true` on real account.
+2. ✅ **Macro Agent data vendor** — MOEX ISS only (user confirmed 2026-08-19). CBR + USD/RUB + IMOEX; deferred Brent/CPI/GDP.
+3. ✅ **Backup target** — GitHub as code backup is sufficient (user confirmed 2026-08-19). Local `/backup/` only if Phase 2.8 ships for hot data, not source-of-truth.
 
 ---
 
