@@ -447,8 +447,17 @@ class TinkoffAccount(BrokerAccount):
         return mapping.get(raw, OrderStatus.SUBMITTED)
 
 
-def from_env(env: Optional[dict[str, str]] = None) -> TinkoffAccount:
-    """Construct TinkoffAccount from environment variables."""
+def from_env(
+    env: Optional[dict[str, str]] = None,
+    risk_gate: Any = None,
+) -> "TinkoffAccount":
+    """Construct TinkoffAccount from environment variables.
+
+    Issue #26: `risk_gate` is forwarded to the constructor so callers
+    can share a single RiskGate instance between the gate stage and the
+    broker stage. If None, the broker falls back to a fail-safe default
+    (all orders rejected, see TinkoffAccount.place_order).
+    """
     if env is None:
         env = dict(os.environ)  # cast _Environ[str] to dict[str, str]
     sandbox_token = env.get("TINKOFF_SANDBOX_TOKEN")
@@ -457,7 +466,7 @@ def from_env(env: Optional[dict[str, str]] = None) -> TinkoffAccount:
 
     # Prefer REAL token (full universe, 200 req/min)
     if real_token and real_token.strip():
-        return TinkoffAccount(token=real_token, account_id=account_id)
+        return TinkoffAccount(token=real_token, account_id=account_id, risk_gate=risk_gate)
     if sandbox_token and sandbox_token.strip() and sandbox_token != "placeholder_get_from_tbank":
-        return TinkoffAccount(token=sandbox_token, account_id=account_id)
+        return TinkoffAccount(token=sandbox_token, account_id=account_id, risk_gate=risk_gate)
     raise BrokerError("No TINKOFF_SANDBOX_TOKEN or TINKOFF_REAL_TOKEN set")
