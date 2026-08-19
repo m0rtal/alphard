@@ -505,3 +505,34 @@ class TestUniverse:
             metas = loader.list_tickers_with_figi()
         tickers = {m.ticker for m in metas}
         assert tickers == {"SBER"}
+
+    def test_figi_for_returns_none_for_unknown_ticker(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """_figi_for returns None when ticker is not in cached universe.
+
+        This covers the runtime check from issue #14 D.2 (assert -> runtime)
+        in src/data/tinkoff_md_loader.py:540-549.
+        """
+        monkeypatch.setenv("TINKOFF_SANDBOX_TOKEN", "fake-token-1234567890")
+        from src.data.token_bucket import TokenBucket
+        from src.data.models import TickerMeta
+
+        loader = TinkoffInvestMDDataLoader(bucket=TokenBucket(rate=1000.0, window_seconds=1.0))
+
+        # Mock list_tickers so _figi_for has a deterministic universe
+        # without needing a real gRPC connection.
+        cached = [
+            TickerMeta(
+                ticker="SBER",
+                figi="BBG004730N88",
+                class_code="TQBR",
+                name="Sber",
+                lot=1,
+                source="tkf",
+            ),
+        ]
+        monkeypatch.setattr(loader, "list_tickers", lambda: cached)
+
+        # SBER is cached -> TickerMeta returned
+        assert loader._figi_for("SBER") is not None
+        # Unknown ticker -> None (covers line 549)
+        assert loader._figi_for("UNKNOWN") is None

@@ -1203,6 +1203,30 @@ class TestOrderFlow:
         assert len(state.positions) == 1
         assert state.positions[0].symbol == "SBER"
 
+    def test_order_slicer_value_error_handled(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """If OrderSlicer raises ValueError (e.g. negative qty slips through),
+        OrderFlow.submit_market must catch it and continue with empty slices.
+
+        Covers src/broker/integration.py:104-105 (except ValueError).
+        """
+        from src.broker.slicer import OrderSlicer
+
+        monkeypatch.setenv("TINKOFF_SANDBOX_TOKEN", "fake-token-1234567890")
+
+        def _raise_value_error(*args, **kwargs):
+            raise ValueError("forced for test")
+
+        monkeypatch.setattr(OrderSlicer, "slice", _raise_value_error)
+
+        broker = MagicMock()
+        flow = OrderFlow(broker=broker, risk_gate=self._approved_gate())
+        result = flow.submit_market(
+            "SBER", OrderSide.BUY, Decimal("100"), self._portfolio()
+        )
+        # No slices submitted; final_status is REJECTED
+        assert result.slice_count == 0
+        assert broker.place_order.call_count == 0
+
 
 # ────────────────────────────────────────────
 # ABC contract
