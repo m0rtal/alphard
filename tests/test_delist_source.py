@@ -8,7 +8,6 @@ from unittest.mock import patch
 
 from src.data.delist_source import fetch_delist_dates, _parse_date
 
-
 # ---------------------------------------------------------------------------
 # _parse_date
 # ---------------------------------------------------------------------------

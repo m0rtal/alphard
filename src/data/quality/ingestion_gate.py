@@ -61,7 +61,6 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .severity import Issue, IssueKind, QualityReport
 
-
 # ---------------------------------------------------------------------------
 # Data types
 # ---------------------------------------------------------------------------

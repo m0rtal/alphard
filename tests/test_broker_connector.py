@@ -142,8 +142,13 @@ from src.broker.orders import (  # noqa: E402
     OrderSide,
     OrderStatus,
 )
+<<<<<<< HEAD
 from src.broker.slicer import OrderSlicer  # noqa: E402
 from src.broker.tinkoff_account import BrokerError, TinkoffAccount  # noqa: E402
+=======
+from src.broker.slicer import OrderSlicer
+from src.broker.tinkoff_account import BrokerError, TinkoffAccount
+>>>>>>> 18b1d42 (chore(deps): bump black 24.10.0→26.3.1, pytest 7.4.4→9.0.3 (issue #16))
 
 # ────────────────────────────────────────────
 # Orders tests

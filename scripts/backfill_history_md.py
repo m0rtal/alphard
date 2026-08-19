@@ -95,6 +95,7 @@ The history-data endpoint (``invest-public-api.tinkoff.ru``) and the
 aggregation to daily bars are otherwise identical to the upstream
 ``download_md.sh`` reference script.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -610,10 +611,7 @@ def main() -> int:
             # without --skip-known-bad will still attempt the ticker
             # (useful when Tinkoff later backfills the missing history).
             if args.skip_known_bad and meta is not None and meta.delisted_at is not None:
-                logger.info(
-                    f"{i}/{len(tickers)} {ticker}: skip (delisted_at={meta.delisted_at}, "
-                    "--skip-known-bad)"
-                )
+                logger.info(f"{i}/{len(tickers)} {ticker}: skip (delisted_at={meta.delisted_at}, " "--skip-known-bad)")
                 skipped_complete += 1
                 circuit_breaker_streak = 0
                 continue

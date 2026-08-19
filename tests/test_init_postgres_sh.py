@@ -16,7 +16,6 @@ from pathlib import Path
 
 import pytest
 
-
 HBA_PATH = Path(__file__).resolve().parent.parent / "scripts" / "init_postgres.sh"
 
 
