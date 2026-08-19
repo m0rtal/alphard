@@ -23,7 +23,6 @@ from typing import Any, Iterable
 from .models import CorporateAction, OHLCVRow, TickerMeta
 from .store import DataStore, StoreError
 
-
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS ticker_universe (
     ticker         TEXT PRIMARY KEY,

@@ -46,7 +46,6 @@ from .historical import HistoricalParams, check_historical
 from .ingestion_gate import Bar, IngestionParams, check_ingestion
 from .severity import QualityReport, Severity
 
-
 # ---------------------------------------------------------------------------
 # CSV -> Bar list
 # ---------------------------------------------------------------------------

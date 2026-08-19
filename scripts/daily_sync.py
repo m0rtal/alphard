@@ -18,6 +18,7 @@ ticker is safe to consume. Same logic lives in
 ``scripts/backfill_history_md._is_complete`` — we re-import it
 rather than duplicate.
 """
+
 from __future__ import annotations
 
 import argparse

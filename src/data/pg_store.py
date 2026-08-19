@@ -414,8 +414,7 @@ class PostgresDataStore(DataStore):
         """
         self._connect()
         with self._conn.cursor() as cur:
-            cur.execute(
-                """
+            cur.execute("""
                 WITH ranked AS (
                     SELECT ctid,
                            ROW_NUMBER() OVER (
@@ -429,8 +428,7 @@ class PostgresDataStore(DataStore):
                 )
                 DELETE FROM ohlcv_daily
                 WHERE ctid IN (SELECT ctid FROM to_delete)
-            """
-            )
+            """)
             deleted = int(cur.rowcount)
         self._conn.commit()
         return deleted

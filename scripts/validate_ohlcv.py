@@ -33,6 +33,7 @@ Run as
 Exit codes: 0 = clean (or only WARNING/INFO), 2 = at least one
 CRITICAL issue, 3 = infrastructure error (DB connection, etc.).
 """
+
 from __future__ import annotations
 
 import argparse

@@ -11,11 +11,9 @@ from __future__ import annotations
 from datetime import date
 from unittest.mock import MagicMock
 
-
 # conftest.py adds PROJECT_ROOT to sys.path so ``backfill_history_md``
 # resolves as a top-level module.
 import backfill_history_md as bh  # noqa: E402
-
 
 # ---------------------------------------------------------------------------
 # _resolve_universe

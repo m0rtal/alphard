@@ -157,14 +157,12 @@ class PostgresAuditLog:
                 "PostgresAuditLog needs psycopg: install with `pip install psycopg[binary]`"
             ) from e  # noqa: E501
         self._cursor.execute(
-            sql.SQL(
-                """
+            sql.SQL("""
                 INSERT INTO {}
                     (ticker, gate, kind, severity, message, count, extra)
                 VALUES
                     (%s, %s, %s, %s, %s, %s, %s::jsonb)
-                """
-            ).format(sql.Identifier(self._table)),
+                """).format(sql.Identifier(self._table)),
             (
                 ticker,
                 gate,
