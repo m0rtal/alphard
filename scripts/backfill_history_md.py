@@ -508,6 +508,14 @@ def main() -> int:
     parser.add_argument("--token", default=None, help="Override $TINKOFF_SANDBOX_TOKEN/$TINKOFF_REAL_TOKEN.")
     parser.add_argument("--batch-sleep", type=float, default=0.0, help="Sleep between tickers (rate-limit cushion).")
     parser.add_argument("--force", action="store_true", help="Re-fetch even if ticker already has min-bars.")
+    parser.add_argument(
+        "--skip-known-bad",
+        action="store_true",
+        help="Skip tickers whose ticker_universe.delisted_at is set (heuristic: no-data "
+        "tickers from mark_terminally_failed.py). Default OFF so a fresh universe is "
+        "still attempted; turn ON for re-runs that should focus on live + backfillable "
+        "instruments only.",
+    )
     args = parser.parse_args()
 
     if not args.dsn:
@@ -596,6 +604,19 @@ def main() -> int:
             # (MOEX ISS = 1825d). Without this, we ask MOEX for 9 years of
             # pre-listing data and get nothing back.
             meta = store.ticker_meta(ticker)
+            # Skip-no-data: when --skip-known-bad is set, drop tickers that
+            # mark_terminally_failed.py (or any other source) has flagged
+            # as no-data via delisted_at. The flag remains — re-running
+            # without --skip-known-bad will still attempt the ticker
+            # (useful when Tinkoff later backfills the missing history).
+            if args.skip_known_bad and meta is not None and meta.delisted_at is not None:
+                logger.info(
+                    f"{i}/{len(tickers)} {ticker}: skip (delisted_at={meta.delisted_at}, "
+                    "--skip-known-bad)"
+                )
+                skipped_complete += 1
+                circuit_breaker_streak = 0
+                continue
             # Primary loader is Tinkoff MD archive (yearly ZIPs back to
             # MIN_YEAR, no 1825d cap). The cap only applies if we ever
             # fall back to MOEX ISS as the only source — handled inside

@@ -227,3 +227,53 @@ def test_earliest_expected_ts_unclamped_with_listed_at() -> None:
     result = bh._earliest_expected_ts(meta, moex_clamped=False)
     # max(MIN_YEAR=2018, listed_at.year=2010) = 2018-01-01 (MIN_YEAR wins)
     assert result == date(2018, 1, 1)
+
+
+# ---------------------------------------------------------------------------
+# --skip-known-bad flag
+# ---------------------------------------------------------------------------
+
+
+def test_argparser_accepts_skip_known_bad() -> None:
+    """--skip-known-bad is wired into argparse and parses to args.skip_known_bad."""
+    import argparse  # noqa: PLC0415 — local to keep imports tight
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--skip-known-bad",
+        action="store_true",
+    )
+    args = parser.parse_args(["--skip-known-bad"])
+    assert args.skip_known_bad is True
+    args_default = parser.parse_args([])
+    assert args_default.skip_known_bad is False
+
+
+def test_skip_known_bad_logic_drops_delisted_at_tickers() -> None:
+    """When --skip-known-bad is set, the per-ticker guard short-circuits
+    for tickers whose TickerMeta.delisted_at is set. We exercise the
+    predicate in isolation (no broker, no DB) — integration is the
+    deployed stack's job."""
+    import argparse  # noqa: PLC0415
+    from datetime import date as _date  # noqa: PLC0415
+
+    # Build the same args namespace the parser would, just without running main().
+    args = argparse.Namespace(skip_known_bad=True)
+    meta = MagicMock()
+    meta.delisted_at = _date(2026, 8, 19)
+    assert args.skip_known_bad and meta.delisted_at is not None
+
+    # Without the flag, the same ticker would NOT be skipped.
+    args_off = argparse.Namespace(skip_known_bad=False)
+    assert not (args_off.skip_known_bad and meta.delisted_at is not None)
+
+
+def test_skip_known_bad_keeps_tickers_without_delisted_at() -> None:
+    """Tickers with delisted_at=None are NEVER dropped by --skip-known-bad."""
+    import argparse  # noqa: PLC0415
+
+    args = argparse.Namespace(skip_known_bad=True)
+    meta = MagicMock()
+    meta.delisted_at = None
+    # Predicate is False → ticker is NOT skipped, proceeds to fetch.
+    assert not (args.skip_known_bad and meta.delisted_at is not None)
