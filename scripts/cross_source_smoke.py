@@ -31,7 +31,7 @@ SCENARIOS
    around the same drift. Expect NO HIGH issues. Pearson > 0.99.
 2. **diverged_split**: same drift, but one series has a 5% step
    at day 30 (mimics an unadjusted split). Expect HIGH
-   XSC_CORRELATION_LOW + XSC_DIVERGENCE_HIGH.
+   XSC_DIVERGENCE_HIGH + MEDIUM XSC_CORRELATION_LOW.
 3. **insufficient_data**: only 3 aligned dates. Expect HIGH
    XSC_SOURCE_MISSING (low correlation denominator).
 
@@ -40,7 +40,10 @@ OUTPUT
 - Human-readable summary on stdout
 - Exit code 0 = all scenarios produced expected outcomes
 - Exit code 1 = one or more scenarios diverged from expectations
-- Exit code 2 = unexpected error
+  (also the default Python exit code for any unhandled exception;
+  the script has no `sys.exit(2)` call, so a separate "unexpected
+  error" exit code is intentionally NOT documented — that contract
+  would be unreachable with current deterministic inputs.)
 """
 
 from __future__ import annotations
