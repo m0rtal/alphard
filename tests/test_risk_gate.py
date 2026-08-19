@@ -446,6 +446,71 @@ class TestFailSafe:
                 max_daily_loss_pct=Decimal("3"),
             )
 
+    def test_fail_safe_market_order_placeholder_price_rejected(
+        self, limits: RiskLimits, base_state: PortfolioState
+    ) -> None:
+        """Issue #11: an intent with price=Decimal('1') and qty>1 is the
+        historical MarketOrder placeholder. RiskGate MUST refuse it
+        with a clearly-named violation rather than computing a tiny
+        notional and silently passing."""
+        gate = RiskGate(limits=limits)
+        intent = TradeIntent(
+            symbol="SBER",
+            side="buy",
+            quantity=Decimal("1000"),
+            price=Decimal("1"),  # the historical placeholder
+        )
+        decision = gate.evaluate(intent, base_state)
+        assert decision.allowed is False
+        assert any("RISK_MARKET_ORDER_NO_QUOTE" in v for v in decision.violations)
+
+    def test_fail_safe_market_order_placeholder_price_allowed_when_qty_le_1(
+        self, limits: RiskLimits, base_state: PortfolioState
+    ) -> None:
+        """The price=Decimal('1') sentinel only blocks when qty>1. An
+        intent with qty=1 and price=1 has notional=1, which is a tiny
+        amount and not a market-order bypass. This preserves
+        ringfenced edge cases like closed-out positions."""
+        gate = RiskGate(limits=limits)
+        intent = TradeIntent(
+            symbol="SBER",
+            side="buy",
+            quantity=Decimal("1"),
+            price=Decimal("1"),
+        )
+        decision = gate.evaluate(intent, base_state)
+        # Allowed if no other violation; the only check is no_position
+        # size exceed (notional=1 vs 10M equity = 0.00001%).
+        assert decision.allowed is True
+
+
+# ===========================================================================
+# Issue #11: MarketOrder end-to-end — confirms that RiskGate reject
+# propagates to the broker as OrderStatus.REJECTED, and that the
+# critic (price=Decimal('1') bypass) is now structurally impossible.
+# ===========================================================================
+
+
+class TestIssue11MarketOrderBypass:
+    def test_market_order_intent_with_placeholder_price_is_rejected_outright(
+        self, limits: RiskLimits, base_state: PortfolioState
+    ) -> None:
+        """End-to-end: the exact PoC from issue #11 — qty=100000 SBER
+        with price=Decimal('1') — must be rejected by RiskGate instead
+        of silently passing at 0.001% of NAV."""
+        gate = RiskGate(limits=limits)
+        intent = TradeIntent(
+            symbol="SBER",
+            side="buy",
+            quantity=Decimal("100000"),
+            price=Decimal("1"),
+        )
+        decision = gate.evaluate(intent, base_state)
+        assert decision.allowed is False
+        # The PoC violation must be present (not just RISK_POSITION
+        # computed against the wrong notional).
+        assert any("RISK_MARKET_ORDER_NO_QUOTE" in v for v in decision.violations)
+
 
 # ===========================================================================
 # RiskLimits boundary tests

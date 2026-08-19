@@ -240,6 +240,23 @@ class RiskGate:
         violations: list[str] = []
         meta: dict[str, Any] = {}
 
+        # Hard pre-check (issue #11): the historical ``MarketOrder`` path
+        # in TinkoffAccount._build_intent_and_state used ``Decimal("1")``
+        # as a placeholder price when no live quote was available. That
+        # caused position_pct to be 1/100..1/300 of the real value and
+        # silently bypassed RISK_POSITION / RISK_SECTOR. Here we catch
+        # the sentinel at the gate boundary: if ``price`` is exactly
+        # ``Decimal("1")`` AND ``quantity > 1``, the intent is almost
+        # certainly a market-order-without-live-quote, which is unsafe.
+        # We refuse rather than guessing.
+        if intent.price == Decimal("1") and intent.quantity > Decimal("1"):
+            violations.append(
+                "RISK_MARKET_ORDER_NO_QUOTE: intent.price=Decimal('1') is the "
+                "historical placeholder for an unresolved market-order quote; "
+                "RiskGate cannot evaluate an intent without a real price. "
+                "Caller must fetch a live quote and resubmit."
+            )
+
         self._check_position_size(intent, state, violations, meta)
         self._check_sector_exposure(intent, state, violations, meta)
         self._check_daily_loss(state, violations, meta)
