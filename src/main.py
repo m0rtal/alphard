@@ -194,17 +194,34 @@ def _backfill_supervisor_loop() -> None:
             break
         # Backoff before respawn.
         _sleep_interruptible(_BACKFILL_RESPAWN_BACKOFF_SECONDS)
-        # Rate-limit: count deaths in last hour.
-        now = time.monotonic()
-        death_timestamps = [t for t in death_timestamps if now - t < 3600]
-        death_timestamps.append(now)
-        if len(death_timestamps) > _BACKFILL_MAX_RESPAWNS_PER_HOUR:
-            _supervisor_logger.critical(
-                f"_backfill_supervisor_loop: backfill died {len(death_timestamps)} times in the "
-                f"last hour (>_BACKFILL_MAX_RESPAWNS_PER_HOUR); aborting container so Docker "
-                f"can restart cleanly with fresh state."
-            )
-            os._exit(1)
+        # `rc` is always bound at this point because the inner while/break
+        # guarantees we only reach here via the `waited_pid == pid` branch
+        # which assigns rc. If rc were missing we'd have hit the outer
+        # `else` (shutdown handler) instead. We assert it for safety.
+        assert rc is not None
+        # Rate-limit: count ONLY CRASHES (rc != 0) in the last hour. Clean
+        # exits (rc == 0) are the backfill finishing its universe pass with
+        # no tickers (e.g. empty sandbox universe, mark_terminally_failed
+        # exhausted). Counting those caused a permanent restart loop on
+        # 2026-08-20 because Tinkoff sandbox returned 401 for every token
+        # while Tinkoff's network behaviour cut off HTTP responses from
+        # .103/.107 — every backfill exited rc=0 in 2 seconds, the
+        # supervisor reset the count every 30s, and we never reached a
+        # crash to invert the cycle. The Docker container restart loop
+        # then zeroed the uptime gauge and produced a sawtooth on Grafana.
+        # We now differentiate: rc=0 → no-op, rc≠0 → account toward
+        # the per-hour cap.
+        if rc != 0:
+            now = time.monotonic()
+            death_timestamps = [t for t in death_timestamps if now - t < 3600]
+            death_timestamps.append(now)
+            if len(death_timestamps) > _BACKFILL_MAX_RESPAWNS_PER_HOUR:
+                _supervisor_logger.critical(
+                    f"_backfill_supervisor_loop: backfill crashed {len(death_timestamps)} "
+                    f"times in the last hour (>_BACKFILL_MAX_RESPAWNS_PER_HOUR); "
+                    f"aborting container so Docker can restart cleanly with fresh state."
+                )
+                os._exit(1)
 
 
 def _daily_sync_loop() -> None:
