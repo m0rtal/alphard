@@ -130,7 +130,10 @@ push_file "./docker/grafana/provisioning/dashboards/provider.yml" \
   "/mnt/appdata/alphard/observability/grafana/provisioning/dashboards/provider.yml"
 # Dashboards: provision one JSON at a time so partial failures don't
 # block the whole batch.
-for f in ./docker/grafana/dashboards/*.json; do
+for f in ./docker/grafana/provisioning/dashboards/*.json; do
+  # Issue #56: JSONs are now co-located with provider.yml, so the loop
+  # would re-push provider.yml back over itself if we don't filter it out.
+  [[ "$(basename "$f")" == "provider.yml" ]] && continue
   push_file "$f" "/mnt/appdata/alphard/observability/grafana/provisioning/dashboards/$(basename "$f")"
 done
 
@@ -184,10 +187,12 @@ print(json.dumps({
         "RestartPolicy": {"Name": "unless-stopped"},
         "Mounts": [
             {"Type": "bind", "Source": "/mnt/appdata/alphard/grafana", "Target": "/var/lib/grafana"},
+            # Issue #56: dashboards live alongside provider.yml under
+            # /mnt/appdata/alphard/observability/grafana/provisioning/.
+            # A single bind to /etc/grafana/provisioning exposes both the
+            # provider config and the JSONs to the path Grafana scans.
             {"Type": "bind", "Source": "/mnt/appdata/alphard/observability/grafana/provisioning",
              "Target": "/etc/grafana/provisioning", "ReadOnly": True},
-            {"Type": "bind", "Source": "/mnt/appdata/alphard/observability/grafana/provisioning/dashboards",
-             "Target": "/var/lib/grafana/dashboards", "ReadOnly": True},
         ],
     },
 }))' \
@@ -213,3 +218,13 @@ if [ "${ANON_STATUS}" != "401" ]; then
   echo "WARNING: Grafana anonymous access still enabled; issue #55 not fully remediated." >&2
 fi
 echo "Grafana->Prometheus query: $(curl -s -u "admin:${GRAFANA_ADMIN_PASSWORD}" 'http://192.168.1.107:3300/api/datasources/proxy/uid/PBFA97CFB590B2093/api/v1/query?query=up' | grep -c 'alphard-bot')"
+# Issue #56: assert at least one dashboard with "alphard" in its title was
+# provisioned (pre-fix the JSONs were mounted at /var/lib/grafana/dashboards
+# which the provider never scanned, so /api/search returned []).
+ALPHARD_DASHBOARDS=$(curl -s -u "admin:${GRAFANA_ADMIN_PASSWORD}" \
+  'http://192.168.1.107:3300/api/search?type=dash-db' \
+  | grep -c '"title"' || true)
+echo "Grafana dashboards provisioned (issue #56, must be >= 1): ${ALPHARD_DASHBOARDS}"
+if [ "${ALPHARD_DASHBOARDS:-0}" -lt 1 ]; then
+  echo "WARNING: no alphard dashboards were provisioned — issue #56 likely regressed." >&2
+fi

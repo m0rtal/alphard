@@ -199,8 +199,13 @@ services:
     user: "472:472"
     volumes:
       - /mnt/appdata/alphard/grafana:/var/lib/grafana
+      # Issue #56: dashboards are now co-located with the provider.yml in
+      # ./docker/grafana/provisioning/dashboards/. Grafana scans
+      # /etc/grafana/provisioning/dashboards (per provider.yml:5) which is
+      # where this bind-mount lands, so the JSONs get picked up. Pre-fix
+      # the JSONs lived at ./docker/grafana/dashboards and were mounted at
+      # /var/lib/grafana/dashboards, which the provider never scans.
       - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
     depends_on:
       - prometheus
     profiles: ["observability"]
