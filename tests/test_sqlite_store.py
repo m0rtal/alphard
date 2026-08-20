@@ -475,3 +475,117 @@ class TestCountOhlcv:
         """Count when the table is empty."""
         total = sqlite_store.count_ohlcv()
         assert total == 0
+
+
+# ==============================================================================
+# 5. Adjusted OHLCV (Phase 2.5 step 2b) — coverage tests for sqlite_store
+# ==============================================================================
+
+
+class _FakeExplodingConn:
+    """Mimics sqlite3.Connection whose executemany/execute always raise.
+
+    Patches the read-only attribute by replacing the entire _conn on the
+    store, which python's mock can rebind freely.
+    """
+
+    def __init__(self, real_conn):
+        self._real_conn = real_conn
+
+    def executemany(self, sql, params):
+        raise sqlite3.Error("boom")
+
+    def execute(self, sql, params=None):
+        raise sqlite3.Error("boom")
+
+    def commit(self):
+        pass
+
+    def close(self):
+        pass
+
+
+class TestAdjustedOhlcv:
+    """Coverage for the ohlcv_daily_adj surface introduced in PR #83.
+
+    Targets three uncovered paths in InMemorySQLiteStore that the orchestrator
+    suite (test_apply_corporate_actions.py) does not exercise:
+      - upsert_ohlcv_adj early-return on empty input (line 289)
+      - upsert_ohlcv_adj raises StoreError on sqlite3.Error (lines 319-320)
+      - query_ohlcv_adj raises StoreError on sqlite3.Error (lines 337-338)
+    """
+
+    def _seed_sber(self, store: InMemorySQLiteStore) -> None:
+        store.upsert_tickers(
+            [
+                TickerMeta(
+                    ticker="SBER",
+                    figi="RU0009029540",
+                    name="Sberbank",
+                    lot=10,
+                    isin="RU0009029540",
+                    currency="RUB",
+                    source="moex",
+                )
+            ]
+        )
+
+    def test_upsert_ohlcv_adj_empty_rows_returns_zero(self, sqlite_store: InMemorySQLiteStore) -> None:
+        """Empty input is a no-op (covers early-return at line 289)."""
+        count = sqlite_store.upsert_ohlcv_adj([])
+        assert count == 0
+        assert sqlite_store.count_ohlcv_adj() == 0
+
+    def test_upsert_ohlcv_adj_error_path_raises_store_error(self, sqlite_store: InMemorySQLiteStore) -> None:
+        """Forced sqlite3.Error in executemany is wrapped in StoreError (319-320)."""
+        from src.data.store import StoreError
+
+        exploding = _FakeExplodingConn(sqlite_store._conn)
+        original_conn = sqlite_store._conn
+        sqlite_store._conn = exploding
+        try:
+            with pytest.raises(StoreError, match="upsert_ohlcv_adj failed"):
+                sqlite_store.upsert_ohlcv_adj(
+                    [
+                        OHLCVRow(
+                            ticker="SBER",
+                            ts=date(2024, 1, 2),
+                            open=Decimal("100"),
+                            high=Decimal("101"),
+                            low=Decimal("99"),
+                            close=Decimal("100.5"),
+                            volume=Decimal("1000"),
+                            source="tkf",
+                            adj_close=Decimal("100.5"),
+                        )
+                    ]
+                )
+        finally:
+            sqlite_store._conn = original_conn
+
+    def test_query_ohlcv_adj_error_path_raises_store_error(self, sqlite_store: InMemorySQLiteStore) -> None:
+        """Forced sqlite3.Error in execute is wrapped in StoreError (337-338)."""
+        from src.data.store import StoreError
+
+        self._seed_sber(sqlite_store)
+        exploding = _FakeExplodingConn(sqlite_store._conn)
+        original_conn = sqlite_store._conn
+        sqlite_store._conn = exploding
+        try:
+            with pytest.raises(StoreError, match="query_ohlcv_adj failed"):
+                sqlite_store.query_ohlcv_adj("SBER", date(2024, 1, 1), date(2024, 12, 31))
+        finally:
+            sqlite_store._conn = original_conn
+
+    def test_upsert_ohlcv_adj_happy_path_roundtrip(
+        self, sqlite_store: InMemorySQLiteStore, sample_ohlcv_rows: list[OHLCVRow]
+    ) -> None:
+        """Sanity check that the happy-path rows land and are queryable."""
+        self._seed_sber(sqlite_store)
+        n = sqlite_store.upsert_ohlcv_adj(sample_ohlcv_rows)
+        assert n == len(sample_ohlcv_rows)
+        assert sqlite_store.count_ohlcv_adj() == len(sample_ohlcv_rows)
+        # count_ohlcv_adj("SBER") covers the if-ticker branch (line 343-347).
+        assert sqlite_store.count_ohlcv_adj("SBER") == len(sample_ohlcv_rows)
+        rows = sqlite_store.query_ohlcv_adj("SBER", date(2000, 1, 1), date(2100, 1, 1))
+        assert len(rows) == len(sample_ohlcv_rows)

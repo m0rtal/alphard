@@ -332,6 +332,85 @@ class TestCorporateActions:
         assert rows[0].value == Decimal("3")  # latest write wins
 
 
+class TestAdjustedOhlcv:
+    """Integration tests for the Phase 2.5 step 2b ohlcv_daily_adj surface.
+
+    PR #83 introduced upsert_ohlcv_adj / query_ohlcv_adj on
+    PostgresDataStore. The contract is identical to the SQLite variant
+    (in-memory tests live in tests/test_sqlite_store.py). These tests
+    pin down the round-trip against a live Postgres instance so the
+    16 lines at pg_store.py:512-563 stay covered.
+    """
+
+    def test_upsert_and_query_roundtrip(self, pg_store):
+        """Seed an adjusted bar for a known ticker, query it back by date range."""
+        meta = TickerMeta(
+            ticker="PG_ADJ",
+            name="Adj Co",
+            lot=1,
+            currency="RUB",
+            source="tkf",
+        )
+        pg_store.upsert_ticker(meta)
+        row = OHLCVRow(
+            ticker="PG_ADJ",
+            ts=date(2026, 8, 20),
+            open=Decimal("100"),
+            high=Decimal("101"),
+            low=Decimal("99"),
+            close=Decimal("100.5"),
+            volume=Decimal("1000"),
+            source="tkf",
+            adj_close=Decimal("50.25"),  # 2:1 split — adj_close = close / 2
+        )
+        n = pg_store.upsert_ohlcv_adj([row])
+        assert n == 1
+
+        rows = pg_store.query_ohlcv_adj("PG_ADJ", date(2026, 1, 1), date(2026, 12, 31))
+        assert len(rows) == 1
+        assert rows[0].ticker == "PG_ADJ"
+        assert rows[0].adj_close == Decimal("50.25")
+
+    def test_upsert_replaces_on_conflict(self, pg_store):
+        """ON CONFLICT (ticker, ts) DO UPDATE — same key overwrites."""
+        meta = TickerMeta(
+            ticker="PG_ADJ2",
+            name="Adj Co 2",
+            lot=1,
+            currency="RUB",
+            source="tkf",
+        )
+        pg_store.upsert_ticker(meta)
+        base = OHLCVRow(
+            ticker="PG_ADJ2",
+            ts=date(2026, 8, 20),
+            open=Decimal("100"),
+            high=Decimal("101"),
+            low=Decimal("99"),
+            close=Decimal("100.5"),
+            volume=Decimal("1000"),
+            source="tkf",
+            adj_close=Decimal("100.5"),
+        )
+        pg_store.upsert_ohlcv_adj([base])
+        # Replace with same (ticker, ts), different adj_close (re-run after re-cls).
+        updated = OHLCVRow(
+            ticker="PG_ADJ2",
+            ts=date(2026, 8, 20),
+            open=Decimal("100"),
+            high=Decimal("101"),
+            low=Decimal("99"),
+            close=Decimal("100.5"),
+            volume=Decimal("1000"),
+            source="tkf",
+            adj_close=Decimal("50.25"),
+        )
+        pg_store.upsert_ohlcv_adj([updated])
+        rows = pg_store.query_ohlcv_adj("PG_ADJ2", date(2026, 1, 1), date(2026, 12, 31))
+        assert len(rows) == 1
+        assert rows[0].adj_close == Decimal("50.25")
+
+
 class TestMigrateDeduplicate:
     def test_deduplicate_no_op_when_no_duplicates(self, pg_store):
         """migrate_deduplicate returns 0 when no duplicates exist (steady-state).
