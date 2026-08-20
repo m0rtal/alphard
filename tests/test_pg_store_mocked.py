@@ -205,9 +205,23 @@ class _ConnFactory:
     def __init__(self) -> None:
         self.instances: list[FakeConnection] = []
 
-    def __call__(self, dsn: str, autocommit: bool = False) -> FakeConnection:
+    def __call__(
+        self,
+        dsn: str,
+        autocommit: bool = False,
+        *,
+        connect_timeout: int | None = None,
+        options: str | None = None,
+    ) -> FakeConnection:
         conn = FakeConnection(dsn, autocommit=autocommit)
         self.instances.append(conn)
+        # Record the kwargs alongside the connection so timeout tests can
+        # assert that psycopg.connect was called with the right values
+        # without reaching into unittest.mock internals.
+        self.last_kwargs = {
+            "connect_timeout": connect_timeout,
+            "options": options,
+        }
         return conn
 
     @property
@@ -412,6 +426,48 @@ class TestConnectionLifecycle:
 # ---------------------------------------------------------------------------
 # init_schema
 # ---------------------------------------------------------------------------
+
+
+class TestConnectTimeouts:
+    """H-NETWORK-DETECT (2026-08-20): connect_timeout + statement_timeout.
+
+    Backfill PID 19 on sha-bc867a2 sat idle for 17 hours holding an open
+    Postgres connection while sending zero queries — a deadlock that
+    nobody could see from outside the container. The two timeout guards
+    added in src/data/pg_store.py ensure:
+    - connect_timeout caps the TCP+startup handshake so a network outage
+      surfaces fast (10s) instead of the OS default ~2 minutes.
+    - options="-c statement_timeout=60000" makes Postgres itself cancel
+      any individual query that runs longer than 60s.
+    These tests pin both kwargs so future regressions are caught.
+    """
+
+    def test_connect_passes_connect_timeout_10(self, fake_conn_cls: Any) -> None:
+        s = PostgresDataStore(dsn="host=h dbname=d user=u")
+        s._connect()
+        assert len(fake_conn_cls.instances) == 1
+        # psycopg.connect was called with connect_timeout=10
+        recorded = fake_conn_cls.last_kwargs  # populated by _ConnFactory
+        assert recorded["connect_timeout"] == 10
+
+    def test_connect_passes_statement_timeout_option(self, fake_conn_cls: Any) -> None:
+        s = PostgresDataStore(dsn="host=h dbname=d user=u")
+        s._connect()
+        recorded = fake_conn_cls.last_kwargs
+        assert "options" in recorded
+        # Statement timeout must be in the libpq options string, in ms.
+        assert "statement_timeout" in recorded["options"]
+        assert "60000" in recorded["options"]
+
+    def test_reconnect_uses_timeouts_after_close(self, fake_conn_cls: Any) -> None:
+        s = PostgresDataStore(dsn="host=h dbname=d user=u")
+        s._connect()
+        s.close()
+        s._connect()
+        assert len(fake_conn_cls.instances) == 2
+        # Second connect (re-open) must also carry the timeouts.
+        assert fake_conn_cls.last_kwargs["connect_timeout"] == 10
+        assert "statement_timeout" in fake_conn_cls.last_kwargs["options"]
 
 
 class TestInitSchema:

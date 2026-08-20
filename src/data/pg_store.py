@@ -80,7 +80,27 @@ class PostgresDataStore(DataStore):
 
     def _connect(self) -> None:
         if self._conn is None or self._conn.closed:
-            self._conn = self._psycopg.connect(self._dsn, autocommit=True)
+            # H-NETWORK-DETECT (2026-08-20): backfill PID 19 sat idle for 17
+            # hours against alphard-postgres:5432 because Python held an
+            # open connection without sending any new query. Two timeout
+            # guards prevent this from being a silent indefinite hang:
+            #
+            # - connect_timeout=10: cap TCP+startup handshake so we fail
+            #   fast if Postgres is unreachable (instead of OS default
+            #   ~2 minutes).
+            # - options="-c statement_timeout=60000": force Postgres to
+            #   cancel any individual query that runs longer than 60s.
+            #   This is the real deadlock-buster: a hung query on the
+            #   server side now raises QueryCanceled within 60s, the
+            #   connection is returned to the pool, and the next caller
+            #   gets a fresh attempt. Without this, a single bad ticker
+            #   stall can wedge the backfill daemon for hours.
+            self._conn = self._psycopg.connect(
+                self._dsn,
+                autocommit=True,
+                connect_timeout=10,
+                options="-c statement_timeout=60000",
+            )
             if self._search_path:
                 with self._conn.cursor() as cur:
                     # SET search_path cannot use %s placeholders (Postgres
