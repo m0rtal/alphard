@@ -291,6 +291,16 @@ class TinkoffAccount(BrokerAccount):
         from src.risk.gate import PortfolioState
 
         snapshot = self.get_portfolio()
+        # Issue #42: a zero-NAV account (cold sandbox, or gRPC response
+        # missing total_amount_currencies) must raise a domain error
+        # rather than letting pydantic escape with ValidationError —
+        # PortfolioState requires gt=0 on both total_equity and peak_equity.
+        if snapshot.cash <= 0:
+            raise BrokerError(
+                f"Portfolio NAV is {snapshot.cash} for account {self._account_id}; "
+                "cannot evaluate risk. Fund the account or check that "
+                "total_amount_currencies is present in the gRPC response."
+            )
         # Issue #32: update the high-water mark BEFORE building the
         # snapshot so peak_equity >= total_equity (the PortfolioState
         # invariant). Persist best-effort; an OSError here does not
@@ -361,17 +371,29 @@ class TinkoffAccount(BrokerAccount):
                     portfolio, "total_amount", None
                 )
                 cash = Decimal("0")
-                if total_amount is not None:
-                    if hasattr(total_amount, "units") and hasattr(total_amount, "nano"):
-                        cash = Decimal(str(getattr(total_amount, "units", 0))) + Decimal(
-                            str(getattr(total_amount, "nano", 0))
-                        ) / Decimal("1000000000")
-                    else:
-                        # Legacy Money.value
-                        try:
-                            cash = Decimal(str(total_amount.value))
-                        except (AttributeError, TypeError, ValueError):
-                            cash = Decimal(str(total_amount))
+                if total_amount is None:
+                    # Issue #42: distinguish "gRPC gave us no NAV field"
+                    # from "account genuinely holds 0 RUB". The default
+                    # Decimal("0") conflates a parse/contract failure
+                    # with a real zero balance; _fetch_real_portfolio_state
+                    # raises BrokerError in either case, but logs the
+                    # contract mismatch so the operator can investigate.
+                    logger.warning(
+                        "get_portfolio() for account %s returned neither "
+                        "total_amount_currencies nor total_amount; "
+                        "treating as zero NAV",
+                        self._account_id,
+                    )
+                elif hasattr(total_amount, "units") and hasattr(total_amount, "nano"):
+                    cash = Decimal(str(getattr(total_amount, "units", 0))) + Decimal(
+                        str(getattr(total_amount, "nano", 0))
+                    ) / Decimal("1000000000")
+                else:
+                    # Legacy Money.value
+                    try:
+                        cash = Decimal(str(total_amount.value))
+                    except (AttributeError, TypeError, ValueError):
+                        cash = Decimal(str(total_amount))
                 return PortfolioSnapshot(
                     account_id=self._account_id,
                     cash=cash,

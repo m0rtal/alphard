@@ -308,3 +308,131 @@ class TestDrawdownTriggersRiskDD:
             state,
         )
         assert not any("RISK_DD" in v for v in decision.violations)
+
+
+class TestZeroNavPortfolioState:
+    """Issue #42 regression tests.
+
+    ``_fetch_real_portfolio_state`` must raise ``BrokerError`` (not bare
+    ``pydantic.ValidationError``) when ``get_portfolio`` reports a zero or
+    negative NAV, because ``PortfolioState`` requires ``gt=0`` on both
+    ``total_equity`` and ``peak_equity``. Without the guard, cold-start
+    sandboxes raise a ValidationError that callers catching ``BrokerError``
+    do not handle.
+    """
+
+    def test_zero_cash_on_cold_start_raises_broker_error(self, tmp_path, caplog):
+        """Cold start + cash=0 must raise BrokerError, never ValidationError."""
+        import logging
+
+        from src.broker.tinkoff_account import BrokerError, TinkoffAccount
+
+        with patch.dict(
+            os.environ,
+            {
+                "TINKOFF_SANDBOX_TOKEN": "t.test_token_aaaaaaaaaaaaaaaaaaa",
+                "ALPHARD_PEAK_STORE_DIR": str(tmp_path),
+            },
+        ):
+            acct = TinkoffAccount(
+                token="t.test_token_aaaaaaaaaaaaaaaaaaa",
+                account_id="SB1",
+                risk_gate=None,
+            )
+        assert acct._peak_equity == Decimal("0"), "cold start should seed peak=0"
+
+        with patch.object(acct, "get_portfolio") as mock_gp:
+            mock_gp.return_value = MagicMock(
+                cash=Decimal("0"),
+                positions=[],
+            )
+            with caplog.at_level(logging.WARNING):
+                with __import__("pytest").raises(BrokerError) as exc_info:
+                    acct._fetch_real_portfolio_state()
+
+        msg = str(exc_info.value)
+        assert "SB1" in msg, f"error must name the account id; got: {msg}"
+        assert "total_amount_currencies" in msg, f"error must hint at likely cause; got: {msg}"
+
+    def test_missing_total_amount_currencies_logs_warning(self, tmp_path, caplog):
+        """A gRPC response with no NAV field must be distinguishable in logs.
+
+        Issue #42 secondary defect: silently defaulting to ``Decimal("0")``
+        at the parse site conflates "gRPC contract mismatch" with a real
+        zero balance. The parse path must log at WARNING so operators can
+        distinguish the two.
+        """
+        import logging
+
+        from src.broker.tinkoff_account import TinkoffAccount
+
+        with patch.dict(
+            os.environ,
+            {
+                "TINKOFF_SANDBOX_TOKEN": "t.test_token_aaaaaaaaaaaaaaaaaaa",
+                "ALPHARD_PEAK_STORE_DIR": str(tmp_path),
+            },
+        ):
+            acct = TinkoffAccount(
+                token="t.test_token_aaaaaaaaaaaaaaaaaaa",
+                account_id="SB1",
+                risk_gate=None,
+            )
+
+        fake_portfolio = MagicMock(spec=["positions"])
+        fake_portfolio.positions = []
+        fake_portfolio.total_amount_currencies = None
+        fake_portfolio.total_amount = None
+
+        with patch("t_tech.invest.Client") as mock_client_cls:
+            mock_client = MagicMock()
+            mock_client.__enter__.return_value = mock_client
+            mock_client.users.get_accounts.return_value = MagicMock(accounts=[MagicMock(id="SB1")])
+            mock_client.operations.get_portfolio.return_value = fake_portfolio
+            mock_client_cls.return_value = mock_client
+
+            with caplog.at_level(logging.WARNING, logger="alphard"):
+                result = acct.get_portfolio()
+
+        assert result.cash == Decimal("0")
+        warning_msgs = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            "total_amount_currencies" in m for m in warning_msgs
+        ), f"expected WARNING about missing NAV field; got: {warning_msgs}"
+
+    def test_zero_cash_with_persisted_peak_raises_broker_error(self, tmp_path):
+        """Persisted peak=100000 + cash=0 must still raise BrokerError.
+
+        Guards against a regression where the cold-start guard is bypassed
+        once a peak has been written to disk (peak > 0 would mask the
+        zero cash but still violate total_equity > 0).
+        """
+        from src.broker.tinkoff_account import BrokerError, TinkoffAccount
+
+        peak_dir = tmp_path
+        peak_path = peak_dir / "peak_equity_SB1.json"
+        peak_path.write_text(json.dumps({"peak_equity": "100000"}), encoding="utf-8")
+
+        with patch.dict(
+            os.environ,
+            {
+                "TINKOFF_SANDBOX_TOKEN": "t.test_token_aaaaaaaaaaaaaaaaaaa",
+                "ALPHARD_PEAK_STORE_DIR": str(tmp_path),
+            },
+        ):
+            acct = TinkoffAccount(
+                token="t.test_token_aaaaaaaaaaaaaaaaaaa",
+                account_id="SB1",
+                risk_gate=None,
+            )
+        assert acct._peak_equity == Decimal("100000"), "peak should be loaded from disk"
+
+        with patch.object(acct, "get_portfolio") as mock_gp:
+            mock_gp.return_value = MagicMock(
+                cash=Decimal("0"),
+                positions=[],
+            )
+            with __import__("pytest").raises(BrokerError) as exc_info:
+                acct._fetch_real_portfolio_state()
+
+        assert "SB1" in str(exc_info.value)
