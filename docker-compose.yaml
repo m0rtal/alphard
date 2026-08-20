@@ -56,6 +56,9 @@ services:
       DATA_DEFAULT_TIMEFRAME: ${DATA_DEFAULT_TIMEFRAME:-1d}
       DATA_HISTORY_YEARS: ${DATA_HISTORY_YEARS:-5}
       LIVE_TRADING: ${LIVE_TRADING:-false}
+      # Phase 2.8 step 1: Prometheus metrics HTTP server port.
+      # Defaults to 8765; exposed at alphard-bot:8765/metrics inside the network.
+      ALPHARD_METRICS_PORT: ${ALPHARD_METRICS_PORT:-8765}
     volumes:
       - /mnt/appdata/alphard/logs:/app/logs
     networks:
@@ -187,7 +190,8 @@ services:
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD required}
     volumes:
       - /mnt/appdata/alphard/grafana:/var/lib/grafana
-      - ./docker/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
     ports:
       - "3000:3000"
     depends_on:

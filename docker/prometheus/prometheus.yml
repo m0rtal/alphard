@@ -1,22 +1,33 @@
-# Prometheus skeleton config — Phase 3+
-# Включается через профиль: docker compose --profile observability up -d
-# Targets наполняются в Phase 1+ (Data Agent, Quant Agent, Execution Agent).
-# Сейчас только self-scrape для проверки что Prometheus alive.
+# Prometheus scrape config — Phase 2.8 step 1
+# Activated via: docker compose --profile observability up -d
+# Scrapes alphard-bot on :8765/metrics + self on :9090/metrics.
+#
+# Tune scrape_interval / evaluation_interval here. Defaults: 15s.
 
 global:
   scrape_interval: 15s
   evaluation_interval: 15s
+  external_labels:
+    alphard: phase2-observability
 
 # Retention is configured via --storage.tsdb.retention-time flag (default 15d).
 # Override via PROMETHEUS_RETENTION_DAYS in .env (Phase 3+).
 
 scrape_configs:
+  # Self-scrape so Prometheus itself shows up in its own UI.
   - job_name: prometheus
     static_configs:
       - targets: ["localhost:9090"]
 
-  # Phase 3+: добавить jobs для alphard-bot metrics endpoint
-  # (требует /metrics HTTP endpoint в src/main.py).
-  # - job_name: alphard-bot
-  #   static_configs:
-  #     - targets: ["alphard-bot:8000"]
+  # Phase 2.8 step 1: alphard-bot metrics endpoint.
+  # ALPHARD_METRICS_PORT defaults to 8765; the bot exposes both /health (200 ok)
+  # and /metrics in Prometheus text exposition format on that port.
+  - job_name: alphard-bot
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["alphard-bot:8765"]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        regex: '([^:]+):.*'
+        replacement: '$1'

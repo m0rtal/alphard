@@ -508,6 +508,25 @@ def main() -> None:
         f"subprocess_timeout={DELISTED_SYNC_SUBPROCESS_TIMEOUT}s)"
     )
 
+    # Phase 2.8 step 1: Prometheus metrics HTTP server. Stdlib ThreadingHTTPServer
+    # bound to ALPHARD_METRICS_PORT (default 8765) on 0.0.0.0. Exposes
+    # /health (cheap liveness probe) and /metrics (Prometheus text exposition
+    # format). Port-bind failure is logged at WARNING and ignored — Prometheus
+    # scrape is observability, not a hard dependency for the trading loop.
+    metrics_port = int(os.environ.get("ALPHARD_METRICS_PORT", "8765"))
+    try:
+        from src.metrics_server import MetricsServer
+
+        _metrics_server = MetricsServer(host="0.0.0.0", port=metrics_port)
+        _metrics_server.start()
+        # Stash the registry on module-level so heartbeat / supervisor loops can
+        # emit counters and gauges without re-importing.
+        globals()["_metrics_registry"] = _metrics_server.registry
+        logger.info(f"metrics-server started (0.0.0.0:{metrics_port}, /health + /metrics)")
+    except OSError as exc:
+        logger.warning(f"metrics-server failed to bind :{metrics_port}: {exc}; continuing without metrics")
+        globals()["_metrics_registry"] = None
+
     # Watchdog: checks the _daily_sync_health sentinel every 30 min. If
     # last_successful_run_at is older than WATCHDOG_STALE_SECONDS (26h),
     # the daily_sync daemon thread has either crashed or is wedged, and
@@ -521,6 +540,13 @@ def main() -> None:
         while not _shutdown_event.is_set():
             logger.info("Heartbeat — agents not yet active")
             heartbeat_counter += 1
+            # Phase 2.8 step 1: emit heartbeat metric. Bump counter and update
+            # the last-tick gauge so Prometheus can alert on stale heartbeats
+            # via (time() - alphard_heartbeat_last_tick_timestamp) > N.
+            _registry = globals().get("_metrics_registry")
+            if _registry is not None:
+                _registry.inc_counter("alphard_heartbeats_total")
+                _registry.set_gauge("alphard_heartbeat_last_tick_timestamp", time.time())
             # Run the watchdog check every Nth tick instead of every tick.
             # 30 min / 60s = 30 ticks; 60*30=1800s. Use min counter to be
             # robust to sleep overshoots.
@@ -538,6 +564,12 @@ def main() -> None:
         delisted_thread.join(timeout=10)
         if delisted_thread.is_alive():
             logger.warning("delisted-sync daemon did not exit within 10s")
+        _metrics_registry_obj = globals().get("_metrics_registry")
+        if _metrics_registry_obj is not None and "_metrics_server" in globals():
+            try:
+                globals()["_metrics_server"].stop()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"metrics-server stop failed: {exc}")
         sys.exit(0)
 
 
