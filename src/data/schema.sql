@@ -241,6 +241,30 @@ CREATE INDEX IF NOT EXISTS idx_delisting_log_ticker
     ON delisting_log (ticker);
 
 -- ---------------------------------------------------------------------------
+-- macro_regime_log  (Phase 2.3: Macro Agent — CBR + USD/RUB + IMOEX regime)
+-- ---------------------------------------------------------------------------
+-- One row per fetch. Regime + multiplier is the deterministic output of
+-- src/macro/regime.regime() applied to the latest values of three fetchers
+-- (CBR key rate, USD/RUB CETS, IMOEX index). Upsert key is (fetched_at).
+-- Coordinator (Phase 2.10, not in scope here) reads the most-recent row.
+CREATE TABLE IF NOT EXISTS macro_regime_log (
+    id              BIGSERIAL PRIMARY KEY,
+    fetched_at      TIMESTAMPTZ NOT NULL UNIQUE,
+    cbr_key_rate    NUMERIC(6,2) NOT NULL,
+    usdrub_close    NUMERIC(10,4) NOT NULL,
+    usdrub_5d_prev  NUMERIC(10,4) NOT NULL,
+    imoex_close     NUMERIC(10,2) NOT NULL,
+    imoex_60d_prev  NUMERIC(10,2) NOT NULL,
+    regime          VARCHAR(20) NOT NULL,
+    multiplier      NUMERIC(4,2) NOT NULL,
+    sources         JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_macro_regime_log_fetched_at
+    ON macro_regime_log (fetched_at DESC);
+
+-- ---------------------------------------------------------------------------
 -- -- news_embedding  (RESERVED — Phase 3 will add vector(384) column) (pgvector disabled in Phase 1, Phase 3 will enable)
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS news_embedding (
