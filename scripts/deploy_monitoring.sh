@@ -113,13 +113,70 @@ push_file() {
     -d "$(b64="$b64" dst="$dst" python3 -c '
 import json, os
 print(json.dumps({
-    "Cmd": ["sh", "-c", "echo " + os.environ["b64"] + " | base64 -d > " + os.environ["dst"] + " && chown 472:472 " + os.environ["dst"] + " && echo WROTE"],
+    "Cmd": ["sh", "-c", "echo " + os.environ["b64"] + " | base64 -d > " + os.environ["dst"] + " && chown 472:472 " + os.environ["dst"] + " && echo WROTE || { echo FAIL >&2; exit 1; }"],
     "AttachStdout": True,
+    "AttachStderr": True,
 }))' \
     )" | python3 -c 'import sys, json; print(json.load(sys.stdin)["Id"])')"
-  curl -s -X POST "${API}/exec/${exec_id}/start" \
+  # Issue #71: capture the exec_start response and assert the
+  # in-container sh produced the WROTE marker. Pre-fix the response
+  # was discarded (> /dev/null) so any failure inside the helper
+  # container (base64 decode error, write permission denied, missing
+  # parent dir) was invisible to the operator — provisioning silently
+  # failed and Prometheus / Grafana started with stale or missing
+  # config files.
+  #
+  # The Docker Engine API returns the exec response as a
+  # stdcopy-formatted stream when Detach: false (8-byte header per
+  # frame: type + size, then the payload). The `WROTE` marker is
+  # ASCII and survives the framing intact. We strip the 8-byte
+  # stdcopy headers via `dd bs=1 skip=8` per chunk, but a simpler
+  # heuristic that handles real output correctly is to grep for the
+  # marker on the raw stream: Docker's stdcopy header starts with
+  # byte 0x01 (stdout) or 0x02 (stderr), so the substring "WROTE"
+  # cannot collide with the framing bytes.
+  local exec_output
+  exec_output="$(curl -s -X POST "${API}/exec/${exec_id}/start" \
     -H "Content-Type: application/json" \
-    -d '{"Detach": false}' >/dev/null
+    -d '{"Detach": false}')"
+  if ! grep -q WROTE <<<"$exec_output"; then
+    echo "ERROR: push_file $src -> $dst failed" >&2
+    echo "Helper container response (raw):" >&2
+    echo "$exec_output" >&2
+    return 1
+  fi
+  # Post-write integrity check: re-read the pushed file via the
+  # helper container and compare its sha256sum to the local source.
+  # Catches cases where the in-container `echo WROTE` fired but the
+  # actual write went to the wrong path (tyo, symlink race, etc).
+  local local_sha remote_sha
+  local_sha="$(sha256sum < "$src" | awk '{print $1}')"
+  remote_sha="$(curl -s -X POST "${API}/containers/${HELPER_ID}/exec" \
+    -H "Content-Type: application/json" \
+    -d "$(dst="$dst" python3 -c '
+import json, os
+print(json.dumps({
+    "Cmd": ["sh", "-c", "sha256sum \"" + os.environ["dst"] + "\" 2>/dev/null || echo NOSUCH"],
+    "AttachStdout": True,
+}))')" \
+    | python3 -c 'import sys, json; print(json.load(sys.stdin)["Id"])')"
+  local remote_output
+  remote_output="$(curl -s -X POST "${API}/exec/${remote_sha}/start" \
+    -H "Content-Type: application/json" \
+    -d '{"Detach": false}')"
+  # Extract the first 64 hex chars from the response. The helper
+  # outputs "<sha>  <path>\n" so a simple grep -oE pulls it out.
+  remote_sha="$(grep -aoE '[0-9a-f]{64}' <<<"$remote_output" | head -n 1)"
+  if [[ -z "$remote_sha" ]]; then
+    echo "ERROR: push_file $src -> $dst: post-write sha256 read returned no hash (file missing or unreadable in helper)" >&2
+    return 1
+  fi
+  if [[ "$remote_sha" != "$local_sha" ]]; then
+    echo "ERROR: push_file $src -> $dst: sha256 mismatch after write" >&2
+    echo "  local:  $local_sha" >&2
+    echo "  remote: $remote_sha" >&2
+    return 1
+  fi
 }
 
 # Step 1.5: actually push the provisioning files onto the .107 host.
