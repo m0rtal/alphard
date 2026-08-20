@@ -16,6 +16,13 @@
 #
 # Usage:
 #   docker exec alphard-postgres bash /usr/local/bin/init_postgres.sh
+#
+# This is the LEGACY manual bootstrap path. For normal container
+# deploys, the compose `pg-init` service in docker-compose.yaml
+# (sources POSTGRES_USER / POSTGRES_DB / POSTGRES_PASSWORD from
+# /root/.env via `$$POSTGRES_PASSWORD`) is the active path. Use
+# this script only when running postgres outside compose or
+# recovering from a state where pg-init cannot be re-invoked.
 
 set -e
 
@@ -43,5 +50,12 @@ sed -i '1i host all all 192.168.0.0/16 trust' "$HBA"
 echo "Trust line added (192.168.0.0/16)"
 
 # Reload config
-PGPASSWORD=alphard psql -h localhost -U alphard -d alphard -c 'SELECT pg_reload_conf()' > /dev/null
+# Issue #73: the trust line above makes password irrelevant on localhost
+# (psql will succeed with ANY password or none). Drop the literal
+# `PGPASSWORD=alphard` so the script does not pin the historical credential
+# — `docker-compose.yaml` sources ${POSTGRES_PASSWORD:?...required} from
+# .env and this script should mirror that posture instead of hardcoding a
+# value that contradicts the compose path.
+psql -h localhost -U "${POSTGRES_USER:-alphard}" -d "${POSTGRES_DB:-alphard}" -w \
+  -c 'SELECT pg_reload_conf()' > /dev/null
 echo "Postgres config reloaded"
