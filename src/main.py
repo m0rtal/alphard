@@ -130,19 +130,29 @@ def _spawn_backfill() -> int:
     of shell `setsid`) so the child is its own session leader and survives
     any signal delivered to this main process. Output is appended to the
     shared log so all forensics live in one file.
+
+    The log path is passed via the BACKFILL_LOG env var and the child opens
+    its own FileHandler. The parent does NOT inherit any fd to it — earlier
+    versions did, which leaked one fd per respawn until the soft fd limit
+    (1024 default / 4096 hard on Linux) tripped silently and the supervisor
+    died without the container noticing (issue #48). The child-owns-the-fd
+    pattern eliminates the leak at source.
     """
     log_path = os.environ.get("BACKFILL_LOG", "/app/logs/backfill_history_md.log")
-    log_fh = open(log_path, "a", buffering=1)  # line-buffered
+    child_env = os.environ.copy()
+    child_env["BACKFILL_LOG"] = log_path
     proc = subprocess.Popen(
         ["python3", "scripts/backfill_history_md.py", *_BACKFILL_SCRIPT_ARGS],
         cwd="/app",
-        stdout=log_fh,
-        stderr=subprocess.STDOUT,
+        env=child_env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
-    _supervisor_logger.info(f"_spawn_backfill: pid={proc.pid} args={_BACKFILL_SCRIPT_ARGS} log={log_path}")
-    # Don't close log_fh — child inherited the fd. Closing the parent's copy
-    # would also close the child's copy on some kernels.
+    _supervisor_logger.info(
+        f"_spawn_backfill: pid={proc.pid} args={_BACKFILL_SCRIPT_ARGS} log={log_path} "
+        f"(child opens FileHandler from BACKFILL_LOG; parent holds no fd)"
+    )
     return proc.pid
 
 
