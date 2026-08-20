@@ -797,3 +797,86 @@ class TestSupervisorCommentsAccurate:
             "failed_exhausted path that produces rc=0 on a clean "
             "finish (issue #61)."
         )
+
+
+# ---------------------------------------------------------------------------
+# Issue #72: shutdown must join the backfill supervisor thread
+# ---------------------------------------------------------------------------
+
+
+class TestMainShutdownJoinsBackfillSupervisor:
+    """Regression: main()'s finally block must `backfill_thread.join(...)`.
+
+    Without the join, ``_spawn_backfill`` may have just returned a fresh
+    PID when ``sys.exit(0)`` runs, leaving the child process without a
+    supervisor to reap or restart it. The container exits, the child
+    gets reparented to init, and there's nobody left to count its death
+    or respawn it — exactly the orphan-grandchild problem PR #51
+    originally fixed (issue #47).
+    """
+
+    def test_finally_block_joins_backfill_thread(self, main_module: Any) -> None:
+        """The finally block must call backfill_thread.join(timeout=...)."""
+        import inspect
+
+        src = inspect.getsource(main_module.main)
+        # The join must be inside the `finally:` of main(), AFTER the
+        # _shutdown_event.set() so the supervisor can react.
+        assert "backfill_thread.join(timeout=" in src, (
+            "main()'s finally block must call backfill_thread.join(timeout=...) "
+            "so the supervisor thread is drained on shutdown (issue #72). "
+            "Without this join, _spawn_backfill can be killed mid-subprocess.Popen "
+            "and the child becomes an orphan with no respawn safety net."
+        )
+
+    def test_join_timeout_outlives_respawn_backoff(self, main_module: Any) -> None:
+        """The join timeout must be > _BACKFILL_RESPAWN_BACKOFF_SECONDS.
+
+        The supervisor sleeps ``_BACKFILL_RESPAWN_BACKOFF_SECONDS``
+        between respawns. If we set the shutdown event while the
+        supervisor is in the backoff sleep, we need the join timeout
+        to outlive that sleep — otherwise we exit with the child still
+        mid-backoff and the child process becomes the orphan we're
+        trying to avoid.
+        """
+        import inspect
+        import re
+
+        src = inspect.getsource(main_module.main)
+        backoff = main_module._BACKFILL_RESPAWN_BACKOFF_SECONDS
+        # Find the join line.
+        m = re.search(r"backfill_thread\.join\(timeout=([^\)]+)\)", src)
+        assert m, "expected backfill_thread.join(timeout=...) in main()"
+        timeout_expr = m.group(1)
+        # The canonical form is `_BACKFILL_RESPAWN_BACKOFF_SECONDS + 5`.
+        # We don't eval — we just assert the symbol appears in the
+        # expression so a future refactor that hardcodes a smaller
+        # number trips this test.
+        assert "_BACKFILL_RESPAWN_BACKOFF_SECONDS" in timeout_expr, (
+            f"backfill_thread.join timeout must derive from "
+            f"_BACKFILL_RESPAWN_BACKOFF_SECONDS ({backoff}s); got: {timeout_expr!r}"
+        )
+        # Sanity: the constant exists and is positive.
+        assert backoff > 0
+
+    def test_supervisor_loop_responds_to_shutdown_event(self, main_module: Any) -> None:
+        """The supervisor must exit promptly on _shutdown_event.
+
+        The whole point of the join in main() is to give the supervisor
+        a chance to exit. If the supervisor ignores _shutdown_event,
+        the join will time out and the child stays orphaned. This test
+        is a structural guard: pin that the outer ``while`` in
+        _backfill_supervisor_loop checks ``_shutdown_event``.
+        """
+        import inspect
+
+        src = inspect.getsource(main_module._backfill_supervisor_loop)
+        assert "_shutdown_event" in src
+        # The outer loop must check the event (not just an inner one).
+        # We don't assert on exact syntax — only on the existence of
+        # the shutdown check, so a refactor that flips the loop
+        # structure still passes.
+        assert "not _shutdown_event.is_set" in src, (
+            "_backfill_supervisor_loop must check _shutdown_event.is_set() so "
+            "main()'s join(timeout=...) actually waits for it to exit."
+        )
