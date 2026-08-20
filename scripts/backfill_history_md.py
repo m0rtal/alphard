@@ -95,7 +95,6 @@ The history-data endpoint (``invest-public-api.tinkoff.ru``) and the
 aggregation to daily bars are otherwise identical to the upstream
 ``download_md.sh`` reference script.
 """
-
 from __future__ import annotations
 
 import argparse
@@ -600,7 +599,25 @@ def main() -> int:
             return 1
 
         circuit_breaker_streak = 0
+        # H-NETWORK-DETECT (2026-08-20): emit a progress heartbeat every
+        # 50 tickers so that if _backfill_one ever wedges (no yield from
+        # iter_ohlcv, no log output, no exception) the operator can see
+        # the loop is still alive in the log. Without this the only
+        # signal of life was the final `=== DONE in {elapsed:.0f}s` line,
+        # which never arrives during a deadlock — exactly the symptom we
+        # saw on sha-bc867a2 where the log stopped at "Universe row
+        # state: 3256 tickers upserted" with zero per-ticker output for
+        # 17 hours.
+        progress_every = 50
         for i, ticker in enumerate(tickers, start=1):
+            if i % progress_every == 1 and i > 1:
+                elapsed_so_far = time.monotonic() - started
+                logger.info(
+                    f"progress: {i}/{len(tickers)} tickers scanned in "
+                    f"{elapsed_so_far:.0f}s (fetched={total_fetched} "
+                    f"written={total_written} skipped={skipped_complete} "
+                    f"errors={len(errors)})"
+                )
             # Per-ticker effective start: clamp to source lookback limits
             # (MOEX ISS = 1825d). Without this, we ask MOEX for 9 years of
             # pre-listing data and get nothing back.
@@ -611,7 +628,10 @@ def main() -> int:
             # without --skip-known-bad will still attempt the ticker
             # (useful when Tinkoff later backfills the missing history).
             if args.skip_known_bad and meta is not None and meta.delisted_at is not None:
-                logger.info(f"{i}/{len(tickers)} {ticker}: skip (delisted_at={meta.delisted_at}, " "--skip-known-bad)")
+                logger.info(
+                    f"{i}/{len(tickers)} {ticker}: skip (delisted_at={meta.delisted_at}, "
+                    "--skip-known-bad)"
+                )
                 skipped_complete += 1
                 circuit_breaker_streak = 0
                 continue

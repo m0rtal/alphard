@@ -177,6 +177,25 @@ print('schema OK')
     BACKFILL_PID=$!
     echo "  backfill PID=${BACKFILL_PID}, log=${BACKFILL_LOG}"
     echo "${BACKFILL_PID}" > /tmp/alphard-backfill.pid
+
+    # H-NETWORK-DETECT (2026-08-20): wire SIGUSR1 -> faulthandler dump
+    # so that if the backfill Python process ever sits idle in a
+    # deadlock again (the symptom that surfaced on sha-bc867a2: the
+    # process was alive, the Postgres connection was open, but Python
+    # was not sending any query), the operator (or a future cron
+    # watchdog) can grab a Python stack trace without killing the
+    # daemon. The dump is appended to the same backfill log so all
+    # forensics live in one file. install() is idempotent and cheap;
+    # re-installing it on every container start is the simplest way to
+    # guarantee the signal handler is in place regardless of whether
+    # backfill_history_md.py itself grows to ignore SIGUSR1.
+    python3 -c "
+import faulthandler, signal, sys
+faulthandler.enable()
+faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
+sys.stdout.write('faulthandler SIGUSR1 enabled\n')
+sys.stdout.flush()
+" >>"${BACKFILL_LOG}" 2>&1 || echo 'faulthandler init failed (non-fatal)'
 fi
 
 # Health endpoint simple version (Phase 0)

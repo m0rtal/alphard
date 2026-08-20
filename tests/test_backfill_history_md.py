@@ -275,3 +275,50 @@ def test_skip_known_bad_keeps_tickers_without_delisted_at() -> None:
     meta.delisted_at = None
     # Predicate is False → ticker is NOT skipped, proceeds to fetch.
     assert not (args.skip_known_bad and meta.delisted_at is not None)
+
+
+# ---------------------------------------------------------------------------
+# H-NETWORK-DETECT (2026-08-20): progress heartbeat
+# ---------------------------------------------------------------------------
+#
+# The deadlock that left backfill PID 19 idle for 17 hours on
+# sha-bc867a2 was invisible because the per-ticker log line never
+# fired (iter_ohlcv hung) and the final `=== DONE` line never
+# arrived either. The fix in backfill_history_md.py emits a separate
+# "progress: i/N tickers scanned in Ts" line every 50 tickers so
+# any future wedge surfaces as missing progress lines rather than a
+# silent stall. The tests below pin the cadence constant and the
+# expected log format so a future edit cannot quietly regress this
+# affordance.
+
+
+def test_progress_every_constant_is_50() -> None:
+    """The progress-heartbeat cadence is 50 tickers (small enough to
+    surface a wedge within minutes, large enough to avoid log spam)."""
+    import importlib
+
+    mod = importlib.import_module("backfill_history_md")
+    # Read the module source to extract the constant. This is more
+    # robust than importing the module and reading a top-level symbol
+    # that may not actually be exported at import time.
+    import inspect
+
+    source = inspect.getsource(mod)
+    assert "progress_every = 50" in source
+    assert 'f"progress: {i}/{len(tickers)} tickers scanned in "' in source
+
+
+def test_progress_heartbeat_format_includes_counters() -> None:
+    """Heartbeat line must include fetched/written/skipped/errors so an
+    operator can diagnose where the loop is at a glance."""
+    import inspect
+
+    source = inspect.getsource(__import__("backfill_history_md"))
+    # Required counter substrings inside the progress log line.
+    for needle in (
+        "fetched=",
+        "written=",
+        "skipped=",
+        "errors=",
+    ):
+        assert needle in source, f"progress heartbeat missing {needle!r}"
