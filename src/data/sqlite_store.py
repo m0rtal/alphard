@@ -43,6 +43,7 @@ CREATE INDEX IF NOT EXISTS idx_ticker_universe_delisted
 CREATE TABLE IF NOT EXISTS ohlcv_daily (
     ticker     TEXT NOT NULL,
     ts         TEXT NOT NULL,
+    source     TEXT NOT NULL DEFAULT 'tkf',
     open       TEXT NOT NULL,
     high       TEXT NOT NULL,
     low        TEXT NOT NULL,
@@ -50,11 +51,11 @@ CREATE TABLE IF NOT EXISTS ohlcv_daily (
     volume     TEXT NOT NULL,
     adj_close  TEXT NOT NULL,
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-    PRIMARY KEY (ticker, ts),
+    PRIMARY KEY (ticker, ts, source),
     FOREIGN KEY (ticker) REFERENCES ticker_universe(ticker)
 );
-CREATE INDEX IF NOT EXISTS idx_ohlcv_daily_ticker_ts
-    ON ohlcv_daily (ticker, ts);
+CREATE INDEX IF NOT EXISTS idx_ohlcv_daily_ticker_ts_source
+    ON ohlcv_daily (ticker, ts, source);
 
 CREATE TABLE IF NOT EXISTS corporate_actions (
     ticker     TEXT NOT NULL,
@@ -204,6 +205,7 @@ class InMemorySQLiteStore(DataStore):
             (
                 r.ticker,
                 r.ts.isoformat(),
+                r.source,
                 str(r.open),
                 str(r.high),
                 str(r.low),
@@ -213,11 +215,14 @@ class InMemorySQLiteStore(DataStore):
             )
             for r in rows
         ]
+        # Phase 2.6 step 2: the v2 schema has PK (ticker, ts, source).
+        # The third column lets two writers (Tinkoff MD and MOEX ISS)
+        # store bars for the same (ticker, date) without UPSERT collision.
         sql = """
             INSERT INTO ohlcv_daily
-                (ticker, ts, open, high, low, close, volume, adj_close, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-            ON CONFLICT (ticker, ts) DO UPDATE SET
+                (ticker, ts, source, open, high, low, close, volume, adj_close, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT (ticker, ts, source) DO UPDATE SET
                 updated_at = datetime('now')
         """
         try:
@@ -232,13 +237,23 @@ class InMemorySQLiteStore(DataStore):
         ticker: str,
         start: date,
         end: date,
+        source: str | None = None,
     ) -> list[OHLCVRow]:
+        """Read OHLCV bars for ``ticker`` in ``[start, end]``.
+
+        Phase 2.6 step 2: pass ``source='tkf'`` to read only one source,
+        or omit to read every source tag. The OHLCVRow returned will
+        carry the row's ``source`` field.
+        """
         sql = (
-            "SELECT ticker, ts, open, high, low, close, volume, adj_close "
+            "SELECT ticker, ts, source, open, high, low, close, volume, adj_close "
             "FROM ohlcv_daily WHERE ticker = ? AND ts BETWEEN ? AND ?"
         )
         params: list[Any] = [ticker.upper(), start.isoformat(), end.isoformat()]
-        sql += " ORDER BY ts"
+        if source is not None:
+            sql += " AND source = ?"
+            params.append(source)
+        sql += " ORDER BY ts, source"
         try:
             cur = self._conn.execute(sql, params)
         except sqlite3.Error as exc:
@@ -307,15 +322,29 @@ def _row_to_ticker(r: Any) -> TickerMeta:
 
 
 def _row_to_ohlcv(r: Any) -> OHLCVRow:
+    # Phase 2.6 step 2: read the new ``source`` column. The shape is:
+    #   * 9 columns: v2 schema — source is at index 2.
+    #   * 8 columns: v1 fixture (legacy code path that SELECTs without
+    #     the source column) — fall back to source='tkf' for
+    #     backward-compat. The 8-column path is defensive only — every
+    #     real SELECT in production goes through query_ohlcv() which
+    #     uses the v2 projection.
+    if len(r) > 8:
+        source = r[2]
+        open_v, high_v, low_v, close_v, volume_v, adj_close_v = r[3], r[4], r[5], r[6], r[7], r[8]
+    else:
+        source = "tkf"
+        open_v, high_v, low_v, close_v, volume_v, adj_close_v = r[2], r[3], r[4], r[5], r[6], r[7]
     return OHLCVRow(
         ticker=r[0],
         ts=date.fromisoformat(r[1]),
-        open=Decimal(str(r[2])),
-        high=Decimal(str(r[3])),
-        low=Decimal(str(r[4])),
-        close=Decimal(str(r[5])),
-        volume=Decimal(str(r[6])),
-        adj_close=Decimal(str(r[7])),
+        source=source,
+        open=Decimal(str(open_v)),
+        high=Decimal(str(high_v)),
+        low=Decimal(str(low_v)),
+        close=Decimal(str(close_v)),
+        volume=Decimal(str(volume_v)),
+        adj_close=Decimal(str(adj_close_v)),
     )
 
 

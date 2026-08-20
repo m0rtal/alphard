@@ -58,6 +58,15 @@ class OHLCVRow(BaseModel):
     close: Decimal = Field(..., ge=Decimal("0"))
     volume: Decimal = Field(..., ge=Decimal("0"))
     adj_close: Decimal = Field(..., ge=Decimal("0"))
+    # Phase 2.6 step 2: add source column to ohlcv_daily so the same
+    # (ticker, ts) may legitimately exist under two source tags
+    # (``tkf`` from Tinkoff MD, ``moex`` from MOEX ISS). Default 'tkf'
+    # preserves backward-compat with all single-source callers that
+    # pre-date the migration — no caller is required to set it.
+    source: SourceType = Field(
+        default="tkf",
+        description="Data source tag ('tkf' | 'moex' | 'manual')",
+    )
 
     @field_validator("ticker")
     @classmethod

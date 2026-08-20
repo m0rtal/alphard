@@ -274,6 +274,128 @@ class TestOhlcvStorageAndQuery:
         # Check if the raised exception is wrapped in StoreError
         assert isinstance(exc_info.value, Exception)
 
+    def test_upsert_ohlcv_multi_source_no_pk_collision(self, sqlite_store: InMemorySQLiteStore):
+        """Phase 2.6 step 2: same (ticker, ts) under two source tags coexist.
+
+        The v2 schema lifts the PK from (ticker, ts) to (ticker, ts, source)
+        so Tinkoff MD and MOEX ISS can both write bars for the same date
+        without UPSERT collision. This test proves the contract end-to-end
+        via the public ``upsert_ohlcv`` / ``query_ohlcv`` API.
+        """
+        sber = TickerMeta(
+            ticker="SBER",
+            figi="RU0009029540",
+            name="Sberbank",
+            lot=10,
+            isin="RU0009029540",
+            currency="RUB",
+            source="moex",
+        )
+        sqlite_store.upsert_tickers([sber])
+
+        tkf_row = OHLCVRow(
+            ticker="SBER",
+            ts=date(2026, 8, 1),
+            open=Decimal("100"),
+            high=Decimal("110"),
+            low=Decimal("95"),
+            close=Decimal("105"),
+            volume=Decimal("1000"),
+            adj_close=Decimal("105"),
+            source="tkf",
+        )
+        moex_row = OHLCVRow(
+            ticker="SBER",
+            ts=date(2026, 8, 1),
+            open=Decimal("101"),
+            high=Decimal("111"),
+            low=Decimal("96"),
+            close=Decimal("106"),
+            volume=Decimal("1000"),
+            adj_close=Decimal("106"),
+            source="moex",
+        )
+        sqlite_store.upsert_ohlcv([tkf_row, moex_row])
+
+        # Both rows are stored — no PK collision despite identical (ticker, ts).
+        all_rows = sqlite_store.query_ohlcv("SBER", date(2026, 8, 1), date(2026, 8, 1))
+        assert len(all_rows) == 2
+        sources = {r.source for r in all_rows}
+        assert sources == {"tkf", "moex"}
+
+        # Filter by source — pass-through works.
+        only_tkf = sqlite_store.query_ohlcv("SBER", date(2026, 8, 1), date(2026, 8, 1), source="tkf")
+        assert len(only_tkf) == 1
+        assert only_tkf[0].source == "tkf"
+
+        only_moex = sqlite_store.query_ohlcv("SBER", date(2026, 8, 1), date(2026, 8, 1), source="moex")
+        assert len(only_moex) == 1
+        assert only_moex[0].source == "moex"
+
+    def test_upsert_ohlcv_same_source_collision_still_blocked(self, sqlite_store: InMemorySQLiteStore):
+        """The new PK still enforces uniqueness on (ticker, ts, source).
+
+        The migration lifts the PK; it does NOT weaken it. Two rows with the
+        same triple must still fail the constraint — proven via the same
+        ON CONFLICT path that pre-existed for (ticker, ts).
+        """
+        sber = TickerMeta(
+            ticker="SBER",
+            figi="RU0009029540",
+            name="Sberbank",
+            lot=10,
+            isin="RU0009029540",
+            currency="RUB",
+            source="moex",
+        )
+        sqlite_store.upsert_tickers([sber])
+
+        first = OHLCVRow(
+            ticker="SBER",
+            ts=date(2026, 8, 1),
+            open=Decimal("100"),
+            high=Decimal("110"),
+            low=Decimal("95"),
+            close=Decimal("105"),
+            volume=Decimal("1000"),
+            adj_close=Decimal("105"),
+            source="tkf",
+        )
+        sqlite_store.upsert_ohlcv([first])
+
+        # Re-upsert with the same PK (same ticker, ts, source) — ON CONFLICT
+        # fires, values are kept (existing semantics), no exception.
+        sqlite_store.upsert_ohlcv([first])
+        rows = sqlite_store.query_ohlcv("SBER", date(2026, 8, 1), date(2026, 8, 1))
+        assert len(rows) == 1
+        assert rows[0].source == "tkf"
+
+    def test_query_ohlcv_returns_source_field(
+        self, sqlite_store: InMemorySQLiteStore, sample_ohlcv_rows: list[OHLCVRow]
+    ):
+        """query_ohlcv returns OHLCVRow objects carrying the row's source.
+
+        Sample rows use the OHLCVRow default ('tkf'), so the read-back
+        must also report source='tkf' — proves the v2 SELECT projection
+        is wired correctly through the InMemorySQLiteStore test backend.
+        """
+        sber = TickerMeta(
+            ticker="SBER",
+            figi="RU0009029540",
+            name="Sberbank",
+            lot=10,
+            isin="RU0009029540",
+            currency="RUB",
+            source="moex",
+        )
+        sqlite_store.upsert_tickers([sber])
+        sqlite_store.upsert_ohlcv(sample_ohlcv_rows)
+
+        read_rows = sqlite_store.query_ohlcv("SBER", date(2026, 8, 1), date(2026, 8, 2))
+        assert len(read_rows) == 2
+        for r in read_rows:
+            assert r.source == "tkf", "Every sample_ohlcv_row carries the default 'tkf' source; " f"got {r.source!r}"
+
 
 # ==============================================================================
 # 3. Corporate Actions Storage and Query
