@@ -57,6 +57,27 @@ CREATE TABLE IF NOT EXISTS ohlcv_daily (
 CREATE INDEX IF NOT EXISTS idx_ohlcv_daily_ticker_ts_source
     ON ohlcv_daily (ticker, ts, source);
 
+-- Phase 2.5 step 2b: split-adjusted bars live in a parallel table so
+-- re-running the apply pipeline never overwrites the raw feed. PK is
+-- (ticker, ts) just like ohlcv_daily; columns are identical. Schema is
+-- created here (CREATE TABLE IF NOT EXISTS) so SQLite tests can
+-- construct an InMemorySQLiteStore without any extra setup.
+CREATE TABLE IF NOT EXISTS ohlcv_daily_adj (
+    ticker     TEXT NOT NULL,
+    ts         TEXT NOT NULL,
+    open       TEXT NOT NULL,
+    high       TEXT NOT NULL,
+    low        TEXT NOT NULL,
+    close      TEXT NOT NULL,
+    volume     TEXT NOT NULL,
+    adj_close  TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (ticker, ts),
+    FOREIGN KEY (ticker) REFERENCES ticker_universe(ticker)
+);
+CREATE INDEX IF NOT EXISTS idx_ohlcv_daily_adj_ticker_ts
+    ON ohlcv_daily_adj (ticker, ts);
+
 CREATE TABLE IF NOT EXISTS corporate_actions (
     ticker     TEXT NOT NULL,
     ts         TEXT NOT NULL,
@@ -259,6 +280,74 @@ class InMemorySQLiteStore(DataStore):
         except sqlite3.Error as exc:
             raise StoreError(f"query_ohlcv failed: {exc}") from exc
         return [_row_to_ohlcv(r) for r in cur.fetchall()]
+
+    # ---------------------------------------------------------- OHLCV adjusted (Phase 2.5 step 2b)
+
+    def upsert_ohlcv_adj(self, rows: Iterable[OHLCVRow]) -> int:
+        rows = list(rows)
+        if not rows:
+            return 0
+        params = [
+            (
+                r.ticker,
+                r.ts.isoformat(),
+                str(r.open),
+                str(r.high),
+                str(r.low),
+                str(r.close),
+                str(r.volume),
+                str(r.adj_close),
+            )
+            for r in rows
+        ]
+        sql = """
+            INSERT INTO ohlcv_daily_adj
+                (ticker, ts, open, high, low, close, volume, adj_close, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT (ticker, ts) DO UPDATE SET
+                open       = excluded.open,
+                high       = excluded.high,
+                low        = excluded.low,
+                close      = excluded.close,
+                volume     = excluded.volume,
+                adj_close  = excluded.adj_close,
+                updated_at = datetime('now')
+        """
+        try:
+            self._conn.executemany(sql, params)
+            self._conn.commit()
+        except sqlite3.Error as exc:
+            raise StoreError(f"upsert_ohlcv_adj failed: {exc}") from exc
+        return len(rows)
+
+    def query_ohlcv_adj(
+        self,
+        ticker: str,
+        start: date,
+        end: date,
+    ) -> list[OHLCVRow]:
+        sql = (
+            "SELECT ticker, ts, open, high, low, close, volume, adj_close "
+            "FROM ohlcv_daily_adj WHERE ticker = ? AND ts BETWEEN ? AND ?"
+        )
+        params: list[Any] = [ticker.upper(), start.isoformat(), end.isoformat()]
+        sql += " ORDER BY ts"
+        try:
+            cur = self._conn.execute(sql, params)
+        except sqlite3.Error as exc:
+            raise StoreError(f"query_ohlcv_adj failed: {exc}") from exc
+        return [_row_to_ohlcv(r) for r in cur.fetchall()]
+
+    def count_ohlcv_adj(self, ticker: str | None = None) -> int:
+        """Diagnostic helper used by tests; not part of the ABC contract."""
+        if ticker:
+            cur = self._conn.execute(
+                "SELECT COUNT(*) FROM ohlcv_daily_adj WHERE ticker = ?",
+                (ticker.upper(),),
+            )
+        else:
+            cur = self._conn.execute("SELECT COUNT(*) FROM ohlcv_daily_adj")
+        return int(cur.fetchone()[0])
 
     # ---------------------------------------------------------- corp actions
 

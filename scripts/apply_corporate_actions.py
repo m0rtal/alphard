@@ -1,0 +1,527 @@
+"""Phase 2.5 step 2b: apply split adjustments to OHLCV bars and persist.
+
+Why this script?
+----------------
+PHASE1-AUDIT flagged "Adjusted prices — adj_close = close placeholder".
+Phase 2.5 ships the pipeline in three pieces:
+
+  - Step 1 (PR #45): pure adjustment math in ``src.data.adjustment``.
+  - Step 2a (PR #54): standalone fetcher ``scripts/fetch_moex_corporate_actions.py``
+    that pulls MOEX ISS splits + dividends into JSON.
+  - Step 2b (this script): orchestrator that combines the two — fetches
+    splits per ticker, applies the adjustment to raw OHLCV rows, and
+    persists split-adjusted bars into ``ohlcv_daily_adj``.
+
+This script is invoked as a subprocess by ``src.main._corp_actions_apply_loop``
+on a weekly cadence. It can also be invoked manually::
+
+    python3 scripts/apply_corporate_actions.py                    # full universe
+    python3 scripts/apply_corporate_actions.py --tickers SBER,GAZP # one-off smoke
+    python3 scripts/apply_corporate_actions.py --dry-run          # log only, no DB writes
+    python3 scripts/apply_corporate_actions.py --force            # bypass 7d idempotency
+
+Storage
+-------
+Split-adjusted bars land in ``ohlcv_daily_adj`` (a parallel table
+introduced alongside this script in PR #74). The raw ``ohlcv_daily`` is
+NEVER touched. When Phase 2.6 step 2 lands the ``source`` column on
+``ohlcv_daily``, the parallel table is migrated via ``INSERT INTO
+ohlcv_daily ... SELECT FROM ohlcv_daily_adj``.
+
+Idempotency
+-----------
+A JSON cache at ``--cache-path`` (default ``/var/lib/alphard/cache/corp_actions_applied.json``)
+records ``{ticker: last_applied_iso8601}``. Tickers whose last apply is
+within ``--skip-older-than-days`` (default 7) are skipped on subsequent
+runs unless ``--force`` is set. The cache itself is tolerant to
+corruption — a JSON decode error deletes the cache and treats every
+ticker as fresh (defensive: a corrupt cache must never silently lose
+adjustment work).
+
+Per-ticker error handling
+-------------------------
+If ``apply_split_adjustment`` or the DB write raises for one ticker, the
+exception is logged with the ticker name + traceback and the loop
+continues with the next ticker. The non-fatal path is the default
+because a single bad ticker must not abort the weekly run for 3000+
+others; only a fatal error (store init, schema, network fetch) exits
+non-zero.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import sys
+import traceback
+from collections.abc import Iterable
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
+from pathlib import Path
+from typing import Any
+
+import requests
+
+# scripts/ is on sys.path via pyproject.toml's [tool.pytest.ini_options]
+# pythonpath = ["scripts"]. For direct invocation we rely on the
+# /app layout (src/ as a sibling package); import via sys.path here so
+# the script also works from a checkout tree without `pip install -e .`.
+_SRC_PATH = str(Path(__file__).resolve().parent.parent / "src")
+if _SRC_PATH not in sys.path:
+    sys.path.insert(0, _SRC_PATH)
+
+import fetch_moex_corporate_actions as mca  # noqa: E402
+
+from src.data.adjustment import apply_split_adjustment  # noqa: E402
+from src.data.models import CorporateAction, OHLCVRow, TickerMeta  # noqa: E402
+from src.data.pg_store import PostgresDataStore  # noqa: E402
+from src.data.store import DataStore, StoreError  # noqa: E402
+
+logger = logging.getLogger("alphard.corp_actions_apply")
+
+DEFAULT_CACHE_PATH = Path("/var/lib/alphard/cache/corp_actions_applied.json")
+DEFAULT_FETCH_TIMEOUT = 60  # matches fetch_moex_corporate_actions.REQUEST_TIMEOUT
+DEFAULT_SKIP_OLDER_THAN_DAYS = 7
+PROGRESS_HEARTBEAT_EVERY = 50  # one log line per N tickers processed
+
+EXIT_OK = 0
+EXIT_FATAL = 1  # store init, schema, network — whole run aborted
+EXIT_USAGE = 2  # arg parsing failure
+
+# MOEX ISS endpoint is the source of truth — same URL as
+# scripts/fetch_moex_corporate_actions.py. We hit it directly via the
+# shared fetcher module (which already has retry+backoff per PR #54)
+# so the orchestrator inherits the same behaviour as the standalone
+# snapshot script.
+_FETCHER_MOD = mca
+
+
+def _build_store(args: argparse.Namespace) -> DataStore:
+    """Construct the production Postgres store.
+
+    Reads ``$ALPHARD_PG_DSN`` when ``--pg-dsn`` is omitted. Tests
+    bypass this function entirely by passing ``store=`` directly to
+    ``main()``; see the ``main()`` docstring.
+    """
+    dsn = args.pg_dsn or None
+    return PostgresDataStore(dsn=dsn)
+
+
+def _list_tickers(store: DataStore, *, only: Iterable[str] | None = None) -> list[TickerMeta]:
+    """All listed tickers (delisted included — backfill may need them).
+
+    The ``listed_at IS NOT NULL`` filter matches the task spec. Delisted
+    tickers with a known delisted_at are still included because their
+    pre-delisting history may carry splits that we want adjusted.
+    """
+    all_metas = store.list_tickers(include_delisted=True)
+    listed = [m for m in all_metas if m.listed_at is not None]
+    if only is None:
+        return listed
+    only_set = {t.strip().upper() for t in only}
+    return [m for m in listed if m.ticker in only_set]
+
+
+def _fetch_splits_for_ticker(
+    ticker: str,
+    session: requests.Session,
+    timeout: int,
+) -> list[CorporateAction]:
+    """Per-ticker CorporateAction list (only kind='split').
+
+    Step 2a's fetcher returns ALL splits for ALL tickers in one call.
+    We invoke it once and filter in-process; calling it per ticker would
+    hit MOEX ISS 3000 times for nothing. Filter by ticker AND kind
+    (dividends are ignored here — adjustment is split-only; dividends
+    land in a follow-up step that uses total-return math, not splits).
+    """
+    raw = _FETCHER_MOD.fetch_splits(session, timeout=timeout)
+    actions: list[CorporateAction] = []
+    for entry in raw:
+        if entry.get("ticker") != ticker:
+            continue
+        # MOEX returns ISO date strings ("2014-06-16").
+        ts_raw = entry.get("ts")
+        ratio_raw = entry.get("ratio")
+        if not ts_raw or ratio_raw is None:
+            continue
+        try:
+            ts = date.fromisoformat(ts_raw)
+            ratio = Decimal(str(ratio_raw))
+        except (TypeError, ValueError):
+            # Defensive: MOEX ISS has historical entries in non-standard
+            # formats. step 2a's fetcher drops malformed ratios; we just
+            # skip anything that survives in an unexpected shape.
+            continue
+        if ratio <= Decimal("0"):
+            continue
+        actions.append(
+            CorporateAction(
+                ticker=ticker,
+                ts=ts,
+                kind="split",
+                value=ratio,
+                source="moex",
+            )
+        )
+    return actions
+
+
+def _load_cache(cache_path: Path) -> dict[str, str]:
+    """Read the per-ticker last-applied cache. Returns {} on any failure.
+
+    A corrupt cache is treated as "no cache": the next apply will rewrite
+    it cleanly. This is intentionally permissive — a corrupted JSON file
+    must never block a weekly run.
+    """
+    try:
+        return json.loads(cache_path.read_text())
+    except FileNotFoundError:
+        return {}
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning(
+            "corp_actions cache at %s is unreadable (%s); resetting to empty",
+            cache_path,
+            exc,
+        )
+        return {}
+
+
+def _save_cache(cache_path: Path, cache: dict[str, str]) -> None:
+    """Atomically write the per-ticker cache.
+
+    We do NOT want a crash mid-write to corrupt the cache and silently
+    lose idempotency state. The pattern is: write to ``cache_path.tmp``,
+    then rename. The rename is atomic on POSIX filesystems, so the
+    previous cache stays intact if the run crashes mid-write.
+    """
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(cache, indent=2, sort_keys=True))
+    tmp_path.replace(cache_path)
+
+
+def _is_fresh(cache_entry: str | None, skip_older_than_days: int) -> bool:
+    """True if the ticker was applied within the skip window."""
+    if not cache_entry:
+        return False
+    try:
+        last = datetime.fromisoformat(cache_entry)
+    except ValueError:
+        return False
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    age = datetime.now(timezone.utc) - last
+    return age < timedelta(days=skip_older_than_days)
+
+
+def _apply_for_ticker(
+    store: DataStore,
+    ticker: str,
+    actions: list[CorporateAction],
+    dry_run: bool,
+) -> int:
+    """Apply ``actions`` to raw OHLCV for ``ticker``; return rows upserted.
+
+    Returns the count of adjusted bars written (or that *would* be
+    written under ``dry_run=True``). On no-op (empty actions / empty raw
+    feed) returns 0.
+
+    Idempotency at the row level is achieved by passing the raw rows
+    (not already-adjusted rows) through ``apply_split_adjustment`` and
+    letting the upsert overwrite. Re-running produces the same adjusted
+    output because the input is unchanged.
+    """
+    if not actions:
+        return 0
+
+    # Pull the full history. The adjusted-output range should match the
+    # raw-input range (1:1 row count) so we don't impose a date window
+    # here — every pre-split bar must be scaled.
+    raw_rows = store.query_ohlcv(
+        ticker=ticker,
+        start=date(1990, 1, 1),  # far past — covers the whole Russian market
+        end=date(2100, 1, 1),  # far future — covers any stored bar
+    )
+    if not raw_rows:
+        logger.info("ticker=%s no raw OHLCV rows; nothing to adjust", ticker)
+        return 0
+
+    adjusted = apply_split_adjustment(raw_rows, actions)
+    if dry_run:
+        logger.info(
+            "ticker=%s dry-run: would upsert %d adjusted bars (from %d raw)",
+            ticker,
+            len(adjusted),
+            len(raw_rows),
+        )
+        return len(adjusted)
+
+    written = store.upsert_ohlcv_adj(adjusted)
+    logger.info(
+        "ticker=%s applied %d actions, upserted %d/%d adjusted bars",
+        ticker,
+        len(actions),
+        written,
+        len(raw_rows),
+    )
+    return written
+
+
+def _parse_args() -> argparse.Namespace:
+    """argparse wrapper: parses ``sys.argv[1:]`` (production)."""
+    return _parse_args_from(sys.argv[1:])
+
+
+def _parse_args_from(argv: list[str]) -> argparse.Namespace:
+    """argparse wrapper: parses an explicit argv list (testability)."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--tickers",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated whitelist of tickers to apply (e.g. 'SBER,GAZP,VTBR'). "
+            "Default: full universe from ticker_universe where listed_at IS NOT NULL."
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Log what would be done without writing to Postgres.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Bypass 7d idempotency cache — reapply every ticker.",
+    )
+    parser.add_argument(
+        "--skip-older-than-days",
+        type=int,
+        default=DEFAULT_SKIP_OLDER_THAN_DAYS,
+        help=(
+            "Skip tickers whose last successful apply is younger than this many days. "
+            f"Default {DEFAULT_SKIP_OLDER_THAN_DAYS}. Set to 0 to disable (equivalent to --force)."
+        ),
+    )
+    parser.add_argument(
+        "--cache-path",
+        type=Path,
+        default=DEFAULT_CACHE_PATH,
+        help=(
+            "Path to the per-ticker last-applied JSON cache. "
+            f"Default {DEFAULT_CACHE_PATH}."
+        ),
+    )
+    parser.add_argument(
+        "--pg-dsn",
+        type=str,
+        default=None,
+        help=(
+            "Postgres DSN. Defaults to $ALPHARD_PG_DSN. "
+            "Used only by the production path; tests inject a store via the "
+            "``store=`` kwarg of main()."
+        ),
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=DEFAULT_FETCH_TIMEOUT,
+        help=f"Per-request timeout in seconds (default {DEFAULT_FETCH_TIMEOUT}).",
+    )
+    return parser.parse_args(argv)
+
+
+def main(
+    argv: list[str] | None = None,
+    *,
+    store: DataStore | None = None,
+) -> int:
+    """Orchestrator entry point.
+
+    Parameters
+    ----------
+    argv : list[str] | None
+        CLI arguments. ``None`` means ``sys.argv[1:]`` (production).
+    store : DataStore | None
+        Pre-constructed store. ``None`` means build a PostgresDataStore
+        from the parsed args (production). Tests inject an
+        InMemorySQLiteStore so they can inspect the resulting
+        ``ohlcv_daily_adj`` rows after ``main()`` returns.
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+    args = _parse_args() if argv is None else _parse_args_from(argv)
+
+    if store is None:
+        try:
+            store = _build_store(args)
+        except (StoreError, OSError) as exc:
+            logger.error("cannot initialise store: %s: %s", type(exc).__name__, exc)
+            return EXIT_FATAL
+        # We constructed the store ourselves, so we own its lifecycle.
+        # A caller-injected store is closed by the caller (tests want
+        # to keep using it after main() returns).
+        _owns_store = True
+    else:
+        _owns_store = False
+
+    # At this point ``store`` is bound to a concrete DataStore. The type
+    # narrowing is implicit because every code path above raises or
+    # assigns.
+    assert store is not None  # noqa: S101 — defensive, only for type checkers
+
+    try:
+        tickers = _list_tickers(
+            store,
+            only=args.tickers.split(",") if args.tickers else None,
+        )
+    except StoreError as exc:
+        logger.error("cannot list tickers: %s: %s", type(exc).__name__, exc)
+        # NOTE: store.close() happens in the finally block below (only
+        # when we own the store, see _owns_store). Injected stores are
+        # not closed by main().
+        return EXIT_FATAL
+
+    logger.info("apply_corporate_actions: %d tickers in scope", len(tickers))
+
+    cache = _load_cache(args.cache_path) if not args.force else {}
+    skip_window_days = 0 if args.force else args.skip_older_than_days
+
+    session = requests.Session()
+    session.headers["User-Agent"] = mca.USER_AGENT
+
+    totals = {"applied": 0, "skipped_fresh": 0, "no_actions": 0, "error": 0, "rows_written": 0}
+    applied_at = datetime.now(timezone.utc).isoformat()
+
+    try:
+        for i, meta in enumerate(tickers, start=1):
+            if i % PROGRESS_HEARTBEAT_EVERY == 0 or i == len(tickers):
+                logger.info(
+                    "progress: %d/%d tickers processed (applied=%d, skipped=%d, error=%d)",
+                    i,
+                    len(tickers),
+                    totals["applied"],
+                    totals["skipped_fresh"],
+                    totals["error"],
+                )
+            ticker = meta.ticker
+
+            if not args.force and _is_fresh(cache.get(ticker), skip_window_days):
+                logger.debug("ticker=%s fresh in cache; skipping", ticker)
+                totals["skipped_fresh"] += 1
+                continue
+
+            try:
+                actions = _fetch_splits_for_ticker(ticker, session, args.timeout)
+            except requests.RequestException as exc:
+                logger.warning(
+                    "ticker=%s MOEX ISS fetch failed: %s: %s; skipping",
+                    ticker,
+                    type(exc).__name__,
+                    exc,
+                )
+                totals["error"] += 1
+                continue
+            except Exception as exc:  # noqa: BLE001 — never kill the orchestrator
+                logger.error(
+                    "ticker=%s unexpected fetch error: %s: %s\n%s",
+                    ticker,
+                    type(exc).__name__,
+                    exc,
+                    traceback.format_exc(),
+                )
+                totals["error"] += 1
+                continue
+
+            if not actions:
+                # No splits in the window — still mark as applied so we
+                # don't re-fetch every week. Per-ticker empty-list is
+                # the steady-state for most tickers.
+                cache[ticker] = applied_at
+                totals["no_actions"] += 1
+                continue
+
+            try:
+                rows_written = _apply_for_ticker(store, ticker, actions, args.dry_run)
+            except (StoreError, ValueError) as exc:
+                logger.warning(
+                    "ticker=%s apply failed: %s: %s; skipping",
+                    ticker,
+                    type(exc).__name__,
+                    exc,
+                )
+                totals["error"] += 1
+                continue
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "ticker=%s unexpected apply error: %s: %s\n%s",
+                    ticker,
+                    type(exc).__name__,
+                    exc,
+                    traceback.format_exc(),
+                )
+                totals["error"] += 1
+                continue
+
+            cache[ticker] = applied_at
+            totals["applied"] += 1
+            totals["rows_written"] += rows_written
+    finally:
+        # Always persist cache + close store, even on KeyboardInterrupt.
+        # A partial cache is better than no cache — the weekly run will
+        # pick up where it left off.
+        try:
+            if not args.dry_run:
+                _save_cache(args.cache_path, cache)
+            else:
+                logger.info("dry-run: cache not written")
+        except OSError as exc:
+            logger.error("cache write failed: %s: %s", type(exc).__name__, exc)
+        if _owns_store:
+            try:
+                store.close()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("store.close failed: %s: %s", type(exc).__name__, exc)
+
+    logger.info(
+        "apply_corporate_actions: done applied=%d skipped_fresh=%d no_actions=%d "
+        "error=%d rows_written=%d",
+        totals["applied"],
+        totals["skipped_fresh"],
+        totals["no_actions"],
+        totals["error"],
+        totals["rows_written"],
+    )
+    # Non-zero exit if every attempted ticker errored — operator must
+    # notice. Zero errors or partial success still exit 0; the per-
+    # ticker error count is logged for forensics.
+    if totals["applied"] == 0 and totals["no_actions"] == 0 and totals["error"] > 0:
+        logger.error("apply_corporate_actions: every attempted ticker errored")
+        return EXIT_FATAL
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+
+__all__ = [
+    "EXIT_OK",
+    "EXIT_FATAL",
+    "EXIT_USAGE",
+    "DEFAULT_CACHE_PATH",
+    "DEFAULT_SKIP_OLDER_THAN_DAYS",
+    "PROGRESS_HEARTBEAT_EVERY",
+    "_apply_for_ticker",
+    "_build_store",
+    "_fetch_splits_for_ticker",
+    "_is_fresh",
+    "_list_tickers",
+    "_load_cache",
+    "_save_cache",
+    "main",
+]

@@ -178,6 +178,39 @@ CREATE INDEX IF NOT EXISTS idx_ohlcv_daily_ts
     ON ohlcv_daily (ts);
 
 -- ---------------------------------------------------------------------------
+-- ohlcv_daily_adj  (Phase 2.5 step 2b: split-adjusted bars in a parallel table)
+-- ---------------------------------------------------------------------------
+-- Why a parallel table instead of overwriting ohlcv_daily:
+--   1. Re-running the apply pipeline must never silently overwrite the raw
+--      feed (which is the audit trail for QA reconciliation).
+--   2. Phase 2.6 step 2 (PR #75, branch feat/issue-68-ohlcv-source-column)
+--      adds a ``source`` column on ohlcv_daily so adjusted bars can land in
+--      the same table with source='tkf_adj'. Until that merges, this table
+--      is the storage target.
+--   3. The follow-up migration (planned, not yet scheduled) is a single
+--      ``INSERT ... SELECT FROM ohlcv_daily_adj WHERE source = 'tkf_adj'``
+--      and a DROP of this table. The migration is auditable because the
+--      parallel table preserves every (ticker, ts) pair with its adjusted
+--      OHLCV even if the source feed is later corrected.
+CREATE TABLE IF NOT EXISTS ohlcv_daily_adj (
+    ticker           VARCHAR(12) NOT NULL,
+    ts               DATE NOT NULL,
+    open             NUMERIC(20, 8) NOT NULL,
+    high             NUMERIC(20, 8) NOT NULL,
+    low              NUMERIC(20, 8) NOT NULL,
+    close            NUMERIC(20, 8) NOT NULL,
+    volume           NUMERIC(20, 0) NOT NULL,
+    adj_close        NUMERIC(20, 8) NOT NULL,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (ticker, ts),
+    CONSTRAINT fk_ohlcv_adj_ticker FOREIGN KEY (ticker)
+        REFERENCES ticker_universe(ticker) ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS idx_ohlcv_daily_adj_ticker_ts
+    ON ohlcv_daily_adj (ticker, ts);
+
+-- ---------------------------------------------------------------------------
 -- corporate_actions  (splits, dividends, ticker renames)
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS corporate_actions (

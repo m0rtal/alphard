@@ -49,6 +49,10 @@ class DataStore(abc.ABC):
     def init_schema(self) -> None:
         """Create tables / extensions if missing. Idempotent."""
 
+    @abc.abstractmethod
+    def close(self) -> None:
+        """Release the underlying connection / handle. Idempotent."""
+
     # ---- ticker universe ------------------------------------------------
 
     @abc.abstractmethod
