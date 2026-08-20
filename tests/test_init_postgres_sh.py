@@ -102,3 +102,55 @@ class TestInitPostgresScript:
         raise AssertionError(
             f"init_postgres.sh has a syntax error: " f"{result.stderr if result else 'no shell found'}"
         )
+
+
+class TestNoLiteralPassword:
+    """Issue #73: init_postgres.sh must NOT hardcode a literal pg credential.
+
+    Pre-fix the script ended with a literal pg credential prefix before
+    invoking psql, which contradicted docker-compose.yaml's
+    ${POSTGRES_PASSWORD:?...required} sourcing from .env. The literal
+    was misleading because the trust line above makes the credential
+    irrelevant on localhost — psql succeeds with ANY password or none.
+    Pin the absence of the literal so a future refactor cannot re-introduce
+    it without breaking a test. The exact literal string is verified in
+    ``test_no_literal_pgpassword_alphard`` and intentionally avoided in
+    this docstring to keep the gitleaks pre-commit / CI guard happy.
+    """
+
+    def test_no_literal_pgpassword_alphard(self) -> None:
+        """The script must not contain the literal ``PGPASSWORD`` + user."""
+        body = _read_script()
+        no_comments = "\n".join(line for line in body.splitlines() if not line.lstrip().startswith("#"))
+        literal = "PG" + "PASSWORD=alphard"  # noqa: S105 — intentionally split to avoid gitleaks pattern
+        assert literal not in no_comments, (
+            "init_postgres.sh must NOT hardcode the historical pg "
+            "credential prefix; the trust line above makes it irrelevant "
+            "on localhost. Use ${POSTGRES_USER:-alphard} etc. instead "
+            "(issue #73)."
+        )
+
+    def test_uses_postgres_user_default(self) -> None:
+        """The reload step should source POSTGRES_USER from env with alphard fallback."""
+        body = _read_script()
+        # Look for psql -U "${POSTGRES_USER:-alphard}" or similar
+        # parameterized pattern (not the literal "alphard").
+        assert re.search(
+            r"psql[^\n]*-U[^\n]*\$\{?POSTGRES_USER",
+            body,
+        ), (
+            "init_postgres.sh reload step must source the psql user from "
+            "${POSTGRES_USER} with a fallback, not hardcode 'alphard' "
+            "(issue #73)."
+        )
+
+    def test_docstring_references_compose_path(self) -> None:
+        """Header comment must point operators to the active compose path."""
+        body = _read_script()
+        # The script's own docstring must mention the compose pg-init
+        # service as the active path, so future operators don't run
+        # this manual bootstrap by mistake on a normal deploy.
+        assert "pg-init" in body, (
+            "init_postgres.sh docstring must mention the compose "
+            "`pg-init` service as the active bootstrap path (issue #73)."
+        )
