@@ -112,6 +112,40 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 
+  # Issue #55: catch any future commit that hardcodes the Grafana admin
+  # password or re-enables anonymous auth. The deploy script (and only the
+  # deploy script, per issue #55) is allowed to read GF_SECURITY_ADMIN_PASSWORD
+  # from a runtime env var via ${GRAFANA_ADMIN_PASSWORD} — gitleaks doesn't
+  # understand bash interpolation, so this ripgrep-based guard complements
+  # it with project-specific semantics.
+  grafana-secrets:
+    name: Grafana secrets guard
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Scan for hardcoded Grafana admin password or anonymous flag
+        run: |
+          set -euo pipefail
+          BAD=0
+          # Match assignments like GF_SECURITY_ADMIN_PASSWORD=alphard or
+          # GF_SECURITY_ADMIN_PASSWORD: alphard (YAML compose form is OK
+          # because it uses ${GRAFANA_ADMIN_PASSWORD:?...required} — we
+          # look for a literal RHS only).
+          if grep -RnE 'GF_SECURITY_ADMIN_PASSWORD[[:space:]]*[:=][[:space:]]*[A-Za-z0-9]' \
+              scripts/ docker-compose.yaml docker/; then
+            echo "::error::Hardcoded GF_SECURITY_ADMIN_PASSWORD detected — must source from env."
+            BAD=1
+          fi
+          if grep -RnE 'GF_AUTH_ANONYMOUS_ENABLED[[:space:]]*[:=][[:space:]]*true' \
+              scripts/ docker-compose.yaml docker/; then
+            echo "::error::GF_AUTH_ANONYMOUS_ENABLED=true detected — LAN info-disclosure (issue #55)."
+            BAD=1
+          fi
+          exit "${BAD}"
+
+
   sca:
     name: SCA (pip-audit)
     runs-on: ubuntu-latest
