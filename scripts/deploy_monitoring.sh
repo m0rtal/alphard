@@ -62,14 +62,48 @@ HELPER_ID="$(curl -s -X POST "${API}/containers/create?name=hermes-monitor-push"
 curl -s -X POST "${API}/containers/${HELPER_ID}/start" >/dev/null
 
 push_file() {
-  local src="$1" dst="$2
+  local src="$1" dst="$2"
+  # Stream the file via base64 + `echo ... | base64 -d > ...` inside
+  # the helper container. We build the JSON body with python (already
+  # used elsewhere in this script for JSON parsing) so b64 chars
+  # (+/=) and the dst path are escaped safely. Pre-fix (issue #54)
+  # this inlined `$b64` inside an already-shell-escaped JSON string,
+  # which broke at parse time — the script had a syntax error on
+  # line 65 (missing closing `"`) AND never actually invoked the
+  # function from anywhere.
+  local b64
   b64="$(base64 -w0 < "$src")"
-  curl -s -X POST "${API}/containers/${HELPER_ID}/exec" \
+  local exec_id
+  exec_id="$(curl -s -X POST "${API}/containers/${HELPER_ID}/exec" \
     -H "Content-Type: application/json" \
-    -d "{\"Cmd\":[\"sh\",\"-c\",\"echo '$b64' | base64 -d > '$dst' && chown 472:472 '$dst' && echo WROTE\"],\"AttachStdout\":true}" \
-    >/dev/null
-  curl -s -X POST "${API}/exec/$(curl -s -X POST "${API}/containers/${HELPER_ID}/exec" -H "Content-Type: application/json" -d "{\"Cmd\":[\"true\"],\"AttachStdout\":true}" | python3 -c 'import sys, json; print(json.load(sys.stdin)["Id"])')/start" -d '{"Detach":false}' >/dev/null
+    -d "$(b64="$b64" dst="$dst" python3 -c '
+import json, os
+print(json.dumps({
+    "Cmd": ["sh", "-c", "echo " + os.environ["b64"] + " | base64 -d > " + os.environ["dst"] + " && chown 472:472 " + os.environ["dst"] + " && echo WROTE"],
+    "AttachStdout": True,
+}))' \
+    )" | python3 -c 'import sys, json; print(json.load(sys.stdin)["Id"])')"
+  curl -s -X POST "${API}/exec/${exec_id}/start" \
+    -H "Content-Type: application/json" \
+    -d '{"Detach": false}' >/dev/null
 }
+
+# Step 1.5: actually push the provisioning files onto the .107 host.
+# Pre-fix (PR #53) the `push_file` function was defined but never
+# called, so the script silently failed to provision anything on a
+# clean host. See issue #54 — `bash -n scripts/deploy_monitoring.sh`
+# returned parse error AND the only path that copies files was dead.
+push_file "./docker/prometheus/prometheus.yml" \
+  "/mnt/appdata/alphard/observability/prometheus/prometheus.yml"
+push_file "./docker/grafana/provisioning/datasources/prometheus.yml" \
+  "/mnt/appdata/alphard/observability/grafana/provisioning/datasources/prometheus.yml"
+push_file "./docker/grafana/provisioning/dashboards/provider.yml" \
+  "/mnt/appdata/alphard/observability/grafana/provisioning/dashboards/provider.yml"
+# Dashboards: provision one JSON at a time so partial failures don't
+# block the whole batch.
+for f in ./docker/grafana/dashboards/*.json; do
+  push_file "$f" "/mnt/appdata/alphard/observability/grafana/provisioning/dashboards/$(basename "$f")"
+done
 
 # Step 2: deploy Prometheus (bridge network, port mapping works standalone).
 echo "deploying prometheus..."
