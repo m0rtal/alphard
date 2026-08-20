@@ -95,16 +95,34 @@ The history-data endpoint (``invest-public-api.tinkoff.ru``) and the
 aggregation to daily bars are otherwise identical to the upstream
 ``download_md.sh`` reference script.
 """
+
 from __future__ import annotations
 
+# H-NETWORK-DETECT (2026-08-20): register faulthandler at module import
+# so the live backfill_history_md.py process owns the SIGUSR1 → Python
+# stack-trace handler. The entrypoint.sh shim registers in a throwaway
+# subprocess and therefore did NOT cover this process; that was the
+# reason the SIGUSR1 dump sent to PID 19 produced no output on the
+# fresh sha-1e3b6dd container.
+#
+# Module-level register is safe: faulthandler is idempotent (re-calling
+# register() replaces the handler) and dump_to_stderr is cheap when not
+# triggered. all_threads=True catches both the main ticker loop and any
+# ThreadPoolExecutor workers the fallback chain uses internally.
+
 import argparse
+import faulthandler
 import logging
 import os
+import signal as _signal  # used only by the faulthandler.register call below
 import signal
 import sys
-import time
 import threading
+import time
 from datetime import date
+
+faulthandler.enable()
+faulthandler.register(_signal.SIGUSR1, all_threads=True, chain=False)
 
 # Make alphard.src importable when run from /app in container.
 sys.path.insert(0, "/app")
@@ -627,11 +645,15 @@ def main() -> int:
             # as no-data via delisted_at. The flag remains — re-running
             # without --skip-known-bad will still attempt the ticker
             # (useful when Tinkoff later backfills the missing history).
-            if args.skip_known_bad and meta is not None and meta.delisted_at is not None:
-                logger.info(
-                    f"{i}/{len(tickers)} {ticker}: skip (delisted_at={meta.delisted_at}, "
-                    "--skip-known-bad)"
-                )
+            # NOTE: store.ticker_meta() returns a raw psycopg tuple
+            # ``(listed_at, delisted_at)`` (or None), not a TickerMeta
+            # object — accessing via index, not attribute. This was a
+            # regression from feat(backfill) --skip-known-bad (bc867a2)
+            # that only got caught at 2026-08-20 runtime because the
+            # unit tests covered argparse+predicate but never the
+            # integration with a real PostgresDataStore fixture.
+            if args.skip_known_bad and meta is not None and meta[1] is not None:
+                logger.info(f"{i}/{len(tickers)} {ticker}: skip (delisted_at={meta[1]}, " "--skip-known-bad)")
                 skipped_complete += 1
                 circuit_breaker_streak = 0
                 continue

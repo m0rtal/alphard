@@ -153,30 +153,20 @@ print('schema OK')
 
     echo "Launching backfill_history_md as background service..."
     BACKFILL_LOG="${BACKFILL_LOG:-/app/logs/backfill_history_md.log}"
-    # Run in background; redirect output; use setsid so backfill survives
-    # any signal sent to this entrypoint. PID goes to a file so health
-    # checks / debug exec can find it.
-    #
-    # BUGFIX (2026-08-18 / Phase 1.6 audit): removed --classes TQBR TQOB
-    # TQCB TQTE so the backfill pulls the FULL universe (TQBR + SPBXM +
-    # TQBS + TQDE + TQNO + TQLV + TQPI + TQOB + TQCB + TQTE ≈ 5500+ tickers
-    # per Tinkoff). Per-ticker completion is decided inside the script by
-    # the age-aware _is_complete() helper, which already skips tickers
-    # whose expected bar count is satisfied. SPBXM (US tickers) is
-    # filtered inside the loader because the MD archive only covers
-    # TQBR/TQOB/TQCB/TQTE; everything else still gets pulled via
-    # gRPC + MOEX fallback. SPBXM ETL via the dedicated
-    # backfill_spbxm_universe.py one-shot is left in place for the
-    # historical 2018-only archive pulls because gRPC pagination over
-    # 1.5k SPBXM tickers is slow.
-    setsid python3 scripts/backfill_history_md.py \
-        --limit 5500 \
-        --start-year 2018 \
-        --min-bars 1300 \
-        >>"${BACKFILL_LOG}" 2>&1 &
-    BACKFILL_PID=$!
-    echo "  backfill PID=${BACKFILL_PID}, log=${BACKFILL_LOG}"
-    echo "${BACKFILL_PID}" > /tmp/alphard-backfill.pid
+    # NOTE (2026-08-20): backfill_history_md.py is now owned by the
+    # _backfill_supervisor_loop thread inside src/main.py. The thread
+    # spawns, waitpids, and respawns on death — exactly the lifecycle
+    # control we needed when the old `setsid ... &` shell pattern left
+    # a zombie PID 19 with no reaper and no respawner (the 17-hour
+    # "network stall" that wasn't). The shell no longer launches the
+    # backfill; main.py does. We just touch the log file so the log
+    # stream exists before the supervisor writes to it, and drop a
+    # marker so the next operator can tell supervisor-managed vs
+    # shell-launched apart at a glance.
+    install -d -m 0755 "$(dirname "${BACKFILL_LOG}")"
+    : >"${BACKFILL_LOG}"
+    echo "  backfill: owned by alphard-backfill-supervisor thread in src/main.py" >>"${BACKFILL_LOG}"
+    echo "  backfill log=${BACKFILL_LOG} (supervisor-managed)"
 
     # H-NETWORK-DETECT (2026-08-20): wire SIGUSR1 -> faulthandler dump
     # so that if the backfill Python process ever sits idle in a
@@ -189,11 +179,18 @@ print('schema OK')
     # re-installing it on every container start is the simplest way to
     # guarantee the signal handler is in place regardless of whether
     # backfill_history_md.py itself grows to ignore SIGUSR1.
+    #
+    # The faulthandler registers in THIS throwaway python subprocess, so
+    # the live backfill_history_md.py child needs its own register call
+    # (handled at module-import time in scripts/backfill_history_md.py).
+    # This entrypoint hook is kept as a defense-in-depth for the main
+    # src.main heartbeat loop and any future daemons that don't carry
+    # their own registration.
     python3 -c "
 import faulthandler, signal, sys
 faulthandler.enable()
 faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
-sys.stdout.write('faulthandler SIGUSR1 enabled\n')
+sys.stdout.write('faulthandler SIGUSR1 enabled (entrypoint shim)\n')
 sys.stdout.flush()
 " >>"${BACKFILL_LOG}" 2>&1 || echo 'faulthandler init failed (non-fatal)'
 fi
