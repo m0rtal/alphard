@@ -120,17 +120,14 @@ def _run_scan(
             env_file_path.parent.mkdir(parents=True, exist_ok=True)
         if not env_file_path.exists():
             # Create file with explicit body (or empty if not specified).
-            env_file_path.write_text(
-                env_file_body or "", encoding="utf-8"
-            )
+            env_file_path.write_text(env_file_body or "", encoding="utf-8")
 
     # Write the snippet body so the subshell sources it. We pin the bind
     # and tmp paths via env vars so we don't have to monkey-patch
     # entrypoint.sh itself.
     body = scratch / "scan.sh"
     body.write_text(
-        _SCAN_SNIPPET
-        + """
+        _SCAN_SNIPPET + """
 # Only print vars that were actually exported by the sourced file. We
 # invert the test (``[ -z "..." ] && ...``) because the empty-expansion
 # of ``${VAR+x}`` for unset variables causes the standard ``[ -n ]`` form
@@ -204,9 +201,7 @@ class TestEntrypointEnvFile:
             text,
             flags=re.DOTALL,
         )
-        assert match is not None, (
-            "docker/entrypoint.sh no longer contains a for-ENV_FILE_CANDIDATE-in loop"
-        )
+        assert match is not None, "docker/entrypoint.sh no longer contains a for-ENV_FILE_CANDIDATE-in loop"
 
         def _tokens(raw: str) -> list[str]:
             # Strip backslash-newline continuations first so the whole
@@ -221,9 +216,7 @@ class TestEntrypointEnvFile:
             _SCAN_SNIPPET,
             flags=re.DOTALL,
         )
-        assert snippet_match is not None, (
-            "_SCAN_SNIPPET must contain a for-ENV_FILE_CANDIDATE-in loop"
-        )
+        assert snippet_match is not None, "_SCAN_SNIPPET must contain a for-ENV_FILE_CANDIDATE-in loop"
         snippet_tokens = _tokens(snippet_match.group(1))
 
         assert ep_tokens == snippet_tokens, (
@@ -239,8 +232,7 @@ class TestEntrypointEnvFile:
         """ENV_FILE=/some/path → that path is sourced and tokens appear."""
         env_file = tmp_path / "real.env"
         env_file.write_text(
-            "TINKOFF_SANDBOX_TOKEN=t.SANDBOX_FROM_ENV_FILE\n"
-            "ALPHARD_FROM=env_file\n",
+            "TINKOFF_SANDBOX_TOKEN=t.SANDBOX_FROM_ENV_FILE\n" "ALPHARD_FROM=env_file\n",
             encoding="utf-8",
         )
 
@@ -250,9 +242,9 @@ class TestEntrypointEnvFile:
             tmp_file=None,
         )
         assert rc == 0
-        assert parsed.get("TINKOFF_SANDBOX_TOKEN") == "t.SANDBOX_FROM_ENV_FILE", (
-            "ENV_FILE override must be sourced; got: " + repr(parsed)
-        )
+        assert (
+            parsed.get("TINKOFF_SANDBOX_TOKEN") == "t.SANDBOX_FROM_ENV_FILE"
+        ), "ENV_FILE override must be sourced; got: " + repr(parsed)
         assert parsed.get("ALPHARD_FROM") == "env_file"
 
     def test_env_file_takes_precedence_over_bind_candidates(self, tmp_path: Path) -> None:
@@ -268,10 +260,7 @@ class TestEntrypointEnvFile:
         matters — the exact path of the bind-mounted candidate is
         tested by ``test_candidate_order_matches_entrypoint``.
         """
-        env_file_body = (
-            "TINKOFF_SANDBOX_TOKEN=t.FROM_ENV_FILE\n"
-            "ALPHARD_FROM=env_file\n"
-        )
+        env_file_body = "TINKOFF_SANDBOX_TOKEN=t.FROM_ENV_FILE\n" "ALPHARD_FROM=env_file\n"
         env_file = tmp_path / "env_file_path.env"
         env_file.write_text(env_file_body, encoding="utf-8")
 
@@ -282,8 +271,7 @@ class TestEntrypointEnvFile:
         )
         assert rc == 0
         assert parsed.get("TINKOFF_SANDBOX_TOKEN") == "t.FROM_ENV_FILE", (
-            "ENV_FILE must be sourced as the first candidate; "
-            f"got: {parsed.get('TINKOFF_SANDBOX_TOKEN')!r}"
+            "ENV_FILE must be sourced as the first candidate; " f"got: {parsed.get('TINKOFF_SANDBOX_TOKEN')!r}"
         )
         assert parsed.get("ALPHARD_FROM") == "env_file"
 
@@ -300,17 +288,14 @@ class TestEntrypointEnvFile:
             bind_mount_file=None,
             tmp_file=None,
         )
-        assert rc == 0, "sourcing loop itself must not exit non-zero; " \
-            "the token-presence guard fires further down"
+        assert rc == 0, "sourcing loop itself must not exit non-zero; " "the token-presence guard fires further down"
         assert "TINKOFF_SANDBOX_TOKEN" not in parsed, (
             "When no candidate resolves to a real file, no TINKOFF_*_TOKEN "
             "should be exported — the downstream exit-1 guard needs that "
             f"condition to fire. Got: {parsed}"
         )
 
-    def test_empty_env_file_var_falls_through_to_bind_candidate(
-        self, tmp_path: Path
-    ) -> None:
+    def test_empty_env_file_var_falls_through_to_bind_candidate(self, tmp_path: Path) -> None:
         """When ENV_FILE is the empty string (unset), the for-loop must
         skip it (the `[ -n "${ENV_FILE_CANDIDATE}" ]` guard) and fall
         through to the next candidate. We can't easily put a real file at

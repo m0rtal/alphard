@@ -135,9 +135,7 @@ class TestCompose:
         )
         # Either default to /root/.env or override via host .env — both are
         # acceptable; the constraint is just that SOME path is passed.
-        assert isinstance(env_file, str) and env_file.strip(), (
-            f"ENV_FILE must be a non-empty string, got: {env_file!r}"
-        )
+        assert isinstance(env_file, str) and env_file.strip(), f"ENV_FILE must be a non-empty string, got: {env_file!r}"
         # The Portainer Env-parameter 60-char limit: Tinkoff sandbox tokens
         # are 64+ chars and CANNOT live here. We only put the short PATH
         # in Portainer Env; the long token values live in the .env body.
