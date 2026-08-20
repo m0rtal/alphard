@@ -186,18 +186,23 @@ services:
     image: grafana/grafana:latest
     container_name: alphard-grafana
     restart: unless-stopped
+    # BUGFIX (2026-08-20): .107 Docker daemon has broken bridge port mapping
+    # (iptables NAT empty after ContainerStart). Standard HostPort publishing
+    # silently fails — host->container port is unreachable. Workaround: use
+    # network_mode: host. Grafana shares the host network namespace, so its
+    # 0.0.0.0:3000 listener = host's 0.0.0.0:3000. forgejo already lives on
+    # host:3000, so Grafana binds to 3300 via GF_SERVER_HTTP_PORT instead.
+    network_mode: host
     environment:
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD required}
+      GF_SERVER_HTTP_PORT: "3300"
+    user: "472:472"
     volumes:
       - /mnt/appdata/alphard/grafana:/var/lib/grafana
       - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
-    ports:
-      - "3000:3000"
     depends_on:
       - prometheus
-    networks:
-      - alphard-net
     profiles: ["observability"]
 
 networks:
