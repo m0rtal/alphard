@@ -2,7 +2,7 @@
 
 > Single source of truth for what Phase 1 explicitly punts and what Phase 2 plans to land.
 > Synthesized from README.md, docs/PHASE1-AUDIT-2026-08-17.md, docs/SECURITY.md, docs/RUNBOOK.md.
-> **Last updated:** 2026-08-19 (after PR #17 merge + sha-bc867a2 deploy).
+> **Last updated:** 2026-08-20 (issue #74 — Phase 2.5 step 2b: corp-actions apply orchestrator).
 
 ## Status
 
@@ -77,12 +77,54 @@ This gate exists by design — it is a Phase 1 guarantee, not a bug.
 **PR #17 (commit `e406488`):** Added fail-safe on VALIDATE/RISK exception + TOCTOU guard.
 **Next:** Wire Quant + Macro into the `stages` list. Coordinator `stage 0 = MACRO`, `stage 1 = QUANT`, `stage 2 = VALIDATE`, `stage 3 = RISK`, `stage 4 = EXECUTE`, `stage 5 = AUDIT`.
 
-### 2.4 — Adjusted prices
+### 2.4 — Adjusted prices pipeline (split adjustment, Phase 2.5 step 2b)
 
-**What:** `adj_close = close * split_factor * dividend_factor`.
-**Today:** placeholder, `adj_close = close`.
-**Sources:** Tinkoff corporate actions feed (already pulled in `corporate_actions` table) + MOEX ISS.
-**Why Phase 2:** Backtest accuracy drops 5-15% without adj_close; needs QA harness comparing backtest PnL with/without adjustment on 2y window.
+**What:** Phase 2.4 ships `apply_split_adjustment` end-to-end:
+splits + adjusted OHLCV bars land in Postgres, ready for backtests.
+
+**Steps:**
+- **Step 1 — pure math (PR #45, merged 2026-08-20):**
+  `src/data/adjustment.py::apply_split_adjustment(rows, actions)`.
+  22 unit tests, 91% coverage, no IO. Scales prices by 1/R for
+  pre-split bars; volume by R. Multiple splits compose multiplicatively.
+- **Step 2a — fetcher (PR #54, merged 2026-08-20):**
+  `scripts/fetch_moex_corporate_actions.py` — MOEX ISS splits + (optional)
+  dividends into a JSON snapshot. 24 tests. Standalone utility.
+- **Step 2b — apply orchestrator (issue #74, branch
+  `feat/issue-74-corp-actions-apply`):**
+  `scripts/apply_corporate_actions.py` — pulls splits per ticker from
+  step 2a, applies step 1 to raw OHLCV, persists to a new parallel
+  table `ohlcv_daily_adj` (FK to `ticker_universe`). 16 orchestrator
+  tests + 9 daemon-thread tests. Daemon runs weekly via
+  `src/main.py::_corp_actions_apply_loop` (mirrors `_delisted_sync_loop`,
+  first run 24h after launch, then every 7 days).
+- **Step 3 — migration to ohlcv_daily (planned, not yet scheduled):**
+  When PR #75 lands the `source` column on `ohlcv_daily`, the parallel
+  `ohlcv_daily_adj` table is migrated:
+  `INSERT INTO ohlcv_daily (..., source='tkf_adj') SELECT FROM ohlcv_daily_adj`
+  and the parallel table is dropped. The migration is a single DDL +
+  DML; it's auditable because the parallel table preserves every
+  (ticker, ts) pair with its adjusted OHLCV even if the raw feed is
+  later corrected.
+
+**Why a parallel table for step 2b (not overwriting ohlcv_daily):**
+1. Re-running the apply pipeline must never silently overwrite the raw
+   feed (which is the audit trail for QA reconciliation).
+2. PR #75 (branch feat/issue-68-ohlcv-source-column) is approved but
+   not yet in main; until it merges, `ohlcv_daily` has no `source`
+   column to tag adjusted bars. The parallel table is the storage
+   target that does not depend on merge order.
+
+**Deferred to Phase 3+:** Dividend adjustment (`kind='dividend'`)
+needs total-return-index math — out of scope for step 2b. The fetcher
+already emits dividends; they wait in `corporate_actions` for the
+follow-up.
+
+**Sources:** `scripts/fetch_moex_corporate_actions.py` (step 2a fetcher),
+`src/data/adjustment.py` (step 1 math), `scripts/apply_corporate_actions.py`
+(step 2b orchestrator), and the test contracts at
+`tests/test_apply_corporate_actions.py` +
+`tests/test_main_corp_actions_apply.py`.
 
 ### 2.5 — Cross-source validation cron
 

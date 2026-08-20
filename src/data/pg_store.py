@@ -498,6 +498,70 @@ class PostgresDataStore(DataStore):
             cur.execute(sql, params)
             return [_row_to_ohlcv(r) for r in cur.fetchall()]
 
+    # ---------------------------------------------------------- OHLCV adjusted (Phase 2.5 step 2b)
+
+    def upsert_ohlcv_adj(self, rows: list[OHLCVRow]) -> int:
+        """Upsert split-adjusted OHLCV bars into ``ohlcv_daily_adj``.
+
+        Phase 2.5 step 2b lands before Phase 2.6 step 2 (the ``source``
+        column on ``ohlcv_daily``). We persist adjusted bars in a
+        parallel table so the raw feed stays intact and the migration
+        path stays auditable. See ``src/data/store.py`` for the ABC
+        contract and PR #74 body for the merge plan.
+        """
+        if not rows:
+            return 0
+        self._connect()
+        sql = """
+            INSERT INTO ohlcv_daily_adj
+                (ticker, ts, open, high, low, close, volume, adj_close,
+                 updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s,
+                    NOW())
+            ON CONFLICT (ticker, ts) DO UPDATE SET
+                open       = EXCLUDED.open,
+                high       = EXCLUDED.high,
+                low        = EXCLUDED.low,
+                close      = EXCLUDED.close,
+                volume     = EXCLUDED.volume,
+                adj_close  = EXCLUDED.adj_close,
+                updated_at = NOW()
+        """
+        params = [
+            (
+                r.ticker,
+                r.ts,
+                str(r.open),
+                str(r.high),
+                str(r.low),
+                str(r.close),
+                str(r.volume),
+                str(r.adj_close),
+            )
+            for r in rows
+        ]
+        with self._conn.cursor() as cur:
+            cur.executemany(sql, params)
+        self._conn.commit()
+        return len(rows)
+
+    def query_ohlcv_adj(
+        self,
+        ticker: str,
+        start: date,
+        end: date,
+    ) -> list[OHLCVRow]:
+        self._connect()
+        sql = (
+            "SELECT ticker, ts, open, high, low, close, volume, adj_close "
+            "FROM ohlcv_daily_adj WHERE ticker = %s AND ts BETWEEN %s AND %s"
+        )
+        params: list[Any] = [ticker.upper(), start, end]
+        sql += " ORDER BY ts"
+        with self._conn.cursor() as cur:
+            cur.execute(sql, params)
+            return [_row_to_ohlcv(r) for r in cur.fetchall()]
+
     # ---------------------------------------------------------- corp actions
 
     def upsert_corporate_actions(self, rows: list[CorporateAction]) -> int:

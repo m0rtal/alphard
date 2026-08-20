@@ -55,6 +55,18 @@ DAILY_SYNC_SUBPROCESS_TIMEOUT = 600  # 10 min hard cap per sync; longer = kill.
 DELISTED_SYNC_CADENCE_SECONDS = 7 * 24 * 3600  # 7 days between runs.
 DELISTED_SYNC_SUBPROCESS_TIMEOUT = 2400  # 40 min hard cap; larger window than daily.
 
+# Phase 2.5 step 2b: weekly apply_corporate_actions cron. Pulls MOEX ISS
+# splits per ticker and re-applies them to raw OHLCV bars, persisting
+# split-adjusted bars to ohlcv_daily_adj. Same daemon pattern as
+# delisted_sync: subprocess + sentinel + watchdog. 7-day cadence mirrors
+# delisted_sync because split events are also slow-moving (a handful
+# per year on MOEX).
+CORP_ACTIONS_APPLY_CADENCE_SECONDS = 7 * 24 * 3600  # 7 days between runs.
+# 60 min hard cap: walking 3000 tickers through apply_split_adjustment
+# is fast (~1ms/ticker), so even a worst-case cold-cache run finishes
+# inside 30 min. 60 min gives headroom for MOEX ISS latency.
+CORP_ACTIONS_APPLY_SUBPROCESS_TIMEOUT = 3600
+
 # Phase 1.6 audit: in-process watchdog for the daily_sync daemon thread.
 # A thread that crashes inside a live process leaves no signal — heartbeat
 # keeps ticking, container stays "Up", but the daily schedule is silently
@@ -367,6 +379,73 @@ def _delisted_sync_loop() -> None:
         _sleep_interruptible(DELISTED_SYNC_CADENCE_SECONDS)
 
 
+def _corp_actions_apply_loop() -> None:
+    """Run scripts/apply_corporate_actions.py weekly.
+
+    Phase 2.5 step 2b: fetches MOEX ISS splits per ticker and re-applies
+    them to raw OHLCV bars via ``src.data.adjustment.apply_split_adjustment``.
+    Persists the result to ``ohlcv_daily_adj`` (a parallel table — raw
+    ``ohlcv_daily`` is never overwritten).
+
+    Why subprocess instead of in-process call?
+    - The orchestrator walks the entire universe (3000+ tickers) and
+      holds open a Postgres connection for the duration. In-process
+      would block the heartbeat for tens of minutes. Subprocess
+      isolates the connection lifecycle and any latent IO errors from
+      the heartbeat thread.
+    - Subprocess crash MUST NOT kill the heartbeat. Process boundary
+      = circuit breaker, same rationale as daily_sync and delisted_sync.
+
+    Schedule (Phase 2.5 step 2b):
+    - First run waits 24h after launch (let daily_sync and delisted_sync
+      settle first; corp_actions_apply is the lowest-priority of the
+      three because split events are slow-moving).
+    - Subsequent runs repeat every 7 days. Anchored on 7d-since-last-fire
+      to keep the rhythm weekly even if a single run drags.
+    - The script owns its own per-ticker idempotency cache (default
+      /var/lib/alphard/cache/corp_actions_applied.json, 7-day window),
+      so a re-run within the same week is a fast no-op.
+    """
+    logger = logging.getLogger("alphard.corp_actions_apply")
+
+    # Wait 24h before first run: daily_sync and delisted_sync get
+    # priority. Corp actions are slow-moving (a handful per year) so
+    # a 24h startup delay is invisible.
+    logger.info(
+        f"corp_actions_apply scheduled: first run in 24h, "
+        f"then every {CORP_ACTIONS_APPLY_CADENCE_SECONDS / 3600 / 24:.0f} days, "
+        f"subprocess_timeout={CORP_ACTIONS_APPLY_SUBPROCESS_TIMEOUT}s"
+    )
+    _sleep_interruptible(24 * 3600)
+
+    while not _shutdown_event.is_set():
+        logger.info("Triggering apply_corporate_actions subprocess")
+        try:
+            r = subprocess.run(
+                ["python", "scripts/apply_corporate_actions.py"],
+                capture_output=True,
+                text=True,
+                timeout=CORP_ACTIONS_APPLY_SUBPROCESS_TIMEOUT,
+                cwd="/app",
+            )
+            if r.returncode == 0:
+                tail = r.stdout[-500:] if r.stdout else ""
+                logger.info(f"corp_actions_apply OK rc={r.returncode}: {tail!r}")
+            else:
+                tail = (r.stderr or "")[-500:]
+                logger.warning(f"corp_actions_apply FAILED rc={r.returncode}: {tail!r}")
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                f"corp_actions_apply timeout after {CORP_ACTIONS_APPLY_SUBPROCESS_TIMEOUT}s; " "subprocess killed"
+            )
+        except Exception as exc:  # noqa: BLE001 — never kill the heartbeat
+            logger.error(f"corp_actions_apply unexpected error: {exc}")
+        if _shutdown_event.is_set():
+            logger.info("corp_actions_apply daemon received shutdown signal, exiting")
+            return
+        _sleep_interruptible(CORP_ACTIONS_APPLY_CADENCE_SECONDS)
+
+
 def _sleep_interruptible(seconds: float) -> None:
     """Sleep up to `seconds`, but wake up immediately on shutdown_event.
 
@@ -551,6 +630,20 @@ def main() -> None:
         f"subprocess_timeout={DELISTED_SYNC_SUBPROCESS_TIMEOUT}s)"
     )
 
+    # Phase 2.5 step 2b: weekly corp_actions_apply cron. Same daemon pattern
+    # as delisted_sync: subprocess + sentinel + watchdog. Lowest priority
+    # of the three weekly daemons (split events are slow-moving); first run
+    # waits 24h after launch.
+    corp_actions_thread = threading.Thread(
+        target=_corp_actions_apply_loop, daemon=True, name="alphard-corp-actions-apply"
+    )
+    corp_actions_thread.start()
+    logger.info(
+        f"corp-actions-apply daemon started "
+        f"(cadence={CORP_ACTIONS_APPLY_CADENCE_SECONDS / 3600 / 24:.0f}d, "
+        f"subprocess_timeout={CORP_ACTIONS_APPLY_SUBPROCESS_TIMEOUT}s)"
+    )
+
     # Phase 2.8 step 1: Prometheus metrics HTTP server. Stdlib ThreadingHTTPServer
     # bound to ALPHARD_METRICS_PORT (default 8765) on 0.0.0.0. Exposes
     # /health (cheap liveness probe) and /metrics (Prometheus text exposition
@@ -625,6 +718,9 @@ def main() -> None:
                 "child PID may be orphaned — verify with "
                 "`ps -ef | grep backfill_history_md` after container exit"
             )
+        corp_actions_thread.join(timeout=10)
+        if corp_actions_thread.is_alive():
+            logger.warning("corp-actions-apply daemon did not exit within 10s")
         _metrics_registry_obj = globals().get("_metrics_registry")
         if _metrics_registry_obj is not None and "_metrics_server" in globals():
             try:
