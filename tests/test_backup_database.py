@@ -367,3 +367,104 @@ def test_main_module_callable(monkeypatch):
     monkeypatch.setattr("backup_database.run_backup", lambda args: 0)
     rc = bd.main()
     assert rc == 0
+
+
+# ---------- _prune issue #41 regression ----------
+
+
+def test_prune_weekly_keeps_most_recent_iso_weeks_not_oldest(tmp_path: Path):
+    """Issue #41: weekly retention must keep the most recent per-week
+    backups, not the oldest.
+
+    Regression: previously the weekly branch iterated ``older``
+    oldest-first and stopped after ``weekly_keep - 1`` weeks, which
+    inverted the retention window — keeping backups from ~2 months ago
+    and dropping the 1-8 week range.
+    """
+    # 60 consecutive daily backups, newest = 2026-08-19.
+    base = datetime(2026, 8, 19, 12, 0, 0)
+    written: list[Path] = []
+    for i in range(60):
+        when = base - timedelta(days=i)
+        written.append(_write_backup_at(tmp_path, when))
+
+    backups = bd._list_backups(tmp_path)
+    assert len(backups) == 60, "_list_backups must surface all 60 files"
+
+    bd._prune(backups, daily_keep=7, weekly_keep=4)
+
+    remaining_dates: set[str] = set()
+    for _, p in backups:
+        if p.exists():
+            # _backup_path yields alphard_<when:%Y-%m-%d_%H%M%S>.sql.gz
+            name = p.name
+            assert name.startswith("alphard_"), name
+            assert name.endswith(".sql.gz"), name
+            remaining_dates.add(name[len("alphard_") : len("alphard_") + 10])
+
+    # 7 daily backups for Aug 13-19 must survive.
+    expected_dailies = {f"2026-08-{d:02d}" for d in range(13, 20)}
+    assert expected_dailies.issubset(
+        remaining_dates
+    ), f"daily window (Aug 13-19) missing; remaining={sorted(remaining_dates)}"
+
+    # The 4 weekly backups must be the 4 ISO weeks immediately preceding
+    # the daily window — i.e. no retained weekly is older than Aug 6
+    # while more-recent weekly candidates exist.
+    weekly_candidates = remaining_dates - expected_dailies
+    assert len(weekly_candidates) == 4, (
+        f"expected exactly 4 weekly files; got {len(weekly_candidates)}: " f"{sorted(weekly_candidates)}"
+    )
+
+    # No retained weekly may be older than daily_keep + weekly_keep*7
+    # days back from the newest backup, while more-recent weekly
+    # candidates exist. AC from issue #41.
+    oldest_allowed = base - timedelta(days=7 + 4 * 7)
+    old_retention = [d for d in weekly_candidates if d < oldest_allowed.strftime("%Y-%m-%d")]
+    assert old_retention == [], (
+        f"retained weekly files older than {oldest_allowed:%Y-%m-%d} — " f"window is inverted: {sorted(old_retention)}"
+    )
+
+
+def test_prune_weekly_keep_exact_count(tmp_path: Path):
+    """weekly_keep=N must retain exactly N weekly files when ≥N distinct
+    older ISO weeks exist. Issue #41 off-by-one: previously kept N-1.
+    """
+    # 28 daily backups, one per day for the last 4 ISO weeks (Aug 4-19,
+    # inclusive). daily_keep=7 keeps Aug 13-19; weekly window should
+    # keep one per week for the preceding 3 weeks.
+    base = datetime(2026, 8, 19, 12, 0, 0)
+    for i in range(28):
+        when = base - timedelta(days=i)
+        _write_backup_at(tmp_path, when)
+
+    backups = bd._list_backups(tmp_path)
+    bd._prune(backups, daily_keep=7, weekly_keep=3)
+
+    remaining = [p for _, p in backups if p.exists()]
+    # 7 dailies + 3 weeklies = 10
+    assert len(remaining) == 10, (
+        f"expected 7+3=10; got {len(remaining)}. Files: " f"{sorted(p.name for p in remaining)}"
+    )
+
+
+def test_prune_weekly_does_not_double_count_adjacent_iso_weeks(tmp_path: Path):
+    """Two backups 1 day apart but in different ISO weeks must not both
+    consume weekly slots when older distinct weeks are available.
+
+    2026-06-21 (Sun) and 2026-06-22 (Mon) are adjacent ISO weeks. The
+    buggy code would consume two slots for them, leaving a 6-week hole.
+    """
+    # Backups: today, 1 day ago, 8 days ago, 15 days ago, 22 days ago,
+    # 29 days ago, 36 days ago, 43 days ago, 50 days ago, 57 days ago.
+    # That's daily_keep=2 (today + yesterday) + 5 distinct older weeks.
+    base = datetime(2026, 8, 19, 12, 0, 0)
+    for d in [0, 1, 8, 15, 22, 29, 36, 43, 50, 57]:
+        _write_backup_at(tmp_path, base - timedelta(days=d))
+
+    backups = bd._list_backups(tmp_path)
+    bd._prune(backups, daily_keep=2, weekly_keep=4)
+
+    remaining = [p for _, p in backups if p.exists()]
+    # 2 dailies + 4 weeklies = 6
+    assert len(remaining) == 6, f"expected 2+4=6; got {len(remaining)}: " f"{sorted(p.name for p in remaining)}"
