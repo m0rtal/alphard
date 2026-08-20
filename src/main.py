@@ -159,22 +159,46 @@ def _spawn_backfill() -> int:
 def _backfill_supervisor_loop() -> None:
     """Supervise the backfill daemon: waitpid, respawn on death, back off.
 
-    Runs forever until _shutdown_event. On an excessive-death-rate
-    (>10/hour) it logs CRITICAL and exits non-zero so Docker restart kicks in.
+    Runs forever until ``_shutdown_event``. Counts ONLY crashes
+    (``rc != 0``) toward the per-hour rate limit
+    (``_BACKFILL_MAX_RESPAWNS_PER_HOUR``). Clean exits (``rc == 0``) —
+    e.g. universe already complete, ``mark_terminally_failed`` exhausted,
+    or sandbox universe empty — are respawned without incrementing the
+    death counter. This carve-out was added in PR #57 after the
+    2026-08-20 sawtooth-uptime incident (root cause: empty-universe
+    ``rc=0`` exits tripped the cap every ~6 minutes and zeroed the
+    container-uptime gauge on every Docker restart). See issue #59 for
+    the invariant hardening (``rc`` is always bound before use, even
+    under ``python -O``).
+
+    On excessive CRASHES (>10/hour) it logs CRITICAL and exits non-zero
+    so Docker restart kicks in with fresh state.
     """
     death_timestamps: list[float] = []
     while not _shutdown_event.is_set():
         pid = _spawn_backfill()
+        # Default to rc=0 so every exit path leaves `rc` bound. This
+        # makes the post-loop code safe under `python -O` (where a
+        # runtime check on `rc` would be compiled out) and explicit
+        # about what the ChildProcessError branch means: "child
+        # disappeared, treat as clean exit, do not count toward the
+        # death cap".
+        rc = 0
         # Block until child exits or shutdown fires.
         while not _shutdown_event.is_set():
             try:
                 waited_pid, status = os.waitpid(pid, os.WNOHANG)
             except ChildProcessError:
-                # Already reaped by something else (shouldn't happen — we
-                # are the only process that ever spawned this child via
-                # _spawn_backfill, and we own the lifecycle).
-                waited_pid = pid
-                status = 0
+                # Already reaped by something else (host cgroup reaper,
+                # docker exec, operator `kill -9` from another shell).
+                # Treat as clean exit: rc stays 0 (the default above),
+                # no death-counter increment, no WARN spam in normal
+                # operation. Log only as INFO so the operator can see
+                # reaps if they look.
+                _supervisor_logger.info(
+                    f"_backfill_supervisor_loop: child pid={pid} reaped by something "
+                    f"other than us; treating as clean exit"
+                )
                 break
             if waited_pid == pid:
                 rc = os.waitstatus_to_exitcode(status) if hasattr(os, "waitstatus_to_exitcode") else (status >> 8)
@@ -194,26 +218,28 @@ def _backfill_supervisor_loop() -> None:
             break
         # Backoff before respawn.
         _sleep_interruptible(_BACKFILL_RESPAWN_BACKOFF_SECONDS)
-        # `rc` is always bound at this point because the inner while/break
-        # guarantees we only reach here via the `waited_pid == pid` branch
-        # which assigns rc. If rc were missing we'd have hit the outer
-        # `else` (shutdown handler) instead. We assert it for safety.
-        assert rc is not None
-        # Rate-limit: count ONLY CRASHES (rc != 0) in the last hour. Clean
-        # exits (rc == 0) are the backfill finishing its universe pass with
-        # no tickers (e.g. empty sandbox universe, mark_terminally_failed
-        # exhausted). Counting those caused a permanent restart loop on
-        # 2026-08-20 because Tinkoff sandbox returned 401 for every token
-        # while Tinkoff's network behaviour cut off HTTP responses from
-        # .103/.107 — every backfill exited rc=0 in 2 seconds, the
-        # supervisor reset the count every 30s, and we never reached a
-        # crash to invert the cycle. The Docker container restart loop
-        # then zeroed the uptime gauge and produced a sawtooth on Grafana.
-        # We now differentiate: rc=0 → no-op, rc≠0 → account toward
-        # the per-hour cap.
+        # Prune `death_timestamps` on EVERY iteration (cheap when empty,
+        # bounded when not) so the list cannot grow unbounded on long
+        # stretches of clean exits. Only APPEND on crashes — clean exits
+        # must not poison the rate-limit window. See issue #60: pre-fix
+        # the prune+append was inside `if rc != 0:`, so each clean exit
+        # leaked one float and the list grew ~2880 entries/day at the
+        # 30s respawn cadence (≈1M/year, ≈28 MB/year).
+        now = time.monotonic()
+        death_timestamps = [t for t in death_timestamps if now - t < 3600]
+        # Rate-limit: count ONLY CRASHES (rc != 0) in the last hour. The
+        # code-path producing rc=0 is: (a) the ChildProcessError branch
+        # above (default), (b) a clean backfill finish — empty sandbox
+        # universe, ``mark_terminally_failed_exhausted``, or every ticker
+        # skipped via ``_is_complete``. Note that auth failures in the
+        # backfill return rc=1 (auth_probe, src/main.py:597) and per-
+        # ticker errors return rc=2 (errors accumulator, src/main.py:756),
+        # so the 2026-08-20 incident's "Tinkoff 401 every 2 seconds"
+        # narrative was operator-observation shorthand, not the literal
+        # exit path — the literal exit path was "universe pass finished
+        # with no writes". See Grafana panel ``alphard_backfill_rc`` at
+        # 2026-08-20T10:30Z for the actual sequence.
         if rc != 0:
-            now = time.monotonic()
-            death_timestamps = [t for t in death_timestamps if now - t < 3600]
             death_timestamps.append(now)
             if len(death_timestamps) > _BACKFILL_MAX_RESPAWNS_PER_HOUR:
                 _supervisor_logger.critical(

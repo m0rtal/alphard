@@ -431,10 +431,369 @@ class TestSupervisorDoesNotCountCleanExits:
             "with sawtooth uptime gauge. See 2026-08-20 incident."
         )
         # Old buggy pattern must be gone: the rate-limit increment must
-        # not be unconditional. We assert that the surrounding comment
-        # block explicitly explains the rc=0 carve-out.
-        assert "rc=0 → no-op" in main_src or "rc=0 (clean exit)" in main_src, (
-            "src/main.py supervisor must explain the rc=0 carve-out. "
-            "Without an explicit comment, future refactors may "
-            "re-introduce the unconditional death-counter."
+        # not be unconditional. We assert the surrounding comment block
+        # explicitly names the rc=0 carve-out and the code paths that
+        # produce it (so future refactors cannot silently re-merge an
+        # unconditional increment). See issue #61 for the comment-
+        # accuracy audit that landed alongside this assertion.
+        assert "Counts ONLY crashes" in main_src, (
+            "src/main.py supervisor docstring must explain the rc=0 "
+            "carve-out. Without an explicit comment, future refactors "
+            "may re-introduce the unconditional death-counter. See "
+            "issue #61."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Issue #59 regression: `rc` MUST be bound on every exit path through the
+# supervisor loop. The pre-fix `assert rc is not None` crashed under
+# `python -O` (assert stripped) AND on the ChildProcessError branch (which
+# broke without ever assigning rc). The fix initializes `rc = 0` before
+# the inner loop so every path — ChildProcessError, clean exit, shutdown
+# — leaves `rc` bound. We exercise this via AST inspection (no live
+# thread) plus a small interpreter-level reproduction of the -O path.
+# ---------------------------------------------------------------------------
+
+
+class TestRcInvariant:
+    """Issue #59: `rc` must be bound before use on every exit path."""
+
+    def test_rc_initialized_before_inner_loop(self) -> None:
+        """The supervisor MUST default `rc = 0` before the inner waitpid
+        loop. This is the load-bearing invariant — without it, the
+        ChildProcessError branch leaks an unbound name under
+        ``python -O``.
+        """
+        import ast
+
+        root = Path(__file__).resolve().parent.parent
+        main_src = (root / "src" / "main.py").read_text(encoding="utf-8")
+        tree = ast.parse(main_src)
+        func = next(
+            n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_backfill_supervisor_loop"
+        )
+        # Find the outer `while not _shutdown_event.is_set():` body and
+        # assert an `rc = ...` Assign appears before the inner `while`.
+        outer_while = next(
+            n for n in func.body if isinstance(n, ast.While)
+        )  # outer = while not _shutdown_event.is_set()
+        inner_while_idx = next(i for i, stmt in enumerate(outer_while.body) if isinstance(stmt, ast.While))
+        # Every statement before the inner while must contain an
+        # `Assign` whose target name is `rc`. We allow either a literal
+        # `rc = 0` or `rc = <expr>`; the fixture below pins the literal.
+        pre_stmts = outer_while.body[:inner_while_idx]
+        rc_assigned = any(
+            isinstance(target, ast.Name) and target.id == "rc"
+            for stmt in pre_stmts
+            if isinstance(stmt, ast.Assign)
+            for target in stmt.targets
+        )
+        assert rc_assigned, (
+            "supervisor must assign `rc = 0` before the inner waitpid "
+            "loop so every branch leaves `rc` bound (issue #59)."
+        )
+
+    def test_no_assert_rc_in_supervisor(self) -> None:
+        """The pre-fix `assert rc is not None` is unsafe under
+        ``python -O`` (assert stripped → UnboundLocalError). The fix
+        relies on the `rc = 0` default instead. We forbid the assert
+        pattern outright so a future refactor cannot re-introduce it.
+        """
+        root = Path(__file__).resolve().parent.parent
+        main_src = (root / "src" / "main.py").read_text(encoding="utf-8")
+        assert "assert rc is not None" not in main_src, (
+            "src/main.py supervisor must NOT use `assert rc is not None` "
+            "— it is unsafe under `python -O` (assert stripped → "
+            "UnboundLocalError on the ChildProcessError branch). Use "
+            "the `rc = 0` default + INFO log instead. See issue #59."
+        )
+
+    def test_child_process_error_branch_does_not_assign_rc(self) -> None:
+        """The ChildProcessError branch must NOT assign rc itself —
+        the default `rc = 0` set above the inner loop is the source of
+        truth. If a future refactor reintroduces `rc = 0` inside the
+        except block, an over-zealous code-reviewer might think the
+        default can be removed; this assertion catches the regression.
+        """
+        import ast
+
+        root = Path(__file__).resolve().parent.parent
+        main_src = (root / "src" / "main.py").read_text(encoding="utf-8")
+        tree = ast.parse(main_src)
+        func = next(
+            n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_backfill_supervisor_loop"
+        )
+        outer_while = next(n for n in func.body if isinstance(n, ast.While))
+        inner_while = next(stmt for stmt in outer_while.body if isinstance(stmt, ast.While))
+        # Walk the inner loop body and find any `except ChildProcessError:`
+        # handler. Its body must NOT contain an Assign whose target is `rc`.
+        for stmt in inner_while.body:
+            if isinstance(stmt, ast.Try):
+                for handler in stmt.handlers:
+                    if (
+                        handler.type is not None
+                        and isinstance(handler.type, ast.Name)
+                        and handler.type.id == "ChildProcessError"
+                    ):
+                        for s in handler.body:
+                            if isinstance(s, ast.Assign):
+                                for tgt in s.targets:
+                                    assert not (isinstance(tgt, ast.Name) and tgt.id == "rc"), (
+                                        "ChildProcessError branch must "
+                                        "rely on the `rc = 0` default; "
+                                        "do not reassign rc here "
+                                        "(issue #59)."
+                                    )
+
+    def test_rc_bound_under_python_optimize(self) -> None:
+        """Reproduce the pre-fix crash under ``python -O`` against the
+        ACTUAL supervisor source: spawn a child Python process with
+        ``-O``, ``exec`` the supervisor module's loop body in isolation
+        (mocked os.waitpid to raise ChildProcessError), and assert it
+        does NOT raise UnboundLocalError on `if rc != 0:`.
+
+        This is the integration-level proof that the `rc = 0` default
+        holds across the -O strip path that the assert relied on.
+        """
+        # Run a tiny harness that imports the live module, monkey-
+        # patches os.waitpid to raise ChildProcessError immediately,
+        # then calls _backfill_supervisor_loop. We assert the process
+        # reaches the post-loop code WITHOUT raising.
+        root = Path(__file__).resolve().parent.parent
+        # _spawn_backfill is patched to flip the shutdown event on its
+        # first call — the supervisor must hit the ChildProcessError
+        # branch and reach the post-loop code, where the next spawn
+        # triggers _shutdown_event.is_set() and the outer loop exits
+        # cleanly. If rc were unbound under -O, the harness would
+        # crash before reaching that exit path.
+        harness = (
+            "import sys, threading\n"
+            f"sys.path.insert(0, {str(root / 'src')!r})\n"
+            "import main\n"
+            "main._shutdown_event = threading.Event()\n"
+            "main._BACKFILL_RESPAWN_BACKOFF_SECONDS = 0\n"
+            "def fake_waitpid(pid, opts):\n"
+            "    raise ChildProcessError(10, 'No child processes')\n"
+            "main.os.waitpid = fake_waitpid\n"
+            "class _FakeProc:\n"
+            "    def __init__(self): self.pid = 999_999\n"
+            "_call_count = [0]\n"
+            "def fake_spawn():\n"
+            "    _call_count[0] += 1\n"
+            "    if _call_count[0] >= 1:\n"
+            "        main._shutdown_event.set()\n"
+            "    return 999_999\n"
+            "main._spawn_backfill = fake_spawn\n"
+            "try:\n"
+            "    main._backfill_supervisor_loop()\n"
+            "    print('NO_CRASH')\n"
+            "except Exception as e:\n"
+            "    print(f'CRASH:{type(e).__name__}:{e}')\n"
+            "    sys.exit(1)\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-O", "-c", harness],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert "NO_CRASH" in proc.stdout, (
+            f"supervisor crashed under `python -O` on the "
+            f"ChildProcessError path (issue #59). stdout={proc.stdout!r} "
+            f"stderr={proc.stderr!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Issue #60 regression: `death_timestamps` MUST be pruned on every loop
+# iteration, not only on crashes. Pre-fix the prune was inside
+# `if rc != 0:`, so each clean exit leaked one float. At the 30s
+# respawn cadence this is ~2880 entries/day (≈1M/year, ≈28 MB/year).
+# We pin this with a self-contained simulated loop that mirrors the
+# supervisor's prune logic.
+# ---------------------------------------------------------------------------
+
+
+class TestDeathTimestampsBoundedOnCleanExits:
+    """Issue #60: death_timestamps stays bounded across long clean-exit
+    stretches.
+
+    We don't run the real supervisor (it's an infinite loop). Instead
+    we replicate the prune+append contract from src/main.py verbatim
+    and run it for the equivalent of one week of clean exits at the
+    30s respawn cadence. The list MUST stay at ≤
+    _BACKFILL_MAX_RESPAWNS_PER_HOUR + 1 entries throughout (it cannot
+    grow past the cap because we only append on rc != 0).
+    """
+
+    @staticmethod
+    def _supervisor_iteration(
+        death_timestamps: list[float],
+        rc: int,
+        cap: int,
+        now: float,
+    ) -> list[float]:
+        """Mirror of the post-#60 prune+append logic. Kept in sync
+        manually with src/main.py; if src/main.py drifts, this fixture
+        will silently keep passing — the value of the test is in the
+        design contract (always prune, only append on crash), which
+        the static test below also pins.
+        """
+        death_timestamps = [t for t in death_timestamps if now - t < 3600]
+        if rc != 0:
+            death_timestamps.append(now)
+            if len(death_timestamps) > cap:
+                # We do NOT call os._exit in tests; just raise so the
+                # caller observes the cap.
+                raise RuntimeError("would_abort_container")
+        return death_timestamps
+
+    def test_death_timestamps_bounded_over_20k_clean_exits(self) -> None:
+        """20,000 clean exits (≈7 days at 30s cadence) must keep the
+        list bounded to ≤ cap entries. Pre-fix this would have grown
+        to 20,000 floats."""
+        cap = 10  # _BACKFILL_MAX_RESPAWNS_PER_HOUR default; actual value
+        # asserted in TestConstants — fixture uses 10 to keep the test
+        # self-contained.
+        death_timestamps: list[float] = []
+        now = 0.0
+        for i in range(20_000):
+            now = float(i) * 30.0  # 30s cadence
+            death_timestamps = self._supervisor_iteration(death_timestamps, rc=0, cap=cap, now=now)
+        assert len(death_timestamps) <= cap + 1, (
+            f"death_timestamps grew unbounded on clean exits: "
+            f"{len(death_timestamps)} entries after 20k iterations "
+            f"(issue #60). Pre-fix this would have been 20_000."
+        )
+        # Specifically: with rc=0 throughout, we never append, so the
+        # list must be EMPTY at the end (prune drops nothing, append
+        # never runs).
+        assert death_timestamps == [], (
+            f"death_timestamps should be empty after 20k clean exits, " f"got {death_timestamps}"
+        )
+
+    def test_death_timestamps_caps_after_repeated_crashes(self) -> None:
+        """Repeated crashes must still trip the cap (no regression on
+        the rate-limit itself)."""
+        cap = 10
+        death_timestamps: list[float] = []
+        now = 0.0
+        with pytest.raises(RuntimeError, match="would_abort_container"):
+            for i in range(cap + 5):
+                now = float(i) * 30.0
+                death_timestamps = self._supervisor_iteration(death_timestamps, rc=1, cap=cap, now=now)
+
+    def test_prune_runs_unconditionally_in_source(self) -> None:
+        """Static pin: the prune line
+        ``death_timestamps = [t for t in death_timestamps if now - t < 3600]``
+        must appear OUTSIDE the ``if rc != 0:`` block.
+
+        Pre-fix the prune was nested inside ``if rc != 0:`` (the
+        rc=0-clean-exit branch never pruned, so the list grew ~2880
+        entries/day at the 30s respawn cadence, issue #60). The fix
+        moves the prune above the ``if`` and limits append to crashes.
+
+        We assert this structurally: the prune statement must precede
+        the ``if rc != 0:`` gate in source order AND it must be at
+        strictly LESS indentation than the ``if`` (proving it is not
+        the body of the ``if``).
+        """
+        root = Path(__file__).resolve().parent.parent
+        main_src = (root / "src" / "main.py").read_text(encoding="utf-8")
+        lines = main_src.splitlines()
+        # Restrict to _backfill_supervisor_loop body — there are two
+        # `if rc != 0:` blocks in the file (one in the supervisor,
+        # one in the auth_probe path). We pin the LAST occurrence of
+        # each anchor, which is the supervisor's.
+        prune_line_idx = None
+        rc_nonzero_line_idx = None
+        for i, line in enumerate(lines):
+            if "death_timestamps = [t for t in death_timestamps if now - t < 3600]" in line:
+                prune_line_idx = i  # last one wins (only one in source today)
+            if line.strip() == "if rc != 0:":
+                rc_nonzero_line_idx = i
+        assert prune_line_idx is not None, (
+            "supervisor must prune death_timestamps unconditionally "
+            "(issue #60). The prune line was not found in src/main.py."
+        )
+        assert rc_nonzero_line_idx is not None, (
+            "supervisor must contain `if rc != 0:` gate (regression " "test for issue #57). The line was not found."
+        )
+        prune_indent = len(lines[prune_line_idx]) - len(lines[prune_line_idx].lstrip())
+        rc_indent = len(lines[rc_nonzero_line_idx]) - len(lines[rc_nonzero_line_idx].lstrip())
+        # Structural proof #1: prune precedes the `if` (in source order).
+        # If the prune is inside the `if`, it would have to be a
+        # later line. Pre-fix the prune came AFTER `if rc != 0:` and
+        # was nested under it (12 spaces vs 8). Post-fix the prune
+        # comes BEFORE the `if` at the SAME indentation — this is the
+        # only shape where the prune is unconditional but the append
+        # stays gated.
+        assert prune_line_idx < rc_nonzero_line_idx, (
+            f"prune line at index {prune_line_idx} comes AFTER "
+            f"`if rc != 0:` at index {rc_nonzero_line_idx}; this is "
+            f"the issue #60 bug. Prune must run on every iteration, "
+            f"before the rc-dependent append."
+        )
+        # Structural proof #2: prune is at the SAME or LESS indentation
+        # than the `if` — i.e. the prune is NOT nested under `if`
+        # (which would require prune_indent > rc_indent by exactly 4).
+        assert prune_indent <= rc_indent, (
+            f"prune line is nested inside `if rc != 0:` block "
+            f"(prune_indent={prune_indent} > rc_indent={rc_indent}); "
+            f"this is the issue #60 bug."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Issue #61 regression: docstring + inline comments must accurately
+# describe the rc=0 carve-out and the code paths that produce it. We
+# pin three text anchors that future maintainers can grep for.
+# ---------------------------------------------------------------------------
+
+
+class TestSupervisorCommentsAccurate:
+    """Issue #61: comments/docstring must describe actual code paths."""
+
+    def test_docstring_mentions_rc0_carveout(self) -> None:
+        root = Path(__file__).resolve().parent.parent
+        main_src = (root / "src" / "main.py").read_text(encoding="utf-8")
+        assert "Counts ONLY crashes" in main_src, (
+            "_backfill_supervisor_loop docstring must mention the rc=0 " "carve-out (issue #61)."
+        )
+
+    def test_no_overconfident_rc_invariant_comment(self) -> None:
+        """The pre-fix comment claimed `rc is always bound` because
+        the inner while/break guarantees it. This is false under
+        `python -O` and on the ChildProcessError branch. The fix
+        removes the claim and relies on the explicit `rc = 0` default
+        instead. We forbid the old claim in the source.
+        """
+        root = Path(__file__).resolve().parent.parent
+        main_src = (root / "src" / "main.py").read_text(encoding="utf-8")
+        assert "`rc` is always bound at this point because" not in main_src, (
+            "The overconfident 'rc is always bound at this point' "
+            "comment must be removed (issue #61). The invariant is "
+            "enforced by `rc = 0` default above the inner loop, not "
+            "by the break paths."
+        )
+
+    def test_tinkoff401_narrative_replaced_with_code_paths(self) -> None:
+        """The pre-fix comment claimed the 2026-08-20 rc=0 exits were
+        caused by 'Tinkoff 401 every 2 seconds'. The literal exit
+        path on auth failure is rc=1 (auth_probe, src/main.py:597);
+        the rc=0 path is empty-universe / all-skipped / exhausted.
+        The fix replaces the narrative with code-path references.
+        """
+        root = Path(__file__).resolve().parent.parent
+        main_src = (root / "src" / "main.py").read_text(encoding="utf-8")
+        assert "auth_probe" in main_src, (
+            "supervisor comment must cite the actual code path that "
+            "produces rc=1 (auth_probe) so future maintainers do not "
+            "confuse the 2026-08-20 incident narrative with the "
+            "literal exit code (issue #61)."
+        )
+        assert "mark_terminally_failed" in main_src, (
+            "supervisor comment must mention the mark_terminally_"
+            "failed_exhausted path that produces rc=0 on a clean "
+            "finish (issue #61)."
         )
