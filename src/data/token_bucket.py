@@ -62,6 +62,20 @@ class TokenBucket:
             self.capacity = float(self.rate)
         if self.capacity <= 0:
             raise ValueError(f"capacity must be > 0, got {self.capacity}")
+        # H-NETWORK-DETECT (2026-08-20): capacity must be >= 1.0. The
+        # ``min(cap, ...)`` in ``_refill_locked`` would otherwise cap the
+        # bucket BELOW the 1.0 threshold ``acquire()`` checks against,
+        # so acquire() spins forever in ``time.sleep(delay)``. Bug only
+        # manifests when ``rate < window_seconds`` (the normal case for
+        # ``DEFAULT_BUCKET_RATE=0.5``, ``window_seconds=60`` — i.e. rate
+        # < 1 token per window). Without this floor, the first call to
+        # acquire() deadlocks at 50% of a token forever and backfill
+        # silently never progresses past the first ticker. Floored at
+        # 1.0 so the bucket is exactly full at start (immediate acquire)
+        # and refills back to exactly 1 token per ``window_seconds``,
+        # which is the standard token-bucket semantics.
+        if self.capacity < 1.0:
+            self.capacity = 1.0
         # Start with a full bucket so the first burst is allowed.
         self._tokens = float(self.capacity)
         self._last_refill = time.monotonic()

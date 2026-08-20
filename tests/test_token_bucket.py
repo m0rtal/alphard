@@ -37,6 +37,51 @@ class TestBasicSemantics:
             TokenBucket(rate=0)
 
 
+class TestCapacityFloor:
+    """H-NETWORK-DETECT (2026-08-20): capacity must be floored to 1.0.
+
+    When ``rate < 1.0`` (e.g. ``DEFAULT_BUCKET_RATE=0.5``,
+    ``window_seconds=60`` → rate_per_sec ≈ 0.008), the default
+    ``capacity = rate`` is BELOW the 1.0 threshold acquire() checks
+    against. The first call to acquire() spins in ``time.sleep(delay)``
+    forever because the bucket caps at 0.5 tokens but acquire() needs
+    >= 1.0.
+
+    Symptom in production: backfill PID 24 stuck on
+    ``token_bucket.acquire`` line 111, no progress for 7+ minutes,
+    SIGUSR1 dump shows the same call stack repeatedly.
+    """
+
+    def test_rate_below_one_starts_with_capacity_one(self) -> None:
+        """rate=0.5, window=60 — the alphard production config — must
+        produce a bucket that acquire() can drain IMMEDIATELY (first
+        call returns without sleeping)."""
+        import time as _time
+
+        b = TokenBucket(rate=0.5, window_seconds=60.0)
+        # Bucket is full at construction (post_init sets _tokens=capacity).
+        assert b.tokens_available() >= 1.0, (
+            f"bucket must hold >= 1 token so acquire() works; " f"got tokens_available={b.tokens_available()}"
+        )
+        # And acquire() must return promptly — give it a 1-second
+        # budget. Without the floor this would hang forever.
+        deadline = _time.monotonic() + 1.0
+        b.acquire()
+        assert _time.monotonic() < deadline
+
+    def test_explicit_capacity_below_one_is_floored(self) -> None:
+        """Even explicit capacity=0.3 must be floored to 1.0 — otherwise
+        the same dead-acquire pattern repeats."""
+        b = TokenBucket(rate=0.5, window_seconds=60.0, capacity=0.3)
+        assert b.tokens_available() >= 1.0
+
+    def test_explicit_capacity_above_one_unchanged(self) -> None:
+        """capacity=5 must still be 5 — the floor only kicks in for
+        values < 1.0."""
+        b = TokenBucket(rate=5, window_seconds=1.0, capacity=5.0)
+        assert b.tokens_available() == pytest.approx(5.0, abs=0.01)
+
+
 class TestConcurrencyRegression:
     """BUGFIX (C-5): acquire() must NOT raise RateLimitError under contention.
 
