@@ -35,6 +35,8 @@ docs/AUDIT-Phase0-FINAL.md for the security audit context.
 """
 
 import logging
+import os
+import signal
 import subprocess
 import sys
 import threading
@@ -82,6 +84,117 @@ def _seconds_until_next_target_hour_msk(target_hour: int, target_minute: int) ->
 
 
 _shutdown_event = threading.Event()  # Phase 1.6: signals daemon threads to exit
+
+
+# ---------------------------------------------------------------------------
+# Phase 2.x fix (2026-08-20): backfill supervisor
+# ---------------------------------------------------------------------------
+#
+# Original entrypoint.sh did `setsid python3 ... &` and exec'd into src.main.
+# That left the backfill as an orphaned grandchild: when it crashed (and it
+# did, see below), nothing reaped it AND nothing restarted it, so the
+# container kept ticking heartbeat with a zombie PID 19 holding a stale
+# Postgres connection — exactly the "network stall" symptom everyone
+# misdiagnosed for 17 hours on sha-bc867a2.
+#
+# Real root cause (caught 2026-08-20 via py-spy / State: Z (zombie) on
+# /proc/19/stat): the --skip-known-bad flag (commit bc867a2) accessed
+# ``meta.delisted_at`` on a raw psycopg tuple returned by
+# PostgresDataStore.ticker_meta() — AttributeError on first ticker, exit 1,
+# zombie, no supervisor, no restart.
+#
+# Fix: bring the launch INSIDE src.main so a real Python supervisor can
+# waitpid() the child and respawn on death. The shell-level `setsid` launch
+# in entrypoint.sh is removed; this thread owns the lifecycle. Backoff
+# between respawns is bounded so a tight crash loop is visible in logs.
+_BACKFILL_SCRIPT_ARGS: tuple[str, ...] = (
+    "--limit",
+    "5500",
+    "--start-year",
+    "2018",
+    "--min-bars",
+    "1300",
+)
+_BACKFILL_RESPAWN_BACKOFF_SECONDS = 30
+_BACKFILL_MAX_RESPAWNS_PER_HOUR = 10  # >10 deaths/hour = fatal: stop the loop
+
+# Module-level logger so _spawn_backfill can log without depending on
+# main() having called logging.basicConfig() yet.
+_supervisor_logger = logging.getLogger("alphard.backfill_supervisor")
+
+
+def _spawn_backfill() -> int:
+    """Fork+setsid a fresh backfill daemon. Returns the child PID.
+
+    Using subprocess.Popen with start_new_session=True (the Python equivalent
+    of shell `setsid`) so the child is its own session leader and survives
+    any signal delivered to this main process. Output is appended to the
+    shared log so all forensics live in one file.
+    """
+    log_path = os.environ.get("BACKFILL_LOG", "/app/logs/backfill_history_md.log")
+    log_fh = open(log_path, "a", buffering=1)  # line-buffered
+    proc = subprocess.Popen(
+        ["python3", "scripts/backfill_history_md.py", *_BACKFILL_SCRIPT_ARGS],
+        cwd="/app",
+        stdout=log_fh,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    _supervisor_logger.info(f"_spawn_backfill: pid={proc.pid} args={_BACKFILL_SCRIPT_ARGS} log={log_path}")
+    # Don't close log_fh — child inherited the fd. Closing the parent's copy
+    # would also close the child's copy on some kernels.
+    return proc.pid
+
+
+def _backfill_supervisor_loop() -> None:
+    """Supervise the backfill daemon: waitpid, respawn on death, back off.
+
+    Runs forever until _shutdown_event. On an excessive-death-rate
+    (>10/hour) it logs CRITICAL and exits non-zero so Docker restart kicks in.
+    """
+    death_timestamps: list[float] = []
+    while not _shutdown_event.is_set():
+        pid = _spawn_backfill()
+        # Block until child exits or shutdown fires.
+        while not _shutdown_event.is_set():
+            try:
+                waited_pid, status = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                # Already reaped by something else (shouldn't happen — we
+                # are the only process that ever spawned this child via
+                # _spawn_backfill, and we own the lifecycle).
+                waited_pid = pid
+                status = 0
+                break
+            if waited_pid == pid:
+                rc = os.waitstatus_to_exitcode(status) if hasattr(os, "waitstatus_to_exitcode") else (status >> 8)
+                _supervisor_logger.warning(
+                    f"_backfill_supervisor_loop: child pid={pid} exited rc={rc}; "
+                    f"respawning in {_BACKFILL_RESPAWN_BACKOFF_SECONDS}s"
+                )
+                break
+            # Sleep interruptibly so shutdown is responsive.
+            _sleep_interruptible(5)
+        else:
+            # Shutdown requested while waiting — kill child and exit.
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            break
+        # Backoff before respawn.
+        _sleep_interruptible(_BACKFILL_RESPAWN_BACKOFF_SECONDS)
+        # Rate-limit: count deaths in last hour.
+        now = time.monotonic()
+        death_timestamps = [t for t in death_timestamps if now - t < 3600]
+        death_timestamps.append(now)
+        if len(death_timestamps) > _BACKFILL_MAX_RESPAWNS_PER_HOUR:
+            _supervisor_logger.critical(
+                f"_backfill_supervisor_loop: backfill died {len(death_timestamps)} times in the "
+                f"last hour (>_BACKFILL_MAX_RESPAWNS_PER_HOUR); aborting container so Docker "
+                f"can restart cleanly with fresh state."
+            )
+            os._exit(1)
 
 
 def _daily_sync_loop() -> None:
@@ -351,6 +464,18 @@ def main() -> None:
 
     logger.info("Alphard bot starting (Phase 0 stub)... ")
     logger.warning("Phase 1 ships heartbeat + 1h daily_sync daemon. " "Coordinator (Phase 5.2) replaces this loop.")
+
+    # Phase 2.x (2026-08-20): backfill supervisor. Owns the lifecycle of
+    # the backfill_history_md.py subprocess — spawns once at container
+    # start, waitpid's on death, respawns with backoff. Without this the
+    # `setsid ... &` pattern in entrypoint.sh left the daemon as an
+    # orphaned grandchild that nobody could reap or restart. See the
+    # long docstring above _spawn_backfill for the full incident history.
+    backfill_thread = threading.Thread(
+        target=_backfill_supervisor_loop, daemon=True, name="alphard-backfill-supervisor"
+    )
+    backfill_thread.start()
+    logger.info("backfill-supervisor daemon started (owning backfill_history_md.py subprocess)")
 
     # Phase 1.6: spin up the daily-sync daemon thread. Daemon=True so it
     # exits with the main process; the heartbeat keeps ticking regardless
