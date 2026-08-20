@@ -236,8 +236,7 @@ def test_corp_actions_loop_logs_failure_with_stderr(_setup, caplog):
 
     # Verify the warning message contains the stderr tail.
     assert any(
-        "FAILED rc=1" in record.message and "MOEX ISS connection refused" in record.message
-        for record in caplog.records
+        "FAILED rc=1" in record.message and "MOEX ISS connection refused" in record.message for record in caplog.records
     )
 
 
@@ -266,10 +265,7 @@ def test_corp_actions_loop_logs_success(_setup, caplog):
     with caplog.at_level(logging.INFO, logger="alphard.corp_actions_apply"):
         main._corp_actions_apply_loop()
 
-    assert any(
-        "OK rc=0" in record.message and "applied=42" in record.message
-        for record in caplog.records
-    )
+    assert any("OK rc=0" in record.message and "applied=42" in record.message for record in caplog.records)
 
 
 # ---------- main() thread spawn + join ----------
@@ -312,6 +308,4 @@ def test_main_spawns_corp_actions_thread(_setup, monkeypatch):
     except SystemExit:
         pass
 
-    assert "alphard-corp-actions-apply" in started_threads, (
-        f"corp_actions thread not spawned; got {started_threads}"
-    )
+    assert "alphard-corp-actions-apply" in started_threads, f"corp_actions thread not spawned; got {started_threads}"

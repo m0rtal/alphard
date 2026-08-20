@@ -48,7 +48,6 @@ from src.data.models import CorporateAction, OHLCVRow, TickerMeta  # noqa: E402
 from src.data.sqlite_store import InMemorySQLiteStore  # noqa: E402
 from src.data.store import StoreError  # noqa: E402
 
-
 # ---------- helpers ----------
 
 
@@ -252,7 +251,7 @@ def test_idempotent_rerun_within_skip_window_is_noop(
                 "SBER",
                 "--cache-path",
                 str(cache_path),
-                ],
+            ],
             store=store,
         )
     rows_after_first = store.count_ohlcv_adj("SBER")
@@ -268,7 +267,7 @@ def test_idempotent_rerun_within_skip_window_is_noop(
                 "SBER",
                 "--cache-path",
                 str(cache_path),
-                ],
+            ],
             store=store,
         )
         assert fake_fetcher.fetch_splits.call_count == 0
@@ -293,7 +292,7 @@ def test_force_flag_bypasses_skip_window(
                 "SBER",
                 "--cache-path",
                 str(cache_path),
-                ],
+            ],
             store=store,
         )
     with patch.object(aca, "_FETCHER_MOD") as fake_fetcher:
@@ -306,7 +305,7 @@ def test_force_flag_bypasses_skip_window(
                 "--force",
                 "--cache-path",
                 str(cache_path),
-                ],
+            ],
             store=store,
         )
         assert fake_fetcher.fetch_splits.call_count == 1
@@ -331,7 +330,7 @@ def test_corrupt_cache_is_treated_as_empty(
                 "SBER",
                 "--cache-path",
                 str(cache_path),
-                ],
+            ],
             store=store,
         )
     assert store.count_ohlcv_adj("SBER") == 5
@@ -369,7 +368,7 @@ def test_per_ticker_moex_fetch_error_does_not_abort_loop(
             [
                 "--cache-path",
                 str(cache_path),
-                ],
+            ],
             store=store,
         )
 
@@ -400,7 +399,7 @@ def test_dry_run_does_not_persist(
                 "--dry-run",
                 "--cache-path",
                 str(cache_path),
-                ],
+            ],
             store=store,
         )
 
@@ -437,7 +436,7 @@ def test_ticker_with_no_raw_ohlcv_writes_nothing(
                 "YDEX",
                 "--cache-path",
                 str(cache_path),
-                ],
+            ],
             store=store,
         )
 
@@ -465,7 +464,7 @@ def test_tickers_whitelist_limits_universe(
                 "SBER",
                 "--cache-path",
                 str(cache_path),
-                ],
+            ],
             store=store,
         )
 
@@ -485,13 +484,12 @@ def test_apply_for_ticker_short_circuits_on_empty_actions(
     assert store.count_ohlcv_adj() == 0
 
 
-def test_build_store_raises_store_error_with_no_dsn(tmp_path: Path) -> None:
+def test_build_store_raises_store_error_with_no_dsn(tmp_path: Path, monkeypatch) -> None:
     """Production path: no ALPHARD_PG_DSN set → PostgresDataStore raises
     StoreError → main() catches it and returns EXIT_FATAL."""
-    import os
-
-    # Ensure no DSN leaks from the test environment.
-    os.environ.pop("ALPHARD_PG_DSN", None)
+    # Use monkeypatch so the env-var deletion is restored after this test
+    # and does not pollute sibling tests (e.g. test_mark_terminally_failed).
+    monkeypatch.delenv("ALPHARD_PG_DSN", raising=False)
 
     args = aca._parse_args_from(["--cache-path", str(tmp_path / "cache.json")])
     with pytest.raises(StoreError, match="no DSN"):
@@ -504,8 +502,6 @@ def test_main_returns_fatal_when_postgres_init_fails(
 ) -> None:
     """If store construction raises StoreError (e.g. no ALPHARD_PG_DSN),
     main() returns EXIT_FATAL without ever touching the DB."""
-    import os
-
     monkeypatch.delenv("ALPHARD_PG_DSN", raising=False)
     cache_path = tmp_path / "cache.json"
 
@@ -737,9 +733,7 @@ def test_progress_heartbeat_logged(
             )
 
     # The heartbeat line ends with "... processed (...)" — match by substring.
-    progress_lines = [
-        r.message for r in caplog.records if "progress:" in r.message
-    ]
+    progress_lines = [r.message for r in caplog.records if "progress:" in r.message]
     assert progress_lines, "no progress heartbeat logged"
 
 
