@@ -26,15 +26,44 @@
 #   DOCKER_HOST=tcp://192.168.1.107:2375 ./scripts/deploy_monitoring.sh
 #
 # After deploy:
-#   - Grafana:   http://192.168.1.107:3300/  (admin / alphard)
+#   - Grafana:   http://192.168.1.107:3300/  (admin / <GRAFANA_ADMIN_PASSWORD>)
 #   - Prometheus:  http://192.168.1.107:9090/
 #   - Bot metrics:  http://192.168.1.107:8765/metrics
+#
+# Security (issue #55): Grafana admin password is sourced from /root/.env
+# (or the GRAFANA_ADMIN_PASSWORD env var). The literal "alphard" password
+# is NEVER committed to this file, and GF_AUTH_ANONYMOUS_ENABLED is not
+# set (Grafana requires login for /api/*). See SECURITY.md for the
+# monitoring profile's LAN-exposure footprint.
 
 set -euo pipefail
 
 DOCKER_HOST="${DOCKER_HOST:-tcp://192.168.1.107:2375}"
 API="http://${DOCKER_HOST#tcp://}"
 NET_NAME="alphard_alphard-net"
+
+# Source Grafana admin password from /root/.env (preferred) or env. Refuse
+# to run if neither provides one — the literal "alphard" value is NOT a
+# fallback, so we cannot accidentally re-introduce the leaked credential.
+# Mirrors docker-compose.yaml:197 which uses
+#   GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?...required}
+ENV_FILE="${ENV_FILE:-/root/.env}"
+if [[ -z "${GRAFANA_ADMIN_PASSWORD:-}" && -r "${ENV_FILE}" ]]; then
+  # shellcheck disable=SC1090
+  GRAFANA_ADMIN_PASSWORD="$(grep -E '^GRAFANA_ADMIN_PASSWORD=' "${ENV_FILE}" \
+    | tail -n 1 | cut -d= -f2-)"
+fi
+if [[ -z "${GRAFANA_ADMIN_PASSWORD:-}" ]]; then
+  echo "ERROR: GRAFANA_ADMIN_PASSWORD is not set. Export it or define it in ${ENV_FILE}." >&2
+  exit 1
+fi
+# Sanity-check: catch a stale "alphard" leftover that would silently re-leak
+# the credential if someone re-commits the old .env by accident.
+if [[ "${GRAFANA_ADMIN_PASSWORD}" == "alphard" ]]; then
+  echo "ERROR: GRAFANA_ADMIN_PASSWORD resolves to the literal 'alphard' which is the leaked value from issue #55." >&2
+  echo "       Rotate the password (see SECURITY.md) before re-running this script." >&2
+  exit 1
+fi
 
 # Step 1: copy provisioning files from local repo to .107 bind-target dir.
 # /root/projects/alphard/ does not exist on .107, so we cannot bind-mount
@@ -137,27 +166,32 @@ curl -s -X DELETE "${API}/containers/alphard-grafana?force=true" >/dev/null || t
 sleep 2
 GRAFANA_ID="$(curl -s -X POST "${API}/containers/create?name=alphard-grafana" \
   -H "Content-Type: application/json" \
-  -d '{
+  -d "$(GRAFANA_ADMIN_PASSWORD="${GRAFANA_ADMIN_PASSWORD}" python3 -c '
+import json, os
+print(json.dumps({
     "Image": "grafana/grafana:latest",
+    # Issue #55: never hardcode GF_SECURITY_ADMIN_PASSWORD; pull from /root/.env.
+    # GF_AUTH_ANONYMOUS_ENABLED is intentionally NOT set: Grafana must require
+    # login for /api/* so LAN peers cannot scrape dashboards anonymously.
     "Env": [
-      "GF_SECURITY_ADMIN_PASSWORD=alphard",
-      "GF_AUTH_ANONYMOUS_ENABLED=true",
-      "GF_USERS_ALLOW_SIGN_UP=false",
-      "GF_SERVER_HTTP_PORT=3300"
+        "GF_SECURITY_ADMIN_PASSWORD=" + os.environ["GRAFANA_ADMIN_PASSWORD"],
+        "GF_USERS_ALLOW_SIGN_UP=false",
+        "GF_SERVER_HTTP_PORT=3300",
     ],
     "User": "472:472",
     "HostConfig": {
-      "NetworkMode": "host",
-      "RestartPolicy": {"Name": "unless-stopped"},
-      "Mounts": [
-        {"Type": "bind", "Source": "/mnt/appdata/alphard/grafana", "Target": "/var/lib/grafana"},
-        {"Type": "bind", "Source": "/mnt/appdata/alphard/observability/grafana/provisioning",
-         "Target": "/etc/grafana/provisioning", "ReadOnly": true},
-        {"Type": "bind", "Source": "/mnt/appdata/alphard/observability/grafana/provisioning/dashboards",
-         "Target": "/var/lib/grafana/dashboards", "ReadOnly": true}
-      ]
-    }
-  }' | python3 -c 'import sys, json; print(json.load(sys.stdin)["Id"])')"
+        "NetworkMode": "host",
+        "RestartPolicy": {"Name": "unless-stopped"},
+        "Mounts": [
+            {"Type": "bind", "Source": "/mnt/appdata/alphard/grafana", "Target": "/var/lib/grafana"},
+            {"Type": "bind", "Source": "/mnt/appdata/alphard/observability/grafana/provisioning",
+             "Target": "/etc/grafana/provisioning", "ReadOnly": True},
+            {"Type": "bind", "Source": "/mnt/appdata/alphard/observability/grafana/provisioning/dashboards",
+             "Target": "/var/lib/grafana/dashboards", "ReadOnly": True},
+        ],
+    },
+}))' \
+  )" | python3 -c 'import sys, json; print(json.load(sys.stdin)["Id"])')"
 curl -s -X POST "${API}/containers/${GRAFANA_ID}/start" >/dev/null
 
 # Cleanup helper
@@ -166,7 +200,16 @@ curl -s -X DELETE "${API}/containers/hermes-monitor-push?force=true" >/dev/null 
 # Step 4: wait + verify
 echo "waiting 30s for containers to come up..."
 sleep 30
+# /login should always be 200 (it's the login page, public). Use it as a
+# liveness probe only — anonymous access to /api/search must now 401.
 echo "Grafana:    $(curl -s -o /dev/null -w '%{http_code}' http://192.168.1.107:3300/login)"
 echo "Prometheus: $(curl -s -o /dev/null -w '%{http_code}' http://192.168.1.107:9090/-/ready)"
 echo "Bot metrics: $(curl -s -o /dev/null -w '%{http_code}' http://192.168.1.107:8765/health)"
-echo "Grafana->Prometheus query: $(curl -s -u admin:alphard 'http://192.168.1.107:3300/api/datasources/proxy/uid/PBFA97CFB590B2093/api/v1/query?query=up' | grep -c 'alphard-bot')"
+# Issue #55: verify anonymous /api/search returns 401, then run the
+# dashboard query with Basic-auth using the env-sourced password.
+ANON_STATUS=$(curl -s -o /dev/null -w '%{http_code}' http://192.168.1.107:3300/api/search)
+echo "Grafana /api/search (anon, must be 401): ${ANON_STATUS}"
+if [ "${ANON_STATUS}" != "401" ]; then
+  echo "WARNING: Grafana anonymous access still enabled; issue #55 not fully remediated." >&2
+fi
+echo "Grafana->Prometheus query: $(curl -s -u "admin:${GRAFANA_ADMIN_PASSWORD}" 'http://192.168.1.107:3300/api/datasources/proxy/uid/PBFA97CFB590B2093/api/v1/query?query=up' | grep -c 'alphard-bot')"
