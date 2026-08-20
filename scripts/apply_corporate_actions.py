@@ -309,10 +309,7 @@ def _parse_args_from(argv: list[str]) -> argparse.Namespace:
         "--cache-path",
         type=Path,
         default=DEFAULT_CACHE_PATH,
-        help=(
-            "Path to the per-ticker last-applied JSON cache. "
-            f"Default {DEFAULT_CACHE_PATH}."
-        ),
+        help=("Path to the per-ticker last-applied JSON cache. " f"Default {DEFAULT_CACHE_PATH}."),
     )
     parser.add_argument(
         "--pg-dsn",
@@ -488,8 +485,7 @@ def main(
                 logger.warning("store.close failed: %s: %s", type(exc).__name__, exc)
 
     logger.info(
-        "apply_corporate_actions: done applied=%d skipped_fresh=%d no_actions=%d "
-        "error=%d rows_written=%d",
+        "apply_corporate_actions: done applied=%d skipped_fresh=%d no_actions=%d " "error=%d rows_written=%d",
         totals["applied"],
         totals["skipped_fresh"],
         totals["no_actions"],

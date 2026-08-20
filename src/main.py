@@ -436,8 +436,7 @@ def _corp_actions_apply_loop() -> None:
                 logger.warning(f"corp_actions_apply FAILED rc={r.returncode}: {tail!r}")
         except subprocess.TimeoutExpired:
             logger.warning(
-                f"corp_actions_apply timeout after {CORP_ACTIONS_APPLY_SUBPROCESS_TIMEOUT}s; "
-                "subprocess killed"
+                f"corp_actions_apply timeout after {CORP_ACTIONS_APPLY_SUBPROCESS_TIMEOUT}s; " "subprocess killed"
             )
         except Exception as exc:  # noqa: BLE001 — never kill the heartbeat
             logger.error(f"corp_actions_apply unexpected error: {exc}")
@@ -701,7 +700,7 @@ def main() -> None:
         delisted_thread.join(timeout=10)
         if delisted_thread.is_alive():
             logger.warning("delisted-sync daemon did not exit within 10s")
-# Issue #72: join the backfill supervisor so we don't exit
+        # Issue #72: join the backfill supervisor so we don't exit
         # mid-_spawn_backfill and orphan the child process. The
         # supervisor's outer `while not _shutdown_event.is_set()` exits
         # on the next _sleep_interruptible poll (<= 1s) and breaks out
