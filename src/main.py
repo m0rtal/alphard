@@ -607,6 +607,24 @@ def main() -> None:
         delisted_thread.join(timeout=10)
         if delisted_thread.is_alive():
             logger.warning("delisted-sync daemon did not exit within 10s")
+        # Issue #72: join the backfill supervisor so we don't exit
+        # mid-_spawn_backfill and orphan the child process. The
+        # supervisor's outer `while not _shutdown_event.is_set()` exits
+        # on the next _sleep_interruptible poll (<= 1s) and breaks out
+        # of the inner waitpid loop; the in-flight child is NOT killed
+        # by the supervisor (let it finish its current pass) — the
+        # os._exit(1) on the death-cap branch is the only path that
+        # forces an early child kill, and that one is a Docker-driven
+        # restart path. Timeout is _BACKFILL_RESPAWN_BACKOFF_SECONDS+5
+        # so we always outlive one full backoff cycle.
+        backfill_thread.join(timeout=_BACKFILL_RESPAWN_BACKOFF_SECONDS + 5)
+        if backfill_thread.is_alive():
+            logger.warning(
+                "backfill-supervisor did not exit within "
+                f"{_BACKFILL_RESPAWN_BACKOFF_SECONDS + 5}s; "
+                "child PID may be orphaned — verify with "
+                "`ps -ef | grep backfill_history_md` after container exit"
+            )
         _metrics_registry_obj = globals().get("_metrics_registry")
         if _metrics_registry_obj is not None and "_metrics_server" in globals():
             try:
