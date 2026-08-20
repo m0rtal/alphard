@@ -50,10 +50,24 @@ NET_NAME="alphard_alphard-net"
 # first version of this script (issue #55).
 ALPHARD_ENV_FILE="${ALPHARD_ENV_FILE:-./.env}"
 if [[ -f "$ALPHARD_ENV_FILE" ]]; then
-  # shellcheck disable=SC1090
-  set -a
-  . "$ALPHARD_ENV_FILE"
-  set +a
+  # Source ONLY GRAFANA_ADMIN_PASSWORD from the env file. Issue #81:
+  # `set -a` would auto-export every variable in .env (HTTPS_PROXY,
+  # PROXY_URL, PATH, HOME, RISK_*, ...) into the deploy script's
+  # environment, which silently pollutes every subsequent `curl` and
+  # can route LAN-bound traffic (192.168.1.107:9090/3300/8765/2375)
+  # through an unreachable external proxy. Grep the single key,
+  # strip optional surrounding quotes, and export it explicitly.
+  _pw_line="$(grep -E '^[[:space:]]*GRAFANA_ADMIN_PASSWORD=' "$ALPHARD_ENV_FILE" | head -n1 || true)"
+  if [[ -n "$_pw_line" ]]; then
+    GRAFANA_ADMIN_PASSWORD="${_pw_line#*=}"
+    # Strip a single layer of surrounding ' or " if present.
+    GRAFANA_ADMIN_PASSWORD="${GRAFANA_ADMIN_PASSWORD%\"}"
+    GRAFANA_ADMIN_PASSWORD="${GRAFANA_ADMIN_PASSWORD#\"}"
+    GRAFANA_ADMIN_PASSWORD="${GRAFANA_ADMIN_PASSWORD%\'}"
+    GRAFANA_ADMIN_PASSWORD="${GRAFANA_ADMIN_PASSWORD#\'}"
+    export GRAFANA_ADMIN_PASSWORD
+  fi
+  unset _pw_line
 fi
 if [[ -z "${GRAFANA_ADMIN_PASSWORD:-}" ]]; then
   echo "ERROR: GRAFANA_ADMIN_PASSWORD is not set." >&2
