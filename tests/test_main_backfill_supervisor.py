@@ -405,7 +405,6 @@ class TestBackfillFaulthandlerRegister:
         ), f"faulthandler SIGUSR1 dump missing from stderr; got: {err_text[:500]!r}"
 
 
-
 # ---------------------------------------------------------------------------
 # Regression 2026-08-20: supervisor must NOT count rc=0 (clean exit)
 # toward the per-hour abort cap. The clean-exit case means the backfill
