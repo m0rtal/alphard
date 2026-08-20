@@ -37,6 +37,13 @@ services:
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
     environment:
+      # BUGFIX (#84): pass explicit ENV_FILE path so entrypoint.sh sources
+      # the host's /root/.env even when the bind-mounted candidates
+      # (/run/secrets/alphard.env, /run/secrets/alphard_env) resolve to
+      # empty directories on .107 Docker 29.1.x. 11 chars — well under the
+      # 60-char Portainer Env-parameter limit, so the long Tinkoff tokens
+      # (64+ chars) still have to come from the file body.
+      ENV_FILE: ${ENV_FILE:-/root/.env}
       ENV: ${ENV:-production}
       TINKOFF_SANDBOX_TOKEN: ${TINKOFF_SANDBOX_TOKEN:?TINKOFF_SANDBOX_TOKEN required}
       TINKOFF_REAL_TOKEN: ${TINKOFF_REAL_TOKEN:-}
