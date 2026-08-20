@@ -542,6 +542,24 @@ def main() -> int:
     os.environ["ALPHARD_PG_DSN"] = args.dsn
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
+    # Honour BACKFILL_LOG env: when set (by alphard-backfill-supervisor in
+    # src/main.py), also attach a FileHandler so all log lines land in the
+    # shared backfill log. The parent supervisor owns ZERO fds to this log
+    # (see issue #48) — the child opens its own handle here and the kernel
+    # reaps it on process exit, no leak possible.
+    backfill_log = os.environ.get("BACKFILL_LOG")
+    if backfill_log:
+        try:
+            os.makedirs(os.path.dirname(backfill_log), exist_ok=True)
+            _fh = logging.FileHandler(backfill_log, mode="a", encoding="utf-8")
+            _fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+            logging.getLogger().addHandler(_fh)
+            logger.info("backfill_log=%s (FileHandler attached, parent supervisor owns no fd)", backfill_log)
+        except OSError as e:
+            # Non-fatal: stay on stderr only. An operator investigating a
+            # crash should still see the warning that file logging fell back.
+            logger.warning("could not attach FileHandler to BACKFILL_LOG=%s: %s", backfill_log, e)
+
     start = date(args.start_year, 1, 1)
     end = date(args.end_year, 12, 31)
 

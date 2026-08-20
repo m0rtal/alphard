@@ -164,9 +164,12 @@ print('schema OK')
     # marker so the next operator can tell supervisor-managed vs
     # shell-launched apart at a glance.
     install -d -m 0755 "$(dirname "${BACKFILL_LOG}")"
-    : >"${BACKFILL_LOG}"
-    echo "  backfill: owned by alphard-backfill-supervisor thread in src/main.py" >>"${BACKFILL_LOG}"
-    echo "  backfill log=${BACKFILL_LOG} (supervisor-managed)"
+    # touch — DO NOT truncate. The backfill log is the only forensic record
+    # of supervisor-driven child behaviour, and a restart that wipes it
+    # defeats the whole point. See issue #49.
+    touch "${BACKFILL_LOG}"
+    echo "  backfill: owned by alphard-backfill-supervisor thread in src/main.py (boot $(date -u +%FT%TZ))" >>"${BACKFILL_LOG}"
+    echo "  backfill log=${BACKFILL_LOG} (supervisor-managed; appended, not truncated)"
 
     # H-NETWORK-DETECT (2026-08-20): wire SIGUSR1 -> faulthandler dump
     # so that if the backfill Python process ever sits idle in a

@@ -153,6 +153,19 @@ class TestSpawnBackfill:
         kwargs = captured["kwargs"]
         assert kwargs["start_new_session"] is True
         assert kwargs["cwd"] == "/app"
+        # Issue #48: parent must NOT inherit any fd to the backfill log.
+        # Output goes through the child's FileHandler (driven by
+        # BACKFILL_LOG env var). Use DEVNULL here to make the leak
+        # assertion mechanical — if a future refactor reverts to passing
+        # an open file handle, this assertion will trip.
+        assert kwargs["stdout"] is subprocess.DEVNULL
+        assert kwargs["stderr"] is subprocess.DEVNULL
+        # The BACKFILL_LOG path must be passed via env so the child can
+        # attach its own FileHandler. Asserting presence + equality (not
+        # set membership, since the parent might add unrelated vars).
+        env = kwargs.get("env")
+        assert env is not None, "spawn must pass env= to the child"
+        assert env.get("BACKFILL_LOG") == str(log)
 
     def test_uses_start_new_session(self, main_module: Any, tmp_path: Path) -> None:
         """Child must be its own session leader (setsid-equivalent).
@@ -191,9 +204,112 @@ class TestSpawnBackfill:
         # The supervisor's _spawn_backfill MUST pass start_new_session=True
         # so the child outlives any signal delivered to main.
         assert captured_kwargs["start_new_session"] is True
-        # And stdout=log_fh (a file handle, not DEVNULL) so the child's
-        # output actually ends up in the shared backfill log.
-        assert captured_kwargs["stdout"] is not None
+        # Issue #48: parent must NOT hold a fd to the backfill log. We
+        # assert DEVNULL (the leak-free option) so the contract is
+        # mechanical — a future refactor that re-introduces a parent-held
+        # fd will trip this assertion and force a code review.
+        assert captured_kwargs["stdout"] is subprocess.DEVNULL
+        assert captured_kwargs["stderr"] is subprocess.DEVNULL
+
+
+# ---------------------------------------------------------------------------
+# Issue #48 regression: parent must NOT leak fds across respawns
+# ---------------------------------------------------------------------------
+
+
+class TestNoFdLeakAcrossRespawns:
+    """Regression for issue #48: each respawn leaked one parent-held fd
+    to the backfill log. After ~10 respawns (the rate-limit threshold)
+    the supervisor held 10 fds all pointing at the same file; after
+    ~hundreds of respawns in a long-running container, the parent's
+    `open()` would fail with `OSError: [Errno 24] Too many open files`,
+    silently killing the supervisor while the container kept ticking
+    heartbeat — recreating the original orphan-daemon failure mode.
+
+    The fix passes stdout/stderr=DEVNULL and the log path via BACKFILL_LOG
+    env so the child opens its own FileHandler. We assert the parent's
+    fd count is invariant across many fake respawns.
+    """
+
+    def test_fd_count_invariant_across_100_respawns(self, main_module: Any, tmp_path: Path) -> None:
+        """100 respawns must not add any new fds to the parent process.
+
+        We count fds via /proc/self/fd (POSIX-only; the project is Linux-
+        only via Docker). If the parent re-introduces a held fd to the
+        backfill log, this assertion will trip long before the production
+        rate-limit kicks in.
+        """
+        if not hasattr(os, "scandir") or not Path("/proc/self/fd").exists():
+            pytest.skip("fd-counting via /proc/self/fd only on Linux")
+
+        log = tmp_path / "out.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        old = os.environ.get("BACKFILL_LOG")
+        os.environ["BACKFILL_LOG"] = str(log)
+        try:
+
+            class _FakePopen:
+                def __init__(self) -> None:
+                    self.pid = 700_999
+
+            def fake_popen(*args: Any, **kwargs: Any) -> _FakePopen:
+                return _FakePopen()
+
+            original_popen = main_module.subprocess.Popen
+            main_module.subprocess.Popen = fake_popen  # type: ignore[assignment]
+            try:
+                fd_dir = Path("/proc/self/fd")
+                baseline = len(list(fd_dir.iterdir()))
+                for _ in range(100):
+                    main_module._spawn_backfill()
+                after = len(list(fd_dir.iterdir()))
+            finally:
+                main_module.subprocess.Popen = original_popen  # type: ignore[assignment]
+        finally:
+            if old is None:
+                os.environ.pop("BACKFILL_LOG", None)
+            else:
+                os.environ["BACKFILL_LOG"] = old
+
+        # Allow ±2 slack for pytest's own internal fd churn (temp files,
+        # capture buffers) but reject any growth proportional to N=100.
+        assert after - baseline <= 2, (
+            f"parent fd count grew by {after - baseline} over 100 respawns; "
+            f"baseline={baseline} after={after} (issue #48 regression)"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Issue #49 regression: entrypoint must NOT truncate the backfill log
+# ---------------------------------------------------------------------------
+
+
+class TestEntrypointDoesNotTruncateBackfillLog:
+    """Regression for issue #49: `entrypoint.sh` used to truncate the
+    backfill log via `: >"${BACKFILL_LOG}"` on every container start,
+    wiping operator forensics. We assert the shell source contains the
+    corrective `touch` and does NOT contain the truncate pattern.
+    """
+
+    def test_entrypoint_uses_touch_not_truncate(self) -> None:
+        root = Path(__file__).resolve().parent.parent
+        entrypoint = root / "docker" / "entrypoint.sh"
+        assert entrypoint.is_file(), f"missing {entrypoint}"
+        text = entrypoint.read_text(encoding="utf-8")
+
+        # Must NOT truncate the backfill log on boot.
+        assert ': >"${BACKFILL_LOG}"' not in text, (
+            "entrypoint.sh still truncates the backfill log on container "
+            "start (issue #49). Replace `: >${BACKFILL_LOG}` with `touch`."
+        )
+        # Must append a boot marker instead.
+        assert 'touch "${BACKFILL_LOG}"' in text, (
+            "entrypoint.sh should `touch` the backfill log (no truncation), " "see issue #49"
+        )
+        assert "boot $(date -u" in text, (
+            "entrypoint.sh should append a `boot <UTC timestamp>` marker "
+            "so operators can see when each container started, issue #49"
+        )
 
 
 # ---------------------------------------------------------------------------
