@@ -116,6 +116,56 @@
 - 📅 Token usage anomaly > N API/min — Phase 2+
 - 📅 Unusual hours (вне MOEX) → CRITICAL — Phase 2+
 
+#### Level 4.1 — Monitoring profile (Prometheus + Grafana) LAN exposure (issue #55)
+
+**Surface:**
+- Grafana binds host port 3300 via `network_mode: host` (compose workaround
+  for the broken bridge-NAT on the .107 Docker daemon — see
+  `docker-compose.yaml:190-194`).
+- Prometheus binds host port 9090 via standard bridge port-mapping.
+- Both containers are deployed by `scripts/deploy_monitoring.sh` and live
+  on the .107 host's LAN.
+
+**Threats:**
+1. **Anonymous Grafana access** — any LAN peer that reaches `:3300` would
+   see every provisioned dashboard (`alphard_heartbeats_total`,
+   `alphard_open_positions`, etc.) without authentication. Status:
+   **mitigated** in issue #55 — `GF_AUTH_ANONYMOUS_ENABLED` removed and
+   forbidden by the `ops-policy` CI guard. `/api/search` returns 401
+   without auth.
+2. **Literal admin password in git** — the original `deploy_monitoring.sh`
+   hardcoded `GF_SECURITY_ADMIN_PASSWORD=alphard` (committed 2026-08-19).
+   Status: **mitigated** in issue #55 — the script now sources
+   `GRAFANA_ADMIN_PASSWORD` from `$ALPHARD_ENV_FILE` (default `./.env`)
+   and refuses to run if the variable is missing or set to the historical
+   literal. Note that the literal is **still in git history**; the
+   password must be rotated on the live Grafana instance (owner action,
+   tracked in issue #55 acceptance criteria).
+3. **Cross-stack secret drift** — pre-fix `scripts/deploy_monitoring.sh`
+   and `docker-compose.yaml` had different Grafana security postures
+   (anonymous+literal vs. .env+auth-only). Status: **resolved** — both
+   now require .env-sourced authentication. No more drift.
+
+**Defenses:**
+- `scripts/deploy_monitoring.sh` reads `$GRAFANA_ADMIN_PASSWORD` from
+  `$ALPHARD_ENV_FILE` (default `./.env`) and refuses to run if missing
+  or set to the historical literal `alphard`.
+- `.github/workflows/ci.yml` `ops-policy` job fails the build if
+  `scripts/` contains a literal `GF_SECURITY_ADMIN_PASSWORD=<value>` or
+  `GF_AUTH_ANONYMOUS_ENABLED=true`.
+- `docs/SECURITY.md` (this file) records the threat model so future
+  maintainers know which knobs are forbidden and why.
+
+**Operator actions (out of band for code PRs):**
+- **Rotate the live Grafana admin password on .107.** The historical
+  literal `alphard` is permanently in the public git history; rotation
+  is the only way to invalidate it.
+- **Restrict host:3300 + host:9090 at the LAN firewall.** The current
+  setup exposes Prometheus query API and Grafana UI to anyone on the
+  same subnet. A firewall rule limiting access to the Hermes host's
+  IP (`192.168.1.103`) and an operator workstation is recommended for
+  defense in depth, but is not enforced in code.
+
 ### Level 5: Recovery & incident response
 
 **Phase 2+:**
