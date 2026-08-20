@@ -403,3 +403,39 @@ class TestBackfillFaulthandlerRegister:
         assert (
             "Traceback" in err_text or "Current thread" in err_text or "stack" in err_text.lower()
         ), f"faulthandler SIGUSR1 dump missing from stderr; got: {err_text[:500]!r}"
+
+
+
+# ---------------------------------------------------------------------------
+# Regression 2026-08-20: supervisor must NOT count rc=0 (clean exit)
+# toward the per-hour abort cap. The clean-exit case means the backfill
+# finished its universe pass with no tickers (e.g. sandbox universe
+# empty, mark_terminally_failed exhausted, or — as on 2026-08-20 —
+# Tinkoff API returning 401 for every token). Counting those triggered
+# os._exit(1) every 6 minutes, which produced the sawtooth uptime gauge.
+# ---------------------------------------------------------------------------
+
+
+class TestSupervisorDoesNotCountCleanExits:
+    """Static-analysis regression for the rc=0 supervisor bug."""
+
+    def test_supervisor_only_counts_crashes(self) -> None:
+        root = Path(__file__).resolve().parent.parent
+        main_src = (root / "src" / "main.py").read_text(encoding="utf-8")
+        # The new logic must gate the death-counter increment with
+        # `if rc != 0:` and contain the comment block explaining why.
+        assert "if rc != 0:" in main_src, (
+            "src/main.py supervisor must gate the death-counter with "
+            "`if rc != 0:` — without this, rc=0 clean exits (empty "
+            "sandbox universe, 401-auth-fail finish) increment the "
+            "rate-limit and produce an infinite Docker restart loop "
+            "with sawtooth uptime gauge. See 2026-08-20 incident."
+        )
+        # Old buggy pattern must be gone: the rate-limit increment must
+        # not be unconditional. We assert that the surrounding comment
+        # block explicitly explains the rc=0 carve-out.
+        assert "rc=0 → no-op" in main_src or "rc=0 (clean exit)" in main_src, (
+            "src/main.py supervisor must explain the rc=0 carve-out. "
+            "Without an explicit comment, future refactors may "
+            "re-introduce the unconditional death-counter."
+        )
