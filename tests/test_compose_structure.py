@@ -99,3 +99,49 @@ class TestCompose:
         assert isinstance(deps, dict)
         assert "postgres" in deps, "alphard-bot must depend_on postgres with condition: service_healthy"
         assert deps["postgres"].get("condition") == "service_healthy"
+
+    def test_bot_env_file_override(self) -> None:
+        """BUGFIX (#84): alphard-bot must pass an explicit ENV_FILE env var
+        to entrypoint.sh. Without it, entrypoint.sh falls back to the
+        bind-mounted /run/secrets/alphard.{env,_env} candidates, which on
+        .107 Docker 29.1.x resolve to empty directories when the source
+        path is /root/.env-as-directory (production bug 2026-08-20).
+
+        The compose value MUST be the short default `/root/.env` (11 chars
+        including slash — well under the 60-char Portainer Env-parameter
+        limit), so that even when the host file is missing the entrypoint
+        fails fast with a clear "file not found" rather than silently
+        loading nothing and crashlooping on missing TINKOFF_* tokens.
+        """
+        data = _load_compose()
+        bot = data["services"]["alphard-bot"]
+        env = bot.get("environment", {})
+        # YAML may load bare keys as strings or as None (for `KEY:`).
+        # Normalize: env could be a list of "KEY=value" strings too.
+        if isinstance(env, list):
+            env_map = {}
+            for item in env:
+                if isinstance(item, str) and "=" in item:
+                    k, _, v = item.partition("=")
+                    env_map[k] = v
+                elif isinstance(item, str):
+                    env_map[item] = None
+            env = env_map
+        env_file = env.get("ENV_FILE")
+        assert env_file is not None, (
+            "alphard-bot.environment.ENV_FILE must be declared so entrypoint.sh "
+            "knows where to source TINKOFF_* tokens when the bind-mounted "
+            "candidates resolve to empty directories on .107 Docker 29.1.x"
+        )
+        # Either default to /root/.env or override via host .env — both are
+        # acceptable; the constraint is just that SOME path is passed.
+        assert isinstance(env_file, str) and env_file.strip(), (
+            f"ENV_FILE must be a non-empty string, got: {env_file!r}"
+        )
+        # The Portainer Env-parameter 60-char limit: Tinkoff sandbox tokens
+        # are 64+ chars and CANNOT live here. We only put the short PATH
+        # in Portainer Env; the long token values live in the .env body.
+        assert len(env_file) <= 60, (
+            f"ENV_FILE value must fit the 60-char Portainer Env-parameter "
+            f"limit (long tokens belong in the file body); got {len(env_file)} chars: {env_file!r}"
+        )
