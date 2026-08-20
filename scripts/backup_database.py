@@ -199,21 +199,20 @@ def _prune(
         return _delete_all(backups)
 
     keep: set[Path] = set()
-    sorted_backups = list(reversed(backups))  # oldest first
 
-    # Daily window: most recent N.
-    for _, p in sorted_backups[-daily_keep:]:
+    # Daily window: most recent N. ``backups`` is already sorted newest-first
+    # (see _list_backups), so the head is the most recent.
+    for _, p in backups[:daily_keep]:
         keep.add(p)
 
-    # Weekly window: among backups NOT already kept daily, keep the
-    # most recent per ISO week for `weekly_keep` weeks back from the
-    # current week. Only meaningful if there are backups older than the
-    # daily window.
-    older = [b for b in sorted_backups[:-daily_keep] if b[1] not in keep]
+    # Weekly window: among backups NOT already kept daily, keep the most
+    # recent per ISO week for `weekly_keep` weeks back from the current
+    # week. Iterate newest-first among the older backups so the budget
+    # collects the *most recent* older weeks, not the oldest (issue #41).
+    # Only meaningful if there are backups older than the daily window.
+    older = [b for b in backups[daily_keep:] if b[1] not in keep]
     if older and weekly_keep > 0:
-        # Determine the current ISO week (year, week).
-        most_recent_week = backups[0][0].isocalendar()
-        seen_weeks: set[tuple[int, int]] = {(most_recent_week[0], most_recent_week[1])}
+        seen_weeks: set[tuple[int, int]] = set()
         kept = 0
         for when, p in older:
             year, week, _ = when.isocalendar()
@@ -223,9 +222,7 @@ def _prune(
             seen_weeks.add(wk)
             keep.add(p)
             kept += 1
-            # Have we collected enough weeks? current week is counted, so
-            # we need (weekly_keep - 1) additional weeks.
-            if kept >= weekly_keep - 1:
+            if kept >= weekly_keep:
                 break
 
     return _delete_not_in(backups, keep)
