@@ -846,20 +846,37 @@ class TestUpsertOHLCV:
         assert len(cur.executemany_calls) == 1
         sql, params = cur.executemany_calls[0]
         assert "INSERT INTO ohlcv_daily" in sql
-        assert "ON CONFLICT (ticker, ts) DO UPDATE" in sql
+        # Phase 2.6 step 2: PK is now (ticker, ts, source) so the ON CONFLICT
+        # clause must include the new column. Single-source callers see no
+        # behaviour change because OHLCVRow defaults source='tkf'.
+        assert "ON CONFLICT (ticker, ts, source) DO UPDATE" in sql
         assert len(params) == 3
-        # All Decimal columns converted via str()
-        assert params[0][2] == "100.00"  # open
-        assert params[0][5] == "105.00"  # close
-        assert params[0][6] == "1000000"  # volume
-        assert params[0][7] == "105.00"  # adj_close
+        # The third param column is now the source tag (default 'tkf' for
+        # rows constructed via _bar()); the open / close / volume / adj_close
+        # indices have shifted by +1.
+        assert params[0][2] == "tkf"  # source (default for single-source rows)
+        assert params[0][3] == "100.00"  # open
+        assert params[0][6] == "105.00"  # close
+        assert params[0][7] == "1000000"  # volume
+        assert params[0][8] == "105.00"  # adj_close
 
     def test_covered_flags_passed_through(self, store: PostgresDataStore) -> None:
         row = _bar()
         store.upsert_ohlcv([row])
         cur = store._conn.last_cursor()
         _, params = cur.executemany_calls[0]
-        assert len(params[0]) == 8
+        # 9 params per row: ticker, ts, source, open, high, low, close,
+        # volume, adj_close. The +1 vs the v1 test reflects the source
+        # column added in Phase 2.6 step 2.
+        assert len(params[0]) == 9
+
+    def test_batch_with_explicit_moex_source_uses_moex_in_clause(self, store: PostgresDataStore) -> None:
+        """A multi-source caller (MOEX loader) propagates source='moex' to the SQL."""
+        row = _bar(ts=date(2026, 8, 1)).model_copy(update={"source": "moex"})
+        store.upsert_ohlcv([row])
+        cur = store._conn.last_cursor()
+        _, params = cur.executemany_calls[0]
+        assert params[0][2] == "moex"
 
 
 class TestBackfillWithDedup:
@@ -930,11 +947,15 @@ class TestMigrateDeduplicate:
 
 class TestQueryOHLCV:
     def test_query_without_source(self, store: PostgresDataStore) -> None:
+        """When source is not specified, query_ohlcv SELECTs every column
+        including the new ``source`` column (Phase 2.6 step 2). The mock
+        fetch returns 9 columns so the v2 SELECT projection matches."""
         store._conn.next_fetchall.append(
             [
                 (
                     "SBER",
                     date(2026, 8, 14),
+                    "tkf",  # new source column
                     "100.00",
                     "110.00",
                     "95.00",
@@ -954,10 +975,27 @@ class TestQueryOHLCV:
         assert params[2] == date(2026, 8, 31)
         assert len(rows) == 1
         assert rows[0].ticker == "SBER"
+        assert rows[0].source == "tkf"  # v2: every returned row carries its source
         assert rows[0].close == Decimal("105.00")
         assert rows[0].volume == Decimal("1000000")
 
     def test_query_with_source_filter(self, store: PostgresDataStore) -> None:
+        """Pass source='moex' to filter on the new PK column."""
+        store._conn.next_fetchall.append([])
+        store.query_ohlcv(
+            "SBER",
+            date(2026, 8, 1),
+            date(2026, 8, 31),
+            source="moex",
+        )
+        cur = store._conn.last_cursor()
+        sql, params = cur.calls[0]
+        assert "ORDER BY ts, source" in sql  # v2: ORDER BY ts, source (stable for multi-source)
+        assert "AND source = %s" in sql  # v2: source filter clause
+        assert params == ["SBER", date(2026, 8, 1), date(2026, 8, 31), "moex"]
+
+    def test_query_without_source_param_has_no_and_source(self, store: PostgresDataStore) -> None:
+        """When source is not passed, the SQL must not include the AND clause."""
         store._conn.next_fetchall.append([])
         store.query_ohlcv(
             "SBER",
@@ -966,13 +1004,21 @@ class TestQueryOHLCV:
         )
         cur = store._conn.last_cursor()
         sql, params = cur.calls[0]
-        assert "ORDER BY ts" in sql
+        assert "AND source = %s" not in sql
         assert params == ["SBER", date(2026, 8, 1), date(2026, 8, 31)]
 
     def test_query_short_row_defaults(self) -> None:
-        """A row with 8 columns parses into OHLCVRow."""
+        """A row with 8 columns (legacy fixture) parses into OHLCVRow with source='tkf'.
+
+        Phase 2.6 step 2 backwards-compat: a hypothetical code path that
+        SELECTs from ohlcv_daily without the new column (e.g. a test that
+        hand-wrote a 8-tuple) must not crash; _row_to_ohlcv falls back to
+        source='tkf' via the ``len(r) > 2`` guard.
+        """
         row = ("SBER", date(2026, 8, 14), "100", "110", "95", "105", "1000", "105")
-        _ = _row_to_ohlcv(row)
+        parsed = _row_to_ohlcv(row)
+        assert parsed.source == "tkf"
+        assert parsed.close == Decimal("105")
 
 
 # ---------------------------------------------------------------------------
@@ -1148,22 +1194,29 @@ class TestRowConverters:
         assert m.delisted_at is None
 
     def test_row_to_ohlcv_full_row(self) -> None:
+        """Phase 2.6 step 2: v2 row shape is (ticker, ts, source, open..adj_close).
+
+        Trailing ``True, False`` are extra columns the v1 fixture carried —
+        we now pass them through ``len(r) > 8`` branch where the parser
+        only reads indices [0..8]; the trailing noise is harmless.
+        """
         row = (
             "SBER",
             date(2026, 8, 14),
+            "tkf",  # source at index 2 (v2 layout)
             "100.50",
             "110.75",
             "95.25",
             "105.00",
             "1000000",
             "105.00",
-            "tkf",
             True,
             False,
         )
         o = _row_to_ohlcv(row)
         assert o.ticker == "SBER"
         assert o.ts == date(2026, 8, 14)
+        assert o.source == "tkf"
         assert o.open == Decimal("100.50")
         assert o.high == Decimal("110.75")
         assert o.low == Decimal("95.25")
@@ -1172,9 +1225,13 @@ class TestRowConverters:
         assert o.adj_close == Decimal("105.00")
 
     def test_row_to_ohlcv_numeric_inputs(self) -> None:
-        """Integer / float values get coerced via str()."""
-        row = ("X", date(2026, 1, 1), 100, 110, 95, 105, 1000, 105, "moex", False, True)
+        """Integer / float values get coerced via str().
+
+        Phase 2.6 step 2: v2 row shape is (ticker, ts, source, open..adj_close).
+        """
+        row = ("X", date(2026, 1, 1), "moex", 100, 110, 95, 105, 1000, 105, False, True)
         o = _row_to_ohlcv(row)
+        assert o.source == "moex"
         assert o.open == Decimal("100")
         assert o.close == Decimal("105")
 
@@ -1648,3 +1705,10 @@ class TestSchemaForwardCompat:
         assert "ALTER TABLE ticker_universe ADD COLUMN IF NOT EXISTS backfill_complete" in sql
         # ohlcv_daily: adj_close was added in 1.5; older images skipped it.
         assert "ALTER TABLE ohlcv_daily ADD COLUMN IF NOT EXISTS adj_close" in sql
+        # Phase 2.6 step 2: source column added to ohlcv_daily. A v1 image
+        # that runs the new schema.sql must land on v2 without a separate
+        # migration step (the CREATE TABLE declares the column directly,
+        # and the ADD COLUMN IF NOT EXISTS is a forward-compat safety net
+        # for images where schema.sql was applied before the column was
+        # added to the CREATE TABLE block).
+        assert "ALTER TABLE ohlcv_daily ADD COLUMN IF NOT EXISTS source" in sql

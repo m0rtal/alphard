@@ -354,28 +354,36 @@ class PostgresDataStore(DataStore):
     # ---------------------------------------------------------- OHLCV
 
     def upsert_ohlcv(self, rows: list[OHLCVRow]) -> int:
-        """Upsert OHLCV bars. PK = (ticker, ts). ON CONFLICT keeps existing values.
+        """Upsert OHLCV bars. PK = (ticker, ts, source). ON CONFLICT keeps existing values.
 
-        Behaviour: writes each (ticker, ts) row. If the row exists, the
+        Behaviour: writes each (ticker, ts, source) row. If the row exists, the
         existing OHLCV values are KEPT (preserves whichever source arrived
         first); updated_at is bumped.
+
+        Phase 2.6 step 2: the third PK column ``source`` lets two writers
+        (Tinkoff MD and MOEX ISS) store bars for the same (ticker, date)
+        without UPSERT collision. Existing single-source callers that
+        construct ``OHLCVRow`` without setting ``source`` get the model's
+        default ``source='tkf'``, so the UPSERT key is identical to v1 for
+        every call site that did not opt in to multi-source.
         """
         if not rows:
             return 0
         self._connect()
         sql = """
             INSERT INTO ohlcv_daily
-                (ticker, ts, open, high, low, close, volume, adj_close,
+                (ticker, ts, source, open, high, low, close, volume, adj_close,
                  updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s,
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
                     NOW())
-            ON CONFLICT (ticker, ts) DO UPDATE SET
+            ON CONFLICT (ticker, ts, source) DO UPDATE SET
                 updated_at = NOW()
         """
         params = [
             (
                 r.ticker,
                 r.ts,
+                r.source,
                 str(r.open),
                 str(r.high),
                 str(r.low),
@@ -399,6 +407,13 @@ class PostgresDataStore(DataStore):
 
         Used by MOEX backfill script: skip dates already covered by Tinkoff
         or any other source. Returns dict with stats: {'inserted': N, 'skipped': M}.
+
+        Phase 2.6 step 2: dedup is now keyed on (ticker, ts) alone — same
+        as before — because the cross-source gate (Phase 2.6 step 3)
+        needs both series to align on the same date. If ``source = 'tkf'``
+        already covered the bar, the MOEX bar is intentionally skipped
+        (rather than stored alongside as a divergent point) so the dedup
+        contract matches the v1 behaviour exactly.
         """
         if not new_bars:
             return {"inserted": 0, "skipped": 0}
@@ -422,13 +437,15 @@ class PostgresDataStore(DataStore):
         return {"inserted": len(filtered), "skipped": skipped}
 
     def migrate_deduplicate(self) -> int:
-        """One-time migration: collapse duplicate (ticker, ts) rows.
+        """One-time migration: collapse duplicate (ticker, ts, source) rows.
 
-        The current schema (Phase 1.1) has PK (ticker, ts), so no duplicates
-        can exist. This function is a safety net for legacy states where
-        the PK was dropped (e.g. partial migration from old versioned
-        schema). It deletes duplicates keeping the row with the lowest
-        ctid (effectively whichever row was inserted first).
+        The current schema (Phase 2.6 step 2) has PK (ticker, ts, source),
+        so no duplicates can exist. This function is a safety net for
+        legacy states where the PK was dropped or where a partial
+        migration left duplicates (e.g. an older image that ran the v1
+        PK shape and then had the column added without the new PK).
+        It deletes duplicates keeping the row with the lowest ctid
+        (effectively whichever row was inserted first).
 
         Returns count of rows deleted.
         """
@@ -438,7 +455,7 @@ class PostgresDataStore(DataStore):
                 WITH ranked AS (
                     SELECT ctid,
                            ROW_NUMBER() OVER (
-                               PARTITION BY ticker, ts
+                               PARTITION BY ticker, ts, source
                                ORDER BY ctid
                            ) AS rn
                     FROM ohlcv_daily
@@ -458,14 +475,25 @@ class PostgresDataStore(DataStore):
         ticker: str,
         start: date,
         end: date,
+        source: str | None = None,
     ) -> list[OHLCVRow]:
+        """Read OHLCV bars for ``ticker`` in ``[start, end]``.
+
+        Phase 2.6 step 2: pass ``source='tkf'`` to read only one source,
+        or omit to read every source tag. The OHLCVRow returned will
+        carry the row's ``source`` field so callers can disambiguate
+        when iterating over a multi-source result set.
+        """
         self._connect()
         sql = (
-            "SELECT ticker, ts, open, high, low, close, volume, adj_close "
+            "SELECT ticker, ts, source, open, high, low, close, volume, adj_close "
             "FROM ohlcv_daily WHERE ticker = %s AND ts BETWEEN %s AND %s"
         )
         params: list[Any] = [ticker.upper(), start, end]
-        sql += " ORDER BY ts"
+        if source is not None:
+            sql += " AND source = %s"
+            params.append(source)
+        sql += " ORDER BY ts, source"
         with self._conn.cursor() as cur:
             cur.execute(sql, params)
             return [_row_to_ohlcv(r) for r in cur.fetchall()]
@@ -672,15 +700,29 @@ def _row_to_ticker(r: Any) -> TickerMeta:
 def _row_to_ohlcv(r: Any) -> OHLCVRow:
     from decimal import Decimal
 
+    # Phase 2.6 step 2: read the new ``source`` column. The shape is:
+    #   * 9 columns: v2 schema — source is at index 2.
+    #   * 8 columns: v1 fixture (legacy code path that SELECTs without
+    #     the source column) — fall back to source='tkf' for
+    #     backward-compat. The 8-column path is defensive only — every
+    #     real SELECT in production goes through query_ohlcv() which
+    #     uses the v2 projection.
+    if len(r) > 8:
+        source = r[2]
+        open_v, high_v, low_v, close_v, volume_v, adj_close_v = r[3], r[4], r[5], r[6], r[7], r[8]
+    else:
+        source = "tkf"
+        open_v, high_v, low_v, close_v, volume_v, adj_close_v = r[2], r[3], r[4], r[5], r[6], r[7]
     return OHLCVRow(
         ticker=r[0],
         ts=r[1],
-        open=Decimal(str(r[2])),
-        high=Decimal(str(r[3])),
-        low=Decimal(str(r[4])),
-        close=Decimal(str(r[5])),
-        volume=Decimal(str(r[6])),
-        adj_close=Decimal(str(r[7])),
+        source=source,
+        open=Decimal(str(open_v)),
+        high=Decimal(str(high_v)),
+        low=Decimal(str(low_v)),
+        close=Decimal(str(close_v)),
+        volume=Decimal(str(volume_v)),
+        adj_close=Decimal(str(adj_close_v)),
     )
 
 

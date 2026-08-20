@@ -129,13 +129,25 @@ INSERT INTO _auth_probe (id, probed_at, source)
 
 
 -- ---------------------------------------------------------------------------
--- ohlcv_daily  (PK = ticker, ts)
+-- ohlcv_daily  (PK = ticker, ts, source)  -- Phase 2.6 step 2
 -- -----------------------------------------------------------------------------
--- Each (ticker, ts) is stored ONCE. Source provenance is not tracked at row
--- level — observability (logs, decision_log) is sufficient for Phase 2+.
+-- Phase 2.6 step 1 (PR #27 cross_source_smoke) proved the Level-2 Quality Gate
+-- works on synthetic data that mimics multi-source layout (Tinkoff MD vs
+-- MOEX ISS). Step 1 was scoped to synthetic because the v1 schema had
+-- PK (ticker, ts), so the same date from two sources would UPSERT-collide.
+--
+-- Step 2 (this DDL) lifts that constraint: each (ticker, ts, source) is
+-- stored ONCE per source. The legacy default for any pre-existing row is
+-- 'tkf' (Tinkoff MD was the only historical writer). Phase 2.6 step 3
+-- (nightly cross-source cron) is unblocked once this ships.
+--
+-- Migration history:
+--   v1 (Phase 1.1): PK (ticker, ts), no source column.
+--   v2 (Phase 2.6 step 2): PK (ticker, ts, source), source NOT NULL DEFAULT 'tkf'.
 CREATE TABLE IF NOT EXISTS ohlcv_daily (
     ticker           VARCHAR(12) NOT NULL,
     ts               DATE NOT NULL,
+    source           VARCHAR(8) NOT NULL DEFAULT 'tkf',
     open             NUMERIC(20, 8) NOT NULL,
     high             NUMERIC(20, 8) NOT NULL,
     low              NUMERIC(20, 8) NOT NULL,
@@ -143,18 +155,25 @@ CREATE TABLE IF NOT EXISTS ohlcv_daily (
     volume           NUMERIC(20, 0) NOT NULL,
     adj_close        NUMERIC(20, 8) NOT NULL,
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (ticker, ts),
+    PRIMARY KEY (ticker, ts, source),
     CONSTRAINT fk_ohlcv_ticker FOREIGN KEY (ticker)
         REFERENCES ticker_universe(ticker) ON DELETE RESTRICT
 );
 
 -- Forward-compat for older images that may have skipped columns.
+-- ``ADD COLUMN IF NOT EXISTS`` makes the migration idempotent — re-running
+-- schema.sql against an already-migrated DB is a no-op.
 ALTER TABLE ohlcv_daily ADD COLUMN IF NOT EXISTS adj_close NUMERIC(20, 8);
 ALTER TABLE ohlcv_daily ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE ohlcv_daily ADD COLUMN IF NOT EXISTS source VARCHAR(8) NOT NULL DEFAULT 'tkf';
 
-CREATE INDEX IF NOT EXISTS idx_ohlcv_daily_ticker_ts
-    ON ohlcv_daily (ticker, ts);
+-- Replaces the v1 ``idx_ohlcv_daily_ticker_ts``. The new index covers the
+-- new PK columns and is what every UPSERT / range query will hit.
+CREATE INDEX IF NOT EXISTS idx_ohlcv_daily_ticker_ts_source
+    ON ohlcv_daily (ticker, ts, source);
 
+-- Time-range scan index — preserved across migrations, used by macro /
+-- agent queries that filter by ts across all sources.
 CREATE INDEX IF NOT EXISTS idx_ohlcv_daily_ts
     ON ohlcv_daily (ts);
 
