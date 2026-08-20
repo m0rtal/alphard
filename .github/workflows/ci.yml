@@ -169,3 +169,61 @@ jobs:
         # CVE feed.
         run: |
           pip-audit --strict --requirement requirements-ci.txt
+
+  ops-policy:
+    # Issue #55: forbid hardcoded Grafana admin password and anonymous auth.
+    # This is a defense-in-depth check: the deploy_monitoring.sh script
+    # already sources the password from .env and refuses the literal
+    # "alphard", but a future refactor that re-introduces a literal must
+    # fail CI rather than silently ship. See docs/SECURITY.md §4 for the
+    # monitoring-profile LAN-exposure footprint and the rationale.
+    name: Ops policy (no literal Grafana password, no anonymous auth)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Fail if scripts/ contains a literal GF_SECURITY_ADMIN_PASSWORD value
+        run: |
+          # Match any Env entry like GF_SECURITY_ADMIN_PASSWORD=<literal> in
+          # scripts/. Allow the variable name as a key (e.g. in a check that
+          # REFUSES the literal) but forbid the form "<key>=<non-empty>".
+          # The negative-lookbehind via grep -v filters out the explicit
+          # refusal lines we added (issue #55).
+          if grep -RE 'GF_SECURITY_ADMIN_PASSWORD=[A-Za-z0-9]' scripts/ | grep -v '# issue #55'; then
+            echo "ERROR: GF_SECURITY_ADMIN_PASSWORD=<literal> found in scripts/" >&2
+            echo "  Use GRAFANA_ADMIN_PASSWORD from .env instead." >&2
+            exit 1
+          fi
+
+      - name: Fail if scripts/ sets GF_AUTH_ANONYMOUS_ENABLED=true (active config only)
+        run: |
+          # Anonymous auth on Grafana exposed every provisioned dashboard to
+          # any TCP client on the LAN (issue #55). Forbid it as an active
+          # config in scripts/. Comments that mention the historical
+          # literal in the context "we removed it" are allowed.
+          #
+          # Strategy: use awk to filter out lines that start with `#` (after
+          # optional leading whitespace) before grep. We split on `#` to
+          # keep only the code portion of each line, since `#` inside a
+          # string literal is rare and would break the comment-detection
+          # heuristic; bash scripts in this repo do not embed `#` in Env
+          # values.
+          bad="$(awk '
+            {
+              # Drop comment portion (everything from the first `#` that is
+              # NOT inside quotes). For our scripts this is good enough —
+              # Env values do not contain `#`.
+              code = $0
+              sub(/#.*/, "", code)
+              if (code ~ /GF_AUTH_ANONYMOUS_ENABLED[[:space:]]*=[[:space:]]*true/) {
+                print FILENAME ":" NR ":" $0
+              }
+            }
+          ' scripts/*.sh 2>/dev/null || true)"
+          if [[ -n "$bad" ]]; then
+            echo "ERROR: GF_AUTH_ANONYMOUS_ENABLED=true found as active config:" >&2
+            echo "$bad" >&2
+            echo "  Anonymous Grafana access is forbidden; require authentication." >&2
+            exit 1
+          fi
