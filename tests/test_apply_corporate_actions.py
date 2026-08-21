@@ -482,6 +482,108 @@ def test_apply_for_ticker_short_circuits_on_empty_actions(
     assert store.count_ohlcv_adj() == 0
 
 
+def test_multi_source_ohlcv_collapses_to_one_adjusted_row_per_ts(
+    store: InMemorySQLiteStore,
+    tmp_path: Path,
+) -> None:
+    """Regression for issue #136: Phase 2.6 step 2 added ``source`` to
+    ``ohlcv_daily`` PK, so the same ``(ticker, ts)`` can exist under two
+    source tags (e.g. ``tkf`` and ``moex``). ``ohlcv_daily_adj`` PK is
+    still ``(ticker, ts)``, so if the orchestrator reads BOTH sources
+    and feeds them through ``apply_adjustment`` then ``upsert_ohlcv_adj``,
+    the second ``executemany`` write silently overwrites the first via
+    ``ON CONFLICT (ticker, ts) DO UPDATE`` — the moex-side adjustment is
+    dropped on the floor.
+
+    The fix (PR): the orchestrator passes ``source='tkf'`` to
+    ``store.query_ohlcv`` so only the primary source is read. This test
+    asserts the post-fix behaviour:
+
+      * the adjusted table contains exactly ONE row per ``(ticker, ts)``
+        regardless of how many source rows exist in the raw feed;
+      * the surviving row carries values derived from the chosen
+        source's pre-adjustment bar (the SBER 1:2 split halves close
+        and doubles volume, so the moex source's close=104 would also
+        become close=52 after adjustment — but if the orchestrator
+        accidentally read BOTH sources, the adjusted table would have
+        exactly one row whose close came from whichever source was
+        processed last; this test pins it to the ``tkf`` source by
+        making the two sources disagree on the pre-split close and
+        checking the adjusted close matches ``tkf``).
+    """
+    cache_path = tmp_path / "cache.json"
+
+    # Seed a SECOND source ('moex') for SBER with DIFFERENT closes so we
+    # can detect which source the orchestrator picked. The default store
+    # fixture seeds ``tkf`` only; we add moex via a second ``upsert_ohlcv``
+    # call (Phase 2.6 step 2: source column is now part of the PK).
+    moex_rows = [
+        OHLCVRow(
+            ticker="SBER",
+            ts=ts,
+            open=Decimal("9999"),
+            high=Decimal("9999"),
+            low=Decimal("9999"),
+            close=Decimal("9999"),  # impossible pre-split close — sentinel
+            volume=Decimal("9999"),
+            adj_close=Decimal("9999"),
+            source="moex",
+        )
+        for ts in [
+            date(2026, 1, 6),
+            date(2026, 1, 7),
+            date(2026, 1, 8),
+            date(2026, 1, 9),
+            date(2026, 1, 12),
+        ]
+    ]
+    store.upsert_ohlcv(moex_rows)
+
+    fetcher_payload = [
+        {"ticker": "SBER", "ts": "2026-01-09", "ratio": 2.0, "source": "moex"},
+    ]
+
+    with patch.object(aca, "_FETCHER_MOD") as fake_fetcher:
+        fake_fetcher.fetch_splits.return_value = fetcher_payload
+        fake_fetcher.fetch_dividends.return_value = []
+        fake_fetcher.USER_AGENT = "alphard-test"
+        rc = aca.main(
+            [
+                "--tickers",
+                "SBER",
+                "--cache-path",
+                str(cache_path),
+            ],
+            store=store,
+        )
+    assert rc == aca.EXIT_OK
+
+    adj = store.query_ohlcv_adj("SBER", date(2026, 1, 1), date(2026, 12, 31))
+    # Exactly one adjusted row per date — no PK-collision drops.
+    assert len(adj) == 5, f"expected 5 adjusted rows, got {len(adj)}"
+    assert len({r.ts for r in adj}) == 5, "duplicate (ticker, ts) in ohlcv_daily_adj"
+
+    by_ts = {r.ts: r for r in adj}
+    # Pre-split bars (ts < 2026-01-09): the 'tkf' source had close 100..102
+    # → halved to 50, 50.5, 51. If the orchestrator had picked 'moex'
+    # instead, the adjusted close would be 9999/2 = 4999.5 (sentinel).
+    for ts, expected_close in (
+        (date(2026, 1, 6), Decimal("50")),
+        (date(2026, 1, 7), Decimal("50.5")),
+        (date(2026, 1, 8), Decimal("51")),
+    ):
+        assert by_ts[ts].close == expected_close, (
+            f"ts={ts} close={by_ts[ts].close} (expected {expected_close}); "
+            "if close≈4999.5 the orchestrator picked 'moex' instead of 'tkf'"
+        )
+        assert by_ts[ts].volume == Decimal("2000"), f"ts={ts} volume={by_ts[ts].volume} (expected 2000)"
+    # Post-split / split-date bars (moex was 9999; tkf 103..104). The
+    # split math is a no-op for bars at/after the split date — so the
+    # adjusted value MUST equal the tkf value (103, 104), not 9999.
+    assert by_ts[date(2026, 1, 9)].close == Decimal("103")
+    assert by_ts[date(2026, 1, 12)].close == Decimal("104")
+
+
 def test_build_store_raises_store_error_with_no_dsn(tmp_path: Path, monkeypatch) -> None:
     """Production path: no ALPHARD_PG_DSN set → PostgresDataStore raises
     StoreError → main() catches it and returns EXIT_FATAL."""

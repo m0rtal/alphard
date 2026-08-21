@@ -331,10 +331,20 @@ def _apply_for_ticker(
     # Pull the full history. The adjusted-output range should match the
     # raw-input range (1:1 row count) so we don't impose a date window
     # here — every pre-split bar must be scaled.
+    #
+    # source='tkf' is mandatory post-Phase 2.6 step 2 (issue #136):
+    # ``ohlcv_daily_adj`` is keyed on (ticker, ts) only, so reading both
+    # sources and feeding them through ``apply_adjustment`` would run
+    # ``upsert_ohlcv_adj`` twice per date — the second write silently
+    # overwrites the first via ``ON CONFLICT (ticker, ts) DO UPDATE``,
+    # dropping half the adjusted output without any error. 'tkf' is the
+    # primary source ('tkf' is the default in OHLCVRow.source) and
+    # matches the orchestrator's pre-Phase-2.6 behavior.
     raw_rows = store.query_ohlcv(
         ticker=ticker,
         start=date(1990, 1, 1),  # far past — covers the whole Russian market
         end=date(2100, 1, 1),  # far future — covers any stored bar
+        source="tkf",
     )
     if not raw_rows:
         logger.info("ticker=%s no raw OHLCV rows; nothing to adjust", ticker)
@@ -352,7 +362,7 @@ def _apply_for_ticker(
 
     written = store.upsert_ohlcv_adj(adjusted)
     logger.info(
-        "ticker=%s applied %d actions, upserted %d/%d adjusted bars",
+        "ticker=%s applied %d actions, upserted %d/%d adjusted bars (source=tkf)",
         ticker,
         len(actions),
         written,

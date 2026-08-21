@@ -90,8 +90,20 @@ class DataStore(abc.ABC):
         ticker: str,
         start: date,
         end: date,
+        source: str | None = None,
     ) -> list[OHLCVRow]:
-        """Read OHLCV bars for ``ticker`` in ``[start, end]``."""
+        """Read OHLCV bars for ``ticker`` in ``[start, end]``.
+
+        Parameters
+        ----------
+        source : str | None
+            Phase 2.6 step 2: optional source tag filter (``'tkf'`` /
+            ``'moex'`` / ``'manual'``). ``None`` returns rows for every
+            source. Callers that write into a destination keyed by
+            ``(ticker, ts)`` only MUST pass an explicit source to avoid
+            silent overwrites (issue #136: ``ohlcv_daily_adj`` PK has no
+            ``source`` column).
+        """
 
     # ---- corporate actions ----------------------------------------------
 
