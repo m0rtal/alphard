@@ -494,8 +494,7 @@ class TestRedisFailFast:
         # For backslash and backtick the literal escape form is used.
         for needle in ("REDIS_PASSWORD", "exit 1"):
             assert needle in rendered, (
-                f"redis command must reference {needle!r} in the "
-                f"metachar-rejection case block; got: {rendered!r}"
+                f"redis command must reference {needle!r} in the " f"metachar-rejection case block; got: {rendered!r}"
             )
         # The pattern must match at least one of the dangerous chars.
         # We accept any of the four: `\$`, `\"`, `\\`, or backtick `` ` ``.
@@ -503,26 +502,13 @@ class TestRedisFailFast:
         # escaping is shell-specific (alpine busybox ash vs bash vs
         # dash all differ). The functional contract — reject at least
         # one dangerous char — is what matters.
-        has_dollar_escape = (
-            r"\$" in rendered
-            or "printf '%s' '$'" in rendered
-            or "printf '%s' \"$\"" in rendered
-        )
-        has_quote_escape = (
-            ('\\"' in rendered)
-            or "printf '%s' '\\\"'" in rendered
-            or "printf '%s' \"\\\"\"" in rendered
-        )
+        has_dollar_escape = r"\$" in rendered or "printf '%s' '$'" in rendered or "printf '%s' \"$\"" in rendered
+        has_quote_escape = ('\\"' in rendered) or "printf '%s' '\\\"'" in rendered or 'printf \'%s\' "\\""' in rendered
         has_backslash_escape = (r"\\" in rendered) or (r"'\'" in rendered)
         has_backtick_escape = "`" in rendered
-        assert (
-            has_dollar_escape
-            or has_quote_escape
-            or has_backslash_escape
-            or has_backtick_escape
-        ), (
+        assert has_dollar_escape or has_quote_escape or has_backslash_escape or has_backtick_escape, (
             f"redis command's metachar-rejection case block must match "
-            f"at least one dangerous char ($, \", \\, or backtick); "
+            f'at least one dangerous char ($, ", \\, or backtick); '
             f"got: {rendered!r}"
         )
 
@@ -548,9 +534,9 @@ class TestRedisFailFast:
         cmd = self._redis_service().get("command")
         assert cmd is not None
         # The exec-form list is [sh, -c, script]. Join script parts.
-        assert isinstance(cmd, list) and len(cmd) >= 3 and cmd[0] == "sh" and cmd[1] == "-c", (
-            f"redis command must be exec-form [sh, -c, script]; got: {cmd!r}"
-        )
+        assert (
+            isinstance(cmd, list) and len(cmd) >= 3 and cmd[0] == "sh" and cmd[1] == "-c"
+        ), f"redis command must be exec-form [sh, -c, script]; got: {cmd!r}"
         script = "\n".join(str(x) for x in cmd[2:])
         # Replace $$ with $ (compose escapes $ for the container shell)
         # and replace the final `exec redis-server` with a stub echo
@@ -558,8 +544,8 @@ class TestRedisFailFast:
         # installed locally.
         rendered = script.replace("$$", "$")
         rendered = rendered.replace(
-            "exec redis-server --requirepass \"${REDIS_PASSWORD}\"",
-            "echo redis-server-stub --requirepass \"${REDIS_PASSWORD}\"",
+            'exec redis-server --requirepass "${REDIS_PASSWORD}"',
+            'echo redis-server-stub --requirepass "${REDIS_PASSWORD}"',
         )
 
         # Cases: (password, expected_exit). Exit 0 == ACCEPTED, else REJECTED.
