@@ -422,6 +422,96 @@ class TestCoordinatorValidateSeverity:
 
 
 # -----------------------------------------------------------------------------
+# Coordinator._validate() — multi-source dedup (issue #102)
+# -----------------------------------------------------------------------------
+
+
+class TestCoordinatorValidateMultiSourceDedup:
+    """Issue #102: Phase 2.6 step 2 multi-source schema lets one
+    (ticker, ts) have multiple OHLCVRow entries — one per source tag.
+    The ingestion gate treats every Bar as an independent observation,
+    so feeding the gate 2× the bar list would inflate the row count,
+    double-count volume, and let a ticker with only 126 unique dates
+    squeak past min_history_rows=252. _validate must dedup by ts.
+    """
+
+    def _bar_for_ts(self, ts: date, volume: int = 1000) -> MagicMock:
+        bar = MagicMock()
+        bar.ts = ts
+        bar.open = Decimal("100")
+        bar.high = Decimal("101")
+        bar.low = Decimal("99")
+        bar.close = Decimal("100.5")
+        bar.volume = Decimal(volume)
+        return bar
+
+    def test_validate_dedup_duplicate_ts_same_source(self) -> None:
+        """Same ts appearing twice (e.g. two source='tkf' rows from a
+        noisy loader) — _validate must collapse to one Bar per ts.
+        """
+        seen_bars: list = []
+        mock_report = MagicMock()
+        mock_report.worst_severity.return_value = None
+
+        def _capture(*args, **kwargs):
+            seen_bars.extend(args[1])
+            return mock_report
+
+        today = date.today()
+        d1 = today - timedelta(days=1)
+        d2 = today - timedelta(days=2)
+        bars_input = [
+            self._bar_for_ts(d1),
+            self._bar_for_ts(d1),  # duplicate of d1
+            self._bar_for_ts(d2),
+            self._bar_for_ts(d2),  # duplicate of d2
+            self._bar_for_ts(d2),  # third copy of d2
+        ]
+        with patch(
+            "src.data.quality.ingestion_gate.check_ingestion",
+            side_effect=_capture,
+        ):
+            coord = Coordinator(_config())
+            result = coord._validate(bars_input)
+        assert result is True
+        # 5 input rows → 2 unique dates → 2 Bars handed to the gate.
+        assert len(seen_bars) == 2
+        seen_keys = {b.primary_key for b in seen_bars}
+        assert seen_keys == {d1, d2}
+
+    def test_validate_dedup_multi_source_keeps_first_seen(self) -> None:
+        """Multi-source rows for the same ts: query_ohlcv orders by
+        (ts, source), so source='tkf' arrives before source='moex'.
+        _validate must keep the FIRST occurrence (tkf), not the last.
+        """
+        seen_bars: list = []
+        mock_report = MagicMock()
+        mock_report.worst_severity.return_value = None
+
+        def _capture(*args, **kwargs):
+            seen_bars.extend(args[1])
+            return mock_report
+
+        today = date.today()
+        d1 = today - timedelta(days=1)
+        # Simulate query_ohlcv ORDER BY ts, source: tkf first, moex second.
+        tkf_bar = self._bar_for_ts(d1, volume=1000)
+        tkf_bar.source = "tkf"
+        moex_bar = self._bar_for_ts(d1, volume=2000)
+        moex_bar.source = "moex"
+
+        with patch(
+            "src.data.quality.ingestion_gate.check_ingestion",
+            side_effect=_capture,
+        ):
+            coord = Coordinator(_config())
+            coord._validate([tkf_bar, moex_bar])
+        assert len(seen_bars) == 1
+        # First-seen wins → tkf volume, not moex.
+        assert int(seen_bars[0].volume) == 1000
+
+
+# -----------------------------------------------------------------------------
 # Coordinator._execute() — risk-denied, success, and broker-error (lines 303-320)
 # -----------------------------------------------------------------------------
 
