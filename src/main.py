@@ -67,6 +67,16 @@ CORP_ACTIONS_APPLY_CADENCE_SECONDS = 7 * 24 * 3600  # 7 days between runs.
 # inside 30 min. 60 min gives headroom for MOEX ISS latency.
 CORP_ACTIONS_APPLY_SUBPROCESS_TIMEOUT = 3600
 
+# Phase 2.3: hourly macro sync (CBR + USD/RUB + IMOEX -> regime label).
+# Issue #70 hard constraint: first run waits 5 minutes after launch
+# (let Postgres + daily_sync settle); subsequent runs every hour.
+# Macro data moves slowly (CBR rate = meeting-by-meeting, IMOEX/USD = daily)
+# but we still want hourly to absorb the 18:40 close without waiting
+# 24h. The script itself has a 1h skip gate so re-runs are no-ops.
+MACRO_SYNC_CADENCE_SECONDS = 3600  # 1 hour between runs.
+MACRO_SYNC_FIRST_RUN_DELAY_SECONDS = 5 * 60  # 5 min after launch.
+MACRO_SYNC_SUBPROCESS_TIMEOUT = 300  # 5 min hard cap; fetch + upsert is sub-second.
+
 # Phase 1.6 audit: in-process watchdog for the daily_sync daemon thread.
 # A thread that crashes inside a live process leaves no signal — heartbeat
 # keeps ticking, container stays "Up", but the daily schedule is silently
@@ -446,6 +456,63 @@ def _corp_actions_apply_loop() -> None:
         _sleep_interruptible(CORP_ACTIONS_APPLY_CADENCE_SECONDS)
 
 
+def _macro_sync_loop() -> None:
+    """Run scripts/run_macro_sync.py hourly (Phase 2.3 Macro Agent).
+
+    Issue #70 hard constraints:
+    - First run waits MACRO_SYNC_FIRST_RUN_DELAY_SECONDS (5 min) after launch
+      so Postgres + daily_sync settle. Macro data is hourly at the fastest,
+      so a 5-min startup delay costs us nothing.
+    - Subsequent runs every MACRO_SYNC_CADENCE_SECONDS (1h). The script
+      itself enforces a 1h skip-window so this loop firing hourly is
+      a fast no-op rather than redundant fetches.
+
+    Why subprocess instead of in-process call?
+    - The fetcher does urllib calls to cbr-xml-daily.ru + MOEX ISS. A
+      network hang in the main process would kill the heartbeat.
+      Subprocess + timeout = circuit breaker.
+    - PostgresDataStore() init in the script opens its own connection;
+      in-process would conflict with the backfill supervisor's pg_store.
+
+    Failure isolation:
+    - The script returns exit code 0 even when the skip gate fires (no-op).
+      Non-zero means an upstream issue; we log but keep the loop alive.
+    """
+    logger = logging.getLogger("alphard.macro_sync")
+
+    logger.info(
+        f"macro_sync scheduled: first run in {MACRO_SYNC_FIRST_RUN_DELAY_SECONDS / 60:.0f} min, "
+        f"then every {MACRO_SYNC_CADENCE_SECONDS / 3600:.1f}h, "
+        f"subprocess_timeout={MACRO_SYNC_SUBPROCESS_TIMEOUT}s"
+    )
+    _sleep_interruptible(MACRO_SYNC_FIRST_RUN_DELAY_SECONDS)
+
+    while not _shutdown_event.is_set():
+        logger.info("Triggering run_macro_sync subprocess")
+        try:
+            r = subprocess.run(
+                ["python", "scripts/run_macro_sync.py"],
+                capture_output=True,
+                text=True,
+                timeout=MACRO_SYNC_SUBPROCESS_TIMEOUT,
+                cwd="/app",
+            )
+            if r.returncode == 0:
+                tail = r.stdout[-500:] if r.stdout else ""
+                logger.info(f"macro_sync OK rc={r.returncode}: {tail!r}")
+            else:
+                tail = (r.stderr or "")[-500:]
+                logger.warning(f"macro_sync FAILED rc={r.returncode}: {tail!r}")
+        except subprocess.TimeoutExpired:
+            logger.warning(f"macro_sync timeout after {MACRO_SYNC_SUBPROCESS_TIMEOUT}s; subprocess killed")
+        except Exception as exc:  # noqa: BLE001 — never kill the heartbeat
+            logger.error(f"macro_sync unexpected error: {exc}")
+        if _shutdown_event.is_set():
+            logger.info("macro_sync daemon received shutdown signal, exiting")
+            return
+        _sleep_interruptible(MACRO_SYNC_CADENCE_SECONDS)
+
+
 def _sleep_interruptible(seconds: float) -> None:
     """Sleep up to `seconds`, but wake up immediately on shutdown_event.
 
@@ -644,6 +711,19 @@ def main() -> None:
         f"subprocess_timeout={CORP_ACTIONS_APPLY_SUBPROCESS_TIMEOUT}s)"
     )
 
+    # Phase 2.3: hourly macro_sync daemon. CBR + USD/RUB + IMOEX ->
+    # regime + multiplier -> upsert to macro_regime_log. First run 5
+    # minutes after launch; subsequent runs every hour. Subprocess
+    # isolates the urllib + Postgres lifecycle from the heartbeat.
+    macro_sync_thread = threading.Thread(target=_macro_sync_loop, daemon=True, name="alphard-macro-sync")
+    macro_sync_thread.start()
+    logger.info(
+        f"macro-sync daemon started "
+        f"(first_run_in={MACRO_SYNC_FIRST_RUN_DELAY_SECONDS / 60:.0f}min, "
+        f"cadence={MACRO_SYNC_CADENCE_SECONDS / 3600:.1f}h, "
+        f"subprocess_timeout={MACRO_SYNC_SUBPROCESS_TIMEOUT}s)"
+    )
+
     # Phase 2.8 step 1: Prometheus metrics HTTP server. Stdlib ThreadingHTTPServer
     # bound to ALPHARD_METRICS_PORT (default 8765) on 0.0.0.0. Exposes
     # /health (cheap liveness probe) and /metrics (Prometheus text exposition
@@ -721,6 +801,9 @@ def main() -> None:
         corp_actions_thread.join(timeout=10)
         if corp_actions_thread.is_alive():
             logger.warning("corp-actions-apply daemon did not exit within 10s")
+        macro_sync_thread.join(timeout=10)
+        if macro_sync_thread.is_alive():
+            logger.warning("macro-sync daemon did not exit within 10s")
         _metrics_registry_obj = globals().get("_metrics_registry")
         if _metrics_registry_obj is not None and "_metrics_server" in globals():
             try:

@@ -95,6 +95,22 @@ CREATE TABLE IF NOT EXISTS delisting_log (
     reason      TEXT NOT NULL DEFAULT '',
     source      TEXT NOT NULL DEFAULT 'manual'
 );
+
+-- Phase 2.3: Macro Agent regime log. Mirror of the Postgres
+-- macro_regime_log table. fetched_at is the upsert key.
+CREATE TABLE IF NOT EXISTS macro_regime_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    fetched_at      TEXT NOT NULL UNIQUE,
+    cbr_key_rate    TEXT NOT NULL,
+    usdrub_close    TEXT NOT NULL,
+    usdrub_5d_prev  TEXT NOT NULL,
+    imoex_close     TEXT NOT NULL,
+    imoex_60d_prev  TEXT NOT NULL,
+    regime          TEXT NOT NULL,
+    multiplier      TEXT NOT NULL,
+    sources         TEXT NOT NULL DEFAULT '{}',
+    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 

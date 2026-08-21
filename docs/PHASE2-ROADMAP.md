@@ -71,7 +71,43 @@ This gate exists by design — it is a Phase 1 guarantee, not a bug.
 
 **Why Phase 2:** Single-feature regime is a clean unit test; multi-factor requires 6+ months of history.
 
-### 2.3 — Coordinator wired to all agents (Phase 5.2 in audit)
+### 2.3 — Macro Agent (CBR + USD/RUB + IMOEX regime classifier) — issue #70
+
+**Status:** ✅ implemented (branch `fix/issue-70-macro-agent`).
+
+**Goal:** Pull three macro inputs, compute a deterministic regime label +
+risk-budget multiplier in [0.5, 1.0], persist to Postgres. Coordinator
+(Phase 2.10) consumes the output.
+
+**Inputs (no paid vendor):**
+- CBR key rate — `cbr-xml-daily.ru` XML.
+- USD/RUB CETS — `iss.moex.com/.../USD000000TOD/candles.csv`.
+- IMOEX index — `iss.moex.com/.../MOEX.csv`.
+
+**Regime classifier (pure Decimal math):**
+- `risk_off`         if CBR > 15% OR IMOEX drawdown > 20% over 60d
+- `risk_on_reduced`  if USD/RUB Δ > 5% over 5d
+- `neutral`          otherwise
+
+Multipliers: `risk_off` → 0.50, `risk_on_reduced` → 0.75, `neutral` → 1.00.
+
+**Modules:**
+- `src/macro/regime.py::classify()` — pure function, no IO. 4 branches + 4 edges covered by `tests/test_regime.py`.
+- `src/macro/persistence.py` — store-agnostic upsert (`upsert_regime`, `latest_regime`). Tested against `InMemorySQLiteStore`.
+- `src/data/macro_fetcher.py::build_snapshot()` — composes three fetchers with retry+backoff+cache; atomic `.tmp+rename` writes.
+- `scripts/run_macro_sync.py` — CLI entrypoint with 1h skip-window gate; subprocess-isolated.
+- `src/main.py::_macro_sync_loop` — hourly daemon thread, 5-min startup delay, 1h cadence, 5-min subprocess timeout.
+
+**Schema:** `macro_regime_log` (one row per fetch, keyed by `fetched_at`). Mirrored in `InMemorySQLiteStore` for tests.
+
+**Hard constraints honoured:**
+- No scheduler changes to `_daily_sync_loop` / `_delisted_sync_loop` (separate daemon thread).
+- `src/coordinator/*` untouched (Phase 2.10 scope).
+- `models.py OHLCVRow` untouched (regime uses its own `MacroSnapshot`).
+- Cache writes atomic via `.tmp + os.replace`.
+- `regime.classify()` is PURE — no IO, no DB.
+
+### 2.4 — Coordinator wired to all agents (Phase 5.2 in audit)
 
 **What:** Coordinator calls Quant + Macro before Risk, not just Risk stub.
 **PR #17 (commit `e406488`):** Added fail-safe on VALIDATE/RISK exception + TOCTOU guard.
