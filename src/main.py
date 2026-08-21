@@ -530,6 +530,98 @@ def _sleep_interruptible(seconds: float) -> None:
             return
 
 
+def _read_proc_starttime_jiffies(pid: int) -> int:
+    """Read the ``starttime`` field from ``/proc/<pid>/stat`` in clock ticks.
+
+    Implements the standard proc(5) parser: the ``comm`` field is wrapped
+    in parentheses and CAN contain whitespace, parens (except ``)``), and
+    any other character, so a naive ``.split()`` lands on the wrong
+    offsets whenever ``comm`` contains a space (e.g. ``entrypoint.sh``
+    with arguments, or a Python process whose argv[0] has a space).
+    The robust idiom (recommended in proc(5)) is to find the LAST
+    ``)`` and split the remainder — that gives the post-comm slice in
+    its guaranteed whitespace-separated form.
+
+    Issue #106: the prior implementation used ``.read().split()`` and
+    indexed ``fields[21]``, which is wrong whenever comm contains a
+    space. On the .107 host /proc/1/stat reflects the HOST init (not
+    the container's entrypoint), so the field was off-by-N for every
+    common deployment shape.
+
+    Returns the starttime in clock ticks (Jiffies since boot). Raises
+    ``OSError`` if the file does not exist or is not readable (e.g.
+    another PID namespace when --pid=host is not set), and ``RuntimeError``
+    if the file is malformed.
+    """
+    with open(f"/proc/{pid}/stat") as fh:
+        content = fh.read()
+    close_idx = content.rfind(")")
+    if close_idx < 0:
+        raise RuntimeError(f"malformed /proc/{pid}/stat: no closing ')'")
+    tail = content[close_idx + 1 :].split()
+    # After the closing paren, the first field is state, then the rest
+    # of the standard proc(5) layout. starttime is field 22 from the
+    # start of the line, which is index 19 (22 - 3 fields for pid/state
+    # counted before comm).
+    if len(tail) < 20:
+        raise RuntimeError(f"malformed /proc/{pid}/stat: expected >=20 fields after comm, got {len(tail)}")
+    return int(tail[19])
+
+
+def _read_proc_stat_btime() -> int:
+    """Return the host boot epoch (Unix seconds) from ``/proc/stat``.
+
+    Raises ``RuntimeError`` if the ``btime`` line is missing or
+    unparseable.
+    """
+    with open("/proc/stat") as fh:
+        for line in fh:
+            if line.startswith("btime "):
+                return int(line.split()[1])
+    raise RuntimeError("btime not found in /proc/stat")
+
+
+def _container_uptime_seconds() -> float:
+    """Best-effort container uptime in seconds.
+
+    Strategy (issue #106):
+    1. Try ``/proc/1/stat`` starttime + ``/proc/stat`` btime. This is
+       the intended path on hosts where PID 1 inside the container is
+       the entrypoint (default Docker behaviour — PID 1 is
+       ``entrypoint.sh``).
+    2. Fall back to ``/proc/self/stat`` if /proc/1/stat is missing
+       or unreadable (e.g. when the container shares the host PID
+       namespace and /proc/1 is the host init, not the container's
+       entrypoint). ``self`` is the Python process — its starttime
+       is at most a few hundred ms after the container start because
+       entrypoint.sh ``exec``s python.
+
+    Raises ``RuntimeError`` if every path fails — caller logs and falls
+    back to the pre-first-run assumption (skip watchdog).
+    """
+    try:
+        start_jiffies = _read_proc_starttime_jiffies(1)
+        btime = _read_proc_stat_btime()
+    except OSError:
+        # /proc/1/stat or /proc/stat missing/unreadable. Most common
+        # cause: container shares host PID namespace (--pid=host) and
+        # the file we need is the host's. Try /proc/self as fallback.
+        try:
+            start_jiffies = _read_proc_starttime_jiffies(os.getpid())
+            btime = _read_proc_stat_btime()
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"neither /proc/1/stat nor /proc/self/stat readable " f"({type(exc).__name__}: {exc})"
+            ) from exc
+    except RuntimeError:
+        # Malformed /proc/* (extremely rare; would mean kernel bug).
+        # Re-raise — caller logs and falls back to skip.
+        raise
+    clk_tck = os.sysconf("SC_CLK_TCK")
+    start_sec = start_jiffies / clk_tck
+    return (time.time() - btime) - start_sec
+
+
 def _run_daily_sync_watchdog() -> None:
     """Detect a stuck daily_sync daemon thread and force a container restart.
 
@@ -566,39 +658,16 @@ def _run_daily_sync_watchdog() -> None:
             # is broken.
             from datetime import datetime, timezone
 
-            # /proc/1/stat field 22 is start_time in clock ticks since boot.
-            # We need clock ticks → seconds via sysconf(_SC_CLK_TCK).
-            # posix.clock_gettime(CLOCK_BOOTTIME) is simpler and exact.
             try:
-                import os
-
-                # Prefer /proc/1/stat start time if available.
-                with open("/proc/1/stat") as fh:
-                    fields = fh.read().split()
-                start_jiffies = int(fields[21])
-                clk_tck = os.sysconf("SC_CLK_TCK")
-                start_sec = start_jiffies / clk_tck
-                # We don't know container boot epoch without /proc/stat —
-                # but in our case /proc/1 is the entrypoint-sh, which
-                # forks python, so its start time is the container start.
-                # To convert to wall clock: read /proc/stat btime.
-                with open("/proc/stat") as fh:
-                    btime = 0
-                    for line in fh:
-                        if line.startswith("btime "):
-                            btime = int(line.split()[1])
-                            break
-                if btime == 0:
-                    raise RuntimeError("btime not found in /proc/stat")
-                boot_time = datetime.fromtimestamp(btime, tz=timezone.utc)
-                container_start = boot_time.replace() + (
-                    datetime.fromtimestamp(start_sec, tz=timezone.utc) - datetime.fromtimestamp(0, tz=timezone.utc)
-                )
-                uptime_sec = (datetime.now(timezone.utc) - container_start).total_seconds()
-            except Exception:  # noqa: BLE001
+                uptime_sec = _container_uptime_seconds()
+            except Exception as exc:  # noqa: BLE001
                 # Fallback: assume pre-first-run and skip. Better to
                 # skip than to crash the heartbeat.
-                logger.info("watchdog: cannot determine container uptime — skipping " "(assume pre-first-run)")
+                logger.info(
+                    f"watchdog: cannot determine container uptime "
+                    f"({type(exc).__name__}: {exc}) — skipping "
+                    f"(assume pre-first-run)"
+                )
                 return
             if uptime_sec < 24 * 3600:
                 logger.info(
