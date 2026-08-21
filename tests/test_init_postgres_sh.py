@@ -45,13 +45,22 @@ class TestInitPostgresScript:
     def test_uses_private_subnet(self) -> None:
         """Script must inject a trust rule bound to a private subnet."""
         body = _read_script()
-        # Match a sensible private-range trust rule.
-        assert re.search(
-            r"sed\s+-i\s+['\"]?1[ih].*trust.*['\"]?\s+\"?\$?\S*HBA\S*",
-            body,
-        ), "expected an `sed -i '1i ... trust ...'` style line"
+        # Match an `sed -i '1i ... trust ...'` style INSERT line. As of
+        # issue #97 the rule is parameterised via $TRUST_RULE so the
+        # `trust` keyword may live in the variable assignment rather than
+        # inline — accept both forms.
+        assert (
+            re.search(
+                r"sed\s+-i\s+['\"]?1[ih]\s",
+                body,
+            )
+            or "TRUST_RULE=" in body
+        ), (
+            "expected an `sed -i '1i ...' style prepend line or a " "parameterised TRUST_RULE variable"
+        )
         # The injected line must contain a private CIDR (10.x, 172.16.x,
-        # 192.168.x) — not 0.0.0.0/0.
+        # 192.168.x) — not 0.0.0.0/0. Either as literal or as the default
+        # of POSTGRES_TRUST_SUBNET (issue #97).
         active_lines = (
             line
             for line in body.splitlines()
@@ -59,7 +68,7 @@ class TestInitPostgresScript:
         )
         joined = "\n".join(active_lines)
         assert (
-            "192.168." in joined or "10." in joined or "172.16." in joined
+            "192.168." in joined or "172.16." in joined or "10." in joined or "POSTGRES_TRUST_SUBNET" in joined
         ), "the trust rule must be scoped to a private RFC1918 subnet"
 
     def test_idempotent_old_line_removal(self) -> None:
@@ -153,4 +162,84 @@ class TestNoLiteralPassword:
         assert "pg-init" in body, (
             "init_postgres.sh docstring must mention the compose "
             "`pg-init` service as the active bootstrap path (issue #73)."
+        )
+
+
+class TestPostgresTrustScope:
+    """Issue #97: narrow the pg_hba.conf trust range.
+
+    The historical trust line covered 192.168.0.0/16 — ~65k LAN
+    addresses — which is wider than the actual client population
+    (Docker containers on the ``alphard-net`` bridge). The fix narrows
+    the default to ``172.16.0.0/12`` (RFC1918 Docker bridge range)
+    and makes the CIDR operator-overridable via ``POSTGRES_TRUST_SUBNET``.
+    These tests pin the new behaviour so a future drive-by refactor
+    cannot widen it back.
+    """
+
+    def test_no_legacy_192_168_trust_prepend(self) -> None:
+        """The hardcoded `192.168.0.0/16 trust` line must be gone.
+
+        We still reference the legacy range in a comment (as an audit
+        breadcrumb) and may echo it as a log line, but the active
+        ``sed -i '1i ... trust ...'`` rule must use ``${TRUST_CIDR}``
+        (parameterised) or a narrower CIDR.
+        """
+        body = _read_script()
+        # Only inspect *active* sed lines that prepend/insert a trust rule
+        # (the `1i` sed idiom). Comments and echo lines mentioning the
+        # legacy range are allowed — they document the cleanup.
+        active_lines = (line for line in body.splitlines() if re.search(r"\bsed\b.*\b1[ih](?:\s|$)", line))
+        joined = "\n".join(active_lines)
+        # Parameterised variable is fine — that's the new behaviour.
+        assert "TRUST_CIDR" in joined or "TRUST_RULE" in joined, (
+            "expected the trust rule to be sourced from " "${POSTGRES_TRUST_SUBNET:-172.16.0.0/12}, not hardcoded"
+        )
+        # Hardcoded literal is NOT fine.
+        assert "192.168.0.0/16 trust" not in joined, (
+            "init_postgres.sh must NOT prepend the legacy 192.168.0.0/16 "
+            "trust line; use ${POSTGRES_TRUST_SUBNET:-172.16.0.0/12} instead "
+            "(issue #97)."
+        )
+
+    def test_strips_legacy_192_168_rule_idempotently(self) -> None:
+        """Re-running the script on a cluster upgraded from the prior
+        version must strip the legacy 192.168.0.0/16 rule.
+        """
+        body = _read_script()
+        # Look for an explicit deletion of the legacy range.
+        assert re.search(
+            r"sed.*192\\\?\.168\\\?\.0\\\?\.0\\\?\/16.*trust.*d",
+            body,
+        ) or re.search(
+            r"sed.*\/\$\{?LEGACY_PATTERN\}?\/d",
+            body,
+        ), (
+            "init_postgres.sh must strip the legacy 192.168.0.0/16 trust " "rule on idempotent re-runs (issue #97)."
+        )
+
+    def test_default_trust_cidr_is_docker_bridge(self) -> None:
+        """Default ``POSTGRES_TRUST_SUBNET`` must point at the RFC1918
+        Docker bridge range, not the legacy /16 LAN range.
+        """
+        body = _read_script()
+        assert re.search(
+            r"POSTGRES_TRUST_SUBNET:-172\.16\.0\.0/12",
+            body,
+        ), (
+            "init_postgres.sh must default POSTGRES_TRUST_SUBNET to " "172.16.0.0/12 (Docker bridge range, issue #97)."
+        )
+
+    def test_docstring_documents_trust_posture(self) -> None:
+        """Header comment must explicitly call out the trust posture so
+        future maintainers do not accidentally widen the CIDR.
+        """
+        body = _read_script()
+        # Must mention RFC1918 / Docker bridge range AND reference #97.
+        assert "172.16.0.0/12" in body, (
+            "init_postgres.sh docstring must reference the 172.16.0.0/12 " "default (issue #97)."
+        )
+        assert "#97" in body or "issue #97" in body, (
+            "init_postgres.sh must reference issue #97 in a comment so "
+            "future maintainers can trace the audit decision."
         )

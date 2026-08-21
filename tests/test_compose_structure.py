@@ -63,8 +63,12 @@ class TestCompose:
     def test_pg_init_service_exists(self) -> None:
         """Phase 1.6 audit: init_postgres.sh must run automatically on
         first deploy. Compose provides this via the one-shot ``pg-init``
-        service that injects the 192.168.0.0/16 trust line into
-        pg_hba.conf after postgres becomes healthy.
+        service that injects a scoped trust line into pg_hba.conf after
+        postgres becomes healthy.
+
+        As of issue #97 the default trust CIDR is
+        ``${POSTGRES_TRUST_SUBNET:-172.16.0.0/12}`` (Docker bridge range),
+        not the legacy ``192.168.0.0/16`` LAN range.
         """
         data = _load_compose()
         services = data["services"]
@@ -74,8 +78,29 @@ class TestCompose:
             "clusters with a fresh volume."
         )
         pg_init = services["pg-init"]
-        assert pg_init.get("restart") == "no", (
-            "pg-init must be a one-shot (restart: no) — once the " "trust line is injected, the container exits."
+        assert (
+            pg_init.get("restart") == "no"
+        ), "pg-init must be a one-shot (restart: no) — once the trust line is injected, the container exits."
+        # Issue #97: pg-init must source POSTGRES_TRUST_SUBNET from .env
+        # and default to the Docker bridge range, never the legacy LAN /16.
+        env = pg_init.get("environment", {})
+        if isinstance(env, list):
+            env_map = {}
+            for item in env:
+                if isinstance(item, str) and "=" in item:
+                    k, _, v = item.partition("=")
+                    env_map[k] = v
+                elif isinstance(item, str):
+                    env_map[item] = None
+            env = env_map
+        trust_subnet = env.get("POSTGRES_TRUST_SUBNET")
+        assert trust_subnet is not None, (
+            "pg-init.environment.POSTGRES_TRUST_SUBNET must be declared "
+            "so the trust range is overridable per deploy (issue #97)."
+        )
+        assert "172.16.0.0/12" in str(trust_subnet), (
+            f"POSTGRES_TRUST_SUBNET default must be 172.16.0.0/12 (Docker "
+            f"bridge range), got: {trust_subnet!r} (issue #97)"
         )
 
     def test_bot_depends_on_pg_init_completed(self) -> None:
