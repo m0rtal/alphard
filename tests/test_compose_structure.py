@@ -38,10 +38,18 @@ class TestCompose:
         data = _load_compose()
         healthcheck = data["services"].get("postgres", {}).get("healthcheck")
         assert healthcheck is not None, "postgres service must declare a healthcheck"
-        # The command must reference our real-auth-check script, not
-        # the bare pg_isready (which silently passes on stale passwords).
+        # The command must perform a real auth round-trip — not the
+        # bare pg_isready (which silently passes on stale passwords).
+        # BUGFIX (#126): accepts either external pg-healthcheck.sh
+        # bind-mount OR inline shell (avoids .107 bind-mount leaf
+        # quirk). Both forms must reference POSTGRES_PASSWORD env
+        # so a stale pg_authid scram hash surfaces as unhealthy.
         cmd = " ".join(healthcheck.get("test", []))
-        assert "pg-healthcheck.sh" in cmd, f"postgres healthcheck must call our custom script; got: {cmd}"
+        assert ("pg-healthcheck.sh" in cmd) or ("pg_isready" in cmd and "PGPASSWORD" in cmd and "SELECT 1" in cmd), (
+            "postgres healthcheck must call our custom auth round-trip "
+            "(either pg-healthcheck.sh bind-mount or inline pg_isready + "
+            f"psql SELECT 1 with PGPASSWORD); got: {cmd}"
+        )
 
     def test_no_cron_service(self) -> None:
         """Phase 1.6 audit cleanup: cron profile is gone.
