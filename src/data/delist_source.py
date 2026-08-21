@@ -54,9 +54,19 @@ def fetch_delist_dates(
     """Look up ``listed_from`` / ``listed_till`` for each ticker via ISS.
 
     Returns dict mapping ticker -> (listed_at, delisted_at). Either
-    side can be None when ISS doesn't expose it (e.g. bonds which
-    mature without delisting). Network errors are logged and produce
-    an empty entry — caller treats None as "use fallback".
+    side can be ``None`` when ISS doesn't expose it (e.g. bonds which
+    mature without delisting, or a board row whose ``listed_from``
+    / ``listed_till`` attribute is absent or empty). Network errors
+    are logged and produce ``(None, None)`` — caller treats ``None``
+    as "use MIN_YEAR fallback".
+
+    Note
+    ----
+    The semantics of ``(None, None)`` are documented as
+    "MOEX did not return these fields for any board row of this
+    ticker". The age-aware backfill completion formula MUST treat
+    this as "use MIN_YEAR as the listed_at floor" — see
+    ``src/data/completion.py`` for the consumer side.
     """
     out: dict[str, tuple[date | None, date | None]] = {}
     for ticker in tickers:
@@ -80,19 +90,21 @@ def fetch_delist_dates(
         # with one row per board the secid trades on. We take the
         # earliest listed_from and the latest listed_till across
         # boards — represents the security's true lifetime at MOEX.
+        #
+        # Issue #101: the previous min(... key=lambda d: d or date.max)
+        # trick was unidiomatic and brittle — it worked only because
+        # ``min(x, x) == x`` when both args coerce to date.max. Any
+        # future refactor that drops the key would silently break the
+        # path for bonds (no listed_from, no listed_till → (None, None)).
+        # The new accumulator is explicit conditional updates, one
+        # branch per field per row.
         for data_block in root.findall(".//data[@id='boards']"):
             for row in data_block.findall("rows/row"):
-                listed_from = (
-                    min(
-                        (listed_from or _parse_date(row.get("listed_from"))),
-                        _parse_date(row.get("listed_from")),
-                        key=lambda d: d or date.max,
-                    )
-                    or listed_from
-                )
-                listed_till_candidate = _parse_date(row.get("listed_till"))
-                if listed_till_candidate is not None:
-                    if listed_till is None or listed_till_candidate > listed_till:
-                        listed_till = listed_till_candidate
+                candidate_from = _parse_date(row.get("listed_from"))
+                if candidate_from is not None and (listed_from is None or candidate_from < listed_from):
+                    listed_from = candidate_from
+                candidate_till = _parse_date(row.get("listed_till"))
+                if candidate_till is not None and (listed_till is None or candidate_till > listed_till):
+                    listed_till = candidate_till
         out[ticker] = (listed_from, listed_till)
     return out
