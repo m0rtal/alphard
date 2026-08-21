@@ -68,9 +68,18 @@ class TradeIntent(BaseModel):
     Placeholder schema — fields match the Phase 1.3 contract but no broker
     is wired up yet. `side` is "buy" only for the skeleton; "sell" / "short"
     will be added in Phase 1.3 once Portfolio bookkeeping is real.
+
+    SECURITY: model is `frozen=True` (issue #98). Without `frozen`, post-
+    construction assignment would bypass every `Field` validator — e.g.
+    `intent.quantity = Decimal('-1')` would NOT raise ValidationError, so
+    a caller holding a reference between construction and gate-evaluate could
+    rewrite price/qty/side AFTER the gate had read the original values. This
+    is the same exploit class as the historical MarketOrder price=1 bypass
+    (issues #11 / #13) but on the intent side. Mutate via `model_copy` if
+    a new value is genuinely needed.
     """
 
-    model_config = ConfigDict(extra="forbid", frozen=False)
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     symbol: str = Field(..., min_length=1, description="Instrument ticker, e.g. 'SBER'")
     side: str = Field(..., description="'buy' (placeholder: only 'buy' supported in skeleton)")
@@ -105,9 +114,17 @@ class TradeIntent(BaseModel):
 
 
 class Position(BaseModel):
-    """A single open position in the portfolio. Placeholder."""
+    """A single open position in the portfolio. Placeholder.
 
-    model_config = ConfigDict(extra="forbid")
+    SECURITY: model is `frozen=True` (issue #98, audit follow-up). Position is
+    a building block of PortfolioState; if a caller could mutate e.g.
+    `pos.quantity = Decimal('0')` after construction, the sector-exposure
+    check in RiskGate would compute against falsified market_value, letting
+    an oversized position slip through RISK_SECTOR. Same defence-in-depth
+    reasoning as TradeIntent / RiskLimits.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     symbol: str
     quantity: Decimal = Field(..., ge=Decimal("0"))
@@ -126,9 +143,15 @@ class PortfolioState(BaseModel):
     `sector_exposure_pct` is intentionally a dict, not a derived property —
     Phase 1.3 will compute it from positions + live marks. The skeleton
     accepts whatever the caller passes (validation is on types, not values).
+
+    SECURITY: model is `frozen=True` (issue #98, audit follow-up). Without
+    `frozen`, a caller could rewrite `state.peak_equity` or `state.positions`
+    between construction and `RiskGate.evaluate()` and silently bypass the
+    drawdown / sector-exposure checks. Mutate via `model_copy` if a new
+    snapshot is genuinely needed.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     total_equity: Decimal = Field(..., gt=Decimal("0"), description="Total equity (NAV); > 0")
     cash: Decimal = Field(..., ge=Decimal("0"))
