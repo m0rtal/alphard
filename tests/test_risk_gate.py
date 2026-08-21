@@ -484,6 +484,112 @@ class TestFailSafe:
 
 
 # ===========================================================================
+# Issue #98: TradeIntent / Position / PortfolioState immutability
+#
+# Without `frozen=True`, post-construction assignment bypasses every Field
+# validator — so a caller can rewrite quantity / price / side AFTER the gate
+# has read the original values. Same exploit class as the historical
+# MarketOrder price=Decimal('1') bypass (issues #11 / #13), but on the
+# intent side. The tests below are the regression net.
+# ===========================================================================
+
+
+class TestIssue98Immutability:
+    def test_trade_intent_is_frozen_at_construction(self) -> None:
+        """TradeIntent.model_config['frozen'] is True (issue #98 acceptance)."""
+        i = TradeIntent(symbol="SBER", side="buy", quantity=Decimal("1"), price=Decimal("100"))
+        assert i.model_config.get("frozen") is True
+
+    def test_trade_intent_post_construction_mutation_raises(self) -> None:
+        """Assigning to a TradeIntent field after construction must raise.
+
+        Repro of issue #98: without frozen=True, the following assignments
+        silently succeed and let an attacker rewrite gate-approved values.
+        """
+        i = TradeIntent(symbol="SBER", side="buy", quantity=Decimal("1"), price=Decimal("100"))
+        with pytest.raises(ValidationError):
+            i.quantity = Decimal("-999999")
+        with pytest.raises(ValidationError):
+            i.price = Decimal("0.0001")
+        with pytest.raises(ValidationError):
+            i.symbol = "@!#"
+        with pytest.raises(ValidationError):
+            i.side = "buy"  # inversion attempt; even valid values are blocked
+
+    def test_trade_intent_mutation_block_preserves_original_values(self) -> None:
+        """A failed mutation does NOT partially mutate the instance.
+
+        Pydantic v2 raises ValidationError on assignment under frozen=True
+        and the original value is preserved.
+        """
+        i = TradeIntent(symbol="SBER", side="buy", quantity=Decimal("1"), price=Decimal("100"))
+        with pytest.raises(ValidationError):
+            i.quantity = Decimal("-999999")
+        assert i.quantity == Decimal("1")
+
+    def test_position_is_frozen_at_construction(self) -> None:
+        """Position.model_config['frozen'] is True (issue #98 audit)."""
+        p = Position(symbol="X", quantity=Decimal("1"), avg_price=Decimal("10"), sector="x")
+        assert p.model_config.get("frozen") is True
+
+    def test_position_post_construction_mutation_raises(self) -> None:
+        """Mutating Position silently would falsify market_value used by
+        RISK_SECTOR; frozen=True now blocks it."""
+        p = Position(symbol="X", quantity=Decimal("1"), avg_price=Decimal("10"), sector="x")
+        with pytest.raises(ValidationError):
+            p.quantity = Decimal("999")
+        with pytest.raises(ValidationError):
+            p.avg_price = Decimal("0")
+        with pytest.raises(ValidationError):
+            p.sector = "other"
+
+    def test_portfolio_state_is_frozen_at_construction(self) -> None:
+        """PortfolioState.model_config['frozen'] is True (issue #98 audit)."""
+        s = PortfolioState(
+            total_equity=Decimal("1000000"),
+            cash=Decimal("1000000"),
+            positions=[],
+            daily_pnl=Decimal("0"),
+            peak_equity=Decimal("1000000"),
+        )
+        assert s.model_config.get("frozen") is True
+
+    def test_portfolio_state_post_construction_mutation_raises(self) -> None:
+        """Mutating PortfolioState would silently bypass RISK_DD /
+        RISK_SECTOR; frozen=True now blocks it."""
+        s = PortfolioState(
+            total_equity=Decimal("1000000"),
+            cash=Decimal("1000000"),
+            positions=[],
+            daily_pnl=Decimal("0"),
+            peak_equity=Decimal("1000000"),
+        )
+        with pytest.raises(ValidationError):
+            s.peak_equity = Decimal("10000000000")  # DD would go negative
+        with pytest.raises(ValidationError):
+            s.total_equity = Decimal("0")
+        with pytest.raises(ValidationError):
+            s.positions = []  # even with same value, frozen blocks __setattr__
+
+    def test_trade_intent_mutation_bypass_repro_issue_98(self) -> None:
+        """End-to-end: the exact PoC from issue #98.
+
+        Before the fix, this code would print '-999999 0.0001' — silently
+        mutated values. After the fix, both assignments raise ValidationError.
+        """
+        i = TradeIntent(symbol="SBER", side="buy", quantity=Decimal("1"), price=Decimal("100"))
+        with pytest.raises(ValidationError):
+            i.quantity = Decimal("-999999")
+        with pytest.raises(ValidationError):
+            i.price = Decimal("0.0001")
+        # Confirm gate-approved values are intact
+        assert i.quantity == Decimal("1")
+        assert i.price == Decimal("100")
+        assert i.symbol == "SBER"
+        assert i.side == "buy"
+
+
+# ===========================================================================
 # Issue #11: MarketOrder end-to-end — confirms that RiskGate reject
 # propagates to the broker as OrderStatus.REJECTED, and that the
 # critic (price=Decimal('1') bypass) is now structurally impossible.
