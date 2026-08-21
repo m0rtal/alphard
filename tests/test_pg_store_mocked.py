@@ -1193,6 +1193,31 @@ class TestRowConverters:
         assert m.delisted is True
         assert m.delisted_at is None
 
+    def test_row_to_ticker_v1_ten_columns_defaults_source_tkf(self) -> None:
+        """Issue #104: a 10-column v1 result (no source column) must default
+        source to "tkf" instead of reading listed_at (which would crash
+        pydantic Literal validation)."""
+        # v1-shape: ticker, figi, name, lot, isin, currency, class_code,
+        # delisted, delisted_at, listed_at (no source column).
+        row = (
+            "SBER",
+            "BBG004730N88",
+            "Sberbank",
+            10,
+            "RU0009029540",
+            "RUB",
+            "TQBR",  # class_code present in pg v1
+            False,
+            None,
+            date(2020, 1, 1),
+        )
+        m = _row_to_ticker(row)
+        assert m.ticker == "SBER"
+        # class_code slot reads None when len(r) <= 10 (v1 defensive branch).
+        assert m.class_code is None
+        assert m.listed_at == date(2020, 1, 1)
+        assert m.source == "tkf"  # default fallback, NOT listed_at
+
     def test_row_to_ohlcv_full_row(self) -> None:
         """Phase 2.6 step 2: v2 row shape is (ticker, ts, source, open..adj_close).
 

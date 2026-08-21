@@ -746,6 +746,11 @@ class PostgresDataStore(DataStore):
 
 
 def _row_to_ticker(r: Any) -> TickerMeta:
+    # Issue #104: when len(r) <= 10 we are looking at a legacy v1 result
+    # without the source column. The previous fallback `source=r[9]` aliased
+    # listed_at (a date) into the SourceType Literal slot, which fails
+    # pydantic validation downstream. Default to "tkf" — the only writer
+    # before Phase 2.6.
     return TickerMeta(
         ticker=r[0],
         figi=r[1],
@@ -757,7 +762,7 @@ def _row_to_ticker(r: Any) -> TickerMeta:
         delisted=bool(r[7] if len(r) > 7 else False),
         delisted_at=r[8] if len(r) > 8 else None,
         listed_at=r[9] if len(r) > 9 else None,
-        source=r[10] if len(r) > 10 else r[9],
+        source=(r[10] if len(r) > 10 else "tkf"),
     )
 
 
