@@ -73,7 +73,21 @@ services:
       # Defaults to 8765; exposed at alphard-bot:8765/metrics inside the network.
       ALPHARD_METRICS_PORT: ${ALPHARD_METRICS_PORT:-8765}
     volumes:
-      - /mnt/appdata/alphard/logs:/app/logs
+      # BUGFIX (alphard#108): bind-mount on .107 PVE LXC leaves the
+      # leaf owned by userns-mapped nobody (uid 65534), which neither
+      # the container's root user nor CAP_CHOWN can change. Alphard-bot
+      # entrypoint.sh therefore cannot write /app/logs/backfill_*.log
+      # and the whole stack restart-loops. Workaround: use a tmpfs
+      # mount for /app/logs (root-owned, always writable). Cost: log
+      # files live only inside the container, not on host filesystem,
+      # so they are lost on container restart. Acceptable for Phase 0
+      # — restore bind-mount once we move logs to a non-LXC Docker host
+      # (e.g. .110, no userns mapping) or fix the bind-mount leaf
+      # ownership via a different mechanism.
+      - type: tmpfs
+        target: /app/logs
+        tmpfs:
+          size: 100M
     networks:
       - alphard-net
     # BUGFIX (H-7): wait for postgres to be healthy before starting the bot,
