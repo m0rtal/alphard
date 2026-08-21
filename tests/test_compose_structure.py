@@ -314,3 +314,146 @@ class TestCompose:
                     f"legacy bind-mount to /app/logs must NOT survive "
                     f"(re-introduces .107 userns-mapping bug): {v!r}"
                 )
+
+
+class TestRedisFailFast:
+    """Issue #126 — regression guard for the redis password fail-fast
+    contract.
+
+    PR #122/#124 replaced the `${REDIS_PASSWORD:?...}` form with
+    `${REDIS_PASSWORD:-}` to keep Portainer StackUpdate happy; in doing
+    so they silently turned redis into an unauthenticated listener when
+    the operator left the .env blank. This test pins the contract back:
+
+      * the rendered redis command must refuse to exec redis-server
+        when REDIS_PASSWORD is empty (fail-fast via non-zero exit);
+      * the rendered command must NOT contain a literal
+        ``--requirepass ""`` argument, because redis treats that as
+        "no requirepass directive" (== unauthenticated listener);
+      * the rendered command must end up invoking redis-server with
+        ``--requirepass`` and a non-empty password value when
+        REDIS_PASSWORD is provided.
+    """
+
+    @staticmethod
+    def _redis_service() -> dict:
+        data = _load_compose()
+        redis = data["services"].get("redis")
+        assert redis is not None, "redis service must exist in docker-compose.yaml"
+        return redis
+
+    def test_redis_command_does_not_pass_empty_requirepass(self) -> None:
+        """The most direct regression: forbid the literal
+        ``--requirepass ""`` (or anything that composes to an empty
+        argument value) in the redis command. This is the exact form
+        that was committed in PR #124 and the issue's reproduction PoC.
+        """
+        cmd = self._redis_service().get("command")
+        assert cmd is not None, "redis service must declare a command"
+        # Normalize: command may be a string OR a list (exec-form). For
+        # exec-form, join with \x00 so we can detect "--requirepass \"\""
+        # regardless of how YAML serialized the list.
+        if isinstance(cmd, list):
+            rendered = "\x00".join(str(x) for x in cmd)
+        else:
+            rendered = str(cmd)
+        # Compose-level defaulting ${REDIS_PASSWORD:-} would render to
+        # an empty string. After the fix, ${REDIS_PASSWORD:-} appears
+        # only inside a sh -c script — never as a raw --requirepass
+        # argument to redis-server.
+        assert '--requirepass ""' not in rendered, (
+            "redis command must NOT pass --requirepass with an empty value; "
+            "that is the unauthenticated-listener regression from PR #124. "
+            f"Got: {rendered!r}"
+        )
+        # Also forbid the bash-quoted form (single or no quotes)
+        assert "--requirepass ''" not in rendered, f"redis command must NOT pass --requirepass ''; got: {rendered!r}"
+
+    def test_redis_command_fails_fast_on_empty_password(self) -> None:
+        """The fix must wrap the command in a shell that exits non-zero
+        if REDIS_PASSWORD is unset/empty. We check this by inspecting
+        the rendered command for an explicit emptiness test.
+        """
+        cmd = self._redis_service().get("command")
+        assert cmd is not None
+        if isinstance(cmd, list):
+            rendered = "\n".join(str(x) for x in cmd)
+        else:
+            rendered = str(cmd)
+        # The fail-fast must reference REDIS_PASSWORD AND a "-z" (empty
+        # string) test AND an explicit "exit 1" branch. Any one of these
+        # missing means the contract is broken.
+        assert "REDIS_PASSWORD" in rendered, (
+            f"redis command must reference REDIS_PASSWORD (fail-fast check); " f"got: {rendered!r}"
+        )
+        assert "-z" in rendered, (
+            f"redis command must test for empty REDIS_PASSWORD "
+            f'(e.g. `[ -z "${{REDIS_PASSWORD:-}}" ]`); got: {rendered!r}'
+        )
+        assert "exit 1" in rendered, f"redis command must exit non-zero on empty REDIS_PASSWORD; got: {rendered!r}"
+
+    def test_redis_command_uses_shell_interpolation_not_compose_default(self) -> None:
+        """Defence-in-depth: the literal compose-level defaulting
+        form ``--requirepass ${REDIS_PASSWORD:-}`` must NOT survive
+        in the YAML. The shell-level defaulting form
+        ``$${REDIS_PASSWORD:-}`` (with the doubled `$$` escaping
+        compose interpolation) IS allowed and is the fix's runtime
+        emptiness check.
+
+        Why this matters: if someone re-introduces the
+        pre-fix form
+        ``command: redis-server --requirepass ${REDIS_PASSWORD:-}``
+        (a single string), compose will expand ``${REDIS_PASSWORD:-}``
+        to an empty string and redis will start unauthenticated.
+        The exec-form + sh -c + ``$${REDIS_PASSWORD:-}`` form
+        escapes the expansion so it only fires at container runtime.
+        """
+        raw = COMPOSE.read_text(encoding="utf-8")
+        redis = self._redis_service()
+        cmd = redis.get("command")
+        # The redis command must be in exec-form (a list). If it is a
+        # bare string containing the compose-defaulting form, that
+        # is exactly the pre-fix regression and must be rejected.
+        assert isinstance(cmd, list), (
+            f"redis command must be in exec-form (list) to escape " f"compose interpolation; got string: {cmd!r}"
+        )
+        # In the raw YAML, the compose-level form (single $) must
+        # NOT appear on a --requirepass line. The shell-level form
+        # (doubled $) is allowed and is in fact the fix.
+        for line in raw.splitlines():
+            assert "--requirepass ${REDIS_PASSWORD" not in line, (
+                f"raw docker-compose.yaml still contains the compose-"
+                f"defaulted form `--requirepass ${{REDIS_PASSWORD...}}` "
+                f"on a single line; this is the pre-fix unauthenticated-"
+                f"listener regression. Line: {line!r}"
+            )
+        # Sanity: the fix's script block must be present.
+        assert "$${REDIS_PASSWORD:-}" in raw, (
+            "raw docker-compose.yaml is missing the fail-fast shell "
+            "script block (look for `$${REDIS_PASSWORD:-}`); the "
+            "runtime empty-password check did not land. See issue #126."
+        )
+
+    def test_redis_command_passes_password_when_set(self) -> None:
+        """Positive control: with a non-empty REDIS_PASSWORD, the
+        rendered command must exec redis-server with --requirepass and
+        a non-empty value. We simulate this by checking the script
+        text — the script must contain a `exec redis-server
+        --requirepass "${REDIS_PASSWORD}"` line (the value is read
+        at container runtime, not at compose time).
+        """
+        cmd = self._redis_service().get("command")
+        assert cmd is not None
+        if isinstance(cmd, list):
+            rendered = "\n".join(str(x) for x in cmd)
+        else:
+            rendered = str(cmd)
+        assert "exec redis-server" in rendered, (
+            f"redis command must exec redis-server after the fail-fast " f"check; got: {rendered!r}"
+        )
+        assert "--requirepass" in rendered, f"redis command must pass --requirepass to redis-server; got: {rendered!r}"
+        # The script must reference the password (via ${REDIS_PASSWORD})
+        # rather than interpolating an empty default.
+        assert "REDIS_PASSWORD" in rendered, (
+            f"redis command must reference REDIS_PASSWORD in the exec " f"line; got: {rendered!r}"
+        )
