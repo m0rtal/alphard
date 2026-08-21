@@ -21,7 +21,12 @@ from src.macro.regime import (
     MULTIPLIER_NEUTRAL,
     MULTIPLIER_OFF,
     MULTIPLIER_REDUCED,
+    PERCENT_SCALE,
+    THRESHOLD_CBR_HIGH,
+    THRESHOLD_IMOEX_DRAWDOWN,
+    THRESHOLD_USDRUB_DELTA,
     _safe_delta,
+    _safe_delta_percent,
     classify,
 )
 from src.macro.models import MacroSnapshot
@@ -220,3 +225,77 @@ def test_safe_delta_returns_zero_when_prev_is_zero() -> None:
 
 def test_safe_delta_computes_normal_delta() -> None:
     assert _safe_delta(Decimal("105"), Decimal("100")) == Decimal("0.05")
+
+
+# ---------------------------------------------------------------------------
+# _safe_delta_percent helper (issue #88 — percent canonicalization)
+# ---------------------------------------------------------------------------
+
+
+def test_safe_delta_percent_returns_zero_when_prev_is_zero() -> None:
+    """Same zero-divisor behaviour as ``_safe_delta``, but in percent."""
+    assert _safe_delta_percent(Decimal("100"), Decimal("0")) == Decimal("0")
+
+
+def test_safe_delta_percent_computes_percent_delta() -> None:
+    """5/100 = 5.0% (not 0.05)."""
+    assert _safe_delta_percent(Decimal("105"), Decimal("100")) == Decimal("5.00")
+
+
+def test_percent_scale_is_100() -> None:
+    """Sanity guard: the percent constant is exactly 100.
+
+    A future refactor that swaps PERCENT_SCALE for ``0.01`` (or anything
+    else) would silently flip the regime semantics. This test makes the
+    intent explicit.
+    """
+    assert PERCENT_SCALE == Decimal("100")
+
+
+def test_thresholds_are_in_percent_not_fraction() -> None:
+    """Issue #88: all three thresholds are now percent values.
+
+    - ``THRESHOLD_CBR_HIGH``          must be 15.00  (not 0.15)
+    - ``THRESHOLD_IMOEX_DRAWDOWN``    must be 20.00  (not 0.20)
+    - ``THRESHOLD_USDRUB_DELTA``      must be 5.00   (not 0.05)
+
+    If a refactor reintroduces the fraction representation, the
+    classifier will silently mis-trigger (or never trigger).
+    """
+    assert THRESHOLD_CBR_HIGH == Decimal("15.00")
+    assert THRESHOLD_IMOEX_DRAWDOWN == Decimal("20.00")
+    assert THRESHOLD_USDRUB_DELTA == Decimal("5.00")
+
+
+def test_cbr_threshold_is_strict_greater_than_at_exactly_15() -> None:
+    """Issue #88: boundary check at exactly 15.00 is NOT risk_off.
+
+    The rule is ``cbr > 15.00`` (strict). Exactly 15.00 is a no-op.
+    Tests both the just-below and exactly-at cases through the reason
+    string so a regression in the comparator surfaces immediately.
+    """
+    # Exactly 15.00: no trigger.
+    reg = classify(_snap(cbr="15.00"))
+    assert reg.regime == "neutral"
+    assert "> 15%" not in reg.reason
+
+    # Just below 15.00: no trigger.
+    reg = classify(_snap(cbr="14.99"))
+    assert reg.regime == "neutral"
+    assert "> 15%" not in reg.reason
+
+
+def test_imoex_drawdown_uses_percent_comparator() -> None:
+    """Sanity: 20.0% drawdown = exactly at threshold → NOT risk_off.
+
+    After the issue #88 refactor, the comparator is ``> 20.00`` (percent),
+    not ``> 0.20`` (fraction). Both produce the same arithmetic outcome
+    on valid inputs, but the unit documentation now matches the input.
+    """
+    # 20.0% drawdown exactly: no trigger.
+    reg = classify(_snap(imoex="2400.00", imoex_60d="3000.00"))
+    assert reg.regime == "neutral"
+
+    # 20.01% drawdown: risk_off.
+    reg = classify(_snap(imoex="2399.40", imoex_60d="3000.00"))
+    assert reg.regime == "risk_off"
