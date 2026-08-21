@@ -143,6 +143,56 @@ def test_main_limit_clause_for_sample_mode() -> None:
     cursor = store._conn.cursor.return_value.__enter__.return_value
     sql = cursor.execute.call_args[0][0]
     assert "LIMIT" in sql
+    # Issue #131 (Bug B regression guard): the limit placeholder must
+    # receive an INTEGER, not None. The previous implementation passed
+    # ``None`` for the no-ticker case, which psycopg translated to
+    # ``LIMIT NULL`` — Postgres treated it as "no limit" and returned
+    # every row.
+    assert cursor.execute.call_args[0][1] == (100,)
+
+
+def test_main_limit_with_ticker_passes_both_params() -> None:
+    """Issue #131 (Bug A regression guard): --ticker X --limit N must
+    bind BOTH the ticker and the limit, in one execute call.
+
+    The previous implementation ran two separate ``cur.execute()`` calls:
+    one bound the ticker, then the second appended ``LIMIT %s`` but only
+    passed ``(limit,)`` — leaving the original ``%s`` in the WHERE clause
+    unfilled, which psycopg rejected with ``ProgrammingError: Query has
+    2 parameters but 1 was passed``. The fix folds the LIMIT into the
+    SQL template and binds both placeholders in one call.
+    """
+    store = _patch_store([_make_ohlcv_row("SBER")])
+    with patch.object(validate_ohlcv, "PostgresDataStore", return_value=store):
+        with patch.object(sys, "argv", ["validate_ohlcv.py", "--ticker", "SBER", "--limit", "10"]):
+            assert validate_ohlcv.main() == 0
+    cursor = store._conn.cursor.return_value.__enter__.return_value
+    sql = cursor.execute.call_args[0][0]
+    params = cursor.execute.call_args[0][1]
+    # Both placeholders must be filled by the same execute call.
+    assert sql.count("%s") == len(params) == 2
+    assert "WHERE ticker" in sql
+    assert "LIMIT" in sql
+    assert params == ("SBER", 10)
+
+
+def test_main_no_limit_no_params_for_unfiltered_select() -> None:
+    """Issue #131 (regression guard): the no-ticker / no-limit path must
+    bind zero parameters. The previous implementation always called
+    ``cur.execute(sql + " LIMIT %s", ...)`` when ``limit`` was truthy,
+    which silently inserted a ``LIMIT %s`` with ``None`` placeholder
+    when ``ticker`` was also None. The fix keeps the no-params path
+    genuinely parameter-free.
+    """
+    store = _patch_store([_make_ohlcv_row("SBER")])
+    with patch.object(validate_ohlcv, "PostgresDataStore", return_value=store):
+        with patch.object(sys, "argv", ["validate_ohlcv.py"]):
+            assert validate_ohlcv.main() == 0
+    cursor = store._conn.cursor.return_value.__enter__.return_value
+    sql = cursor.execute.call_args[0][0]
+    params = cursor.execute.call_args[0][1]
+    assert "LIMIT" not in sql
+    assert params == ()
 
 
 def test_main_db_infrastructure_error_exits_three() -> None:
