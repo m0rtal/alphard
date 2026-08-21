@@ -600,6 +600,22 @@ class TestCrossSource:
         r = check_cross_source("X", sa, sb)
         assert IssueKind.XSC_SOURCE_MISSING in {i.kind for i in r.issues}
 
+    def test_empty_bars_constructs_without_indexerror(self) -> None:
+        """Issue #105: SourceSeries(bars=[]) must construct (raw[0] probe guarded)."""
+        s = SourceSeries(source_name="x", bars=[])
+        assert s.bars == ()
+        s2 = SourceSeries(source_name="y", bars=())
+        assert s2.bars == ()
+        # The coercion branch must still work for non-empty Bar-like input.
+        from types import SimpleNamespace
+
+        bars_like = [
+            SimpleNamespace(primary_key=date(2026, 1, 1), close=100.0),
+            SimpleNamespace(primary_key=date(2026, 1, 2), close=101.0),
+        ]
+        s3 = SourceSeries(source_name="z", bars=bars_like)
+        assert s3.bars == ((date(2026, 1, 1), 100.0), (date(2026, 1, 2), 101.0))
+
     def test_alignment_drops_dropped_count(self) -> None:
         """If one series has dates the other doesn't, they are dropped and counted."""
         sa, sb_full = _aligned_pair(30)

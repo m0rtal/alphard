@@ -94,8 +94,11 @@ class SourceSeries(BaseModel):
     def __init__(self, **data: object) -> None:
         # Convenience: accept iterable of Bar-like objects too.
         raw = data.get("bars")
-        if raw is not None:
+        if raw:
             # Probe the first element to decide whether to coerce.
+            # Guard with truthy check so empty iterables fall through
+            # to pydantic validation as `()` (the default_factory),
+            # instead of raising IndexError on raw[0].
             first = raw[0]  # type: ignore[index]
             if not isinstance(first, tuple):
                 coerced: list[tuple[date, float]] = []
