@@ -411,15 +411,81 @@ class TestTinkoffAccount:
 
     def test_rate_limit_respects_limit(self):
         a = TinkoffAccount(token="t.x", rate_limit_per_sec=2)
-        # Push 5 requests, count time taken
+        # TokenBucket starts full at capacity=2, so the first 2 acquire()
+        # calls return immediately. The 3rd call must wait for the
+        # bucket to refill at 2 tokens/sec → ~0.5s sleep before
+        # acquiring. (Pre-TokenBucket implementation used a sliding-
+        # window list with no burst allowance, hence the old test
+        # asserted >= 0.9s.)
         import time
 
         start = time.time()
         for _ in range(3):
             a._rate_limit_acquire()
         elapsed = time.time() - start
-        # Should block at least 1 second (3 reqs at 2/sec)
-        assert elapsed >= 0.9
+        # Should block at least ~0.4s (refill 2→3 takes ~0.5s)
+        assert elapsed >= 0.4
+
+    def test_rate_limit_thread_safe_under_concurrency(self):
+        """Issue #103: concurrent _rate_limit_acquire must not burst above SLA.
+
+        The pre-fix implementation maintained self._last_request_ts as
+        a list mutated without any lock, so two threads could both
+        observe an empty list, both append, and both submit to Tinkoff
+        in the same instant — violating the 60 req/sec SLA. After
+        switching to TokenBucket (thread-safe), 2 threads × 50 calls at
+        rate=10/s should serialize into a wall-clock of ~10s for 100
+        calls and the bucket's internal Lock must prevent any two
+        acquire()s from observing > capacity tokens in a single
+        critical section.
+        """
+        import threading
+
+        import time
+
+        rate = 10
+        per_thread = 50
+        n_threads = 2
+
+        a = TinkoffAccount(token="t.x", rate_limit_per_sec=rate)
+
+        stamps: list[float] = []
+        stamp_lock = threading.Lock()
+
+        def hit() -> None:
+            for _ in range(per_thread):
+                a._rate_limit_acquire()
+                with stamp_lock:
+                    stamps.append(time.monotonic())
+
+        threads = [threading.Thread(target=hit) for _ in range(n_threads)]
+        start = time.monotonic()
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        elapsed = time.monotonic() - start
+
+        total = n_threads * per_thread
+        assert len(stamps) == total
+        # 100 calls at 10/s: initial burst == capacity (10) is free,
+        # then 90 more at 1/10s each = 9s. Allow generous slack.
+        assert elapsed >= 8.0, f"elapsed {elapsed:.2f}s < 8.0s — bucket did not block"
+        # Worst-case window can hold capacity tokens (initial burst)
+        # plus a small refill during the test run. Any window of 1.0s
+        # must hold < rate + capacity + small slack.
+        stamps_sorted = sorted(stamps)
+        max_in_window = 0
+        for i in range(len(stamps_sorted)):
+            j = i
+            while j < len(stamps_sorted) and stamps_sorted[j] < stamps_sorted[i] + 1.0:
+                j += 1
+            max_in_window = max(max_in_window, j - i)
+        # Bound: capacity (initial burst) + one full refill window.
+        assert max_in_window <= 2 * rate, (
+            f"observed {max_in_window} acquires within a 1s window "
+            f"(rate={rate}, capacity={rate}); thread-safety regression"
+        )
 
     def test_get_portfolio_mock_when_no_sdk(self, monkeypatch: pytest.MonkeyPatch):
         # Mock t_tech.invest (SDK is now installed, but we want offline unit tests)
