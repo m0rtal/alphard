@@ -135,11 +135,7 @@ def classify(snapshot: MacroSnapshot | None) -> MacroRegime:
         diagnostics.append("IMOEX 60d prior is zero — dd treated as 0")
         imoex_dd_pct = Decimal("0")
     else:
-        imoex_dd_pct = (
-            (snapshot.imoex_60d_prev - snapshot.imoex_close)
-            / snapshot.imoex_60d_prev
-            * PERCENT_SCALE
-        )
+        imoex_dd_pct = (snapshot.imoex_60d_prev - snapshot.imoex_close) / snapshot.imoex_60d_prev * PERCENT_SCALE
         if imoex_dd_pct > THRESHOLD_IMOEX_DRAWDOWN:
             triggers.append(f"IMOEX 60d drawdown {imoex_dd_pct:.2f}% > 20%")
 
@@ -150,11 +146,7 @@ def classify(snapshot: MacroSnapshot | None) -> MacroRegime:
         diagnostics.append("USD/RUB 5d prior is zero — Δ treated as 0")
         usdrub_delta_pct = Decimal("0")
     else:
-        usdrub_delta_pct = (
-            (snapshot.usdrub_close - snapshot.usdrub_5d_prev)
-            / snapshot.usdrub_5d_prev
-            * PERCENT_SCALE
-        )
+        usdrub_delta_pct = (snapshot.usdrub_close - snapshot.usdrub_5d_prev) / snapshot.usdrub_5d_prev * PERCENT_SCALE
         if usdrub_delta_pct > THRESHOLD_USDRUB_DELTA:
             triggers.append(f"USD/RUB 5d Δ {usdrub_delta_pct:.2f}% > 5%")
 
