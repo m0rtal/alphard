@@ -29,6 +29,7 @@ Both SELECT projections use this column order:
 from __future__ import annotations
 
 import json
+from contextlib import ExitStack
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Mapping, Optional
@@ -138,12 +139,16 @@ def upsert_regime(conn: Any, regime: MacroRegime) -> None:
     )
 
     if _is_postgres(conn):
-        cur = conn.cursor()
-        try:
+        # Issue #95: ``conn.cursor()`` itself can raise (corrupt connection,
+        # failed-transaction state). Using a bare try/finally would mask the
+        # original exception with ``UnboundLocalError: cur`` if the cursor is
+        # never bound. ``ExitStack.enter_context`` calls ``__enter__`` first;
+        # if it raises, the stack is empty and no ``__exit__`` runs — letting
+        # the original exception propagate cleanly.
+        with ExitStack() as stack:
+            cur = stack.enter_context(conn.cursor())
             cur.execute(_PG_UPSERT_SQL, params)
             conn.commit()
-        finally:
-            cur.close()
     else:
         cur = conn.execute(_SQLITE_UPSERT_SQL, params)
         conn.commit()
@@ -153,12 +158,13 @@ def upsert_regime(conn: Any, regime: MacroRegime) -> None:
 def latest_regime(conn: Any) -> Optional[MacroRegime]:
     """Return the most-recent ``MacroRegime`` row, or None if empty."""
     if _is_postgres(conn):
-        cur = conn.cursor()
-        try:
+        # See issue #95 for the rationale — same ExitStack pattern as
+        # ``upsert_regime`` so a cursor-acquisition failure propagates the
+        # underlying exception instead of being masked by UnboundLocalError.
+        with ExitStack() as stack:
+            cur = stack.enter_context(conn.cursor())
             cur.execute(_SELECT_LATEST_SQL)
             row = cur.fetchone()
-        finally:
-            cur.close()
     else:
         cur = conn.execute(_SELECT_LATEST_SQL)
         row = cur.fetchone()
