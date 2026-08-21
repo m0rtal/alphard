@@ -113,6 +113,7 @@ from __future__ import annotations
 import argparse
 import faulthandler
 import logging
+import logging.handlers  # issue #120: RotatingFileHandler caps backfill log at 10MiB x3
 import os
 import signal as _signal  # used only by the faulthandler.register call below
 import signal
@@ -543,22 +544,42 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
     # Honour BACKFILL_LOG env: when set (by alphard-backfill-supervisor in
-    # src/main.py), also attach a FileHandler so all log lines land in the
-    # shared backfill log. The parent supervisor owns ZERO fds to this log
-    # (see issue #48) — the child opens its own handle here and the kernel
-    # reaps it on process exit, no leak possible.
+    # src/main.py), also attach a rotating FileHandler so all log lines land
+    # in the shared backfill log. The parent supervisor owns ZERO fds to
+    # this log (see issue #48) — the child opens its own handle here and
+    # the kernel reaps it on process exit, no leak possible.
+    #
+    # Issue #120 (Defect 1): plain FileHandler would grow unbounded until
+    # the /app/logs tmpfs fills up, then a single emit() would raise
+    # OSError ENOSPC and (with `set -e` in entrypoint.sh) restart-loop the
+    # whole container — exactly the failure mode PR #119 was merged to
+    # eliminate, shifted one layer down. Use RotatingFileHandler capped
+    # at 10 MiB × 3 backups = ~40 MiB ceiling, well below the 100 MiB tmpfs.
+    # Backups land beside backfill_log as <log>.1 .. <log>.3 (oldest
+    # rotated out automatically) so on tmpfs the older backups evaporate
+    # at restart along with the active log — the rotation prevents the
+    # ENOSPC that would otherwise have triggered a restart loop.
     backfill_log = os.environ.get("BACKFILL_LOG")
     if backfill_log:
         try:
             os.makedirs(os.path.dirname(backfill_log), exist_ok=True)
-            _fh = logging.FileHandler(backfill_log, mode="a", encoding="utf-8")
+            _fh = logging.handlers.RotatingFileHandler(
+                backfill_log,
+                mode="a",
+                encoding="utf-8",
+                maxBytes=10 * 1024 * 1024,
+                backupCount=3,
+            )
             _fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
             logging.getLogger().addHandler(_fh)
-            logger.info("backfill_log=%s (FileHandler attached, parent supervisor owns no fd)", backfill_log)
+            logger.info(
+                "backfill_log=%s (RotatingFileHandler 10MiB x3, parent supervisor owns no fd)",
+                backfill_log,
+            )
         except OSError as e:
             # Non-fatal: stay on stderr only. An operator investigating a
             # crash should still see the warning that file logging fell back.
-            logger.warning("could not attach FileHandler to BACKFILL_LOG=%s: %s", backfill_log, e)
+            logger.warning("could not attach RotatingFileHandler to BACKFILL_LOG=%s: %s", backfill_log, e)
 
     start = date(args.start_year, 1, 1)
     end = date(args.end_year, 12, 31)

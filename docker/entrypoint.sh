@@ -167,9 +167,24 @@ print('schema OK')
     # touch — DO NOT truncate. The backfill log is the only forensic record
     # of supervisor-driven child behaviour, and a restart that wipes it
     # defeats the whole point. See issue #49.
+    #
+    # Issue #120 (Defect 2): PR #119 moved /app/logs to a 100M tmpfs to
+    # work around the .107 PVE LXC userns bug, which means the backfill
+    # log evaporates on every container restart — the exact moment an
+    # operator needs it most. Emit a single banner on every boot to
+    # /app/logs/backfill_history_md.log AND stderr so the operator
+    # always knows whether a restart wiped prior forensics. The banner
+    # is itself inside the log, so even if the log is gone post-restart
+    # the stderr line is the only surviving record.
     touch "${BACKFILL_LOG}"
-    echo "  backfill: owned by alphard-backfill-supervisor thread in src/main.py (boot $(date -u +%FT%TZ))" >>"${BACKFILL_LOG}"
-    echo "  backfill log=${BACKFILL_LOG} (supervisor-managed; appended, not truncated)"
+    {
+        echo "  backfill: owned by alphard-backfill-supervisor thread in src/main.py (boot $(date -u +%FT%TZ))"
+        echo "  backfill log=${BACKFILL_LOG} (supervisor-managed; appended, not truncated)"
+        echo "  WARN [issue #120]: /app/logs is tmpfs on this host (PR #119) — container restart wipes prior forensics."
+    } >>"${BACKFILL_LOG}"
+    # Mirror the banner to stderr so it's visible in `docker logs` even
+    # after the in-container log has evaporated.
+    echo "WARN [issue #120]: /app/logs is tmpfs on this host (PR #119) — container restart wipes prior forensics." >&2
 
     # H-NETWORK-DETECT (2026-08-20): wire SIGUSR1 -> faulthandler dump
     # so that if the backfill Python process ever sits idle in a

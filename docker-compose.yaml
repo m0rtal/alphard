@@ -84,6 +84,11 @@ services:
       # — restore bind-mount once we move logs to a non-LXC Docker host
       # (e.g. .110, no userns mapping) or fix the bind-mount leaf
       # ownership via a different mechanism.
+      #
+      # Issue #120 (Defects 1, 2, 4) mitigates the tmpfs trade-off
+      # (RotatingFileHandler in backfill_history_md.py, stderr banner
+      # in entrypoint.sh, regression tests in test_compose_structure.py).
+      # Defect 3 follow-up is tracked in issue #123.
       - type: tmpfs
         target: /app/logs
         tmpfs:
