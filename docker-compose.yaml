@@ -162,11 +162,35 @@ services:
       - sh
       - -c
       - |
+        # Issue #129: harden the fail-fast gate against shell-metacharacter
+        # passwords. PR #128 only checked for empty REDIS_PASSWORD, but the
+        # command runs under `sh -c`, so a non-empty password containing
+        # `$`, `"`, `\`, or backtick would be silently mangled before
+        # `redis-server --requirepass` saw it. In the worst case the
+        # mangling produces an empty `--requirepass` arg and Redis starts
+        # without authentication (any container on the alphard-net bridge
+        # can then read/write Redis). In the more common case Redis fails
+        # to start with "wrong number of arguments" and the container
+        # restart-loops until the operator notices.
         if [ -z "$${REDIS_PASSWORD:-}" ]; then
           echo "[alphard-redis] FATAL: REDIS_PASSWORD is required (unset/empty in env)" >&2
           echo "[alphard-redis] FATAL: set REDIS_PASSWORD in .env before 'docker compose up'" >&2
           exit 1
         fi
+        # Reject any shell metacharacter in the password. We use printf
+        # to inject literal `$` and `"` into the case pattern because
+        # POSIX case-pattern matching has no portable way to escape them
+        # inside a literal-string pattern; backslash and backtick can be
+        # written as literal `'\'` and `` '`' ``. The heredoc preserves
+        # the backslashes verbatim. See issue #129.
+        case "$${REDIS_PASSWORD}" in
+          *$(printf '%s' '$')*|*$(printf '%s' '"')*|*'\'*|*'`'*)
+            echo "[alphard-redis] FATAL: REDIS_PASSWORD contains shell-unsafe characters (\$, \", \\, or backtick)" >&2
+            echo "[alphard-redis] FATAL: regenerate with: openssl rand -base64 24" >&2
+            echo "[alphard-redis] FATAL: the inline sh -c wrapper would mangle --requirepass before redis-server could read it" >&2
+            exit 1
+            ;;
+        esac
         exec redis-server --requirepass "$${REDIS_PASSWORD}"
     volumes:
       - alphard-redis-data:/data
