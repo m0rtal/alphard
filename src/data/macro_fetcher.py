@@ -30,13 +30,24 @@ Reliability:
   cache (with a warning).
 
 Output contract:
-- ``build_snapshot(state_dir=...) -> MacroSnapshot`` — composes the
-  three sub-fetchers, returns a snapshot ready for ``regime.classify``.
-  Returns ``None`` only if EVERY fetcher failed AND the cache is empty
-  (i.e. this is the very first run, no cached data, and the network
-  is down). A degraded snapshot with cached values is preferred to
-  ``None`` — the daemon would rather classify on stale-but-real data
-  than skip the regime entirely.
+-- ``build_snapshot(state_dir=...) -> MacroSnapshot | None`` — composes
+  the three sub-fetchers, returns a snapshot ready for ``regime.classify``.
+  Returns ``None`` ONLY when at least one of the three sources has no
+  live data AND no on-disk cache (fresh, stale, or otherwise). Concretely:
+  * Every source has live data          → snapshot.
+  * One source live-down, cache present  → snapshot (cache via fallback).
+  * One source live-down, no cache file  → ``None`` (cold start for that
+    source — daemon skips the regime tick and tries again next cycle).
+  * Two or more sources lack data        → ``None`` (regime classifier
+    needs the paired 5d/60d deltas; partial coverage is worse than a
+    explicit skip because stale-but-real numbers from one source paired
+    with cold-None from another would silently mislabel the regime).
+  Cache fallback policy: each fetcher first tries a 1h-fresh cache read,
+  then on live failure tries a 30-day cache read, then on second failure
+  ``_safe_fetch`` tries an unlimited-age cache read (emergency fallback
+  for stale-then-offline deployment rotation). The cache file is the
+  last-resort source of truth — better than ``None`` when the network
+  is permanently down.
 """
 
 from __future__ import annotations
@@ -63,6 +74,14 @@ from src.macro.models import MacroSnapshot
 logger = logging.getLogger("alphard.macro_fetcher")
 
 CACHE_TTL_SECONDS: Final[int] = 3600
+# Cache fallback ladder:
+#   1. fetcher's own 30-day fallback (covers transient outages within a month).
+#   2. _safe_fetch's unlimited-age fallback (covers long outages / stale cache).
+# We never fall back longer than 30 days inside the fetcher because the URL
+# contract may have drifted; only the emergency fallback (post-resolution of
+# an exception) reads an arbitrarily old file, and only because the alternative
+# is a hard ``None`` for the orchestrator.
+CACHE_FALLBACK_UNLIMITED_AGE_SECONDS: Final[int] = 10**9
 HTTP_TIMEOUT_SECONDS: Final[int] = 15
 MAX_RETRIES: Final[int] = 3
 RETRY_BACKOFF_BASE_SECONDS: Final[float] = 1.0
@@ -398,10 +417,22 @@ def build_snapshot(
 ) -> Optional[MacroSnapshot]:
     """Compose the three fetchers into a ``MacroSnapshot``.
 
-    Returns None only when EVERY fetcher fails AND every cache is empty
-    (i.e. very-first run with no network). On partial failure we use
-    cache for the missing piece and continue — the regime classifier
-    works fine on stale-but-real numbers.
+    Returns ``None`` if at least one fetcher produces no usable data
+    (live OR cache). Otherwise builds a ``MacroSnapshot`` from whatever
+    the three fetchers returned — live payloads, fresh-cached payloads,
+    or unlimited-age-cached payloads (the last-resort emergency fallback
+    in ``_safe_fetch``).
+
+    The cache fallback ladder is:
+
+        1. Live fetch (network).
+        2. Fetcher's own 30-day-old cache (handles transient outages).
+        3. ``_safe_fetch``'s unlimited-age cache read (handles long
+           outages / stale cache after deployment rotation).
+
+    If all three rungs fail for any source, ``_safe_fetch`` returns
+    ``None`` and ``_compose_snapshot`` bails out with ``None`` — the
+    daemon skips the regime tick and tries again on the next cycle.
 
     Args:
         state_dir: where to read/write per-fetcher caches.
@@ -411,9 +442,9 @@ def build_snapshot(
     if now is None:
         now = datetime.now(tz=timezone.utc)
 
-    cbr = _safe_fetch("cbr", lambda: fetch_cbr_key_rate(state_dir=state_dir, http_get=http_get))
-    usdrub = _safe_fetch("usdrub", lambda: fetch_usdrub_history(state_dir=state_dir, http_get=http_get))
-    imoex = _safe_fetch("imoex", lambda: fetch_imoex_history(state_dir=state_dir, http_get=http_get))
+    cbr = _safe_fetch("cbr", state_dir, lambda: fetch_cbr_key_rate(state_dir=state_dir, http_get=http_get))
+    usdrub = _safe_fetch("usdrub", state_dir, lambda: fetch_usdrub_history(state_dir=state_dir, http_get=http_get))
+    imoex = _safe_fetch("imoex", state_dir, lambda: fetch_imoex_history(state_dir=state_dir, http_get=http_get))
 
     if cbr is None and usdrub is None and imoex is None:
         logger.error("All three macro fetchers failed; cannot build snapshot")
@@ -427,15 +458,42 @@ def build_snapshot(
     return snap
 
 
-def _safe_fetch(name: str, fn: Callable[[], dict[str, Any]]) -> Optional[dict[str, Any]]:
+def _safe_fetch(
+    name: str,
+    state_dir: Path,
+    fn: Callable[[], dict[str, Any]],
+) -> Optional[dict[str, Any]]:
     """Run ``fn`` and swallow exceptions into a logged warning.
 
-    The orchestrator must not abort because one source is down.
+    Fallback ladder (per source):
+
+        1. ``fn()`` — live fetch via the underlying fetcher.
+        2. The fetcher's own 30-day cache fallback (already wired inside
+           ``fetch_cbr_key_rate``/``fetch_usdrub_history``/``fetch_imoex_history``).
+        3. **This function's emergency fallback**: if the fetcher raised
+           AND ``fn()`` did not return a cached payload (because the cache
+           file is missing or stale >30 days), we read the cache file
+           regardless of age and return it with
+           ``source="cache:<name>(stale)"``. This is the last-resort rung
+           of the ladder: the cache file is the only signal we have left,
+           and the alternative is a hard ``None`` that skips the regime
+           entirely (issue #93).
+
+    Returns ``None`` only when the fetcher raised AND no cache file
+    exists on disk at all (cold-state for that source).
     """
     try:
         return fn()
     except Exception as exc:  # noqa: BLE001 — fetch is best-effort per source
-        logger.warning(f"{name} fetch failed: {exc}")
+        logger.warning(f"{name} fetch raised: {exc}; attempting emergency stale-cache fallback")
+        cached = _read_cache(
+            _cache_path(state_dir, name),
+            max_age_seconds=CACHE_FALLBACK_UNLIMITED_AGE_SECONDS,
+        )
+        if cached is not None:
+            cached["source"] = f"cache:{name}(stale)"
+            return cached
+        logger.warning(f"{name} fetch failed with no cache file; returning None")
         return None
 
 

@@ -182,6 +182,91 @@ def test_build_snapshot_returns_none_when_history_too_short(state_dir: Path) -> 
     assert snap is None
 
 
+def test_build_snapshot_returns_none_when_one_source_fails_without_cache(
+    state_dir: Path,
+) -> None:
+    """Issue #93: cold state + 1 source down → ``None`` (acceptance).
+
+    Reproduces the documented acceptance criterion: when the state
+    directory is fresh (no cache file) and one source fails, the fetcher
+    cannot synthesise a snapshot for that source — the regime
+    classifier needs all five numeric fields, and a ``None`` for one
+    fetcher would propagate into ``_compose_snapshot`` and bail.
+
+    The "degraded snapshot" behaviour of the docstring applies only to
+    warm-state scenarios (see ``test_build_snapshot_uses_cache_when_cbr_fails``
+    and the new ``test_build_snapshot_uses_stale_cache_when_cbr_fails``
+    test). Cold-state single-source outages legitimately skip the tick.
+    """
+    fail_only_cbr = _fake_http_get(fail_urls={macro_fetcher.CBR_DAILY_XML_URL})
+    snap = build_snapshot(state_dir=state_dir, http_get=fail_only_cbr)
+    assert snap is None
+
+
+def test_build_snapshot_uses_stale_cache_when_cbr_fails(state_dir: Path) -> None:
+    """Issue #93: live fetch fails AND cache is stale (>30 days) → snapshot.
+
+    Warmup with a fresh run, then age the cache file beyond the
+    fetcher's 30-day TTL. The emergency fallback inside ``_safe_fetch``
+    must read the stale file anyway and return a snapshot, instead of
+    bailing with ``None``.
+    """
+    import os
+    import time
+
+    # 1. Warm the cache.
+    http_get = _fake_http_get(cbr_rate="15.00")
+    build_snapshot(state_dir=state_dir, http_get=http_get)
+
+    # 2. Push the cache mtime back 60 days (beyond the 30-day TTL).
+    cbr_cache = state_dir / "macro" / "cbr.json"
+    assert cbr_cache.exists()
+    sixty_days_ago = time.time() - 60 * 24 * 3600
+    os.utime(cbr_cache, (sixty_days_ago, sixty_days_ago))
+
+    # 3. Block the CBR URL.
+    fail_only_cbr = _fake_http_get(fail_urls={macro_fetcher.CBR_DAILY_XML_URL})
+    snap = build_snapshot(state_dir=state_dir, http_get=fail_only_cbr)
+    assert snap is not None
+    assert snap.cbr_key_rate == Decimal("15.00")
+    # Emergency fallback renames the source to ``cache:<name>(stale)``.
+    assert "stale" in snap.sources["cbr"]
+
+
+def test_safe_fetch_returns_none_when_no_cache_exists(state_dir: Path) -> None:
+    """Direct test of ``_safe_fetch``: no cache + raising fn → ``None``."""
+    import urllib.error
+
+    def _raise() -> dict[str, object]:
+        raise urllib.error.URLError("network down")
+
+    result = macro_fetcher._safe_fetch("cbr", state_dir, _raise)
+    assert result is None
+
+
+def test_safe_fetch_returns_stale_cache_when_fn_raises(state_dir: Path) -> None:
+    """Direct test of ``_safe_fetch``: fn raises + stale cache on disk → dict."""
+    import json
+    import os
+    import time
+    import urllib.error
+
+    # Seed a stale cache file.
+    cache_path = state_dir / "macro" / "cbr.json"
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(json.dumps({"key_rate": "12.50", "as_of": "2026-01-01"}))
+    sixty_days_ago = time.time() - 60 * 24 * 3600
+    os.utime(cache_path, (sixty_days_ago, sixty_days_ago))
+
+    def _raise() -> dict[str, object]:
+        raise urllib.error.URLError("network down")
+
+    result = macro_fetcher._safe_fetch("cbr", state_dir, _raise)
+    assert result is not None
+    assert result["key_rate"] == "12.50"
+    assert result["source"] == "cache:cbr(stale)"
+
+
 # ---------------------------------------------------------------------------
 # Atomic cache + retry/backoff
 # ---------------------------------------------------------------------------
