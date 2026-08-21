@@ -364,17 +364,35 @@ class Coordinator:
             return False
         from src.data.quality.ingestion_gate import Bar, check_ingestion, IngestionParams
 
-        bar_list = [
-            Bar(
-                primary_key=b.ts,
-                open=float(b.open),
-                high=float(b.high),
-                low=float(b.low),
-                close=float(b.close),
-                volume=int(b.volume),
+        # Issue #102: ``bars`` may now carry multiple rows per (ticker, ts)
+        # because the Phase 2.6 step 2 multi-source schema allows one
+        # OHLCVRow per (ticker, ts, source). The ingestion gate's
+        # gap/coverage/outlier analysis treats every Bar as an independent
+        # observation, so two Bars with the same primary_key (ts) would
+        # inflate the row count, double-count volume, and let a ticker with
+        # only 126 unique dates squeak past min_history_rows=252 because
+        # two sources each contribute a copy of the same date.
+        # Dedup by primary_key, keeping the FIRST row encountered (the
+        # ordering from query_ohlcv is ``ORDER BY ts, source`` so the
+        # canonical ``tkf`` source arrives first when present). This
+        # preserves the single-source pre-Phase-2.6 contract for the
+        # gate's row-counting invariants.
+        seen_ts: set[date] = set()
+        bar_list: list[Bar] = []
+        for b in bars:
+            if b.ts in seen_ts:
+                continue
+            seen_ts.add(b.ts)
+            bar_list.append(
+                Bar(
+                    primary_key=b.ts,
+                    open=float(b.open),
+                    high=float(b.high),
+                    low=float(b.low),
+                    close=float(b.close),
+                    volume=int(b.volume),
+                )
             )
-            for b in bars
-        ]
         report = check_ingestion(self.config.ticker, bar_list, params=IngestionParams())
         worst = report.worst_severity()
         if worst is None:
