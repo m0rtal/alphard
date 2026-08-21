@@ -17,7 +17,7 @@ import logging
 import os
 
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from typing import Any, Optional
 
 from src.broker.account import BrokerAccount, PortfolioSnapshot, Position
@@ -472,10 +472,39 @@ class TinkoffAccount(BrokerAccount):
                         order_type=OrderType.ORDER_TYPE_MARKET,
                     )
                 else:
-                    # Limit order — wrap price into Quotation
+                    # Limit order — wrap price into Quotation.
+                    # Issue #100: the wire format caps nano at 9 fractional
+                    # digits (int<0, 1e9)). Input prices with more than 9
+                    # fractional digits used to silently truncate via
+                    # ``int((price - int(price)) * 1e9)``, e.g.
+                    # ``Decimal("100.0000000001")`` would round-trip as
+                    # ``Decimal("100.0")`` — operator places a limit at
+                    # a price they did not intend. Floor to 9 fractional
+                    # digits explicitly via ``quantize(Decimal("1e-9"))``
+                    # with ``ROUND_DOWN`` so the truncation behaviour is
+                    # at least deterministic and a warning is logged when
+                    # the input had > 9 digits (operator should re-quote).
+                    price_9 = order.price.quantize(Decimal("1e-9"), rounding=ROUND_DOWN)
+                    fractional = price_9 - Decimal(int(price_9))
+                    nano = int(fractional * Decimal(1_000_000_000))
+                    # Belt-and-braces: if quantize happened to produce a
+                    # non-9-digit residue (e.g. due to a negative price
+                    # sneaking in), clamp into the wire-format range.
+                    if not 0 <= nano < 1_000_000_000:
+                        nano = max(0, min(nano, 999_999_999))
+                    if order.price != price_9:
+                        logger.warning(
+                            "LimitOrder price %s has > 9 fractional digits; "
+                            "rounded down to %s (units=%d, nano=%d). "
+                            "Re-quote to wire precision to avoid silent loss.",
+                            order.price,
+                            price_9,
+                            int(price_9),
+                            nano,
+                        )
                     price_q = Quotation(
-                        units=int(order.price),
-                        nano=int((order.price - int(order.price)) * 1_000_000_000),
+                        units=int(price_9),
+                        nano=nano,
                     )
                     resp = client.orders.post_order(
                         figi=figi,
