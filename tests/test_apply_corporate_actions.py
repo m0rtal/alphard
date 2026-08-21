@@ -859,3 +859,385 @@ def test_list_tickers_respects_only_filter() -> None:
     metas = aca._list_tickers(s, only=["SBER"])
     assert [m.ticker for m in metas] == ["SBER"]
     s.close()
+
+
+# ===========================================================================
+# Phase 2.5 step 2c — dividend handling in the apply_adjustment() loop.
+# ===========================================================================
+#
+# Coverage targets (all from this commit):
+# - _fetch_dividends_for_ticker: parses MOEX-style dividend dicts into
+#   CorporateAction(kind='dividend'), filtering malformed entries.
+# - _parse_dividend_entry: rejects negative amounts, missing fields,
+#   unparseable dates, unparseable amounts.
+# - _fetch_actions_for_ticker: concatenates splits + dividends from both
+#   fetcher endpoints in one call.
+# - end-to-end: a dividend-only orchestrator run writes adj_close rows
+#   with the dividend discount applied.
+# - end-to-end: a ticker with BOTH a split and a dividend sees both
+#   effects compose (split halves the price level, then the dividend
+#   subtracts from adj_close).
+# - mixed universe: ticker A has only a dividend, ticker B has only a
+#   split — both land in ohlcv_daily_adj with correct math, ticker C
+#   with neither action sees a no-op (cache marks fresh, zero writes).
+
+
+@pytest.fixture
+def fetcher_dividends_sber_one() -> list[dict]:
+    """MOEX-style fetcher output: SBER has a 5-RUB dividend on 2026-01-09.
+
+    Used by dividend-only end-to-end tests. GAZP is intentionally absent
+    to verify the no-actions short-circuit.
+    """
+    return [
+        {
+            "ticker": "SBER",
+            "ts": "2026-01-09",
+            "amount_rub_per_share": "5.00",
+            "source": "moex",
+        }
+    ]
+
+
+@pytest.fixture
+def fetcher_dividends_sber_two() -> list[dict]:
+    """Two SBER dividends: 5 RUB on 2026-01-09, 3 RUB on 2026-01-12."""
+    return [
+        {
+            "ticker": "SBER",
+            "ts": "2026-01-09",
+            "amount_rub_per_share": "5.00",
+            "source": "moex",
+        },
+        {
+            "ticker": "SBER",
+            "ts": "2026-01-12",
+            "amount_rub_per_share": "3.00",
+            "source": "moex",
+        },
+    ]
+
+
+def test_parse_dividend_entry_happy_path() -> None:
+    """A well-formed dividend dict becomes a CorporateAction(kind='dividend')."""
+    entry = {
+        "ticker": "SBER",
+        "ts": "2026-06-15",
+        "amount_rub_per_share": "12.34",
+        "source": "moex",
+    }
+    action = aca._parse_dividend_entry(entry, "SBER")
+    assert action is not None
+    assert action.kind == "dividend"
+    assert action.ticker == "SBER"
+    assert action.ts == date(2026, 6, 15)
+    assert action.value == Decimal("12.34")
+    assert action.source == "moex"
+
+
+def test_parse_dividend_entry_filters_other_ticker() -> None:
+    """A dividend for ticker B does not match a query for ticker A."""
+    entry = {
+        "ticker": "GAZP",
+        "ts": "2026-06-15",
+        "amount_rub_per_share": "12.34",
+        "source": "moex",
+    }
+    assert aca._parse_dividend_entry(entry, "SBER") is None
+
+
+def test_parse_dividend_entry_rejects_negative_amount() -> None:
+    """Negative dividend amounts are dropped — corrupt feed must not corrupt adj_close."""
+    entry = {
+        "ticker": "SBER",
+        "ts": "2026-06-15",
+        "amount_rub_per_share": "-1.00",
+        "source": "moex",
+    }
+    assert aca._parse_dividend_entry(entry, "SBER") is None
+
+
+def test_parse_dividend_entry_rejects_missing_fields() -> None:
+    """Missing ts or amount → drop the entry, don't crash."""
+    for bad in (
+        {"ticker": "SBER", "amount_rub_per_share": "5.00"},  # no ts
+        {"ticker": "SBER", "ts": "2026-06-15"},  # no amount
+        {"ticker": "SBER", "ts": "2026-06-15", "amount_rub_per_share": None},  # None amount
+        {"ticker": "SBER", "ts": None, "amount_rub_per_share": "5.00"},  # None ts
+    ):
+        assert aca._parse_dividend_entry(bad, "SBER") is None, f"unexpectedly accepted: {bad!r}"
+
+
+def test_parse_dividend_entry_rejects_malformed_values() -> None:
+    """Unparseable date or amount → drop, don't crash."""
+    for bad in (
+        {"ticker": "SBER", "ts": "not-a-date", "amount_rub_per_share": "5.00"},
+        {"ticker": "SBER", "ts": "2026-06-15", "amount_rub_per_share": "not-a-number"},
+    ):
+        assert aca._parse_dividend_entry(bad, "SBER") is None, f"unexpectedly accepted: {bad!r}"
+
+
+def test_fetch_dividends_for_ticker_filters_other_tickers() -> None:
+    """The per-ticker dividend filter must drop other-ticker events."""
+    fetcher_payload = [
+        {"ticker": "SBER", "ts": "2026-06-15", "amount_rub_per_share": "5.00", "source": "moex"},
+        {"ticker": "GAZP", "ts": "2026-06-15", "amount_rub_per_share": "7.00", "source": "moex"},
+    ]
+    session = MagicMock()
+    with patch.object(aca, "_FETCHER_MOD") as fake_fetcher:
+        fake_fetcher.fetch_dividends.return_value = fetcher_payload
+        actions = aca._fetch_dividends_for_ticker("SBER", session, timeout=60)
+
+    assert len(actions) == 1
+    assert actions[0].ticker == "SBER"
+    assert actions[0].kind == "dividend"
+    assert actions[0].value == Decimal("5.00")
+
+
+def test_fetch_actions_for_ticker_concatenates_splits_and_dividends() -> None:
+    """_fetch_actions_for_ticker returns both kinds, concatenation order stable."""
+    splits_payload = [
+        {"ticker": "SBER", "ts": "2026-01-09", "ratio": 2.0, "source": "moex"},
+    ]
+    dividends_payload = [
+        {"ticker": "SBER", "ts": "2026-01-09", "amount_rub_per_share": "5.00", "source": "moex"},
+    ]
+    session = MagicMock()
+    with patch.object(aca, "_FETCHER_MOD") as fake_fetcher:
+        fake_fetcher.fetch_splits.return_value = splits_payload
+        fake_fetcher.fetch_dividends.return_value = dividends_payload
+        actions = aca._fetch_actions_for_ticker("SBER", session, timeout=60)
+
+    assert len(actions) == 2
+    kinds = {a.kind for a in actions}
+    assert kinds == {"split", "dividend"}
+
+
+def test_fetch_actions_for_ticker_empty_when_no_events() -> None:
+    """No events for the ticker → empty list (no_errors path)."""
+    session = MagicMock()
+    with patch.object(aca, "_FETCHER_MOD") as fake_fetcher:
+        fake_fetcher.fetch_splits.return_value = []
+        fake_fetcher.fetch_dividends.return_value = []
+        actions = aca._fetch_actions_for_ticker("SBER", session, timeout=60)
+    assert actions == []
+
+
+def test_end_to_end_dividend_only_subtracts_from_adj_close(
+    store: InMemorySQLiteStore,
+    fetcher_dividends_sber_one: list[dict],
+    tmp_path: Path,
+) -> None:
+    """One dividend for SBER → pre-ex bars' adj_close drops by the dividend,
+    raw OHLC and volume untouched."""
+    cache_path = tmp_path / "cache.json"
+
+    with patch.object(aca, "_FETCHER_MOD") as fake_fetcher:
+        fake_fetcher.fetch_splits.return_value = []  # no splits this time
+        fake_fetcher.fetch_dividends.return_value = fetcher_dividends_sber_one
+        fake_fetcher.USER_AGENT = "alphard-test"
+        aca.main(
+            ["--tickers", "SBER", "--cache-path", str(cache_path)],
+            store=store,
+        )
+
+    by_ts = {r.ts: r for r in store.query_ohlcv_adj("SBER", date(2026, 1, 1), date(2026, 12, 31))}
+    assert len(by_ts) == 5
+
+    # 2026-01-06..08 (pre-ex-date): adj_close drops by 5; raw OHLC + volume unchanged.
+    for ts in (date(2026, 1, 6), date(2026, 1, 7), date(2026, 1, 8)):
+        # SBER base closes were 100, 101, 102; raw adj_close = close.
+        base_close = {"2026-01-06": 100, "2026-01-07": 101, "2026-01-08": 102}[ts.isoformat()]
+        assert by_ts[ts].adj_close == Decimal(base_close - 5), f"ts={ts}"
+        # Raw OHLC + volume untouched by dividends.
+        assert by_ts[ts].close == Decimal(base_close), f"ts={ts}"
+        assert by_ts[ts].volume == Decimal("1000"), f"ts={ts}"
+
+    # 2026-01-09 (ex-date) and 2026-01-12 (post-ex): unchanged.
+    assert by_ts[date(2026, 1, 9)].adj_close == Decimal("103")
+    assert by_ts[date(2026, 1, 9)].close == Decimal("103")
+    assert by_ts[date(2026, 1, 12)].adj_close == Decimal("104")
+    assert by_ts[date(2026, 1, 12)].close == Decimal("104")
+
+
+def test_end_to_end_multiple_dividends_compose(
+    store: InMemorySQLiteStore,
+    fetcher_dividends_sber_two: list[dict],
+    tmp_path: Path,
+) -> None:
+    """Two dividends on different dates: pre-ex bars discount by both sums."""
+    cache_path = tmp_path / "cache.json"
+
+    with patch.object(aca, "_FETCHER_MOD") as fake_fetcher:
+        fake_fetcher.fetch_splits.return_value = []
+        fake_fetcher.fetch_dividends.return_value = fetcher_dividends_sber_two
+        fake_fetcher.USER_AGENT = "alphard-test"
+        aca.main(
+            ["--tickers", "SBER", "--cache-path", str(cache_path)],
+            store=store,
+        )
+
+    by_ts = {r.ts: r for r in store.query_ohlcv_adj("SBER", date(2026, 1, 1), date(2026, 12, 31))}
+
+    # 2026-01-06 (before both dividends): adj_close = 100 - 5 - 3 = 92.
+    assert by_ts[date(2026, 1, 6)].adj_close == Decimal("92")
+    # 2026-01-07 (before both): adj_close = 101 - 5 - 3 = 93.
+    assert by_ts[date(2026, 1, 7)].adj_close == Decimal("93")
+    # 2026-01-08 (before both): adj_close = 102 - 5 - 3 = 94.
+    assert by_ts[date(2026, 1, 8)].adj_close == Decimal("94")
+    # 2026-01-09 (first dividend ex-date): past dividends still apply (2nd is in future).
+    # adj_close = 103 - 3 = 100.
+    assert by_ts[date(2026, 1, 9)].adj_close == Decimal("100")
+    # 2026-01-12 (both dividends in past): adj_close = 104 unchanged.
+    assert by_ts[date(2026, 1, 12)].adj_close == Decimal("104")
+
+
+def test_end_to_end_split_and_dividend_compose(
+    store: InMemorySQLiteStore,
+    tmp_path: Path,
+) -> None:
+    """SBER with a 1:2 split on 2026-01-09 AND a 5-RUB dividend on the same day.
+
+    Final math on pre-ex bars (e.g. 2026-01-06, close=100, volume=1000):
+      - Split halves the price level: close 100 -> 50, volume 1000 -> 2000.
+      - Dividend subtracts from adj_close: 100/2 - 5 = 45.
+    """
+    cache_path = tmp_path / "cache.json"
+
+    with patch.object(aca, "_FETCHER_MOD") as fake_fetcher:
+        fake_fetcher.fetch_splits.return_value = [
+            {"ticker": "SBER", "ts": "2026-01-09", "ratio": 2.0, "source": "moex"},
+        ]
+        fake_fetcher.fetch_dividends.return_value = [
+            {"ticker": "SBER", "ts": "2026-01-09", "amount_rub_per_share": "5.00", "source": "moex"},
+        ]
+        fake_fetcher.USER_AGENT = "alphard-test"
+        aca.main(
+            ["--tickers", "SBER", "--cache-path", str(cache_path)],
+            store=store,
+        )
+
+    by_ts = {r.ts: r for r in store.query_ohlcv_adj("SBER", date(2026, 1, 1), date(2026, 12, 31))}
+
+    # 2026-01-06 (pre both): split halves, dividend subtracts from adj_close.
+    assert by_ts[date(2026, 1, 6)].close == Decimal("50")  # 100 / 2
+    assert by_ts[date(2026, 1, 6)].volume == Decimal("2000")  # 1000 * 2
+    assert by_ts[date(2026, 1, 6)].adj_close == Decimal("45")  # (100 / 2) - 5
+    # 2026-01-07: close 101/2 = 50.5; adj_close = 50.5 - 5 = 45.5.
+    assert by_ts[date(2026, 1, 7)].close == Decimal("50.5")
+    assert by_ts[date(2026, 1, 7)].adj_close == Decimal("45.5")
+    # 2026-01-08: close 102/2 = 51; adj_close = 51 - 5 = 46.
+    assert by_ts[date(2026, 1, 8)].close == Decimal("51")
+    assert by_ts[date(2026, 1, 8)].adj_close == Decimal("46")
+    # 2026-01-09 (ex-date of both): unchanged.
+    assert by_ts[date(2026, 1, 9)].close == Decimal("103")
+    assert by_ts[date(2026, 1, 9)].adj_close == Decimal("103")
+    assert by_ts[date(2026, 1, 9)].volume == Decimal("1000")
+
+
+def test_end_to_end_mixed_universe_dividend_and_split_and_noop(
+    store: InMemorySQLiteStore,
+    tmp_path: Path,
+) -> None:
+    """SBER has only a dividend, GAZP has only a split, NOEX (added on the fly)
+    has neither.
+
+    Verify each ticker is handled correctly in one orchestrator run.
+    """
+    # Add NOEX with no actions in the fetcher.
+    store.upsert_tickers(
+        [
+            _make_ticker("NOEX", listed_at=date(2010, 1, 1)),
+        ]
+    )
+    for ts in (date(2026, 1, 6), date(2026, 1, 9)):
+        store.upsert_ohlcv(
+            [
+                _make_ohlcv(
+                    "NOEX",
+                    ts,
+                    "50",
+                    "500",
+                )
+            ]
+        )
+
+    cache_path = tmp_path / "cache.json"
+
+    with patch.object(aca, "_FETCHER_MOD") as fake_fetcher:
+        fake_fetcher.fetch_splits.return_value = [
+            {"ticker": "GAZP", "ts": "2026-01-09", "ratio": 2.0, "source": "moex"},
+        ]
+        fake_fetcher.fetch_dividends.return_value = [
+            {"ticker": "SBER", "ts": "2026-01-09", "amount_rub_per_share": "5.00", "source": "moex"},
+        ]
+        fake_fetcher.USER_AGENT = "alphard-test"
+        aca.main(
+            [
+                "--tickers",
+                "SBER,GAZP,NOEX",
+                "--cache-path",
+                str(cache_path),
+            ],
+            store=store,
+        )
+
+    # SBER: dividend effect on 2026-01-06 (adj_close 100 - 5 = 95).
+    sber_adj = {r.ts: r for r in store.query_ohlcv_adj("SBER", date(2026, 1, 1), date(2026, 12, 31))}
+    assert sber_adj[date(2026, 1, 6)].adj_close == Decimal("95")
+    assert sber_adj[date(2026, 1, 6)].close == Decimal("100")  # no splits
+
+    # GAZP: split effect on 2026-01-06 (close 200 -> 100, volume 2000 -> 4000).
+    # No dividends so adj_close matches raw close.
+    gazp_adj = {r.ts: r for r in store.query_ohlcv_adj("GAZP", date(2026, 1, 1), date(2026, 12, 31))}
+    assert gazp_adj[date(2026, 1, 6)].close == Decimal("100")
+    assert gazp_adj[date(2026, 1, 6)].volume == Decimal("4000")
+    assert gazp_adj[date(2026, 1, 6)].adj_close == Decimal("100")
+
+    # NOEX: no actions — no rows in ohlcv_daily_adj (no-ops don't write).
+    noex_adj = store.query_ohlcv_adj("NOEX", date(2026, 1, 1), date(2026, 12, 31))
+    assert noex_adj == []
+
+    # But NOEX should still be marked fresh in the cache.
+    cache = json.loads(cache_path.read_text())
+    assert "NOEX" in cache
+
+
+def test_dividend_negative_amount_dropped_in_orchestrator(
+    store: InMemorySQLiteStore,
+    tmp_path: Path,
+) -> None:
+    """A negative-amount dividend is dropped at the parse layer, so the
+    orchestrator treats the ticker as "no actions" — same short-circuit
+    as a ticker with no corporate actions at all.
+
+    The bar must NOT appear in ohlcv_daily_adj (the no-actions path
+    short-circuits before any DB write) and the orchestrator must
+    return EXIT_OK (no ValueError).
+    """
+    cache_path = tmp_path / "cache.json"
+
+    with patch.object(aca, "_FETCHER_MOD") as fake_fetcher:
+        fake_fetcher.fetch_splits.return_value = []
+        fake_fetcher.fetch_dividends.return_value = [
+            # Negative amount — must be dropped at _parse_dividend_entry.
+            {
+                "ticker": "SBER",
+                "ts": "2026-01-09",
+                "amount_rub_per_share": "-5.00",
+                "source": "moex",
+            },
+        ]
+        fake_fetcher.USER_AGENT = "alphard-test"
+        rc = aca.main(
+            ["--tickers", "SBER", "--cache-path", str(cache_path)],
+            store=store,
+        )
+    assert rc == aca.EXIT_OK  # graceful: no crash
+
+    # No actions survive the parse → no writes. The ticker is still
+    # marked fresh in the cache so we don't re-fetch the corrupt feed.
+    sber_adj = store.query_ohlcv_adj("SBER", date(2026, 1, 1), date(2026, 12, 31))
+    assert sber_adj == []
+    cache = json.loads(cache_path.read_text())
+    assert "SBER" in cache

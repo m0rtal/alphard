@@ -1,16 +1,24 @@
-"""Phase 2.5 step 2b: apply split adjustments to OHLCV bars and persist.
+"""Phase 2.5 step 2b/2c: apply split AND dividend adjustments to OHLCV bars.
 
 Why this script?
 ----------------
 PHASE1-AUDIT flagged "Adjusted prices — adj_close = close placeholder".
 Phase 2.5 ships the pipeline in three pieces:
 
-  - Step 1 (PR #45): pure adjustment math in ``src.data.adjustment``.
+  - Step 1 (PR #45): pure adjustment math in ``src.data.adjustment``
+    (splits only at that point).
   - Step 2a (PR #54): standalone fetcher ``scripts/fetch_moex_corporate_actions.py``
     that pulls MOEX ISS splits + dividends into JSON.
-  - Step 2b (this script): orchestrator that combines the two — fetches
-    splits per ticker, applies the adjustment to raw OHLCV rows, and
-    persists split-adjusted bars into ``ohlcv_daily_adj``.
+  - Step 2b (PR #74): orchestrator that combines splits with raw
+    OHLCV bars, persists split-adjusted bars into ``ohlcv_daily_adj``.
+  - Step 2c (this commit, branch feat/issue-dividend-apply): extend the
+    orchestrator so the same pipeline applies BOTH splits and
+    dividends. The pure-math stage was extended in
+    ``src.data.adjustment.apply_dividend_adjustment`` (subtract
+    cumulative dividends from ``adj_close`` for bars before the
+    dividend ex-date) and ``apply_adjustment`` is now the unified
+    entry point that runs splits first, then dividends. PHASE2-ROADMAP
+    explicitly defers dividend handling past step 2b — step 2c lands it.
 
 This script is invoked as a subprocess by ``src.main._corp_actions_apply_loop``
 on a weekly cadence. It can also be invoked manually::
@@ -22,11 +30,11 @@ on a weekly cadence. It can also be invoked manually::
 
 Storage
 -------
-Split-adjusted bars land in ``ohlcv_daily_adj`` (a parallel table
-introduced alongside this script in PR #74). The raw ``ohlcv_daily`` is
-NEVER touched. When Phase 2.6 step 2 lands the ``source`` column on
-``ohlcv_daily``, the parallel table is migrated via ``INSERT INTO
-ohlcv_daily ... SELECT FROM ohlcv_daily_adj``.
+Split- and dividend-adjusted bars land in ``ohlcv_daily_adj`` (a
+parallel table introduced alongside this script in PR #74). The raw
+``ohlcv_daily`` is NEVER touched. When Phase 2.6 step 2 lands the
+``source`` column on ``ohlcv_daily``, the parallel table is migrated
+via ``INSERT INTO ohlcv_daily ... SELECT FROM ohlcv_daily_adj``.
 
 Idempotency
 -----------
@@ -40,7 +48,7 @@ adjustment work).
 
 Per-ticker error handling
 -------------------------
-If ``apply_split_adjustment`` or the DB write raises for one ticker, the
+If ``apply_adjustment`` or the DB write raises for one ticker, the
 exception is logged with the ticker name + traceback and the loop
 continues with the next ticker. The non-fatal path is the default
 because a single bad ticker must not abort the weekly run for 3000+
@@ -73,7 +81,7 @@ if _SRC_PATH not in sys.path:
 
 import fetch_moex_corporate_actions as mca  # noqa: E402
 
-from src.data.adjustment import apply_split_adjustment  # noqa: E402
+from src.data.adjustment import apply_adjustment  # noqa: E402
 from src.data.models import CorporateAction, OHLCVRow, TickerMeta  # noqa: E402
 from src.data.pg_store import PostgresDataStore  # noqa: E402
 from src.data.store import DataStore, StoreError  # noqa: E402
@@ -130,11 +138,15 @@ def _fetch_splits_for_ticker(
 ) -> list[CorporateAction]:
     """Per-ticker CorporateAction list (only kind='split').
 
+    Kept as a thin wrapper around ``_FETCHER_MOD.fetch_splits`` for
+    backwards-compat with the existing test surface (``aca._fetch_splits_for_ticker``
+    is patched by tests in ``test_apply_corporate_actions.py``). New code
+    should call ``_fetch_actions_for_ticker`` instead, which returns
+    both splits and dividends.
+
     Step 2a's fetcher returns ALL splits for ALL tickers in one call.
     We invoke it once and filter in-process; calling it per ticker would
-    hit MOEX ISS 3000 times for nothing. Filter by ticker AND kind
-    (dividends are ignored here — adjustment is split-only; dividends
-    land in a follow-up step that uses total-return math, not splits).
+    hit MOEX ISS 3000 times for nothing. Filter by ticker AND kind.
     """
     raw = _FETCHER_MOD.fetch_splits(session, timeout=timeout)
     actions: list[CorporateAction] = []
@@ -166,6 +178,86 @@ def _fetch_splits_for_ticker(
             )
         )
     return actions
+
+
+def _parse_dividend_entry(entry: dict, ticker: str) -> CorporateAction | None:
+    """Convert a MOEX-style dividend dict into a CorporateAction(kind='dividend').
+
+    Returns None on malformed input (missing ticker, unparseable date
+    or amount, negative amount). Negative-amount rows are dropped
+    defensively — they are not a real product of MOEX ISS but we don't
+    want a corrupt feed to silently propagate into apply_adjustment.
+    """
+    if entry.get("ticker") != ticker:
+        return None
+    ts_raw = entry.get("ts")
+    amount_raw = entry.get("amount_rub_per_share")
+    if not ts_raw or amount_raw is None:
+        return None
+    try:
+        ts = date.fromisoformat(ts_raw)
+        # Decimal() raises decimal.InvalidOperation (not ValueError) on
+        # unparseable strings — catch the broader InvalidOperation parent
+        # class plus ValueError so a corrupt feed can never crash the
+        # orchestrator mid-loop.
+        amount = Decimal(str(amount_raw))
+    except (TypeError, ValueError, ArithmeticError):
+        return None
+    if amount < Decimal("0"):
+        return None
+    return CorporateAction(
+        ticker=ticker,
+        ts=ts,
+        kind="dividend",
+        value=amount,
+        source="moex",
+    )
+
+
+def _fetch_dividends_for_ticker(
+    ticker: str,
+    session: requests.Session,
+    timeout: int,
+) -> list[CorporateAction]:
+    """Per-ticker dividend CorporateAction list.
+
+    Sister to ``_fetch_splits_for_ticker``. Hits MOEX ISS once per
+    ticker (matches the existing splits pattern; an orchestrator-level
+    cache would let both helpers share a single round-trip, but that's
+    a separate optimisation). Returns an empty list if MOEX has no
+    dividends for the ticker or the call fails (the caller treats an
+    empty list as "nothing to apply" rather than as an error).
+    """
+    raw = _FETCHER_MOD.fetch_dividends(session, timeout=timeout)
+    actions: list[CorporateAction] = []
+    for entry in raw:
+        action = _parse_dividend_entry(entry, ticker)
+        if action is not None:
+            actions.append(action)
+    return actions
+
+
+def _fetch_actions_for_ticker(
+    ticker: str,
+    session: requests.Session,
+    timeout: int,
+) -> list[CorporateAction]:
+    """Fetch splits + dividends for ``ticker`` in one MOEX ISS round-trip per kind.
+
+    The fetcher returns ALL splits and ALL dividends across the entire
+    share market in one call; we filter by ticker in-process to avoid
+    3000 round-trips. Splits and dividends are concatenated into a
+    single list — apply_adjustment() dispatches by kind.
+
+    Phase 2.5 step 2c (this commit) wires dividends into the
+    orchestrator: every ticker now receives both kinds of corporate
+    action. Previously the orchestrator only fetched splits and
+    dividends sat in ``corporate_actions`` ignored. See PHASE2-ROADMAP
+    for the deferred-work context.
+    """
+    splits = _fetch_splits_for_ticker(ticker, session, timeout)
+    dividends = _fetch_dividends_for_ticker(ticker, session, timeout)
+    return splits + dividends
 
 
 def _load_cache(cache_path: Path) -> dict[str, str]:
@@ -248,7 +340,7 @@ def _apply_for_ticker(
         logger.info("ticker=%s no raw OHLCV rows; nothing to adjust", ticker)
         return 0
 
-    adjusted = apply_split_adjustment(raw_rows, actions)
+    adjusted = apply_adjustment(raw_rows, actions)
     if dry_run:
         logger.info(
             "ticker=%s dry-run: would upsert %d adjusted bars (from %d raw)",
@@ -413,7 +505,7 @@ def main(
                 continue
 
             try:
-                actions = _fetch_splits_for_ticker(ticker, session, args.timeout)
+                actions = _fetch_actions_for_ticker(ticker, session, args.timeout)
             except requests.RequestException as exc:
                 logger.warning(
                     "ticker=%s MOEX ISS fetch failed: %s: %s; skipping",
@@ -514,10 +606,13 @@ __all__ = [
     "PROGRESS_HEARTBEAT_EVERY",
     "_apply_for_ticker",
     "_build_store",
+    "_fetch_actions_for_ticker",
+    "_fetch_dividends_for_ticker",
     "_fetch_splits_for_ticker",
     "_is_fresh",
     "_list_tickers",
     "_load_cache",
+    "_parse_dividend_entry",
     "_save_cache",
     "main",
 ]
