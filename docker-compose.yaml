@@ -132,9 +132,11 @@ services:
       - alphard-net
 
   # BUGFIX (Phase 1.6 audit): init_postgres.sh runs as a one-shot
-  # service after postgres becomes healthy. It applies the
-  # 192.168.0.0/16 trust line to pg_hba.conf so any client from the
-  # internal subnet can authenticate without a password match.
+  # service after postgres becomes healthy. It applies a scoped
+  # pg_hba.conf trust line so Docker-internal clients can authenticate
+  # without a password match — the trust range is now narrowed from
+  # the legacy 192.168.0.0/16 (which covered 65k LAN addresses) to
+  # 172.16.0.0/12 (RFC1918 Docker bridge range, see issue #97).
   # Idempotent (skips if the line already exists).
   pg-init:
     image: alpine:3.20
@@ -156,20 +158,29 @@ services:
         # Run the same logic as scripts/init_postgres.sh, but in-container
         # (since hba_file is on the postgres container's filesystem).
         if grep -q '192.168.0.0/16 trust' "$$HBA" 2>/dev/null; then
-          echo "[pg-init] trust line already present, skipping"
+          echo "[pg-init] legacy 192.168.0.0/16 trust present, removing (issue #97)"
+          sed -i '/^host all all 192\.168\.0\.0\/16 trust$/d' "$$HBA" 2>/dev/null || true
+        fi
+        TRUST_CIDR="${POSTGRES_TRUST_SUBNET:-172.16.0.0/12}"
+        TRUST_RULE="host all all $${TRUST_CIDR} trust"
+        if grep -F "$$TRUST_RULE" "$$HBA" >/dev/null 2>&1; then
+          echo "[pg-init] trust line ($${TRUST_CIDR}) already present, skipping"
         else
           # Strip legacy 0.0.0.0/0 if present.
           sed -i '/^host all all 0\.0\.0\.0\/0 trust$/d' "$$HBA" 2>/dev/null || true
-          sed -i '1i host all all 192.168.0.0/16 trust' "$$HBA"
+          sed -i "1i $${TRUST_RULE}" "$$HBA"
           PGPASSWORD="$$POSTGRES_PASSWORD" psql -h alphard-postgres -U "$$POSTGRES_USER" \
             -d "$$POSTGRES_DB" -c 'SELECT pg_reload_conf()' >/dev/null
-          echo "[pg-init] injected 192.168.0.0/16 trust + pg_reload_conf()"
+          echo "[pg-init] injected $${TRUST_CIDR} trust + pg_reload_conf()"
         fi
         echo "[pg-init] OK"
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-alphard}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}
       POSTGRES_DB: ${POSTGRES_DB:-alphard}
+      # Issue #97: narrow the pg_hba.conf trust range to the RFC1918
+      # Docker bridge range by default. Operators can override via .env.
+      POSTGRES_TRUST_SUBNET: ${POSTGRES_TRUST_SUBNET:-172.16.0.0/12}
     networks:
       - alphard-net
     depends_on:

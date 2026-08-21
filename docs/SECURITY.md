@@ -83,6 +83,54 @@
 - ❌ Dedicated bridge `alphard-net` — нет отдельного network, всё в default bridge
 - 📅 Phase 2+: dedicated bridge, separate redis net, outbound allowlist (нет файрвола в compose)
 
+#### Level 2.1 — Postgres pg_hba.conf trust posture (issue #97)
+
+**Surface:**
+- `docker-compose.yaml` has a one-shot `pg-init` service that prepends
+  a `host all all <CIDR> trust` rule to `pg_hba.conf` so the bot can
+  authenticate under Docker-internal DNS even when scram hashes drift
+  (recovery safety net — see issue #73).
+- `scripts/init_postgres.sh` mirrors the same rule for off-compose
+  recovery runs.
+- The legacy CIDR was `192.168.0.0/16` — ~65k LAN addresses covered,
+  including any peer that might accidentally reach `alphard-postgres`
+  via port-forwarding or a future bridge misconfig.
+
+**Threats:**
+1. **LAN credential theft** — anyone on `.107`'s /16 segment with
+   reach to the postgres container could read or write the entire DB
+   (`decision_log`, `ohlcv_daily`, `ticker_universe`,
+   `corporate_actions`) without a password. Status: **mitigated** in
+   issue #97 — default CIDR narrowed to `172.16.0.0/12` (Docker
+   bridge range only).
+2. **Public exposure via misconfig** — historical `0.0.0.0/0` rule
+   (commit ~2026-08-18) would have exposed Postgres to the entire
+   internet if the container port were ever host-published. Status:
+   **mitigated** — explicit `sed -i '/^host all all 0\.0\.0\.0\/0
+   trust$/d'` removes any legacy `0.0.0.0/0` rule before the new
+   scoped rule is added.
+
+**Defenses:**
+- `docker-compose.yaml` `pg-init` and `scripts/init_postgres.sh` now
+  default `POSTGRES_TRUST_SUBNET=172.16.0.0/12` (RFC1918 Docker bridge
+  range). Operators can override per-deploy via `.env` if their bridge
+  subnet differs.
+- Both files strip the legacy `192.168.0.0/16` rule on the next
+  redeploy — no manual cleanup required.
+- The bot's primary auth path is **password** (`POSTGRES_PASSWORD`
+  sourced from `.env`, fail-fast at startup). Trust is a recovery
+  fallback only; the bot does not depend on it.
+
+**Operator actions (out of band for code PRs):**
+- After redeploy, verify with
+  `psql -h alphard-postgres -U alphard -d alphard -c "SELECT type,
+  auth_method FROM pg_hba_file_rules WHERE address NOT IN ('localhost',
+  '::1')"`: no row should have `address='192.168.0.0/16'` and
+  `auth_method='trust'`.
+- If your `alphard-net` bridge lives outside `172.16.0.0/12`
+  (uncommon — Docker defaults to `172.17-32.0.0/16`), set
+  `POSTGRES_TRUST_SUBNET` explicitly in `.env`.
+
 ### Level 3: Broker-specific hardening
 
 **Tinkoff sandbox vs real:**

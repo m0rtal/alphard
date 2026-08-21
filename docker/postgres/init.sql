@@ -33,5 +33,8 @@ INSERT INTO _auth_probe (id, probed_at, source)
 GRANT ALL PRIVILEGES ON TABLE _auth_probe TO CURRENT_USER;
 GRANT USAGE, SELECT ON SEQUENCE _auth_probe_id_seq TO CURRENT_USER;
 
--- pg_hba.conf trust line for our subnet (mounted at /usr/local/bin/alphard-pg-healthcheck.sh + pg_hba.conf override):
--- Run scripts/init_postgres.sh on host to add 'host all all 0.0.0.0/0 trust' to pg_hba.conf
+-- pg_hba.conf trust line for the Docker-bridge subnet. See
+-- scripts/init_postgres.sh (and the pg-init one-shot in
+-- docker-compose.yaml) for the active rule. As of issue #97 the trust
+-- range defaults to 172.16.0.0/12 (Docker bridge range), not the
+-- legacy 192.168.0.0/16 LAN range and explicitly NOT 0.0.0.0/0.
