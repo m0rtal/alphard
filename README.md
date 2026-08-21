@@ -38,7 +38,7 @@ Alphard — автономный multi-agent trading system:
 
 | Agent | Phase | Status |
 |---|---|---|
-| Data | 1.3 → 2.5/2.6 | ✅ Tinkoff (gRPC + history-data) + MOEX ISS + apply_split_adjustment, multi-source ready |
+| Data | 1.3 → 2.5/2.6 | ✅ Tinkoff (gRPC + history-data) + MOEX ISS + apply_adjustment (splits+dividends), multi-source ready |
 | Risk | 1.1 | ✅ 35 tests, fail-safe limits frozen, drawdown tracker (peak-equity) |
 | Quality | 1.2 | ✅ 3 уровня (CRITICAL/HIGH/MEDIUM/LOW), cross_source_smoke (PR #27) |
 | Broker | 1.3 → 1.4 | ✅ TinkoffAccount, sandbox switch, LIVE_TRADING=false hardlock |
@@ -136,7 +136,7 @@ alphard/
 │   │   ├── fallback_loader.py  # 3-source fallback chain
 │   │   ├── pg_store.py         # psycopg v3, ON CONFLICT, connect_timeout=10
 │   │   ├── sqlite_store.py     # Local fallback (InMemorySQLiteStore for tests)
-│   │   ├── adjustment.py       # apply_split_adjustment() pure function
+│   │   ├── adjustment.py       # apply_split_adjustment / apply_dividend_adjustment / apply_adjustment
 │   │   ├── token_bucket.py     # Tinkoff rate-limit guard (capacity ≥ 1.0)
 │   │   ├── quality/            # 3-tier quality gate
 │   │   └── models.py           # TickerMeta, OHLCVRow, CorporateAction, SourceType
@@ -263,7 +263,7 @@ Branch protection на `main`:
 | 2.2 Quant Agent | ⏳ not started | Phase 2.4+ |
 | 2.3 Macro Agent | 🟡 in flight (t_3ff3391f) | CBR+USD/RUB+IMOEX, regime classifier deterministic |
 | 2.4 ML pipeline | ⏳ not started | |
-| 2.5 Adjusted prices | ✅ step 1 merged (PR #45) | apply_split_adjustment + MOEX fetcher |
+| 2.5 Adjusted prices | ✅ step 1 (PR #45) + step 2b (PR #74) + step 2c (this PR) | apply_adjustment (splits+dividends) + MOEX fetcher + orchestrator |
 | 2.6 Cross-source | ✅ step 1 (PR #27), 🟡 step 2 (t_5596e3ba) | multi-source schema migration |
 | 2.7 Delisted cron | ✅ merged (PR #37) | |
 | 2.8 Metrics /metrics + /health | ✅ merged (PR #52, #53) | Grafana live on .107:3300 |
@@ -272,8 +272,6 @@ Branch protection на `main`:
 
 ### Backlog (Phase 2 → 3)
 
-- Phase 2.5 step 2b — wire MOEX fetcher + apply_split_adjustment into backfill
-  pipeline (t_5f768374)
 - Phase 2.6 step 3 — cross-source validation cron (depends on step 2)
 - Backfill speed: 16 мин/тикер × 3253 ≈ 40 дней — non-production rate
 - 18 old autostash entries (`git stash list`) — destructive cleanup pending user OK

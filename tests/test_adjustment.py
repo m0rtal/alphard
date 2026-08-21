@@ -32,7 +32,11 @@ _SRC_PATH = str(Path(__file__).resolve().parent.parent / "src")
 if _SRC_PATH not in sys.path:
     sys.path.insert(0, _SRC_PATH)
 
-from src.data.adjustment import apply_split_adjustment  # noqa: E402
+from src.data.adjustment import (  # noqa: E402
+    apply_adjustment,
+    apply_dividend_adjustment,
+    apply_split_adjustment,
+)
 from src.data.models import CorporateAction, OHLCVRow  # noqa: E402
 
 # ---------- helpers ----------
@@ -68,6 +72,16 @@ def _split(ts: date, value: str) -> CorporateAction:
         ts=ts,
         kind="split",
         value=Decimal(value),
+        source="moex",
+    )
+
+
+def _dividend(ts: date, amount: str) -> CorporateAction:
+    return CorporateAction(
+        ticker="SBER",
+        ts=ts,
+        kind="dividend",
+        value=Decimal(amount),
         source="moex",
     )
 
@@ -373,3 +387,377 @@ def test_decimal_precision_preserved():
     assert isinstance(out[0].close, Decimal)
     assert out[0].close * Decimal("7") == Decimal("100")
     assert out[0].volume * Decimal("1") / Decimal("7") == Decimal("1000")
+
+
+# ===========================================================================
+# apply_dividend_adjustment
+# ===========================================================================
+#
+# Dividend contract:
+#   * Only ``adj_close`` is modified — raw close/open/high/low/volume are
+#     untouched (dividends are a return-of-capital event, not a price
+#     multiplier).
+#   * Bars with ts < ex_date have adj_close reduced by the dividend amount.
+#   * Bars with ts >= ex_date are unchanged.
+#   * Multiple dividends compose additively.
+#   * Splits are ignored (they have their own stage).
+#   * Zero / negative dividend amounts are invalid.
+#   * Negative result (dividend larger than the bar's adj_close) raises.
+
+
+def test_dividend_empty_rows_returns_empty():
+    out = apply_dividend_adjustment([], [_dividend(date(2026, 6, 1), "5")])
+    assert out == []
+
+
+def test_dividend_empty_actions_returns_rows_unchanged():
+    rows = [_make_row(date(2026, 1, 1), close="100", volume="1000")]
+    out = apply_dividend_adjustment(rows, [])
+    assert out == rows
+    assert rows[0].close == Decimal("100")
+    assert rows[0].adj_close == Decimal("100")
+
+
+def test_dividend_at_row_date_unchanged():
+    """A bar at the dividend ex-date is the source-feed regime — already ex-div."""
+    rows = [_make_row(date(2026, 6, 1), close="100")]
+    out = apply_dividend_adjustment(rows, [_dividend(date(2026, 6, 1), "5")])
+    assert out[0] == rows[0]
+
+
+def test_dividend_pre_ex_date_subtracts_from_adj_close_only():
+    """Bar BEFORE ex-date: only adj_close drops; raw OHLC and volume intact."""
+    rows = [
+        OHLCVRow(
+            ticker="SBER",
+            ts=date(2026, 5, 1),
+            open=Decimal("100"),
+            high=Decimal("110"),
+            low=Decimal("99"),
+            close=Decimal("105"),
+            volume=Decimal("1000"),
+            adj_close=Decimal("105"),
+        )
+    ]
+    out = apply_dividend_adjustment(rows, [_dividend(date(2026, 6, 1), "7")])
+    assert out[0].adj_close == Decimal("98")  # 105 - 7
+    # Raw OHLC + volume untouched.
+    assert out[0].open == Decimal("100")
+    assert out[0].high == Decimal("110")
+    assert out[0].low == Decimal("99")
+    assert out[0].close == Decimal("105")
+    assert out[0].volume == Decimal("1000")
+
+
+def test_dividend_post_ex_date_unchanged():
+    """Bar AFTER ex-date: investor already received the cash, no further discount."""
+    rows = [_make_row(date(2026, 7, 1), close="100")]
+    out = apply_dividend_adjustment(rows, [_dividend(date(2026, 6, 1), "5")])
+    assert out[0] == rows[0]
+
+
+def test_dividend_only_future_dividends_apply():
+    """A dividend whose ex-date is BEFORE a bar must NOT affect that bar."""
+    rows = [_make_row(date(2026, 6, 1), close="100")]
+    out = apply_dividend_adjustment(rows, [_dividend(date(2026, 5, 1), "5")])
+    assert out[0] == rows[0]
+
+
+def test_dividend_zero_amount_is_valid():
+    """Zero dividends are technically valid (special / non-cash distributions)."""
+    rows = [_make_row(date(2026, 5, 1), close="100")]
+    out = apply_dividend_adjustment(rows, [_dividend(date(2026, 6, 1), "0")])
+    # adj_close unchanged because cumulative_dividend == 0 -> no copy.
+    assert out[0] == rows[0]
+
+
+def test_dividend_negative_amount_raises():
+    rows = [_make_row(date(2026, 5, 1), close="100")]
+    with pytest.raises(ValueError, match="must be non-negative"):
+        apply_dividend_adjustment(rows, [_dividend(date(2026, 6, 1), "-1")])
+
+
+def test_dividend_amount_validator_rejects_non_dividend_kind():
+    """The dividend validator rejects CorporateAction of kind != 'dividend'.
+
+    Filtering at the call-site keeps apply_dividend_adjustment tolerant
+    of mixed inputs (a unified ``apply_adjustment`` call passes both
+    splits and dividends, and the dividend filter strips them). The
+    validator branch is exercised when a non-dividend action slips
+    past the filter — we trigger it directly here so the contract is
+    pinned even though the public path doesn't reach it.
+    """
+    from src.data import adjustment as adj_mod
+
+    split = CorporateAction(
+        ticker="SBER",
+        ts=date(2026, 6, 1),
+        kind="split",
+        value=Decimal("2"),
+        source="moex",
+    )
+    with pytest.raises(ValueError, match="not 'dividend'"):
+        adj_mod._dividend_amount(split)
+
+
+def test_dividend_negative_result_raises():
+    """Dividend larger than the bar's adj_close would produce a negative value."""
+    rows = [_make_row(date(2026, 5, 1), close="10")]
+    with pytest.raises(ValueError, match="negative adj_close"):
+        apply_dividend_adjustment(rows, [_dividend(date(2026, 6, 1), "20")])
+
+
+def test_dividend_multiple_dividends_compose_additively():
+    """Two pre-bar dividends both subtract from adj_close."""
+    rows = [_make_row(date(2026, 1, 1), close="100")]
+    actions = [
+        _dividend(date(2026, 3, 1), "5"),
+        _dividend(date(2026, 5, 1), "7"),
+    ]
+    out = apply_dividend_adjustment(rows, actions)
+    assert out[0].adj_close == Decimal("88")  # 100 - 5 - 7
+
+
+def test_dividend_mixed_windowed_dividends():
+    """Some dividends before the bar, some after — only future ones apply."""
+    rows = [
+        _make_row(date(2026, 1, 1), close="100"),
+        _make_row(date(2026, 4, 1), close="100"),
+        _make_row(date(2026, 6, 1), close="100"),
+    ]
+    actions = [
+        _dividend(date(2026, 2, 1), "5"),  # future for Jan, future for Apr, past for Jun
+        _dividend(date(2026, 5, 1), "7"),  # future for Jan, future for Apr, past for Jun
+    ]
+    out = apply_dividend_adjustment(rows, actions)
+    # Jan row: both future. 100 - 5 - 7 = 88.
+    assert out[0].adj_close == Decimal("88")
+    # Apr row: only May dividend is future. 100 - 7 = 93.
+    assert out[1].adj_close == Decimal("93")
+    # Jun row: both dividends are past. adj_close unchanged.
+    assert out[2].adj_close == Decimal("100")
+
+
+def test_dividend_non_dividend_kinds_ignored():
+    """Splits and 'change' events interleaved with dividends are ignored."""
+    rows = [_make_row(date(2026, 1, 1), close="100")]
+    actions = [
+        _split(date(2026, 6, 1), "2"),
+        _dividend(date(2026, 6, 1), "5"),
+        CorporateAction(
+            ticker="SBER",
+            ts=date(2026, 4, 1),
+            kind="change",
+            value=Decimal("0"),
+            source="moex",
+        ),
+    ]
+    out = apply_dividend_adjustment(rows, actions)
+    # Only the dividend applies — adj_close drops by 5.
+    assert out[0].adj_close == Decimal("95")
+    # Raw OHLC + volume unchanged (splits ignored here).
+    assert out[0].close == Decimal("100")
+    assert out[0].volume == Decimal("1000")
+
+
+def test_dividend_unsorted_actions_still_correct():
+    """Action list order should not affect output."""
+    rows = [_make_row(date(2026, 1, 1), close="100")]
+    actions = [
+        _dividend(date(2026, 7, 1), "3"),
+        _dividend(date(2026, 6, 1), "5"),
+    ]
+    out = apply_dividend_adjustment(rows, actions)
+    assert out[0].adj_close == Decimal("92")  # 100 - 5 - 3
+
+
+def test_dividend_idempotency_raw_input_run_twice():
+    """Running the function twice on the SAME raw input gives the same result.
+
+    The function is not idempotent on already-adjusted input — applying a
+    dividend to an already-discounted adj_close would over-discount. Callers
+    that re-apply must always feed the function raw (pre-adjustment) bars.
+    """
+    raw_rows = [_make_row(date(2026, 1, 1), close="100")]
+    actions = [_dividend(date(2026, 6, 1), "5")]
+    once = apply_dividend_adjustment(raw_rows, actions)
+    twice = apply_dividend_adjustment(raw_rows, actions)
+    assert twice == once
+
+
+def test_dividend_input_not_mutated():
+    """apply_dividend_adjustment must not mutate input rows."""
+    row = _make_row(date(2026, 1, 1), close="100")
+    actions = [_dividend(date(2026, 6, 1), "5")]
+    out = apply_dividend_adjustment([row], actions)
+    assert row.adj_close == Decimal("100")  # input preserved
+    assert out[0] is not row  # output is a new object
+
+
+def test_dividend_returns_new_object_per_changed_row():
+    """Changed rows are model_copied (new objects), unchanged rows are
+    passed through (same object reference)."""
+    rows = [
+        _make_row(date(2026, 5, 1), close="100"),  # will change (pre-ex)
+        _make_row(date(2026, 7, 1), close="100"),  # unchanged (post-ex)
+    ]
+    actions = [_dividend(date(2026, 6, 1), "5")]
+    out = apply_dividend_adjustment(rows, actions)
+    assert out[0] is not rows[0]
+    assert out[1] is rows[1]
+
+
+# ===========================================================================
+# apply_adjustment (unified entry point — split + dividend composition)
+# ===========================================================================
+
+
+def test_apply_adjustment_empty_inputs_returns_input():
+    rows = [_make_row(date(2026, 1, 1), close="100")]
+    out = apply_adjustment(rows, [])
+    # Empty actions: both stages are no-ops. Output is the same object
+    # because apply_split_adjustment returns list(rows) for empty splits,
+    # and apply_dividend_adjustment returns list(rows) for empty dividends.
+    # We accept either same-object or a fresh list as long as values match.
+    assert len(out) == 1
+    assert out[0] == rows[0]
+
+
+def test_apply_adjustment_only_splits():
+    """If no dividends are present, output matches apply_split_adjustment."""
+    rows = [_make_row(date(2026, 5, 1), close="100", volume="1000")]
+    actions = [_split(date(2026, 6, 1), "2")]
+    out = apply_adjustment(rows, actions)
+    assert out[0].close == Decimal("50")
+    assert out[0].volume == Decimal("2000")
+    assert out[0].adj_close == Decimal("50")
+
+
+def test_apply_adjustment_only_dividends():
+    """If no splits are present, output matches apply_dividend_adjustment."""
+    rows = [_make_row(date(2026, 5, 1), close="100")]
+    actions = [_dividend(date(2026, 6, 1), "7")]
+    out = apply_adjustment(rows, actions)
+    # Only adj_close drops; raw OHLC + volume unchanged.
+    assert out[0].adj_close == Decimal("93")
+    assert out[0].close == Decimal("100")
+    assert out[0].volume == Decimal("1000")
+
+
+def test_apply_adjustment_split_then_dividend_compose():
+    """Splits scale the price level; dividends subtract from adj_close.
+
+    A bar at ts=T with a 1:2 split at ts=S (S > T) and a 5-RUB dividend at
+    ts=D (D > T) should produce:
+      - raw open/high/low/close: divided by 2 (split effect)
+      - volume: multiplied by 2
+      - adj_close: (raw adj_close / 2) - 5  — the split halves the price
+        level first, then the dividend subtracts from the post-split
+        adj_close.
+    """
+    rows = [_make_row(date(2026, 5, 1), close="100", volume="1000")]
+    actions = [
+        _split(date(2026, 6, 1), "2"),
+        _dividend(date(2026, 7, 1), "5"),
+    ]
+    out = apply_adjustment(rows, actions)
+    # Final state: split halved the price level, then dividend subtracted 5.
+    # adj_close goes through BOTH stages (split first, then dividend), so
+    # the final value is (100/2) - 5 = 45.
+    assert out[0].close == Decimal("50")
+    assert out[0].volume == Decimal("2000")
+    assert out[0].adj_close == Decimal("45")
+    # Raw OHLC + volume still hold the split-adjusted values.
+    assert out[0].open == Decimal("50")
+    assert out[0].high == Decimal("50")
+    assert out[0].low == Decimal("50")
+
+
+def test_apply_adjustment_dividend_then_split_compose_correctly():
+    """Reversed action list (split after dividend by date) — same outcome.
+
+    Sorting is by action.ts so a dividend dated before a split still
+    discounts the bar before the split scales it. With both dated in
+    the future relative to the bar, the composition is the same as if
+    they were listed in either order.
+    """
+    rows = [_make_row(date(2026, 1, 1), close="100", volume="1000")]
+    actions = [
+        _dividend(date(2026, 6, 1), "5"),  # first chronologically
+        _split(date(2026, 7, 1), "2"),  # second chronologically
+    ]
+    out = apply_adjustment(rows, actions)
+    # Bar at Jan: both future. Composition: (100/2) - 5 = 45.
+    assert out[0].adj_close == Decimal("45")
+    assert out[0].close == Decimal("50")
+    assert out[0].volume == Decimal("2000")
+
+
+def test_apply_adjustment_split_halves_then_dividend_uses_pre_split_scale():
+    """Documented invariant: dividends subtract from POST-SPLIT adj_close.
+
+    The convention matters because MOEX ISS quotes dividend amounts in
+    post-split shares. A 1:2 split on 2026-06-01 means a 10 RUB dividend
+    declared on 2026-06-15 is per post-split share — the bar BEFORE
+    the split needs adj_close first divided by 2 (post-split scale),
+    then have 10 subtracted.
+    """
+    rows = [_make_row(date(2026, 5, 1), close="200", volume="4000")]
+    actions = [
+        _split(date(2026, 6, 1), "2"),  # pre: 200 -> 100
+        _dividend(date(2026, 6, 15), "10"),  # adj_close - 10
+    ]
+    out = apply_adjustment(rows, actions)
+    assert out[0].adj_close == Decimal("90")  # 100 - 10
+    assert out[0].close == Decimal("100")  # 200 / 2
+    assert out[0].volume == Decimal("8000")  # 4000 * 2
+
+
+def test_apply_adjustment_change_kind_ignored():
+    """'change' (ticker rename) actions are metadata; they don't move math."""
+    rows = [_make_row(date(2026, 1, 1), close="100")]
+    actions = [
+        _dividend(date(2026, 6, 1), "5"),
+        CorporateAction(
+            ticker="SBER",
+            ts=date(2026, 4, 1),
+            kind="change",
+            value=Decimal("0"),
+            source="moex",
+        ),
+    ]
+    out = apply_adjustment(rows, actions)
+    assert out[0].adj_close == Decimal("95")  # 100 - 5
+    # close + volume untouched (no splits).
+    assert out[0].close == Decimal("100")
+
+
+def test_apply_adjustment_iterator_consumed_once():
+    """Passing a one-shot iterator must still produce a fully-adjusted result.
+
+    apply_adjustment must materialise the iterator before delegating to
+    the split stage, because the dividend stage needs to iterate again.
+    A naive implementation that forwarded the iterator twice would
+    silently drop the dividend math.
+    """
+    rows = [_make_row(date(2026, 1, 1), close="100")]
+
+    def gen():
+        yield _split(date(2026, 6, 1), "2")
+        yield _dividend(date(2026, 7, 1), "5")
+
+    out = apply_adjustment(rows, gen())
+    assert out[0].adj_close == Decimal("45")  # (100/2) - 5
+    assert out[0].volume == Decimal("2000")
+
+
+def test_apply_adjustment_idempotency_raw_input_run_twice():
+    """Same raw input + same actions -> same output, twice in a row."""
+    raw_rows = [_make_row(date(2026, 1, 1), close="100", volume="1000")]
+    actions = [
+        _split(date(2026, 6, 1), "2"),
+        _dividend(date(2026, 7, 1), "5"),
+    ]
+    once = apply_adjustment(raw_rows, actions)
+    twice = apply_adjustment(raw_rows, actions)
+    assert twice == once

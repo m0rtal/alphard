@@ -113,10 +113,11 @@ Multipliers: `risk_off` → 0.50, `risk_on_reduced` → 0.75, `neutral` → 1.00
 **PR #17 (commit `e406488`):** Added fail-safe on VALIDATE/RISK exception + TOCTOU guard.
 **Next:** Wire Quant + Macro into the `stages` list. Coordinator `stage 0 = MACRO`, `stage 1 = QUANT`, `stage 2 = VALIDATE`, `stage 3 = RISK`, `stage 4 = EXECUTE`, `stage 5 = AUDIT`.
 
-### 2.4 — Adjusted prices pipeline (split adjustment, Phase 2.5 step 2b)
+### 2.4 — Adjusted prices pipeline (Phase 2.5 step 2b/2c)
 
-**What:** Phase 2.4 ships `apply_split_adjustment` end-to-end:
-splits + adjusted OHLCV bars land in Postgres, ready for backtests.
+**What:** Phase 2.5 ships the full split+dividend adjustment pipeline:
+splits + dividends + adjusted OHLCV bars land in Postgres, ready for
+backtests.
 
 **Steps:**
 - **Step 1 — pure math (PR #45, merged 2026-08-20):**
@@ -126,14 +127,28 @@ splits + adjusted OHLCV bars land in Postgres, ready for backtests.
 - **Step 2a — fetcher (PR #54, merged 2026-08-20):**
   `scripts/fetch_moex_corporate_actions.py` — MOEX ISS splits + (optional)
   dividends into a JSON snapshot. 24 tests. Standalone utility.
-- **Step 2b — apply orchestrator (issue #74, branch
+- **Step 2b — apply orchestrator (PR #74 / issue #74, branch
   `feat/issue-74-corp-actions-apply`):**
   `scripts/apply_corporate_actions.py` — pulls splits per ticker from
   step 2a, applies step 1 to raw OHLCV, persists to a new parallel
-  table `ohlcv_daily_adj` (FK to `ticker_universe`). 16 orchestrator
+  table `ohlcv_daily_adj` (FK to `ticker_universe`). 25 orchestrator
   tests + 9 daemon-thread tests. Daemon runs weekly via
   `src/main.py::_corp_actions_apply_loop` (mirrors `_delisted_sync_loop`,
   first run 24h after launch, then every 7 days).
+- **Step 2c — dividend handling (PR for issue #74 follow-up, branch
+  `feat/issue-dividend-apply`):** extends the pure-math stage with
+  `apply_dividend_adjustment` (subtracts cumulative dividends from
+  `adj_close` for bars before each ex-date; raw OHLC and volume
+  untouched — dividends are a return-of-capital event, not a
+  price-multiplier event) and introduces the unified
+  `apply_adjustment()` entry point that runs splits first, then
+  dividends. The orchestrator (`scripts/apply_corporate_actions.py`)
+  now fetches dividends per ticker (`_fetch_dividends_for_ticker`) and
+  feeds them into the same `apply_adjustment()` call as splits — no
+  schema change, same parallel `ohlcv_daily_adj` table. 30 new tests
+  in `tests/test_adjustment.py` + 13 new orchestrator tests in
+  `tests/test_apply_corporate_actions.py`. PHASE2-ROADMAP deferred
+  dividend handling past step 2b; step 2c lands it.
 - **Step 3 — migration to ohlcv_daily (planned, not yet scheduled):**
   When PR #75 lands the `source` column on `ohlcv_daily`, the parallel
   `ohlcv_daily_adj` table is migrated:
@@ -151,10 +166,15 @@ splits + adjusted OHLCV bars land in Postgres, ready for backtests.
    column to tag adjusted bars. The parallel table is the storage
    target that does not depend on merge order.
 
-**Deferred to Phase 3+:** Dividend adjustment (`kind='dividend'`)
-needs total-return-index math — out of scope for step 2b. The fetcher
-already emits dividends; they wait in `corporate_actions` for the
-follow-up.
+**Done in step 2c (branch `feat/issue-dividend-apply`):** Dividend
+adjustment (`kind='dividend'`) now flows through the same orchestrator
+as splits. The pure-math stage (`apply_dividend_adjustment`) subtracts
+cumulative dividends from `adj_close` on pre-ex-date bars; the
+orchestrator's `_fetch_dividends_for_ticker` pulls dividends per
+ticker from MOEX ISS alongside splits. 43 new tests
+(`test_adjustment.py` + `test_apply_corporate_actions.py`) cover the
+dividend path, end-to-end composition with splits, and defensive
+filters (negative amounts, malformed dates).
 
 **Sources:** `scripts/fetch_moex_corporate_actions.py` (step 2a fetcher),
 `src/data/adjustment.py` (step 1 math), `scripts/apply_corporate_actions.py`
