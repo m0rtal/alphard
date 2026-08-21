@@ -133,7 +133,18 @@ def _http_get(url: str, *, timeout: int = HTTP_TIMEOUT_SECONDS) -> FetchResult:
             logger.warning(f"GET {url} URLError on attempt {attempt + 1}/{MAX_RETRIES}: {exc.reason}")
         if attempt < MAX_RETRIES - 1:
             time.sleep(RETRY_BACKOFF_BASE_SECONDS * (2**attempt))
-    assert last_exc is not None
+    if last_exc is None:
+        # Defence-in-depth: every branch of the retry loop either
+        # returned a successful payload or appended to ``last_exc``. If
+        # we got here with nothing, the loop invariant is broken
+        # (e.g. MAX_RETRIES was set to 0, or a future refactor dropped
+        # an except branch). Raising a clear RuntimeError beats an
+        # AssertionError (stripped under ``python -O``) or, worse, an
+        # UnboundLocalError pointing at this line and not the real cause.
+        raise RuntimeError(
+            "_http_get: retry loop exited with no result and no exception "
+            f"(MAX_RETRIES={MAX_RETRIES}); this is a code bug, not a network error"
+        )
     raise last_exc
 
 
