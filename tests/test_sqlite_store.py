@@ -589,3 +589,51 @@ class TestAdjustedOhlcv:
         assert sqlite_store.count_ohlcv_adj("SBER") == len(sample_ohlcv_rows)
         rows = sqlite_store.query_ohlcv_adj("SBER", date(2000, 1, 1), date(2100, 1, 1))
         assert len(rows) == len(sample_ohlcv_rows)
+
+
+# -----------------------------------------------------------------------------
+# _row_to_ticker v1 fixture (issue #104)
+# -----------------------------------------------------------------------------
+
+
+def test_row_to_ticker_v1_nine_columns_defaults_source_tkf() -> None:
+    """Issue #104: a 9-column v1 row (no source) defaults source to "tkf"
+    instead of crashing on r[9] (listed_at)."""
+    from src.data.sqlite_store import _row_to_ticker
+
+    # sqlite list_tickers SELECT returns 10 cols (no class_code), so a v1
+    # fixture without the source column is a 9-tuple ending at listed_at.
+    row = (
+        "SBER",  # ticker
+        "BBG004730N88",  # figi
+        "Sberbank",  # name
+        10,  # lot
+        "RU0009029540",  # isin
+        "RUB",  # currency
+        False,  # delisted
+        None,  # delisted_at
+        "2020-01-01",  # listed_at (ISO string as sqlite returns)
+    )
+    m = _row_to_ticker(row)
+    assert m.ticker == "SBER"
+    assert m.source == "tkf"
+
+
+def test_row_to_ticker_v2_ten_columns_uses_explicit_source() -> None:
+    """v2-shape: source column is at r[9] and must be honored verbatim."""
+    from src.data.sqlite_store import _row_to_ticker
+
+    row = (
+        "SBER",
+        "BBG004730N88",
+        "Sberbank",
+        10,
+        "RU0009029540",
+        "RUB",
+        False,
+        None,
+        "2020-01-01",
+        "moex",
+    )
+    m = _row_to_ticker(row)
+    assert m.source == "moex"

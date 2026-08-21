@@ -412,6 +412,10 @@ class InMemorySQLiteStore(DataStore):
 
 
 def _row_to_ticker(r: Any) -> TickerMeta:
+    # Issue #104: defensively handle v1-shape fixtures (no source column).
+    # The sqlite list_tickers SELECT always returns 10 columns with source
+    # at r[9], but if a caller passes a legacy 9-tuple (no source) default
+    # to "tkf" — same convention as pg_store._row_to_ticker.
     return TickerMeta(
         ticker=r[0],
         figi=r[1],
@@ -422,7 +426,7 @@ def _row_to_ticker(r: Any) -> TickerMeta:
         delisted=bool(r[6]),
         delisted_at=date.fromisoformat(r[7]) if r[7] else None,
         listed_at=date.fromisoformat(r[8]) if r[8] else None,
-        source=r[9],
+        source=(r[9] if len(r) > 9 else "tkf"),
     )
 
 
