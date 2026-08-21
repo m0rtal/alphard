@@ -117,17 +117,14 @@ class TestCompose:
         bot = data["services"]["alphard-bot"]
         deps = bot.get("depends_on", [])
         if isinstance(deps, dict):
-            assert deps.get("pg-init", {}).get("condition") == (
-                "service_completed_successfully"
-            ), (
+            assert deps.get("pg-init", {}).get("condition") == ("service_completed_successfully"), (
                 "alphard-bot.depends_on.pg-init.condition must be "
                 "service_completed_successfully so the trust line is "
                 "applied before the bot tries to connect"
             )
         else:
             assert "pg-init" in deps, (
-                "alphard-bot must depend on pg-init so the trust line is "
-                "applied before the bot tries to connect"
+                "alphard-bot must depend on pg-init so the trust line is " "applied before the bot tries to connect"
             )
 
     def test_bot_depends_on_postgres_health(self) -> None:
