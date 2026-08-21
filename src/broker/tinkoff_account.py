@@ -16,7 +16,6 @@ import json
 import logging
 import os
 
-import time
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Optional
@@ -29,6 +28,7 @@ from src.broker.orders import (
     OrderStatus,
     OrderType,
 )
+from src.data.token_bucket import TokenBucket
 
 logger = logging.getLogger("alphard.broker.tinkoff")
 
@@ -108,7 +108,18 @@ class TinkoffAccount(BrokerAccount):
         self._account_id = account_id
         self._risk_gate = risk_gate
         self._rate_limit_per_sec = rate_limit_per_sec
-        self._last_request_ts: list[float] = []
+        # Issue #103: use the shared, thread-safe TokenBucket primitive
+        # instead of a hand-rolled list-without-lock. Two threads calling
+        # place_order concurrently used to both observe an empty list,
+        # both append, and burst above the SLA (Tinkoff's server-side
+        # rate-limiter then 429s — order silently rejected AFTER RiskGate
+        # had already approved). TokenBucket.acquire() is documented
+        # thread-safe and is the same primitive data loaders use
+        # (src/data/token_bucket.py).
+        self._rate_bucket = TokenBucket(
+            rate=float(rate_limit_per_sec),
+            window_seconds=1.0,
+        )
         # Issue #32: peak-equity high-water mark tracker. Holds the
         # maximum total_equity observed across this account's history so
         # that _check_drawdown() in src/risk/gate.py can compute
@@ -174,15 +185,15 @@ class TinkoffAccount(BrokerAccount):
         return self._token.startswith("t.")
 
     def _rate_limit_acquire(self) -> None:
-        """Block until we have capacity for 1 more request."""
-        now = time.time()
-        window_start = now - 1.0
-        self._last_request_ts = [t for t in self._last_request_ts if t > window_start]
-        if len(self._last_request_ts) >= self._rate_limit_per_sec:
-            sleep_for = 1.0 - (now - self._last_request_ts[0])
-            if sleep_for > 0:
-                time.sleep(sleep_for)
-        self._last_request_ts.append(time.time())
+        """Block until we have capacity for 1 more request.
+
+        Issue #103: delegates to the shared ``TokenBucket`` primitive
+        which is documented thread-safe (``threading.Lock`` inside
+        ``acquire``). The previous hand-rolled list-without-lock
+        implementation could burst above the SLA under concurrent
+        ``place_order`` calls.
+        """
+        self._rate_bucket.acquire()
 
     def _build_intent_and_state(
         self,
