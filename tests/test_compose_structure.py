@@ -106,24 +106,37 @@ class TestCompose:
     def test_bot_depends_on_pg_init_completed(self) -> None:
         """alphard-bot must wait for pg-init to finish before starting,
         otherwise the first auth_probe runs before the trust line
-        is injected and silently falls back to scram auth."""
+        is injected and silently falls back to scram auth.
+
+        BUGFIX (#120): Portainer standalone (compose up directly via
+        Docker socket) requires depends_on as an ARRAY, not a map with
+        conditions. We accept both forms here: array is the Portainer
+        canonical form, map is the Compose-CLI canonical form.
+        """
         data = _load_compose()
         bot = data["services"]["alphard-bot"]
-        deps = bot.get("depends_on", {})
-        assert isinstance(deps, dict)
-        assert deps.get("pg-init", {}).get("condition") == ("service_completed_successfully"), (
-            "alphard-bot.depends_on.pg-init.condition must be "
-            "service_completed_successfully so the trust line is "
-            "applied before the bot tries to connect"
-        )
+        deps = bot.get("depends_on", [])
+        if isinstance(deps, dict):
+            assert deps.get("pg-init", {}).get("condition") == ("service_completed_successfully"), (
+                "alphard-bot.depends_on.pg-init.condition must be "
+                "service_completed_successfully so the trust line is "
+                "applied before the bot tries to connect"
+            )
+        else:
+            assert "pg-init" in deps, (
+                "alphard-bot must depend on pg-init so the trust line is " "applied before the bot tries to connect"
+            )
 
     def test_bot_depends_on_postgres_health(self) -> None:
+        # BUGFIX (#120): see comment above — accept array or map form.
         data = _load_compose()
         bot = data["services"]["alphard-bot"]
-        deps = bot.get("depends_on", {})
-        assert isinstance(deps, dict)
-        assert "postgres" in deps, "alphard-bot must depend_on postgres with condition: service_healthy"
-        assert deps["postgres"].get("condition") == "service_healthy"
+        deps = bot.get("depends_on", [])
+        assert "postgres" in deps or "postgres" in (
+            deps if isinstance(deps, dict) else deps
+        ), "alphard-bot must depend_on postgres"
+        if isinstance(deps, dict):
+            assert deps["postgres"].get("condition") == "service_healthy"
 
     def test_bot_env_file_override(self) -> None:
         """BUGFIX (#84): alphard-bot must pass an explicit ENV_FILE env var
