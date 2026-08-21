@@ -253,6 +253,15 @@ class _FakeCursor:
     def close(self) -> None:
         self.closed = True
 
+    # Context-manager protocol — psycopg2 connections expose ``cursor()``
+    # as a context manager (``with conn.cursor() as cur:``), so the
+    # production code now relies on that. Test fakes must match.
+    def __enter__(self) -> "_FakeCursor":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
 
 class _FakePgConn:
     """Duck-typed psycopg2 connection — has ``.cursor()`` but NOT ``.execute``."""
@@ -310,3 +319,66 @@ def test_latest_regime_postgres_returns_none_when_empty() -> None:
 
     fake = _EmptyPgConn()
     assert persistence.latest_regime(fake) is None  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Issue #95: cursor-acquisition failure must propagate, not be masked by
+# ``UnboundLocalError`` on the manual try/finally pattern.
+# ---------------------------------------------------------------------------
+
+
+class _FlakyCursorFactory:
+    """conn.cursor() raises — simulates a failed-transaction-state connection."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+        self.call_count = 0
+
+    def __call__(self) -> None:
+        self.call_count += 1
+        raise self._exc
+
+
+class _ExplodingPgConn:
+    """Postgres-flavoured connection whose .cursor() raises on every call."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self._cursor_factory = _FlakyCursorFactory(exc)
+        self.committed = False  # must remain False after the failure
+
+    def cursor(self) -> None:
+        return self._cursor_factory()
+
+    def commit(self) -> None:
+        self.committed = True
+
+
+def test_upsert_postgres_cursor_acquisition_failure_propagates() -> None:
+    """Issue #95: cursor() raises → original exception propagates, no UnboundLocalError,
+    commit() never runs."""
+    sentinel = RuntimeError("simulated failed-transaction state")
+    fake = _ExplodingPgConn(sentinel)
+    snap = _snap()
+
+    with pytest.raises(RuntimeError) as excinfo:
+        persistence.upsert_regime(fake, classify(snap))  # type: ignore[arg-type]
+
+    # The original exception is what surfaces — no UnboundLocalError masking.
+    assert excinfo.value is sentinel
+    assert "UnboundLocalError" not in str(excinfo.value)
+    # Cursor was actually attempted.
+    assert fake._cursor_factory.call_count == 1
+    # commit() must NOT run when the cursor never opened.
+    assert fake.committed is False
+
+
+def test_latest_regime_postgres_cursor_acquisition_failure_propagates() -> None:
+    """Same guarantee for the read path."""
+    sentinel = ConnectionError("simulated psycopg2 connection closed")
+    fake = _ExplodingPgConn(sentinel)
+
+    with pytest.raises(ConnectionError) as excinfo:
+        persistence.latest_regime(fake)  # type: ignore[arg-type]
+
+    assert excinfo.value is sentinel
+    assert "UnboundLocalError" not in str(excinfo.value)
