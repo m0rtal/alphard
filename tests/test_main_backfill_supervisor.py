@@ -313,6 +313,145 @@ class TestEntrypointDoesNotTruncateBackfillLog:
 
 
 # ---------------------------------------------------------------------------
+# Issue #120 (Defect 2): entrypoint must warn operator that /app/logs is tmpfs
+# ---------------------------------------------------------------------------
+
+
+class TestEntrypointWarnsAboutTmpfsLogs:
+    """Issue #120 (Defect 2): PR #119 moved /app/logs to a 100M tmpfs on
+    .107 PVE LXC to work around the userns-mapping bug. The trade-off is
+    that the backfill log evaporates on every container restart — exactly
+    the moment an operator needs the forensic record most.
+
+    Required: every container boot writes a one-line warning to BOTH
+    /app/logs/backfill_history_md.log (so it shows up alongside other
+    forensic lines) AND stderr (so it's visible in `docker logs` even
+    after the in-container log has been wiped by the next restart).
+    """
+
+    def test_entrypoint_warns_about_tmpfs_in_log(self) -> None:
+        root = Path(__file__).resolve().parent.parent
+        entrypoint = root / "docker" / "entrypoint.sh"
+        text = entrypoint.read_text(encoding="utf-8")
+
+        # Must write the warning inside the backfill log block.
+        assert "WARN [issue #120]" in text, (
+            "entrypoint.sh must append a `WARN [issue #120]` banner to "
+            "${BACKFILL_LOG} so operators see the tmpfs caveat alongside "
+            "the rest of the forensic stream (issue #120 Defect 2)."
+        )
+        # Must mention tmpfs explicitly so a future grep picks it up.
+        assert "tmpfs" in text, (
+            "entrypoint.sh banner must mention tmpfs so the warning is "
+            "self-describing in `docker logs` and post-mortem review."
+        )
+        # Must reference PR #119 as the source of the tmpfs decision so a
+        # future operator investigating can trace the rationale quickly.
+        assert "PR #119" in text, (
+            "entrypoint.sh banner must reference PR #119 so the operator "
+            "can trace the tmpfs decision back to its source."
+        )
+
+    def test_entrypoint_warns_to_stderr(self) -> None:
+        root = Path(__file__).resolve().parent.parent
+        entrypoint = root / "docker" / "entrypoint.sh"
+        text = entrypoint.read_text(encoding="utf-8")
+
+        # The stderr mirror MUST be on a `>&2` redirect — not just an
+        # `echo` to stdout — so `docker logs` captures it regardless of
+        # whether the in-container log has been wiped.
+        #
+        # Look for `echo ... >&2` (the form used by the new banner) in
+        # the same block that mentions BACKFILL_LOG / tmpfs.
+        assert ">&2" in text, (
+            "entrypoint.sh must redirect the tmpfs warning to stderr "
+            "(>&2) so it survives container restart (issue #120 Defect 2)."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Issue #120 (Defect 1): backfill_history_md.py must use RotatingFileHandler
+# ---------------------------------------------------------------------------
+
+
+class TestBackfillHistoryMdUsesRotatingFileHandler:
+    """Issue #120 (Defect 1): scripts/backfill_history_md.py used a plain
+    ``logging.FileHandler`` against the backfill log. With PR #119's 100M
+    tmpfs mount for /app/logs, a long-running backfill would grow the log
+    until the next emit() raised OSError ENOSPC — and `set -e` in
+    entrypoint.sh would then restart-loop the whole container, exactly
+    the failure mode PR #119 was merged to eliminate.
+
+    Required: the handler is ``RotatingFileHandler`` with ``maxBytes`` and
+    ``backupCount`` such that the total ceiling stays well below 100 MiB
+    so the tmpfs can never fill. We assert on the *source* because the
+    handler is only instantiated when ``BACKFILL_LOG`` is set (set by the
+    alphard-backfill-supervisor in src/main.py), which is not the path
+    unit tests can easily exercise without spinning a real subprocess.
+    """
+
+    def test_uses_rotating_file_handler(self) -> None:
+        root = Path(__file__).resolve().parent.parent
+        script = root / "scripts" / "backfill_history_md.py"
+        text = script.read_text(encoding="utf-8")
+
+        # Must import logging.handlers (RotatingFileHandler lives there).
+        assert "import logging.handlers" in text or "from logging.handlers import" in text, (
+            "backfill_history_md.py must import logging.handlers so "
+            "RotatingFileHandler is available (issue #120 Defect 1)."
+        )
+        # Must instantiate RotatingFileHandler (not FileHandler).
+        assert "RotatingFileHandler" in text, (
+            "backfill_history_md.py must use RotatingFileHandler (not "
+            "FileHandler) so the backfill log cannot fill the /app/logs "
+            "tmpfs and restart-loop the container (issue #120 Defect 1)."
+        )
+        # Must NOT keep the unbounded FileHandler instantiation that
+        # caused the latent defect.
+        assert "logging.FileHandler(" not in text, (
+            "backfill_history_md.py must not retain the unbounded "
+            "logging.FileHandler — it filled /app/logs tmpfs on .107 "
+            "and caused the ENOSPC restart-loop (issue #120 Defect 1)."
+        )
+
+    def test_max_bytes_and_backup_count_set(self) -> None:
+        root = Path(__file__).resolve().parent.parent
+        text = (root / "scripts" / "backfill_history_md.py").read_text(encoding="utf-8")
+
+        # maxBytes + backupCount must both appear on the RotatingFileHandler
+        # call so the total ceiling is bounded. We don't pin the exact
+        # values — only assert they exist — because the operator may tune
+        # them later, but the absence of either is a hard regression.
+        assert "maxBytes" in text, (
+            "RotatingFileHandler must declare maxBytes so the active log "
+            "cannot grow unbounded (issue #120 Defect 1)."
+        )
+        assert "backupCount" in text, (
+            "RotatingFileHandler must declare backupCount so old rotated " "logs are reaped (issue #120 Defect 1)."
+        )
+        # Sanity: maxBytes should be on the order of a few MiB, not a
+        # single byte (which would thrash) and not >= 100 MiB (which
+        # would defeat the 100M tmpfs ceiling). We assert
+        # ``10 * 1024 * 1024`` is in the source as the canonical value
+        # but allow for a multiple via a regex sanity check.
+        import re
+
+        m = re.search(r"maxBytes\s*=\s*(\d+)\s*\*\s*1024\s*\*\s*1024", text)
+        assert m, (
+            "RotatingFileHandler.maxBytes must be expressed in MiB "
+            "(e.g. ``10 * 1024 * 1024``) for readability; raw byte "
+            "counts are too easy to misread in code review "
+            "(issue #120 Defect 1)."
+        )
+        mib = int(m.group(1))
+        assert 1 <= mib <= 50, (
+            f"RotatingFileHandler.maxBytes must be between 1 MiB and "
+            f"50 MiB (smaller thrashes, larger risks filling the "
+            f"100M tmpfs); got {mib} MiB (issue #120 Defect 1)."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Rate-limit math (pure-function check; no thread)
 # ---------------------------------------------------------------------------
 

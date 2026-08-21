@@ -181,3 +181,128 @@ class TestCompose:
             f"ENV_FILE value must fit the 60-char Portainer Env-parameter "
             f"limit (long tokens belong in the file body); got {len(env_file)} chars: {env_file!r}"
         )
+
+    # ------------------------------------------------------------------
+    # Issue #120 (Defect 4): regression coverage for /app/logs mount
+    # ------------------------------------------------------------------
+    #
+    # PR #119 replaced the bind-mount for /app/logs with a 100M tmpfs to
+    # work around the .107 PVE LXC userns-mapping bug. The fix resolved
+    # the immediate restart-loop but introduced three latent defects and
+    # one missing tracking issue (see issue #120 body). These tests guard
+    # the volumes block so a future PR cannot silently regress to either
+    # the original bind-mount (re-introducing the .107 nobody-leaf bug)
+    # or to a tmpfs size small enough to re-introduce the ENOSPC
+    # restart-loop that PR #119 was merged to eliminate.
+    #
+    # The tmpfs mount + size requirement will become obsolete once we
+    # restore the bind-mount on a non-LXC Docker host (tracked separately
+    # — see Defect 3). At that point these tests must be flipped to
+    # assert the bind-mount instead of the tmpfs, with a fresh
+    # `tests/test_compose_structure.py::test_alphard_bot_no_legacy_bind_mount_on_logs`
+    # (added below) keeping the regression guard in the other direction.
+
+    def _bot_volumes(self) -> list:
+        """Return alphard-bot.volumes as a list of mount-spec dicts.
+
+        Compose accepts two shapes for each volume entry:
+
+        * short form (string)        : "/host/path:/container/path[:ro]"
+        * long form (dict with keys  : type/bind/tmpfs/source/target/read_only
+          ``type: bind|tmpfs|volume``)
+        """
+        data = _load_compose()
+        return list(data["services"]["alphard-bot"].get("volumes", []))
+
+    def test_alphard_bot_logs_is_tmpfs(self) -> None:
+        """Issue #120 (Defect 4a): alphard-bot must mount /app/logs as a
+        tmpfs (PR #119 work-around for .107 PVE LXC userns-mapping). A
+        bind-mount here leaves the leaf owned by userns-mapped nobody
+        (uid 65534), which neither the container's root user nor
+        CAP_CHOWN can change — the original .107 restart-loop bug.
+
+        Regression guard: a future PR that drops this mount (or replaces
+        it with a bind-mount) re-introduces the .107 failure mode on
+        every restart.
+        """
+        volumes = self._bot_volumes()
+        tmpfs_mounts = [
+            v for v in volumes if isinstance(v, dict) and v.get("type") == "tmpfs" and v.get("target") == "/app/logs"
+        ]
+        assert tmpfs_mounts, (
+            "alphard-bot must mount /app/logs as a tmpfs (PR #119, issue "
+            "#108 + #120). Found volumes: "
+            f"{volumes!r}"
+        )
+
+    def test_alphard_bot_logs_tmpfs_size_documented(self) -> None:
+        """Issue #120 (Defect 4b): the tmpfs mount for /app/logs MUST
+        declare an explicit ``size`` — and the size must be large enough
+        to comfortably hold the backfill log ceiling (10 MiB active × 4
+        = 40 MiB from issue #120 Defect 1's RotatingFileHandler) plus
+        headroom for handler startup output, but small enough that a
+        runaway log cannot grow the container memory footprint without
+        bound.
+
+        We assert ``size`` is a positive byte quantity and parses cleanly;
+        we do NOT pin the exact byte value because the operator may want
+        to tune it without a code review (e.g. on a 1 GiB-RAM LXC). The
+        lower bound of 40 MiB matches the rotation ceiling so the
+        container can never ENOSPC mid-rotation.
+        """
+        import re
+
+        volumes = self._bot_volumes()
+        tmpfs_mounts = [
+            v for v in volumes if isinstance(v, dict) and v.get("type") == "tmpfs" and v.get("target") == "/app/logs"
+        ]
+        assert tmpfs_mounts, "missing /app/logs tmpfs mount (regression — see test_alphard_bot_logs_is_tmpfs)"
+        spec = tmpfs_mounts[0].get("tmpfs", {})
+        size_raw = spec.get("size")
+        assert size_raw, (
+            f"/app/logs tmpfs must declare an explicit `size` to prevent "
+            f"unbounded growth on .107 LXC; got tmpfs={spec!r}"
+        )
+        m = re.fullmatch(r"\s*(\d+)\s*([KMG]?)\s*", str(size_raw))
+        assert m, f"/app/logs tmpfs.size must be a Docker byte-quantity (e.g. '100M'), got: {size_raw!r}"
+        n = int(m.group(1))
+        unit = m.group(2) or ""
+        factor = {"": 1, "K": 1024, "M": 1024 * 1024, "G": 1024**3}[unit]
+        bytes_ = n * factor
+        # Lower bound: must comfortably exceed the rotation ceiling
+        # (10 MiB active × 4 backups = 40 MiB), so a misconfigured shrink
+        # back to "10M" (which would re-introduce the original ENOSPC
+        # restart-loop) fails loudly here.
+        assert bytes_ >= 40 * 1024 * 1024, (
+            f"/app/logs tmpfs size must be ≥ 40 MiB to hold the rotated "
+            f"backfill log (issue #120 Defect 1); got {size_raw} = {bytes_} bytes"
+        )
+
+    def test_alphard_bot_no_legacy_bind_mount_on_logs(self) -> None:
+        """Issue #120 (Defect 4c — forward-looking): once we restore the
+        bind-mount on a non-LXC host, this test must stay green in the
+        OPPOSITE direction: it asserts there is no surviving bind-mount
+        on /app/logs until the follow-up issue (issue #121, see Defect 3)
+        is filed and worked.
+
+        The legacy short-form bind-mounts we explicitly forbid here are
+        ``/mnt/appdata/alphard/logs:/app/logs`` and
+        ``/root/.env-as-directory:...`` style — any string mount whose
+        target is ``/app/logs``. Long-form bind mounts with
+        ``type: bind, target: /app/logs`` are likewise forbidden.
+        """
+        volumes = self._bot_volumes()
+        for v in volumes:
+            if isinstance(v, str) and ":" in v:
+                src, _, dst = v.partition(":")
+                # Allow read-only host bind-mounts of the .env file
+                # etc., but never to /app/logs (issue #108/#120).
+                assert dst.split(":")[0] != "/app/logs", (
+                    f"legacy bind-mount to /app/logs must NOT survive "
+                    f"(re-introduces .107 userns-mapping bug): {v!r}"
+                )
+            elif isinstance(v, dict) and v.get("target") == "/app/logs":
+                assert v.get("type") != "bind", (
+                    f"legacy bind-mount to /app/logs must NOT survive "
+                    f"(re-introduces .107 userns-mapping bug): {v!r}"
+                )
