@@ -131,6 +131,59 @@ def _list_tickers(store: DataStore, *, only: Iterable[str] | None = None) -> lis
     return [m for m in listed if m.ticker in only_set]
 
 
+# ---- MOEX ISS per-run cache (issue #137) -----------------------------------
+# Both ``fetch_splits`` and ``fetch_dividends`` return the entire MOEX
+# market's data in one HTTP round-trip, but the per-ticker helpers
+# were called inside the main loop, so a 3000-ticker universe issued
+# 6000 redundant HTTP requests per weekly run.
+#
+# ``_MOEX_CACHE`` collapses them into one fetch per endpoint per run:
+# keyed on ``id(session)`` because production creates a fresh
+# ``requests.Session`` in ``main()`` and tests can hold their own.
+# Module-level state is acceptable here because the script is a
+# short-lived subprocess (started by ``_corp_actions_apply_loop`` or by
+# an operator from the shell) — there is no long-running interpreter
+# state to leak across runs.
+#
+# Tests that need a clean cache between assertions call
+# ``_reset_moex_cache_for_tests``.
+_MOEX_CACHE: dict[int, dict[str, list[dict]]] = {}
+
+
+def _reset_moex_cache_for_tests() -> None:
+    """Test-only: clear the MOEX per-session cache between assertions.
+
+    The existing tests in ``test_apply_corporate_actions.py`` patch
+    ``aca._FETCHER_MOD`` per test (so each ``patch.object(aca,
+    "_FETCHER_MOD")`` already gets a fresh mock), but a test that
+    reuses a long-lived ``requests.Session`` across two ``aca.main()``
+    calls would otherwise inherit the first call's response. This
+    helper makes that explicit. Not called from production code.
+    """
+    _MOEX_CACHE.clear()
+
+
+def _all_splits_for_session(session: requests.Session, timeout: int) -> list[dict]:
+    """Return the full MOEX splits list, fetching it at most once per session.
+
+    See module-level ``_MOEX_CACHE`` docstring for the rationale.
+    """
+    key = id(session)
+    cache = _MOEX_CACHE.setdefault(key, {})
+    if "splits" not in cache:
+        cache["splits"] = _FETCHER_MOD.fetch_splits(session, timeout=timeout)
+    return cache["splits"]
+
+
+def _all_dividends_for_session(session: requests.Session, timeout: int) -> list[dict]:
+    """Return the full MOEX dividends list, fetching it at most once per session."""
+    key = id(session)
+    cache = _MOEX_CACHE.setdefault(key, {})
+    if "dividends" not in cache:
+        cache["dividends"] = _FETCHER_MOD.fetch_dividends(session, timeout=timeout)
+    return cache["dividends"]
+
+
 def _fetch_splits_for_ticker(
     ticker: str,
     session: requests.Session,
@@ -147,8 +200,16 @@ def _fetch_splits_for_ticker(
     Step 2a's fetcher returns ALL splits for ALL tickers in one call.
     We invoke it once and filter in-process; calling it per ticker would
     hit MOEX ISS 3000 times for nothing. Filter by ticker AND kind.
+
+    Issue #137: the underlying ``fetch_splits`` call is cached per
+    ``session`` (via module-level ``_MOEX_CACHE``) so a weekly run with
+    N tickers makes exactly ONE HTTP round-trip to ``/splits.json``,
+    not N. The cache is keyed on ``id(session)`` — production creates
+    one ``requests.Session`` per run, so each run gets exactly one
+    fetch per endpoint. Tests can reset the cache via
+    ``_reset_moex_cache_for_tests``.
     """
-    raw = _FETCHER_MOD.fetch_splits(session, timeout=timeout)
+    raw = _all_splits_for_session(session, timeout)
     actions: list[CorporateAction] = []
     for entry in raw:
         if entry.get("ticker") != ticker:
@@ -221,14 +282,14 @@ def _fetch_dividends_for_ticker(
 ) -> list[CorporateAction]:
     """Per-ticker dividend CorporateAction list.
 
-    Sister to ``_fetch_splits_for_ticker``. Hits MOEX ISS once per
-    ticker (matches the existing splits pattern; an orchestrator-level
-    cache would let both helpers share a single round-trip, but that's
-    a separate optimisation). Returns an empty list if MOEX has no
-    dividends for the ticker or the call fails (the caller treats an
-    empty list as "nothing to apply" rather than as an error).
+    Sister to ``_fetch_splits_for_ticker``. Issue #137: shares the same
+    per-session cache (``_all_dividends_for_session``) so a full-universe
+    run makes exactly ONE HTTP round-trip to ``/dividends.json``,
+    not N. Returns an empty list if MOEX has no dividends for the
+    ticker or the call fails (the caller treats an empty list as
+    "nothing to apply" rather than as an error).
     """
-    raw = _FETCHER_MOD.fetch_dividends(session, timeout=timeout)
+    raw = _all_dividends_for_session(session, timeout)
     actions: list[CorporateAction] = []
     for entry in raw:
         action = _parse_dividend_entry(entry, ticker)

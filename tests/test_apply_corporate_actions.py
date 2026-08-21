@@ -1343,3 +1343,131 @@ def test_dividend_negative_amount_dropped_in_orchestrator(
     assert sber_adj == []
     cache = json.loads(cache_path.read_text())
     assert "SBER" in cache
+
+
+# ---------- MOEX fetch caching (issue #137) ----------
+
+
+def test_moex_fetch_is_cached_across_tickers(
+    store: InMemorySQLiteStore,
+    tmp_path: Path,
+) -> None:
+    """Regression for issue #137: with the per-session cache the
+    orchestrator makes exactly ONE HTTP round-trip to ``/splits.json``
+    and ONE to ``/dividends.json`` regardless of universe size.
+
+    The pre-fix behaviour issued 2×N calls for N tickers. We seed a
+    3-ticker universe (SBER, GAZP, YDEX) and assert both
+    ``fetch_splits`` and ``fetch_dividends`` were each called exactly
+    once. This is the acceptance criterion from the issue body:
+
+      > A weekly run with --tickers SBER makes exactly 2 HTTP requests
+        to MOEX ISS (/splits.json, /dividends.json), regardless of
+        universe size, when the cache is fresh.
+    """
+    cache_path = tmp_path / "cache.json"
+
+    # Add YDEX to the universe so the loop iterates over 3 tickers.
+    store.upsert_ticker(_make_ticker("YDEX"))
+
+    fetcher_payload_splits = [
+        {"ticker": "SBER", "ts": "2026-01-09", "ratio": 2.0, "source": "moex"},
+    ]
+    fetcher_payload_dividends = [
+        {
+            "ticker": "GAZP",
+            "ts": "2026-01-09",
+            "amount_rub_per_share": "5.00",
+            "source": "moex",
+        },
+    ]
+
+    # Clean slate — the conftest runs many tests before us and the
+    # cache is module-level; without reset a previous test's
+    # ``fetch_splits`` call could leak through.
+    aca._reset_moex_cache_for_tests()
+
+    with patch.object(aca, "_FETCHER_MOD") as fake_fetcher:
+        fake_fetcher.fetch_splits.return_value = fetcher_payload_splits
+        fake_fetcher.fetch_dividends.return_value = fetcher_payload_dividends
+        fake_fetcher.USER_AGENT = "alphard-test"
+        rc = aca.main(
+            [
+                "--cache-path",
+                str(cache_path),
+            ],
+            store=store,
+        )
+    assert rc == aca.EXIT_OK
+
+    # Exactly ONE fetch_splits and ONE fetch_dividends across the
+    # whole universe. Pre-fix this would be 3 of each (one per ticker).
+    assert fake_fetcher.fetch_splits.call_count == 1, (
+        f"expected 1 fetch_splits call (issue #137 cache), got " f"{fake_fetcher.fetch_splits.call_count}"
+    )
+    assert fake_fetcher.fetch_dividends.call_count == 1, (
+        f"expected 1 fetch_dividends call (issue #137 cache), got " f"{fake_fetcher.fetch_dividends.call_count}"
+    )
+
+
+def test_moex_cache_is_per_session_not_global(
+    store: InMemorySQLiteStore,
+    tmp_path: Path,
+) -> None:
+    """Two consecutive ``aca.main()`` invocations that share a
+    ``requests.Session`` would normally inherit the first run's cached
+    response. The cache is keyed on ``id(session)`` so production's
+    fresh-session-per-run contract keeps the cache from leaking; this
+    test pins that behaviour by using two distinct session objects
+    (each ``main()`` builds its own, so each run fetches once).
+    """
+    cache_path = tmp_path / "cache.json"
+    fetcher_payload = [
+        {"ticker": "SBER", "ts": "2026-01-09", "ratio": 2.0, "source": "moex"},
+    ]
+
+    aca._reset_moex_cache_for_tests()
+
+    with patch.object(aca, "_FETCHER_MOD") as fake_fetcher:
+        fake_fetcher.fetch_splits.return_value = fetcher_payload
+        fake_fetcher.fetch_dividends.return_value = []
+        fake_fetcher.USER_AGENT = "alphard-test"
+        aca.main(
+            ["--tickers", "SBER", "--cache-path", str(cache_path)],
+            store=store,
+        )
+        assert fake_fetcher.fetch_splits.call_count == 1
+        # Second run within the skip window: cache short-circuits
+        # before the fetcher is even reached.
+        aca.main(
+            [
+                "--tickers",
+                "SBER",
+                "--cache-path",
+                str(cache_path),
+            ],
+            store=store,
+        )
+        assert fake_fetcher.fetch_splits.call_count == 1, (
+            "second run within skip window must not re-fetch (cache hit " "in main() before any helper is called)"
+        )
+
+    # And a third run with --force must fetch exactly once for this
+    # fresh session (the script builds a new requests.Session inside
+    # main() each invocation, so the cache key changes).
+    cache_path2 = tmp_path / "cache2.json"
+    with patch.object(aca, "_FETCHER_MOD") as fake_fetcher:
+        fake_fetcher.fetch_splits.return_value = fetcher_payload
+        fake_fetcher.fetch_dividends.return_value = []
+        fake_fetcher.USER_AGENT = "alphard-test"
+        aca.main(
+            [
+                "--tickers",
+                "SBER",
+                "--force",
+                "--cache-path",
+                str(cache_path2),
+            ],
+            store=store,
+        )
+        assert fake_fetcher.fetch_splits.call_count == 1, "--force run on a fresh session must fetch exactly once"
