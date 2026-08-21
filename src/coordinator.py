@@ -120,6 +120,19 @@ class CoordinatorConfig:
     toctou_max_seconds: float = 0.100
 
 
+# Issue #99: alphard-internal refusal markers returned by _execute() when
+# the pipeline blocks before/at the broker. These do NOT count as a
+# "decided" trade — we never put an order on the wire. Real broker
+# outcomes (FILLED, NEW, REJECTED_BY_EXCHANGE, ...) are NOT in this set
+# because the broker itself answered.
+_LOCAL_REJECTIONS: frozenset[str] = frozenset(
+    {
+        "REJECTED_LIVE_TRADING_FALSE",
+        "REJECTED_RISK_GATE",
+    }
+)
+
+
 @dataclass(frozen=True)
 class PipelineResult:
     """Result of one coordinator run."""
@@ -135,10 +148,33 @@ class PipelineResult:
 
     @property
     def decided(self) -> bool:
-        """True iff pipeline reached EXECUTE stage."""
-        return (
-            PipelineStage.EXECUTE in self.stages_completed or PipelineStage.DONE in self.stages_completed  # noqa: E501
-        )  # noqa: E501
+        """True iff the pipeline produced a real broker response.
+
+        Issue #99: previously this property returned True for any run that
+        reached the DONE stage, including paths where the broker rejected
+        (LIVE_TRADING=false, RISK_GATE, broker ERROR). The audit log then
+        conflates "we tried to trade" with "we chose to trade", inflating
+        downstream "trades decided" metrics by every rejected run.
+
+        Semantics: a real decision means the broker responded with an
+        outcome that is not an alphard-internal refusal. Local refusals
+        (``REJECTED_LIVE_TRADING_FALSE``, ``REJECTED_RISK_GATE``) and
+        broker submit errors (``ERROR:<Exc>``) all mean "we did not
+        actually trade" — the audit row should record ``decided=False``.
+
+        Real broker outcomes include FILLED, NEW, PARTIALLY_FILLED, and
+        exchange-level rejections (``REJECTED_BY_EXCHANGE``) — those are
+        decisions: we put an order on the wire and got an answer back.
+        """
+        bs = self.broker_status
+        if bs is None:
+            return False
+        if bs.startswith("ERROR"):
+            return False
+        # Local refusal markers (alphard-internal, not the broker):
+        if bs in _LOCAL_REJECTIONS:
+            return False
+        return True
 
     def to_dict(self) -> dict[str, Any]:
         return {

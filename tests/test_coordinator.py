@@ -640,12 +640,23 @@ class TestPipelineResult:
         )
         assert result.decided is True
 
-    def test_decided_true_when_done_stage_present(self) -> None:
+    def test_decided_true_when_done_stage_with_real_broker_status(self) -> None:
+        """Issue #99: DONE stage alone is no longer sufficient — must also
+        carry a non-rejection broker_status."""
+        result = self._make_result(
+            stages_completed=(PipelineStage.FETCH, PipelineStage.DONE),
+            broker_status="FILLED",
+        )
+        assert result.decided is True
+
+    def test_decided_false_when_done_but_broker_none(self) -> None:
+        """Issue #99: DONE appended unconditionally after a blocked run;
+        decided must remain False when no broker response was received."""
         result = self._make_result(
             stages_completed=(PipelineStage.FETCH, PipelineStage.DONE),
             broker_status=None,
         )
-        assert result.decided is True
+        assert result.decided is False
 
     def test_decided_false_when_neither_execute_nor_done(self) -> None:
         result = self._make_result(
@@ -653,6 +664,43 @@ class TestPipelineResult:
             broker_status=None,
         )
         assert result.decided is False
+
+    @pytest.mark.parametrize(
+        "broker_status",
+        [
+            "REJECTED_LIVE_TRADING_FALSE",
+            "REJECTED_RISK_GATE",
+            "ERROR:ChildProcessError",
+            "ERROR:ConnectionError",
+        ],
+    )
+    def test_decided_false_for_all_rejection_paths(self, broker_status: str) -> None:
+        """Issue #99: every REJECTED_* / ERROR:* broker_status must
+        produce decided=False even when the pipeline reached DONE."""
+        result = self._make_result(
+            stages_completed=(
+                PipelineStage.FETCH,
+                PipelineStage.RISK,
+                PipelineStage.EXECUTE,
+                PipelineStage.AUDIT,
+                PipelineStage.DONE,
+            ),
+            broker_status=broker_status,
+        )
+        assert result.decided is False
+
+    @pytest.mark.parametrize(
+        "broker_status",
+        ["FILLED", "NEW", "REJECTED_BY_EXCHANGE", "PARTIALLY_FILLED"],
+    )
+    def test_decided_true_for_real_broker_responses(self, broker_status: str) -> None:
+        """Real broker outcomes (FILLED, NEW, exchange-level rejections,
+        partial fills) all mean the pipeline produced an actual decision."""
+        result = self._make_result(
+            stages_completed=(PipelineStage.FETCH, PipelineStage.DONE),
+            broker_status=broker_status,
+        )
+        assert result.decided is True
 
     def test_to_dict_serializes_all_fields(self) -> None:
         result = self._make_result(
