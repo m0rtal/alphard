@@ -739,6 +739,84 @@ class TestTinkoffAccount:
         intent_seen = mock_rg.evaluate.call_args[0][0]
         assert intent_seen.price == Decimal("250.5")
 
+    def test_place_limit_order_subnano_price_floors_to_wire_precision(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Issue #100: a LimitOrder price with > 9 fractional digits
+        must round-trip through ``Quotation(units, nano)`` within 1e-9
+        of the rounded value, and a warning must be logged so the
+        operator notices the precision loss.
+
+        Pre-fix: ``Decimal("100.0000000001")`` (10 digits) was packed
+        via ``int(0.0000000001 * 1e9) = 0``, so the wire Quotation
+        became ``(100, 0)`` — Tinkoff sees ``100.0`` and the order is
+        silently placed at the wrong price.
+
+        Post-fix: ``quantize(1e-9, ROUND_DOWN)`` floors to 9 digits,
+        yielding ``(100, 0)`` explicitly with a warning logged.
+        """
+        client = _make_mock_tinkoff_client(cash=Decimal("1000000"))
+        _install_mock_sdk(monkeypatch, client)
+
+        mock_rg = MagicMock()
+        from src.risk.gate import RiskDecision
+
+        mock_rg.evaluate.return_value = RiskDecision(allowed=True, violations=())
+
+        a = TinkoffAccount(token="t.x", risk_gate=mock_rg)
+        # 10 fractional digits — exactly one more than the wire format.
+        subnano_price = Decimal("100.0000000001")
+        order = LimitOrder(
+            ticker="SBER",
+            side=OrderSide.BUY,
+            quantity=Decimal("10"),
+            price=subnano_price,
+        )
+        status = a.place_order(order)
+        assert status == OrderStatus.FILLED
+        # The post_order call's price argument is a MagicMock Quotation.
+        # Inspect it: units=100, nano=0 (floored from 0.0000000001).
+        post_kwargs = client.orders.post_order.call_args.kwargs
+        price_arg = post_kwargs["price"]
+        assert price_arg.units == 100
+        assert price_arg.nano == 0
+        # Round-trip: reconstruct Decimal from wire fields, must equal
+        # the floored input (within 1e-9).
+        reconstructed = Decimal(price_arg.units) + Decimal(price_arg.nano) / Decimal(1_000_000_000)
+        assert reconstructed == Decimal("100.000000000")
+
+    def test_place_limit_order_subnano_high_precision_preserved(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Counterpart to #100: a price with exactly 9 fractional digits
+        must pass through unchanged (no spurious rounding).
+        """
+        client = _make_mock_tinkoff_client(cash=Decimal("1000000"))
+        _install_mock_sdk(monkeypatch, client)
+
+        mock_rg = MagicMock()
+        from src.risk.gate import RiskDecision
+
+        mock_rg.evaluate.return_value = RiskDecision(allowed=True, violations=())
+
+        a = TinkoffAccount(token="t.x", risk_gate=mock_rg)
+        # 9 fractional digits — exactly wire precision.
+        precise_price = Decimal("100.123456789")
+        order = LimitOrder(
+            ticker="SBER",
+            side=OrderSide.BUY,
+            quantity=Decimal("10"),
+            price=precise_price,
+        )
+        status = a.place_order(order)
+        assert status == OrderStatus.FILLED
+        post_kwargs = client.orders.post_order.call_args.kwargs
+        price_arg = post_kwargs["price"]
+        assert price_arg.units == 100
+        assert price_arg.nano == 123_456_789
+
     def test_place_order_sdk_exception(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """If post_order raises after RiskGate approved, the broker
         error is wrapped in BrokerError and re-raised."""
