@@ -67,17 +67,40 @@ def _fetch_all_bars(
     ticker: str | None = None,
     limit: int | None = None,
 ) -> dict[str, list[tuple[Any, ...]]]:
-    """Return ``ticker -> sorted(rows)``. Skip None / missing fields."""
+    """Return ``ticker -> sorted(rows)``. Skip None / missing fields.
+
+    Issue #131: the previous implementation appended ``LIMIT %s`` in a
+    second ``cur.execute()`` call after the first execute had already
+    bound the ticker parameter. That had two failure modes:
+
+      1. ``--ticker X --limit N`` raised ``psycopg.errors.ProgrammingError``
+         because the SQL string now had TWO ``%s`` placeholders (one for
+         the ticker in WHERE, one for LIMIT) but only ``(limit,)`` was
+         passed.
+      2. ``--limit N`` (no ticker) silently passed ``None`` to the LIMIT
+         placeholder, which Postgres treats as "no limit" — the entire
+         ``ohlcv_daily`` table came back, defeating the purpose of the
+         sampling flag.
+
+    Fix: inline ``LIMIT`` into the SQL template per branch and bind
+    everything in a single ``execute()`` so the placeholder/param count
+    is consistent.
+    """
     store._connect()
     with store._conn.cursor() as cur:
         if ticker:
-            sql = "SELECT ticker, ts, open, high, low, close, volume FROM ohlcv_daily WHERE ticker = %s ORDER BY ts"
-            cur.execute(sql, (ticker.upper(),))
+            sql = "SELECT ticker, ts, open, high, low, close, volume " "FROM ohlcv_daily WHERE ticker = %s ORDER BY ts"
+            params: tuple[Any, ...] = (ticker.upper(),)
+            if limit is not None:
+                sql += " LIMIT %s"
+                params = (ticker.upper(), limit)
         else:
-            sql = "SELECT ticker, ts, open, high, low, close, volume FROM ohlcv_daily ORDER BY ticker, ts"
-            cur.execute(sql)
-        if limit:
-            cur.execute(sql + " LIMIT %s", (limit,) if ticker else None)
+            sql = "SELECT ticker, ts, open, high, low, close, volume " "FROM ohlcv_daily ORDER BY ticker, ts"
+            params = ()
+            if limit is not None:
+                sql += " LIMIT %s"
+                params = (limit,)
+        cur.execute(sql, params)
         rows = cur.fetchall()
     grouped: dict[str, list[tuple[Any, ...]]] = {}
     for r in rows:
