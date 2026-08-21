@@ -355,6 +355,30 @@ def test_http_get_retries_on_urlerror_then_succeeds(state_dir: Path) -> None:
         monkey.undo()
 
 
+def test_http_get_raises_runtime_error_when_no_exception_after_retries(state_dir: Path) -> None:
+    """Regression (issue #91): if MAX_RETRIES=0 the loop never enters the
+    body, ``last_exc`` stays unbound, and the bare ``assert last_exc is
+    not None`` either fires AssertionError (stripped under ``python -O``)
+    or, with asserts gone, raises UnboundLocalError. We want a clear
+    RuntimeError regardless of optimisation flags so a future refactor
+    that drops MAX_RETRIES to 0 fails loudly with a message that points
+    at the real cause, not at this line.
+    """
+    monkey = pytest.MonkeyPatch()
+    # Disable urlopen (would never be called, but be explicit).
+    monkey.setattr(
+        macro_fetcher.urllib.request,
+        "urlopen",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("should not be called")),
+    )
+    monkey.setattr(macro_fetcher, "MAX_RETRIES", 0)
+    try:
+        with pytest.raises(RuntimeError, match="retry loop exited with no result"):
+            macro_fetcher._http_get("http://example.invalid/x")
+    finally:
+        monkey.undo()
+
+
 def test_read_cache_returns_none_when_file_missing(state_dir: Path) -> None:
     assert macro_fetcher._read_cache(state_dir / "nope.json", max_age_seconds=60) is None
 
