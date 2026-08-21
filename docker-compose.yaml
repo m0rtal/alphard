@@ -119,18 +119,24 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-alphard}
     volumes:
       - alphard-postgres-data:/var/lib/postgresql/data
-      # BUGFIX (H-9): bind-mount the real-auth healthcheck script.
-      # The default pg_isready check returns healthy even when pg_authid
-      # holds stale scram hashes from a previous deploy (production bug
-      # 2026-08-18). psql -U $USER -c 'SELECT 1' does a full auth
-      # round-trip under our credentials so a real credential mismatch
-      # surfaces as container=unhealthy → depends_on blocks the bot.
-      - ./docker/postgres/healthcheck.sh:/usr/local/bin/alphard-pg-healthcheck.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "/usr/local/bin/alphard-pg-healthcheck.sh"]
+      # BUGFIX (#126): inline shell healthcheck to avoid the .107
+      # PVE LXC bind-mount leaf-directory quirk (Docker 29.1.x creates
+      # ./docker/postgres/healthcheck.sh as a directory, not a file →
+      # /bin/sh: Permission denied exit 126 → container permanently
+      # unhealthy even though the script is correct).
+      #
+      # Two-stage probe:
+      #   1. pg_isready with credentials — TCP+auth liveness
+      #   2. psql SELECT 1 with PGPASSWORD — full auth round-trip,
+      #      catches stale pg_authid scram hashes (prod bug 2026-08-18
+      #      where pg_isready returned healthy but every real auth
+      #      attempt failed)
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\" && PGPASSWORD=\"$$POSTGRES_PASSWORD\" psql -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\" -h localhost -tAc 'SELECT 1' >/dev/null 2>&1"]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 30s
     networks:
       - alphard-net
 
