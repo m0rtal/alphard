@@ -32,6 +32,12 @@ services:
     image: ghcr.io/m0rtal/alphard:latest
     container_name: alphard-bot
     restart: unless-stopped
+    # BUGFIX (2026-08-21 LXC): docker-default AppArmor profile cannot load
+    # in LXC unprivileged sandbox — bypass via unconfined for the whole
+    # stack. Local-only override; .107 production is plain Docker and
+    # tolerates extra cap (security_opt is per-container, not global).
+    security_opt:
+      - apparmor=unconfined
     env_file:
       - .env
     labels:
@@ -87,6 +93,8 @@ services:
     image: postgres:16-alpine
     container_name: alphard-postgres
     restart: unless-stopped
+    security_opt:
+      - apparmor=unconfined
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
     environment:
@@ -120,6 +128,8 @@ services:
     image: redis:7-alpine
     container_name: alphard-redis
     restart: unless-stopped
+    security_opt:
+      - apparmor=unconfined
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
     # BUGFIX (H-8): fail-fast on missing redis password.
@@ -160,6 +170,8 @@ services:
     image: alpine:3.20
     container_name: alphard-chownfix
     restart: "no"
+    security_opt:
+      - apparmor=unconfined
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
@@ -195,6 +207,8 @@ services:
     image: alpine:3.20
     container_name: alphard-pg-init
     restart: "no"
+    security_opt:
+      - apparmor=unconfined
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
