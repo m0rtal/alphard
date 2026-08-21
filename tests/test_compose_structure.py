@@ -462,16 +462,16 @@ class TestRedisFailFast:
         """Issue #129 — extend the fail-fast gate to reject shell
         metacharacters in REDIS_PASSWORD.
 
-        Why this matters: the command is executed under `sh -c`, so a
-        password containing `$`, `"`, `\`, or backtick would be
-        silently mangled by the shell before `redis-server` saw it.
-        In the worst case the mangling produces an empty
-        ``--requirepass`` arg and redis starts without authentication.
+        Why this matters: the command is executed under sh -c, so a
+        password containing dollar, doublequote, backslash, or backtick
+        would be silently mangled by the shell before redis-server
+        saw it. In the worst case the mangling produces an empty
+        --requirepass arg and redis starts without authentication.
         In the more common case redis fails with "wrong number of
         arguments" and the container restart-loops until the operator
         notices.
 
-        The check must be visible in the rendered YAML: a `case` block
+        The check must be visible in the rendered YAML: a case block
         referencing REDIS_PASSWORD with metacharacter patterns. We
         accept any reasonable representation that rejects the four
         characters (the exact escape form varies between shells).
@@ -528,7 +528,6 @@ class TestRedisFailFast:
         This proves the fail-fast gate works on the same shell
         (alpine busybox ash) that the redis container uses.
         """
-        import shlex
         import subprocess
 
         cmd = self._redis_service().get("command")
@@ -565,12 +564,6 @@ class TestRedisFailFast:
         for pw, expected_exit in cases:
             # We pass REDIS_PASSWORD via the environment so that the
             # script's own ${REDIS_PASSWORD} expansion picks it up.
-            env_script = rendered.replace(
-                'if [ -z "${REDIS_PASSWORD:-}" ]',
-                f'if [ -z "${{REDIS_PASSWORD:-}}" ] && [ "{shlex.quote(pw)}" != "" ]',
-                1,
-            )
-            # Simplest: rely on environment, leave script verbatim.
             proc = subprocess.run(
                 ["sh", "-c", rendered],
                 input="",
