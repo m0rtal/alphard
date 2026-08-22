@@ -55,6 +55,13 @@ class OrderFlowResult:
     slice_count: int
     submitted: list[OrderStatus]
     final_status: OrderStatus
+    # Issue #168: per-outcome counts so callers can disambiguate
+    # ``final_status == SUBMITTED`` (legitimate partial fill) from
+    # ``final_status == SUBMITTED`` masquerading as a silent failure
+    # (slicer raised → submitted=[], or all slices rejected by broker).
+    # Without these, the audit log conflates three distinct outcomes.
+    filled_count: int = 0
+    rejected_count: int = 0
 
 
 class OrderFlow:
@@ -190,7 +197,7 @@ class OrderFlow:
             slices = []
 
         # 5. Submit
-        submitted = []
+        submitted: list[OrderStatus] = []
         for i, slc in enumerate(slices):
             order = MarketOrder(ticker=symbol, side=side, quantity=slc.quantity)
             try:
@@ -200,11 +207,30 @@ class OrderFlow:
                 status = OrderStatus.REJECTED
             submitted.append(status)
 
-        final = (
-            OrderStatus.FILLED
-            if submitted and all(s == OrderStatus.FILLED for s in submitted)
-            else OrderStatus.SUBMITTED
-        )
+        # Issue #168: three-tier final_status. The pre-fix logic lumped
+        # every non-fully-FILLED outcome into SUBMITTED, conflating
+        # "partial fill" with "no slice submitted at all" (slicer
+        # raised → submitted == []) and "broker rejected every slice"
+        # (submitted == [REJECTED, ...]). The audit log treated both as
+        # a real SUBMITTED run, misleading operators and flooding
+        # monitoring alerts. New contract:
+        #   * submitted == []             → REJECTED (internal failure;
+        #                                    nothing reached the broker)
+        #   * all submitted == REJECTED   → REJECTED (broker refused all)
+        #   * all submitted == FILLED     → FILLED   (clean execution)
+        #   * mixed FILLED + non-FILLED   → SUBMITTED (legitimate partial
+        #                                    fill, broker is still working
+        #                                    on the order)
+        filled_count = sum(1 for s in submitted if s == OrderStatus.FILLED)
+        rejected_count = sum(1 for s in submitted if s == OrderStatus.REJECTED)
+        if not submitted:
+            final = OrderStatus.REJECTED
+        elif rejected_count == len(submitted):
+            final = OrderStatus.REJECTED
+        elif filled_count == len(submitted):
+            final = OrderStatus.FILLED
+        else:
+            final = OrderStatus.SUBMITTED
 
         return OrderFlowResult(
             intent_symbol=symbol,
@@ -214,6 +240,8 @@ class OrderFlow:
             slice_count=len(slices),
             submitted=submitted,
             final_status=final,
+            filled_count=filled_count,
+            rejected_count=rejected_count,
         )
 
     @staticmethod
