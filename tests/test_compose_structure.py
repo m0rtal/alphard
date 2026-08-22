@@ -736,3 +736,149 @@ class TestPrometheusLXC:
         assert any("9090" in s for s in port_strs), (
             f"prometheus.ports must expose 9090/tcp so host-network " f"Grafana can scrape it; got: {port_strs}"
         )
+
+
+class TestGrafanaPortability:
+    """Issue: 2026-08-22 — grafana bind-mount was hardcoded to
+    ``/mnt/appdata/alphard/grafana``, breaking first-shot install on any
+    host that does not happen to use exactly that path (the default
+    Linux-conventional path is /srv/alphard or /var/lib/alphard, not
+    /mnt/anything). The fix parameterises the host data dir via
+    ``APPDATA_DIR`` (default /srv/alphard) and adds a one-shot
+    ``grafana-init`` service that mkdir -p's the leaf with the correct
+    UID/GID 472:472 before grafana starts.
+
+    Same architectural pattern as pg-init (postgres): front every
+    host-bind-mount service with a one-shot init container that owns
+    the leaf-prep contract. Idempotent (mkdir -p + chown on an
+    existing leaf is a no-op).
+    """
+
+    def test_grafana_volume_uses_appdata_dir(self) -> None:
+        """The grafana bind-mount source MUST be parameterised via
+        ``${APPDATA_DIR:-/srv/alphard}/grafana`` — never hardcoded to
+        /mnt/appdata/... or any other host-specific path. Hardcoded
+        /mnt/... requires every operator to edit the compose before
+        StackUpdate succeeds; with APPDATA_DIR default the compose is
+        portable to any LXC/VM out of the box.
+        """
+        data = _load_compose()
+        grafana = data["services"].get("grafana")
+        assert grafana is not None, "grafana service must exist in docker-compose.yaml"
+        volumes = grafana.get("volumes", [])
+        grafana_data_mounts = []
+        # Compose volume entries use either short-form string
+        # ``"/host:/container[:ro]"`` or long-form dict with target/source.
+        # Note that the host path may itself contain a `:` (inside the
+        # ${APPDATA_DIR:-/srv/...} default), so partition(":"), which
+        # splits on the FIRST colon, is wrong — use rsplit with maxsplit=1
+        # to anchor on the LAST colon instead.
+        for v in volumes:
+            if isinstance(v, str) and ":" in v:
+                parts = v.rsplit(":", 1)
+                if len(parts) != 2:
+                    continue
+                _src, dst = parts
+                if dst == "/var/lib/grafana":
+                    grafana_data_mounts.append(v)
+            elif isinstance(v, dict) and v.get("target") == "/var/lib/grafana":
+                grafana_data_mounts.append(v)
+        assert grafana_data_mounts, (
+            "grafana must mount /var/lib/grafana; cannot test " "APPDATA_DIR parameterisation without a mount target"
+        )
+        # At least one mount must use APPDATA_DIR (not the legacy
+        # /mnt/appdata hardcoded form).
+        mount_strs = [str(v) for v in grafana_data_mounts]
+        legacy_hardcoded = [v for v in mount_strs if "/mnt/appdata/" in v]
+        appdata_param = [v for v in mount_strs if "APPDATA_DIR" in v]
+        assert not legacy_hardcoded, (
+            f"grafana /var/lib/grafana mount source is hardcoded to "
+            f"/mnt/appdata/... — breaks first-shot install portability. "
+            f"Use ${{APPDATA_DIR:-/srv/alphard}}/grafana instead. "
+            f"Found: {legacy_hardcoded}"
+        )
+        assert appdata_param, (
+            f"grafana /var/lib/grafana mount must use ${{APPDATA_DIR:-/srv/alphard}} "
+            f"as the source so operators can override via stack Env. "
+            f"Found: {mount_strs}"
+        )
+
+    def test_grafana_init_service_exists(self) -> None:
+        """A one-shot ``grafana-init`` service must exist that creates
+        ${APPDATA_DIR}/grafana with ownership 472:472 (the grafana
+        user's UID:GID inside the grafana/grafana image) before the
+        real grafana service starts. This is the same architectural
+        pattern as pg-init for postgres: front every host-bind-mount
+        service with an init container that owns the leaf-prep contract.
+        Without grafana-init, a fresh host gets grafana falling into
+        a start-loop because /var/lib/grafana (bind-mounted leaf) is
+        owned by userns-mapped nobody, same .107 LXC quirk that
+        broke /app/logs (#108) and /prometheus (#147).
+        """
+        data = _load_compose()
+        services = data["services"]
+        assert "grafana-init" in services, (
+            "grafana-init service must exist (one-shot mkdir + chown " "for APPDATA_DIR/grafana before grafana starts)"
+        )
+        init_svc = services["grafana-init"]
+        # Must be one-shot — restart: no. A restart-looping init would
+        # leave the stack wedged in `dependencies not ready` forever.
+        assert (
+            init_svc.get("restart") == "no"
+        ), f"grafana-init must be restart: 'no' (one-shot); got: {init_svc.get('restart')!r}"
+        # Must reference APPDATA_DIR in environment so the operator's
+        # stack-level Env override flows into the init script.
+        env = init_svc.get("environment", {})
+        if isinstance(env, list):
+            env_map = {}
+            for item in env:
+                if isinstance(item, str) and "=" in item:
+                    k, _, v = item.partition("=")
+                    env_map[k] = v
+            env = env_map
+        assert "APPDATA_DIR" in env, (
+            "grafana-init.environment must declare APPDATA_DIR so the "
+            "operator's stack Env override flows into the init script"
+        )
+        assert "/srv/alphard" in str(env.get("APPDATA_DIR", "")), (
+            f"APPDATA_DIR must default to /srv/alphard (Linux-conventional "
+            f"path, not /mnt/anything) for first-shot install portability; "
+            f"got: {env.get('APPDATA_DIR')!r}"
+        )
+
+    def test_grafana_depends_on_init(self) -> None:
+        """Grafana must wait for grafana-init to finish before
+        starting — otherwise the bind-mount leaf is not yet owned by
+        472:472 and the grafana image's entrypoint fails on its first
+        touch of /var/lib/grafana.
+        """
+        data = _load_compose()
+        grafana = data["services"]["grafana"]
+        deps = grafana.get("depends_on", [])
+        if isinstance(deps, dict):
+            deps = list(deps.keys())
+        assert "grafana-init" in deps, (
+            f"grafana must depends_on grafana-init so the leaf is "
+            f"prepared (mkdir + chown 472:472) before grafana starts; "
+            f"got depends_on={deps!r}"
+        )
+
+    def test_no_hardcoded_mnt_appdata_volumes(self) -> None:
+        """Wider regression guard: NO service in the compose may
+        bind-mount from /mnt/appdata/... directly. Every host path
+        must flow through ${APPDATA_DIR} so an operator can override
+        the stack root via a single Env.
+        """
+        data = _load_compose()
+        offenders = []
+        for svc_name, svc in data["services"].items():
+            for v in svc.get("volumes", []):
+                if isinstance(v, str) and v.startswith("/mnt/"):
+                    offenders.append((svc_name, v))
+                elif isinstance(v, dict) and isinstance(v.get("source"), str) and v["source"].startswith("/mnt/"):
+                    offenders.append((svc_name, v))
+        assert not offenders, (
+            "No service may bind-mount from /mnt/... — use "
+            "${APPDATA_DIR:-/srv/alphard} so the stack is portable. "
+            f"Found offenders: {offenders}"
+        )

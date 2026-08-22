@@ -4,28 +4,36 @@ version: "3.9"
 # Alphard Phase 1 — docker-compose.yaml
 # =============================================================================
 #
-# Migration 2026-08-15: bind mounts at /mnt/appdata/alphard/{postgres,redis,logs}
-# replace named Docker volumes. Bind mounts:
-#   - Survive `docker stack rm` and stack redeploy
-#   - Show up directly on host filesystem for backups (rsync, restic)
-#   - Allow live inspection of OHLCV data and logs
-#   - Match convention used by 14+ other stacks on .107 (honcho, forgejo,
-#     immich, paperclip, bitmagnet, minecraft, etc.)
+# Stack-level host paths are parameterised via APPDATA_DIR (default
+# /srv/alphard; on .107 this is conventionally overridden to
+# /mnt/appdata/alphard to match the rest of the selfhosted fleet: honcho,
+# forgejo, immich, paperclip, bitmagnet, minecraft, etc.). Each
+# service that touches a host path is fronted by a one-shot <svc>-init
+# service that mkdir -p's the leaf with the correct UID/GID before the
+# real service starts (grafana-init for grafana, pg-init for postgres).
+# This makes first-shot install portable: an operator cloning this repo
+# and running `docker compose --profile observability up` on a fresh LXC
+# gets a working stack without any per-host path edits.
 #
-# Obsolete named volumes to clean up manually if they exist:
-#   docker volume rm alphard_alphard-postgres-data
-#   docker volume rm alphard_alphard-redis-data
-#   docker volume rm alphard_alphard-logs
-#   docker volume rm alphard-logs (legacy)
+# Why not bind-mount directly into named volumes for /app/logs and
+# /prometheus (PR #119, #147)? Same root cause as the /mnt/appdata
+# userns-mapping bug (Docker 29.1.x + PVE LXC maps bind-mount leaf to
+# nobody:nogroup, which neither the in-container user nor CAP_CHOWN can
+# fix). tmpfs is the cheapest portable workaround — data is volatile
+# across container restarts, acceptable for logs (RotatingFileHandler
+# caps log retention) and the Prometheus TSDB (rebuild from bot on
+# restart). Restore named-volume paths once we move to a non-LXC host.
 #
 # Phase 1 components:
-#   - alphard-bot   : heartbeat + cron-launched daily_sync.py
-#   - postgres      : DataStore (ohlcv_daily, ticker_universe, decision_log)
-#   - redis         : cache for risk state, news, portfolio drift
+#   - alphard-bot        : heartbeat + cron-launched daily_sync.py
+#   - postgres           : DataStore (ohlcv_daily, ticker_universe, decision_log)
+#   - redis              : cache for risk state, news, portfolio drift
+#   - pg-init            : injects Docker-bridge trust line into pg_hba.conf
+#   - grafana-init       : creates APPDATA_DIR/grafana with UID 472 ownership
 #
 # Phase 3+ additions (profiles: ["observability"]):
-#   - prometheus    : scrape /metrics
-#   - grafana       : dashboards
+#   - prometheus : scrape /metrics
+#   - grafana    : dashboards
 # =============================================================================
 services:
   alphard-bot:
@@ -303,6 +311,46 @@ services:
           - alphard-prometheus
     profiles: ["observability"]
 
+  # BUGFIX (2026-08-22): /mnt/appdata/.../grafana is a host-specific path that
+  # breaks "first-shot install" portability — any operator must override it via
+  # the Portainer Env stack config before StackUpdate succeeds, otherwise the
+  # bind-mount source must exist on the host with the right ownership or
+  # Grafana falls into the same .107 userns-mapped nobody loop we hit on
+  # /app/logs (#108) and /prometheus (#147). The fix is a stack-level
+  # APPDATA_DIR env (default /srv/alphard — the Linux-conventional path
+  # outside /mnt) plus a one-shot grafana-init service that creates the
+  # bind-mount leaf with the correct UID/GID 472:472 BEFORE grafana starts.
+  # If the leaf already exists from a prior deploy, mkdir -p is a no-op;
+  # chown only touches the leaf root so it doesn't recursively walk the
+  # user's existing dashboard directory.
+  grafana-init:
+    image: alpine:3.20
+    container_name: alphard-grafana-init
+    restart: "no"
+    security_opt:
+      - apparmor=unconfined
+    environment:
+      APPDATA_DIR: ${APPDATA_DIR:-/srv/alphard}
+    entrypoint:
+      - sh
+      - -c
+      - |
+        set -e
+        # Honour operator override for host data dir. ${APPDATA_DIR} on .107
+        # is conventionally /mnt/appdata/alphard (matches the rest of the
+        # selfhosted fleet: honcho, forgejo, immich, paperclip, bitmagnet,
+        # minecraft, etc.). Default /srv/alphard works for any LXC/VM.
+        mkdir -p "$$APPDATA_DIR/grafana"
+        # UID/GID 472 = grafana user inside the grafana/grafana image;
+        # only chown the leaf root, not the contents (preserves any
+        # dashboards the operator provisioned by hand).
+        chown 472:472 "$$APPDATA_DIR/grafana"
+        echo "[grafana-init] OK: $$APPDATA_DIR/grafana owned by 472:472"
+    volumes:
+      - ${APPDATA_DIR_HOST:-/srv/alphard}:${APPDATA_DIR:-/srv/alphard}
+    networks:
+      - alphard-net
+
   grafana:
     image: grafana/grafana:latest
     container_name: alphard-grafana
@@ -319,11 +367,12 @@ services:
       GF_SERVER_HTTP_PORT: "3300"
     user: "472:472"
     volumes:
-      - /mnt/appdata/alphard/grafana:/var/lib/grafana
+      - ${APPDATA_DIR:-/srv/alphard}/grafana:/var/lib/grafana
       - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
     depends_on:
       - prometheus
+      - grafana-init
     profiles: ["observability"]
 
 networks:
