@@ -882,3 +882,113 @@ class TestGrafanaPortability:
             "${APPDATA_DIR:-/srv/alphard} so the stack is portable. "
             f"Found offenders: {offenders}"
         )
+
+
+class TestPortainerStandaloneEnv:
+    """Issue 2026-08-22 #149 — Portainer standalone does NOT propagate
+    stack-level Env vars into service-level environment unless the
+    service explicitly declares them in its `environment:` block.
+
+    Verified on .107 stack #111 after StackUpdate from main HEAD 95c7095:
+    alphard-redis restart-looped every 1s with ``REDIS_PASSWORD is
+    required (unset/empty in env)`` because the stack Env had
+    REDIS_PASSWORD set, but the redis service's environment block
+    did NOT declare it — Portainer stripped it during render.
+
+    Regression guard: every service whose inline command / entrypoint
+    consumes a ${VAR:-} placeholder that has no compose-CLI default
+    fallback MUST declare that VAR in its service.environment block.
+    Without this declaration, ${VAR:-} evaluates to empty inside the
+    container regardless of stack-level Env values.
+    """
+
+    def _env_map(self, svc: dict) -> dict:
+        """Normalize a service.environment block to {key: value}.
+
+        Compose accepts two shapes for env entries:
+          * list of "KEY=value" strings
+          * map {KEY: value}
+        Some entries are bare keys (KEY:) which load as None.
+        """
+        env = svc.get("environment", {})
+        if isinstance(env, list):
+            env_map = {}
+            for item in env:
+                if isinstance(item, str) and "=" in item:
+                    k, _, v = item.partition("=")
+                    env_map[k] = v
+                elif isinstance(item, str):
+                    env_map[item] = None
+            env = env_map
+        return env
+
+    def test_redis_declares_redis_password_explicit(self) -> None:
+        """The redis service's entrypoint gates on REDIS_PASSWORD (see
+        BUGFIX H-8 in compose.yaml). If the env is not declared in the
+        service.environment block, Portainer standalone strips the
+        stack-level value and the gate trips -> restart loop.
+        """
+        data = _load_compose()
+        redis = data["services"]["redis"]
+        env = self._env_map(redis)
+        assert "REDIS_PASSWORD" in env, (
+            "redis service.environment must declare REDIS_PASSWORD "
+            "explicitly so Portainer standalone propagates the stack-level "
+            "Env value into the container (otherwise the inline fail-fast "
+            "gate in redis command: exit 1 on empty REDIS_PASSWORD, "
+            "container restart-loops every 1s)."
+        )
+        # Default is empty so the inline gate can still trip on truly
+        # misconfigured stacks (rather than silently starting with no auth).
+        # This matches the inline gate's `[ -z "${REDIS_PASSWORD:-}" ]` test.
+        assert env.get("REDIS_PASSWORD") in (None, "", "${REDIS_PASSWORD:-}"), (
+            f"REDIS_PASSWORD default in compose must be empty string "
+            f"(fail-fast contract), got: {env.get('REDIS_PASSWORD')!r}"
+        )
+
+    def test_prometheus_declares_prom_yml_b64_explicit(self) -> None:
+        """prometheus service's inline entrypoint decodes PROM_YML_B64
+        from env. Without explicit declaration Portainer strips it ->
+        prometheus starts with empty config -> fails to bind.
+        """
+        data = _load_compose()
+        prom = data["services"]["prometheus"]
+        env = self._env_map(prom)
+        assert "PROM_YML_B64" in env, (
+            "prometheus service.environment must declare PROM_YML_B64 "
+            "explicitly so Portainer standalone propagates the stack-level "
+            "Env value into the container (otherwise the inline entrypoint "
+            "decodes an empty string and prometheus refuses to bind on 9090)."
+        )
+        assert env.get("PROM_YML_B64") in (None, "", "${PROM_YML_B64:-}"), (
+            f"PROM_YML_B64 default in compose must be empty string "
+            f"(loud failure on missing config), got: {env.get('PROM_YML_B64')!r}"
+        )
+
+    def test_postgres_declares_secrets_explicit(self) -> None:
+        """postgres service already has explicit environment block
+        from PR #127 (#129 fix). Regression guard so a future refactor
+        can't silently break the Portainer standalone contract.
+        """
+        data = _load_compose()
+        pg = data["services"]["postgres"]
+        env = self._env_map(pg)
+        for required in ("POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB"):
+            assert required in env, (
+                f"postgres service.environment must declare {required} "
+                f"explicitly (Portainer standalone strips undeclared env)"
+            )
+
+    def test_alphard_bot_declares_env_file_explicit(self) -> None:
+        """alphard-bot service.environment declares ENV_FILE so the
+        bind-mounted /root/.env is sourced by entrypoint.sh. Same
+        Portainer standalone contract as redis/prometheus.
+        """
+        data = _load_compose()
+        bot = data["services"]["alphard-bot"]
+        env = self._env_map(bot)
+        assert "ENV_FILE" in env, (
+            "alphard-bot service.environment must declare ENV_FILE so "
+            "entrypoint.sh sources the right path under Portainer standalone "
+            "(stack Env propagation only reaches declared env vars)"
+        )

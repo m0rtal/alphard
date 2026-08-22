@@ -156,6 +156,24 @@ services:
       - apparmor=unconfined
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
+    # BUGFIX (2026-08-22 #149): Portainer standalone does NOT propagate
+    # stack-level Env vars into service-level environment unless the
+    # service explicitly declares them. Without this explicit declaration
+    # the redis container's entrypoint sees REDIS_PASSWORD as unset,
+    # the inline fail-fast gate trips, and the container restart-loops
+    # forever (verified on .107 stack #111 after StackUpdate from main
+    # HEAD 95c7095 — alphard-redis exited every 1s with "REDIS_PASSWORD
+    # is required (unset/empty in env)").
+    #
+    # The same applies to POSTGRES_PASSWORD on postgres and every other
+    # service that consumes stack-level secrets. Listing them here does
+    # NOT change compose CLI behaviour — `${VAR:-}` defaults still apply
+    # if the operator omits the Env from Portainer stack config — it
+    # just stops Portainer from stripping them from the rendered
+    # container env. Keep this list in sync with the stack Env config
+    # (see /data/compose/111/stack.env on .107 for the canonical list).
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
     # BUGFIX (H-8): fail-fast on missing redis password.
     #
     # Why not `${REDIS_PASSWORD:?...}`: YAML anchor (Portainer StackUpdate
@@ -278,6 +296,14 @@ services:
     # POST /-/reload after the inline startup script writes it on first boot.
     security_opt:
       - apparmor=unconfined
+    # BUGFIX (2026-08-22 #149): PROM_YML_B64 must be declared explicitly
+    # in service.environment because Portainer standalone does NOT
+    # propagate stack-level Env vars into services that don't opt in.
+    # Without this declaration the inline entrypoint decodes an empty
+    # string and prometheus refuses to bind. The downstream
+    # `environment:` block below (with the same key) is the actual
+    # contract — this comment is here to anchor the rationale in
+    # the file's first-pass reader.
     # Inline config write: write prometheus.yml on container startup from an
     # env-baked base64 blob, then exec prometheus. Avoids the bind-mount leaf
     # file-vs-directory quirk that .107 has for src=file mounts.
