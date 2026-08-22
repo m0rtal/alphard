@@ -1299,10 +1299,32 @@ class TestOrderFlow:
         rg.evaluate.return_value = RiskDecision(allowed=False, violations=violations)
         return rg
 
+    def _quote_provider(self, price: Decimal | None = Decimal("250")):
+        """Build a stub QuoteProvider.
+
+        Issue #166: OrderFlow now requires a real, non-placeholder quote.
+        Tests pass a callable returning a fixed price; tests that exercise
+        the "no quote" path override ``_quote_provider`` with a raising
+        callable.
+        """
+
+        def _qp(_symbol: str) -> Decimal:
+            assert price is not None
+            return price
+
+        return _qp
+
+    def _raising_quote_provider(self, exc: Exception | None = None):
+        def _qp(_symbol: str) -> Decimal:
+            raise exc if exc is not None else ConnectionError("tinkoff down")
+
+        return _qp
+
     def test_universe_blocked_short_circuits(self):
         flow = OrderFlow(
             broker=MagicMock(),
             risk_gate=self._approved_gate(),
+            quote_provider=self._quote_provider(),
             universe_filter=lambda s: False,
         )
         result = flow.submit_market("SBER", OrderSide.BUY, Decimal("10"), self._portfolio())
@@ -1313,6 +1335,7 @@ class TestOrderFlow:
         flow = OrderFlow(
             broker=MagicMock(),
             risk_gate=self._blocked_gate(),
+            quote_provider=self._quote_provider(),
         )
         result = flow.submit_market("SBER", OrderSide.BUY, Decimal("10"), self._portfolio())
         assert result.final_status == OrderStatus.REJECTED
@@ -1320,7 +1343,11 @@ class TestOrderFlow:
     def test_risk_gate_approved_submits_via_broker(self):
         broker = MagicMock()
         broker.place_order.return_value = OrderStatus.SUBMITTED
-        flow = OrderFlow(broker=broker, risk_gate=self._approved_gate())
+        flow = OrderFlow(
+            broker=broker,
+            risk_gate=self._approved_gate(),
+            quote_provider=self._quote_provider(),
+        )
         result = flow.submit_market("SBER", OrderSide.BUY, Decimal("100"), self._portfolio())
         assert result.slice_count >= 1
         assert broker.place_order.called
@@ -1328,7 +1355,11 @@ class TestOrderFlow:
     def test_risk_gate_approved_broker_exception_still_records(self):
         broker = MagicMock()
         broker.place_order.side_effect = Exception("network down")
-        flow = OrderFlow(broker=broker, risk_gate=self._approved_gate())
+        flow = OrderFlow(
+            broker=broker,
+            risk_gate=self._approved_gate(),
+            quote_provider=self._quote_provider(),
+        )
         result = flow.submit_market("SBER", OrderSide.BUY, Decimal("100"), self._portfolio())
         # Some slices REJECTED due to broker errors
         assert OrderStatus.REJECTED in result.submitted
@@ -1363,11 +1394,135 @@ class TestOrderFlow:
         monkeypatch.setattr(OrderSlicer, "slice", _raise_value_error)
 
         broker = MagicMock()
-        flow = OrderFlow(broker=broker, risk_gate=self._approved_gate())
+        flow = OrderFlow(broker=broker, risk_gate=self._approved_gate(), quote_provider=self._quote_provider())
         result = flow.submit_market("SBER", OrderSide.BUY, Decimal("100"), self._portfolio())
         # No slices submitted; final_status is REJECTED
         assert result.slice_count == 0
         assert broker.place_order.call_count == 0
+
+    # ---------------------------------------------------------------
+    # Issue #166 — OrderFlow must require a real (non-placeholder) quote.
+    # ---------------------------------------------------------------
+
+    def test_constructor_requires_quote_provider(self):
+        """Passing quote_provider=None is a programming error (issue #166).
+
+        The constructor must raise ``TypeError`` rather than silently
+        degrading to a placeholder — that is exactly the bug OrderFlow
+        carried before this fix.
+        """
+        with pytest.raises(TypeError, match="quote_provider"):
+            OrderFlow(
+                broker=MagicMock(),
+                risk_gate=self._approved_gate(),
+                quote_provider=None,  # type: ignore[arg-type]
+            )
+
+    def test_quote_provider_raises_returns_quote_unavailable(self):
+        """When the live quote cannot be fetched, refuse the order rather than
+        fall back to a placeholder (issue #166).
+
+        The RiskGate is irrelevant here: the order must short-circuit
+        before the gate is consulted so a downstream ``price=Decimal("1")``
+        placeholder can never reach ``TradeIntent`` construction.
+        """
+        broker = MagicMock()
+        flow = OrderFlow(
+            broker=broker,
+            risk_gate=self._approved_gate(),
+            quote_provider=self._raising_quote_provider(),
+        )
+        result = flow.submit_market("SBER", OrderSide.BUY, Decimal("10"), self._portfolio())
+        assert result.final_status == OrderStatus.REJECTED
+        assert result.decision_violations == ("QUOTE_UNAVAILABLE",)
+        assert result.slice_count == 0
+        # The broker must NOT have been touched — refusing the quote is
+        # upstream of order placement.
+        assert not broker.place_order.called
+
+    def test_quote_provider_non_positive_returns_quote_invalid(self):
+        """Defence-in-depth: if the quote provider returns ``Decimal('0')`` or
+        a negative price, refuse the order rather than letting an obviously
+        bogus price reach the RiskGate (issue #166).
+        """
+        flow = OrderFlow(
+            broker=MagicMock(),
+            risk_gate=self._approved_gate(),
+            quote_provider=self._quote_provider(Decimal("0")),
+        )
+        result = flow.submit_market("SBER", OrderSide.BUY, Decimal("10"), self._portfolio())
+        assert result.decision_violations == ("QUOTE_INVALID",)
+
+    def test_real_gate_with_quote_provider_submits_order(self):
+        """End-to-end with a REAL ``RiskGate`` (not a MagicMock).
+
+        This is the regression test that would have caught issue #166:
+        with the pre-fix ``price=Decimal("1")`` placeholder, the real gate
+        blocks every call via ``RISK_MARKET_ORDER_NO_QUOTE``. With the
+        quote_provider returning a real price, the order is allowed.
+        """
+        from src.risk.gate import RiskGate, RiskLimits
+
+        limits = RiskLimits(
+            max_dd_pct=Decimal("10"),
+            max_position_pct=Decimal("10"),
+            max_sector_pct=Decimal("30"),
+            max_daily_loss_pct=Decimal("3"),
+        )
+        real_gate = RiskGate(limits=limits)
+        broker = MagicMock()
+        broker.place_order.return_value = OrderStatus.SUBMITTED
+
+        def _real_quote(_symbol: str) -> Decimal:
+            return Decimal("100")  # 10 shares * 100 = 1000 = 1% of 100k NAV
+
+        flow = OrderFlow(
+            broker=broker,
+            risk_gate=real_gate,
+            quote_provider=_real_quote,
+        )
+        result = flow.submit_market("SBER", OrderSide.BUY, Decimal("10"), self._portfolio(cash="100000"))
+        assert result.final_status == OrderStatus.SUBMITTED
+        assert result.slice_count >= 1
+        assert broker.place_order.called
+
+    def test_real_gate_blocks_oversized_position_with_real_quote(self):
+        """End-to-end with REAL ``RiskGate``: an oversized position is
+        correctly blocked via ``RISK_POSITION`` (not ``RISK_MARKET_ORDER_NO_QUOTE``).
+
+        This pins the contract: with a real quote, the gate evaluates the
+        intended position-sizing rule. Without one, it would have bounced
+        on the placeholder guard and the operator would never see the
+        real sizing violation.
+        """
+        from src.risk.gate import RiskGate, RiskLimits
+
+        limits = RiskLimits(
+            max_dd_pct=Decimal("10"),
+            max_position_pct=Decimal("10"),  # 10% cap
+            max_sector_pct=Decimal("30"),
+            max_daily_loss_pct=Decimal("3"),
+        )
+        real_gate = RiskGate(limits=limits)
+        broker = MagicMock()
+        broker.place_order.return_value = OrderStatus.SUBMITTED
+
+        def _real_quote(_symbol: str) -> Decimal:
+            return Decimal("1000")  # 50 shares * 1000 = 50_000 = 50% of NAV → exceeds 10%
+
+        flow = OrderFlow(
+            broker=broker,
+            risk_gate=real_gate,
+            quote_provider=_real_quote,
+        )
+        result = flow.submit_market("SBER", OrderSide.BUY, Decimal("50"), self._portfolio(cash="100000"))
+        assert result.final_status == OrderStatus.REJECTED
+        # Must be the sizing violation, not the placeholder guard:
+        assert any(
+            v.startswith("RISK_POSITION:") for v in result.decision_violations
+        ), f"unexpected violations: {result.decision_violations}"
+        assert not any("RISK_MARKET_ORDER_NO_QUOTE" in v for v in result.decision_violations)
+        assert not broker.place_order.called
 
 
 # ────────────────────────────────────────────
