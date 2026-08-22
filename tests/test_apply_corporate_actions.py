@@ -1382,9 +1382,10 @@ def test_moex_fetch_is_cached_across_tickers(
         },
     ]
 
-    # Clean slate — the conftest runs many tests before us and the
-    # cache is module-level; without reset a previous test's
-    # ``fetch_splits`` call could leak through.
+    # Belt and braces: main() resets the cache at entry, but the
+    # reset is a single line of defence and we want this test to
+    # stand alone if future refactoring changes that. Belt and braces
+    # vs. regressions in unrelated tests.
     aca._reset_moex_cache_for_tests()
 
     with patch.object(aca, "_FETCHER_MOD") as fake_fetcher:
@@ -1410,26 +1411,32 @@ def test_moex_fetch_is_cached_across_tickers(
     )
 
 
-def test_moex_cache_is_per_session_not_global(
+def test_moex_cache_is_reset_per_main_invocation(
     store: InMemorySQLiteStore,
     tmp_path: Path,
 ) -> None:
-    """Two consecutive ``aca.main()`` invocations that share a
-    ``requests.Session`` would normally inherit the first run's cached
-    response. The cache is keyed on ``id(session)`` so production's
-    fresh-session-per-run contract keeps the cache from leaking; this
-    test pins that behaviour by using two distinct session objects
-    (each ``main()`` builds its own, so each run fetches once).
+    """Issue #140: ``_MOEX_CACHE`` is reset at the entry of every
+    ``aca.main()`` call. Two consecutive ``main()`` invocations must
+    each make exactly one ``fetch_splits`` call — the second run must
+    NOT inherit the first run's cached payload.
+
+    Regression guard against the original ``id(session)`` keying,
+    which leaked across runs because CPython recycles ``id()`` of
+    freed ``Session`` objects.
     """
     cache_path = tmp_path / "cache.json"
-    fetcher_payload = [
+
+    fetcher_payload_first = [
+        # First run: NO splits at all.
+    ]
+    fetcher_payload_second = [
+        # Second run: a real SBER split.
         {"ticker": "SBER", "ts": "2026-01-09", "ratio": 2.0, "source": "moex"},
     ]
 
-    aca._reset_moex_cache_for_tests()
-
+    # First run — empty splits list gets cached.
     with patch.object(aca, "_FETCHER_MOD") as fake_fetcher:
-        fake_fetcher.fetch_splits.return_value = fetcher_payload
+        fake_fetcher.fetch_splits.return_value = fetcher_payload_first
         fake_fetcher.fetch_dividends.return_value = []
         fake_fetcher.USER_AGENT = "alphard-test"
         aca.main(
@@ -1437,37 +1444,33 @@ def test_moex_cache_is_per_session_not_global(
             store=store,
         )
         assert fake_fetcher.fetch_splits.call_count == 1
-        # Second run within the skip window: cache short-circuits
-        # before the fetcher is even reached.
+        # And once cached, the second ticker inside the same run
+        # would NOT re-fetch (covers the within-run dedup contract).
         aca.main(
-            [
-                "--tickers",
-                "SBER",
-                "--cache-path",
-                str(cache_path),
-            ],
+            ["--tickers", "SBER", "--cache-path", str(cache_path)],
             store=store,
         )
-        assert fake_fetcher.fetch_splits.call_count == 1, (
-            "second run within skip window must not re-fetch (cache hit " "in main() before any helper is called)"
-        )
+        assert fake_fetcher.fetch_splits.call_count == 1, "second call within skip window must not re-fetch"
 
-    # And a third run with --force must fetch exactly once for this
-    # fresh session (the script builds a new requests.Session inside
-    # main() each invocation, so the cache key changes).
+    # Second run (separate cache path so the skip-window check doesn't
+    # short-circuit): the SBER split from the second payload MUST
+    # be applied. Pre-fix, the cache from the first run (empty list)
+    # would be reused here because CPython recycled the ``Session``'s
+    # ``id()`` — and the split would silently never reach the store.
     cache_path2 = tmp_path / "cache2.json"
     with patch.object(aca, "_FETCHER_MOD") as fake_fetcher:
-        fake_fetcher.fetch_splits.return_value = fetcher_payload
+        fake_fetcher.fetch_splits.return_value = fetcher_payload_second
         fake_fetcher.fetch_dividends.return_value = []
         fake_fetcher.USER_AGENT = "alphard-test"
-        aca.main(
-            [
-                "--tickers",
-                "SBER",
-                "--force",
-                "--cache-path",
-                str(cache_path2),
-            ],
+        rc = aca.main(
+            ["--tickers", "SBER", "--force", "--cache-path", str(cache_path2)],
             store=store,
         )
-        assert fake_fetcher.fetch_splits.call_count == 1, "--force run on a fresh session must fetch exactly once"
+    assert rc == aca.EXIT_OK
+    assert (
+        fake_fetcher.fetch_splits.call_count == 1
+    ), "each main() call must populate the cache exactly once (issue #140)"
+
+    # And the split must have been applied to the store.
+    adj_rows = store.query_ohlcv_adj("SBER", date(2026, 1, 1), date(2026, 12, 31))
+    assert adj_rows, "the SBER split from the second run must reach the store"
