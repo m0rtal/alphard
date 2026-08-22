@@ -97,6 +97,27 @@ def main() -> int:
 
     store = PostgresDataStore()
     try:
+        # Issue #164: PostgresDataStore uses LAZY connection
+        # (``self._conn = None`` at __init__, ``_connect()`` opens it).
+        # The previous code accessed ``store._conn`` at two sites below
+        # WITHOUT ever calling ``store._connect()`` first, so on a fresh
+        # store ``store._conn is None`` and ``_is_postgres(None)`` returns
+        # True (duck-types as psycopg2). The persistence helpers then
+        # called ``None.cursor()`` and raised AttributeError. Net effect:
+        # the skip-gate was silently disabled (every run re-fetched) and
+        # the upsert always failed with rc=3, so macro_regime_log was
+        # never written.
+        #
+        # Force a single explicit connect here, mirroring the pattern in
+        # scripts/validate_ohlcv.py:89. After this line ``store._conn``
+        # is a live psycopg2 connection (or a StoreError has been raised
+        # by ``_connect()``, which we propagate as rc=3 below).
+        try:
+            store._connect()
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"macro_sync store connect failed: {exc}")
+            return 3
+
         # Skip gate: if the most-recent row is younger than the window, exit 0.
         if not args.force:
             latest = _latest_in_db(store)
