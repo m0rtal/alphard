@@ -1631,6 +1631,61 @@ class TestSyncUniverseDelisted:
         # active ticker: delisted_at None
         assert params[0][1] is None
 
+    def test_sync_universe_delisted_sql_uses_coalesce_for_delisted_at(self) -> None:
+        """Regression: ``delisted_at`` MUST be COALESCE-wrapped, mirroring
+        ``listed_at``. The previous SQL used a bare ``%s`` for
+        ``delisted_at``, which OVERWROTE a previously-stored value with
+        NULL whenever ``fetch_delist_dates`` returned ``(None, None)``
+        for a delisted ticker (e.g. transient ISS outage). The fix
+        wraps both columns symmetrically: None upstream = "keep whatever
+        we have on disk". See the docstring of
+        ``PostgresDataStore.sync_universe_delisted`` for the full
+        rationale.
+        """
+        from datetime import date
+
+        store = self._make_store(rowcount=1)
+        dates = {"VSMO": (date(2004, 4, 15), date(2020, 12, 30))}
+        PostgresDataStore.sync_universe_delisted(store, dates)
+        cursor = store._conn.cursor.return_value.__enter__.return_value
+        sql = cursor.executemany.call_args[0][0]
+        # listed_at side already protected; delisted_at must be too.
+        # Strip whitespace/newlines to make the assertion robust against
+        # formatting changes.
+        sql_flat = " ".join(sql.split())
+        assert "listed_at = COALESCE(%s, listed_at)" in sql_flat
+        assert "delisted_at = COALESCE(%s, delisted_at)" in sql_flat, (
+            "delisted_at is not COALESCE-wrapped; a transient upstream "
+            "None would overwrite a stored delisted_at with NULL."
+        )
+        # And the param tuple order must still be (listed_at, delisted_at, ticker)
+        params = cursor.executemany.call_args[0][1]
+        assert params == [(date(2004, 4, 15), date(2020, 12, 30), "VSMO")]
+
+    def test_sync_universe_delisted_none_values_still_passed_in_params(self) -> None:
+        """The fix must NOT change the param shape. None values are still
+        forwarded to psycopg — the COALESCE happens server-side, not in
+        Python. This guards against a regression where someone "fixes"
+        the asymmetry by silently dropping None entries on the client.
+        """
+        from datetime import date
+
+        store = self._make_store(rowcount=2)
+        dates = {
+            "GAZP": (date(1996, 1, 1), None),  # active — listed_at known, delisted_at unknown
+            "VSMO": (date(2004, 4, 15), date(2020, 12, 30)),  # delisted — both known
+        }
+        PostgresDataStore.sync_universe_delisted(store, dates)
+        cursor = store._conn.cursor.return_value.__enter__.return_value
+        params = cursor.executemany.call_args[0][1]
+        # Order is not guaranteed (dict iteration), check as a set.
+        assert sorted(params) == sorted(
+            [
+                (date(1996, 1, 1), None, "GAZP"),
+                (date(2004, 4, 15), date(2020, 12, 30), "VSMO"),
+            ]
+        )
+
     def test_sync_universe_delisted_returns_int(self) -> None:
         """psycopg may return rowcount as int or str; we coerce to int."""
         from datetime import date

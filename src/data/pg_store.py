@@ -694,6 +694,27 @@ class PostgresDataStore(DataStore):
         don't appear in ``delisted_dates`` are left alone.
 
         Idempotent: re-running with the same dict is a no-op.
+
+        Issue #150: the previous SQL used ``COALESCE(%s, listed_at)``
+        for ``listed_at`` but a bare ``%s`` for ``delisted_at``. When
+        ``fetch_delist_dates()`` returns ``(None, None)`` for a ticker
+        (transient ISS outage, network blip, or a board whose
+        ``listed_from``/``listed_till`` attributes are absent), the
+        sync would OVERWRITE a previously-stored ``delisted_at`` with
+        NULL — silently regressing a known delisted ticker to "active".
+        The age-aware backfill completion formula
+        (``expected_bars = trading_days(listed_at, today|delisted_at) * (1 - halts_pct)``)
+        then computed the wrong denominator, the ticker stayed in
+        "partial" forever, and ML/training layers filtered it out.
+
+        Fix: wrap ``delisted_at`` in ``COALESCE`` too, matching the
+        ``listed_at`` semantics. A None upstream now means "keep
+        whatever we had on disk" — symmetric with listed_at. A new
+        non-None date still overwrites (the canonical "I just learned
+        this delisted today" path). To explicitly NULL a delisted_at,
+        callers must use a separate maintenance path (none exists
+        today — by design; once a ticker is delisted it stays
+        delisted in our universe).
         """
 
         rows: list[tuple[str, object, object]] = []
@@ -702,8 +723,8 @@ class PostgresDataStore(DataStore):
             rows.append(
                 (
                     ticker.upper(),
-                    listed_at,  # may be None
-                    delisted_at,  # may be None
+                    listed_at,  # may be None → COALESCE keeps existing
+                    delisted_at,  # may be None → COALESCE keeps existing
                 )
             )
         if not rows:
@@ -714,7 +735,7 @@ class PostgresDataStore(DataStore):
                 """
                 UPDATE ticker_universe
                    SET listed_at   = COALESCE(%s, listed_at),
-                       delisted_at = %s,
+                       delisted_at = COALESCE(%s, delisted_at),
                        updated_at  = NOW()
                  WHERE ticker = %s
                 """,
