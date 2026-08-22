@@ -807,6 +807,38 @@ class TestMarkDelisted:
         # reason defaults to ""
         assert cur.calls[1][1] == ("GAZP", date(2026, 2, 1), "")
 
+    def test_mark_delisted_normalises_lowercase_ticker(self, store: PostgresDataStore) -> None:
+        """Issue #160: lowercase input must be upper-cased before SQL params.
+
+        Without normalisation, ``mark_delisted("sber", ...)`` would silently
+        no-op the UPDATE (no row matches ``WHERE ticker = 'sber'``) while
+        still INSERTing a "sber" row into delisting_log — leaving
+        ``ticker_universe`` and the audit log permanently inconsistent.
+        """
+        store.mark_delisted("sber", date(2026, 1, 15), reason="merger")
+        cur = store._conn.last_cursor()
+        assert len(cur.calls) == 2
+        sql1, params1 = cur.calls[0]
+        assert "UPDATE ticker_universe SET delisted = TRUE" in sql1
+        assert params1 == (date(2026, 1, 15), "SBER")
+        sql2, params2 = cur.calls[1]
+        assert "INSERT INTO delisting_log" in sql2
+        assert params2 == ("SBER", date(2026, 1, 15), "merger")
+
+    def test_mark_delisted_normalises_mixed_case_ticker(self, store: PostgresDataStore) -> None:
+        """Issue #160: mixed-case input is also normalised to UPPERCASE."""
+        store.mark_delisted("SbEr", date(2026, 3, 10))
+        cur = store._conn.last_cursor()
+        assert cur.calls[0][1] == (date(2026, 3, 10), "SBER")
+        assert cur.calls[1][1] == ("SBER", date(2026, 3, 10), "")
+
+    def test_mark_delisted_uppercase_unchanged(self, store: PostgresDataStore) -> None:
+        """Regression: already-uppercase input is passed through unchanged."""
+        store.mark_delisted("SBER", date(2026, 4, 20))
+        cur = store._conn.last_cursor()
+        assert cur.calls[0][1] == (date(2026, 4, 20), "SBER")
+        assert cur.calls[1][1] == ("SBER", date(2026, 4, 20), "")
+
 
 # ---------------------------------------------------------------------------
 # OHLCV: upsert / query / dedup / migrate
