@@ -256,13 +256,51 @@ services:
     image: prom/prometheus:latest
     container_name: alphard-prometheus
     restart: unless-stopped
+    # BUGFIX (2026-08-22 LXC): .107 Docker 29.1.x + PVE LXC bind-mount leaf
+    # gets userns-mapped nobody:nogroup ownership; Prometheus writes its
+    # WAL into /prometheus which becomes unwritable for the in-image 'nobody'
+    # user. Same class of bug as #108 (alphard-bot /app/logs) and #122 (postgres
+    # init.sql). Fix: replace bind-mount with tmpfs (root-owned, always writable).
+    # Cost: TSDB lives in container memory; data is lost on container restart.
+    # Acceptable for Phase 2 — restore bind-mount once we move observability to
+    # a non-LXC Docker host (e.g. .110) or fix leaf ownership via a different
+    # mechanism (PR #46-style perms_fix init container).
+    #
+    # Also: --web.enable-lifecycle so prometheus.yml can be hot-reloaded via
+    # POST /-/reload after the inline startup script writes it on first boot.
+    security_opt:
+      - apparmor=unconfined
+    # Inline config write: write prometheus.yml on container startup from an
+    # env-baked base64 blob, then exec prometheus. Avoids the bind-mount leaf
+    # file-vs-directory quirk that .107 has for src=file mounts.
+    entrypoint:
+      - sh
+      - -c
+      - |
+        set -e
+        mkdir -p /etc/prometheus /prometheus
+        echo "$$PROM_YML_B64" | base64 -d > /etc/prometheus/prometheus.yml
+        chmod -R 777 /prometheus
+        exec /bin/prometheus \
+          --config.file=/etc/prometheus/prometheus.yml \
+          --storage.tsdb.path=/prometheus \
+          --storage.tsdb.retention.time=30d \
+          --web.listen-address=0.0.0.0:9090 \
+          --web.enable-lifecycle
+    environment:
+      PROM_YML_B64: ${PROM_YML_B64:-}
     volumes:
-      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - /mnt/appdata/alphard/prometheus:/prometheus
+      - type: tmpfs
+        target: /prometheus
+        tmpfs:
+          size: 2G
     ports:
       - "9090:9090"
     networks:
-      - alphard-net
+      alphard-net:
+        aliases:
+          - prometheus
+          - alphard-prometheus
     profiles: ["observability"]
 
   grafana:

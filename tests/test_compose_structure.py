@@ -577,3 +577,162 @@ class TestRedisFailFast:
                 f"got {proc.returncode}.\nstdout={proc.stdout!r}\n"
                 f"stderr={proc.stderr!r}\nscript={rendered!r}"
             )
+
+
+class TestPrometheusLXC:
+    """Issue: 2026-08-22 — prometheus container restart-loops on .107 PVE LXC.
+
+    The .107 Docker daemon (29.1.x on Proxmox VE unprivileged LXC) maps
+    bind-mount leaf directories to userns-mapped nobody:nogroup. The
+    prometheus image runs as the in-image `nobody` user, which then
+    cannot write its WAL into `/prometheus` — the bind-mount leaves the
+    directory read-only for the container.
+
+    Same class of bug as PR #108/#119/#120 (`/app/logs`) and PR #122
+    (postgres init.sql). The fix is the same: replace the bind-mount
+    with a tmpfs (root-owned, always writable). The TSDB then lives in
+    container memory; data is lost on container restart — acceptable
+    trade-off for Phase 2 observability (see docker-compose.yaml comment
+    on the prometheus service for the restore path on a non-LXC host).
+    """
+
+    def _prometheus_service(self) -> dict:
+        data = _load_compose()
+        prom = data["services"].get("prometheus")
+        assert prom is not None, "prometheus service must exist (under profiles: [observability])"
+        return prom
+
+    def _prometheus_mounts(self) -> list:
+        """Return prometheus.volumes as a list of mount-spec dicts.
+
+        Compose accepts the same two shapes as on alphard-bot: short-form
+        strings ``"/host:/container[:ro]"`` and long-form dicts with
+        ``type: bind|tmpfs|volume`` plus ``source/target/read_only``.
+        """
+        return list(self._prometheus_service().get("volumes", []))
+
+    def test_prometheus_no_legacy_bind_mount_on_data(self) -> None:
+        """Regression guard: a future PR must NOT re-introduce the
+        ``/mnt/appdata/alphard/prometheus:/prometheus`` (or any other
+        bind-mount targeting /prometheus) on the prometheus service.
+
+        Such a bind-mount gives userns-mapped nobody:nogroup on the
+        leaf, which the in-image `nobody` user cannot write through
+        — the container restart-loops every 30s. Verified live 2026-08-22
+        via Portainer MCP container exec: `open /prometheus/queries.active:
+        permission denied`.
+        """
+        mounts = self._prometheus_mounts()
+        for v in mounts:
+            if isinstance(v, str) and ":" in v:
+                _src, _, dst = v.partition(":")
+                assert dst.split(":")[0] != "/prometheus", (
+                    f"legacy bind-mount to /prometheus must NOT survive "
+                    f"(re-introduces .107 userns-mapping restart-loop): {v!r}"
+                )
+            elif isinstance(v, dict) and v.get("target") == "/prometheus":
+                assert v.get("type") != "bind", (
+                    f"legacy bind-mount to /prometheus must NOT survive "
+                    f"(re-introduces .107 userns-mapping restart-loop): {v!r}"
+                )
+
+    def test_prometheus_data_is_tmpfs(self) -> None:
+        """Issue #120-style fix: /prometheus must be mounted as tmpfs so
+        the in-image `nobody` user (or any user — tmpfs is root-owned)
+        can write its WAL. Mirrors the alphard-bot /app/logs fix from
+        PR #119, extended to the observability stack.
+        """
+        mounts = self._prometheus_mounts()
+        tmpfs_mounts = [
+            v for v in mounts if isinstance(v, dict) and v.get("type") == "tmpfs" and v.get("target") == "/prometheus"
+        ]
+        assert (
+            tmpfs_mounts
+        ), "prometheus must mount /prometheus as tmpfs (LXC .107 " "userns-mapping fix). Found volumes: " + repr(mounts)
+
+    def test_prometheus_data_tmpfs_size_documented(self) -> None:
+        """The /prometheus tmpfs size must be ≥ 1 GiB so a 30-day
+        retention (configured via --storage.tsdb.retention.time=30d)
+        has headroom. Below ~500 MiB the active head + WAL replay
+        budget collapses and Prometheus restarts itself with
+        ``corruption in the WAL: out of order series`` after a few
+        hours of normal traffic.
+        """
+        import re
+
+        mounts = self._prometheus_mounts()
+        tmpfs_mounts = [
+            v for v in mounts if isinstance(v, dict) and v.get("type") == "tmpfs" and v.get("target") == "/prometheus"
+        ]
+        assert tmpfs_mounts, "missing /prometheus tmpfs mount (regression — see test_prometheus_data_is_tmpfs)"
+        spec = tmpfs_mounts[0].get("tmpfs", {})
+        size_raw = spec.get("size")
+        assert size_raw, (
+            f"/prometheus tmpfs must declare an explicit `size` to prevent "
+            f"unbounded growth on .107 LXC; got tmpfs={spec!r}"
+        )
+        m = re.fullmatch(r"\s*(\d+)\s*([KMG]?)\s*", str(size_raw))
+        assert m, f"/prometheus tmpfs.size must be a Docker byte-quantity (e.g. '2G'), got: {size_raw!r}"
+        n = int(m.group(1))
+        unit = m.group(2) or ""
+        factor = {"": 1, "K": 1024, "M": 1024 * 1024, "G": 1024**3}[unit]
+        bytes_ = n * factor
+        # Lower bound: 1 GiB. TSDB + WAL for 30d retention + heartbeat-style
+        # scrape @ 15s of a single 3-metric bot is well under 100 MiB, but
+        # we want headroom for label churn and Grafana recording rules in
+        # Phase 3+. A future shrink to e.g. 256M would risk WAL corruption
+        # under the 30d retention budget and fail loudly here.
+        assert bytes_ >= 1024 * 1024 * 1024, (
+            f"/prometheus tmpfs size must be ≥ 1 GiB to hold 30d retention "
+            f"+ WAL replay budget; got {size_raw} = {bytes_} bytes"
+        )
+
+    def test_prometheus_config_inlined_via_b64_env(self) -> None:
+        """The /etc/prometheus/prometheus.yml bind-mount is also broken
+        on .107 (src=file becomes a leaf directory, Docker 29.1.x quirk).
+        Solution: ship the config inline as a base64 env var and have
+        the container's entrypoint decode it into the tmpfs on startup.
+        This avoids the bind-mount file-vs-directory leaf quirk.
+
+        The env var name MUST be PROM_YML_B64 (used by the inline
+        entrypoint shell) and MUST default to empty so a stack
+        restart without a fresh env falls back to an empty config
+        (loud failure, not silent scrape of a half-loaded rule set).
+        """
+        svc = self._prometheus_service()
+        env = svc.get("environment", {})
+        if isinstance(env, list):
+            env_map = {}
+            for item in env:
+                if isinstance(item, str) and "=" in item:
+                    k, _, v = item.partition("=")
+                    env_map[k] = v
+                elif isinstance(item, str):
+                    env_map[item] = None
+            env = env_map
+        assert "PROM_YML_B64" in env, (
+            "prometheus.environment must declare PROM_YML_B64 so the "
+            "inline entrypoint can decode the config at startup (avoids "
+            "the .107 bind-mount file-vs-directory leaf quirk)"
+        )
+        # Must default to empty (no fallback baked into the image) so
+        # partial envs fail loudly with a 'No such file or directory'
+        # from base64 -d, not silently load a stale config.
+        assert env.get("PROM_YML_B64") in (None, "", "${PROM_YML_B64:-}"), (
+            f"PROM_YML_B64 must default to empty string for fail-fast " f"behaviour; got: {env.get('PROM_YML_B64')!r}"
+        )
+
+    def test_prometheus_exposes_port_9090(self) -> None:
+        """Grafana (network_mode: host, see compose) reaches Prometheus
+        via ``http://localhost:9090``. For this to work Prometheus must
+        publish its 9090/tcp port to the host's bridge, OR run on host
+        network. The compose form here uses the standard
+        ``ports: ["9090:9090"]`` mapping — sufficient for Grafana to
+        scrape it.
+        """
+        svc = self._prometheus_service()
+        ports = svc.get("ports", [])
+        port_strs = [str(p) for p in ports]
+        assert any("9090" in s for s in port_strs), (
+            f"prometheus.ports must expose 9090/tcp so host-network " f"Grafana can scrape it; got: {port_strs}"
+        )
