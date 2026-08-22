@@ -19,6 +19,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any
 from unittest.mock import MagicMock, patch
+import threading
 from urllib.error import HTTPError, URLError
 
 import pytest
@@ -535,3 +536,126 @@ class TestUniverse:
         assert loader._figi_for("SBER") is not None
         # Unknown ticker -> None (covers line 549)
         assert loader._figi_for("UNKNOWN") is None
+
+    def test_universe_cache_is_per_instance_not_shared(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """BUGFIX (issue #152): ``_universe_cache`` must be instance-scoped.
+
+        Two ``TinkoffInvestMDDataLoader`` instances constructed with
+        different tokens must have independent caches. The historical
+        bug declared ``_universe_cache`` at class scope, so every
+        instance shared the first instance's broker results — a
+        cross-token cache leak.
+        """
+        monkeypatch.setenv("TINKOFF_SANDBOX_TOKEN", "fake-token-1234567890")
+        from src.data.token_bucket import TokenBucket
+
+        loader_a = TinkoffInvestMDDataLoader(
+            token="token-A-12345678901234567890",
+            bucket=TokenBucket(rate=1000.0, window_seconds=1.0),
+        )
+        loader_b = TinkoffInvestMDDataLoader(
+            token="token-B-09876543210987654321",
+            bucket=TokenBucket(rate=1000.0, window_seconds=1.0),
+        )
+
+        # Each instance has its own (initially None) cache slot.
+        assert loader_a._universe_cache is None
+        assert loader_b._universe_cache is None
+
+        # Inject distinct cached universes on each instance directly.
+        # If the bug were present, loader_a._universe_cache and
+        # loader_b._universe_cache would be the SAME list object.
+        loader_a._universe_cache = [
+            TickerMeta(
+                ticker="FROM_A",
+                figi="BBG000000001",
+                class_code="TQBR",
+                name="From A",
+                lot=1,
+                source="tkf",
+            ),
+        ]
+        loader_b._universe_cache = [
+            TickerMeta(
+                ticker="FROM_B",
+                figi="BBG000000002",
+                class_code="TQBR",
+                name="From B",
+                lot=1,
+                source="tkf",
+            ),
+        ]
+
+        # Mutating A must not leak into B (would prove class-level aliasing).
+        assert loader_a._universe_cache is not loader_b._universe_cache
+        assert {m.ticker for m in loader_a._universe_cache} == {"FROM_A"}
+        assert {m.ticker for m in loader_b._universe_cache} == {"FROM_B"}
+
+    def test_list_tickers_double_checked_lock_fills_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """BUGFIX (issue #152): concurrent ``list_tickers()`` must fill the
+        cache exactly once.
+
+        Without the ``_universe_lock``, two threads entering
+        ``list_tickers()`` simultaneously would both see
+        ``_universe_cache is None`` and both call the broker harvest
+        routine — spending the rate-limit budget twice and racing on
+        the ``seen`` dict. With the lock + double-checked pattern, only
+        one thread performs the fill; the second observes the populated
+        cache and returns immediately.
+        """
+        monkeypatch.setenv("TINKOFF_SANDBOX_TOKEN", "fake-token-1234567890")
+        from src.data.token_bucket import TokenBucket
+
+        loader = TinkoffInvestMDDataLoader(
+            bucket=TokenBucket(rate=1000.0, window_seconds=1.0),
+        )
+
+        call_count = 0
+        original_fill = loader._fill_universe_cache
+
+        def counting_fill() -> list[TickerMeta]:
+            nonlocal call_count
+            call_count += 1
+            # Tiny sleep so the second thread has a chance to enter
+            # the function before the first one finishes filling.
+            import time as _time
+
+            _time.sleep(0.05)
+            return original_fill()
+
+        monkeypatch.setattr(loader, "_fill_universe_cache", counting_fill)
+        # Also patch the underlying gRPC loader so the real
+        # ``_fill_universe_cache`` doesn't try to reach the broker.
+        monkeypatch.setattr(
+            "src.data.tinkoff_loader.TinkoffInvestDataLoader",
+            MagicMock(
+                return_value=MagicMock(
+                    list_shares_all=MagicMock(return_value=[]),
+                    list_bonds=MagicMock(return_value=[]),
+                    list_etfs=MagicMock(return_value=[]),
+                )
+            ),
+        )
+
+        results: list[list[TickerMeta]] = []
+        errors: list[BaseException] = []
+
+        def worker() -> None:
+            try:
+                results.append(loader.list_tickers())
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10.0)
+            assert not t.is_alive(), "thread hung — lock deadlock"
+
+        assert errors == [], f"unexpected exceptions: {errors}"
+        # All threads must see the same list object (filled exactly once).
+        first = results[0]
+        for r in results[1:]:
+            assert r is first, "each thread got a distinct list — fill ran more than once"
+        assert call_count == 1, f"_fill_universe_cache called {call_count} times, expected 1"

@@ -51,6 +51,7 @@ import csv
 import io
 import logging
 import os
+import threading
 import time
 import zipfile
 from collections import defaultdict
@@ -237,13 +238,20 @@ class TinkoffInvestMDDataLoader(DataLoader):
         # Per-year ZIP cache: (figi, year) -> bytes. Empty cache on
         # construction; tests assert clean state.
         self._archive_cache: dict[tuple[str, int], bytes | None] = {}
+        # BUGFIX (issue #152): the universe cache used to be a class-level
+        # attribute (``_universe_cache: list[TickerMeta] | None = None`` at
+        # class scope), which meant every ``TinkoffInvestMDDataLoader``
+        # instance shared the same cache. A second loader constructed with
+        # a different token (CI vs prod, OAuth refresh, retry in
+        # ``apply_corporate_actions.py``) would silently return the first
+        # loader's broker results bound to the wrong token. Move it into
+        # ``__init__`` so each loader gets its own cache, and guard the
+        # fill critical section with a lock so two threads can't race on
+        # the ``seen`` dict build inside ``_fill_universe_cache()``.
+        self._universe_cache: list[TickerMeta] | None = None
+        self._universe_lock: threading.Lock = threading.Lock()
 
     # ---- universe -------------------------------------------------------
-
-    # Cache the broker-side universe for the lifetime of this loader. The
-    # universe is constant across a backfill run; we don't want to re-fetch
-    # it once per ticker (would issue ~14k gRPC calls for 1971 tickers).
-    _universe_cache: list[TickerMeta] | None = None
 
     def list_tickers(self) -> list[TickerMeta]:
         """Universe = everything Tinkoff exposes, regardless of class_code or
@@ -266,6 +274,30 @@ class TinkoffInvestMDDataLoader(DataLoader):
         """
         if self._universe_cache is not None:
             return self._universe_cache
+        # BUGFIX (issue #152): wrap the fill in a lock so concurrent
+        # ``list_tickers()`` calls don't race on the ``seen`` dict and
+        # don't issue duplicate gRPC harvest calls. Without this lock,
+        # two threads entering the function simultaneously would both
+        # observe ``_universe_cache is None``, both call
+        # ``TinkoffInvestDataLoader.list_shares_all(...)`` ~14 times,
+        # and one would overwrite the other's cache with a half-built
+        # dict (the late writer wins, the early writer's results are
+        # discarded — but the broker already spent the rate-limit
+        # budget).
+        with self._universe_lock:
+            if self._universe_cache is not None:
+                # Double-checked after acquiring the lock.
+                return self._universe_cache
+            self._universe_cache = self._fill_universe_cache()
+        return self._universe_cache
+
+    def _fill_universe_cache(self) -> list[TickerMeta]:
+        """Build the universe list by harvesting every broker class_code.
+
+        Extracted from :meth:`list_tickers` so the cache fill happens
+        under ``self._universe_lock`` (issue #152). Returns the final
+        list to be assigned to ``self._universe_cache``.
+        """
         from .tinkoff_loader import TinkoffInvestDataLoader
 
         grpc_loader = TinkoffInvestDataLoader(token=self._token)
@@ -299,8 +331,7 @@ class TinkoffInvestMDDataLoader(DataLoader):
                     seen[m.ticker] = m
         except Exception as e:  # noqa: BLE001
             logger.warning("list_etfs() failed: %s", e)
-        self._universe_cache = list(seen.values())
-        return self._universe_cache
+        return list(seen.values())
 
     def list_tickers_with_figi(self) -> list[TickerMeta]:
         """Same as ``list_tickers`` but drops entries with missing FIGI."""
