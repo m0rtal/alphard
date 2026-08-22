@@ -459,8 +459,12 @@ class TestMOEXDataLoader:
             ),
         ]
         loader, _ = self._loader(handlers)
-        # Prime the cache with all tickers (no board filter — test data has no BOARDID)
+        # Prime the cache with all tickers (no board filter — test data has no BOARDID).
+        # Re-key the cache to "TQBR" so the internal default-arg call
+        # (iter_ohlcv -> _meta_for -> list_tickers(board_id="TQBR")) hits
+        # the cache instead of refetching.
         loader._universe_cache = loader.list_tickers(board_id=None)
+        loader._board_filter = "TQBR"
         bars = list(loader.iter_ohlcv("sber", date(2026, 8, 1), date(2026, 8, 1)))
         assert len(bars) == 1
         assert bars[0].volume == Decimal("500")  # 100 lots × 5 lot size
