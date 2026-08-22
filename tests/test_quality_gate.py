@@ -821,6 +821,77 @@ class TestCLI:
         )
         assert rc == 0
 
+    def test_cli_passes_aware_datetime_to_gates(self, tmp_path) -> None:
+        """Regression: issue #154.
+
+        ``check_ingestion`` (and ``check_historical``) build an
+        offset-aware ``latest_dt`` inside the staleness check (line 401 of
+        ``ingestion_gate.py``). Passing an offset-naive ``now`` raises
+        ``TypeError: can't subtract offset-naive and offset-aware
+        datetimes`` BEFORE the regression fix.
+
+        This test fails fast if anyone reintroduces a naive ``datetime.now()``
+        in ``src/data/quality/__main__.py``. We force the audit sink to
+        InMemoryAuditLog (CI sets ALPHARD_PG_DSN, but the data_quality
+        schema is not migrated) and exercise the real production
+        datetime path with the live wall clock — no monkeypatch on
+        ``datetime`` itself. 260 fresh bars ending on a recent weekday
+        guarantees the staleness branch is exercised; if the gate
+        crashed with naive datetimes, this test would error.
+        """
+        import os
+        from src.data.quality.__main__ import main
+        from src.data.quality import __main__ as cli_mod
+        from src.data.quality.audit import InMemoryAuditLog
+
+        # Isolate from CI Postgres — schema isn't migrated in this test.
+        orig_dsn = os.environ.pop("ALPHARD_PG_DSN", None)
+        orig_make = cli_mod.make_default_audit_log
+        cli_mod.make_default_audit_log = lambda: InMemoryAuditLog()
+        try:
+            csv_path = tmp_path / "fresh.csv"
+            bars = _bars(260)
+            self._write_csv(str(csv_path), bars)
+
+            rc = main(["ingestion", "SBER", "--csv", str(csv_path), "--allow-high"])
+            # CRITICAL => 1, HIGH => 1 unless --allow-high, no issues => 0.
+            assert rc in (0, 1)
+
+            # Also exercise the historical subcommand for symmetry.
+            hist_csv = tmp_path / "hist.csv"
+            self._write_csv(
+                str(hist_csv),
+                _bars(30, close_fn=lambda i: 100.0 + i * 0.1),
+            )
+            rc_h = main(["historical", "SBER", "--csv", str(hist_csv), "--allow-high"])
+            assert rc_h == 0
+        finally:
+            cli_mod.make_default_audit_log = orig_make
+            if orig_dsn is not None:
+                os.environ["ALPHARD_PG_DSN"] = orig_dsn
+
+    def test_cli_now_is_offset_aware(self) -> None:
+        """Regression: issue #154 (static guarantee).
+
+        The CLI dispatchers (``_cmd_ingestion``, ``_cmd_historical``) MUST
+        pass an offset-aware ``now`` to their respective gate functions.
+        We assert this by reading the live source and confirming the
+        call sites construct ``datetime.now(tz=timezone.utc)`` — not the
+        bare ``datetime.now()`` that triggered the original TypeError.
+        """
+        import inspect
+        from src.data.quality import __main__ as cli_mod
+
+        for fn_name in ("_cmd_ingestion", "_cmd_historical"):
+            fn = getattr(cli_mod, fn_name)
+            source = inspect.getsource(fn)
+            assert "datetime.now()" not in source, (
+                f"{fn_name} uses naive datetime.now(); " "check_ingestion requires offset-aware UTC now."
+            )
+            assert "timezone.utc" in source, (
+                f"{fn_name} does not pin tz=timezone.utc on its 'now' " "argument; passes naive datetime to the gate."
+            )
+
 
 class TestInvariants:
     def test_severity_decision_is_deterministic(self) -> None:

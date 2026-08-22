@@ -37,7 +37,7 @@ from __future__ import annotations
 import argparse
 import csv
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Callable
 
 from .audit import InMemoryAuditLog, make_default_audit_log, write_report
@@ -106,7 +106,7 @@ def _cmd_ingestion(args: argparse.Namespace) -> QualityReport:
     return check_ingestion(
         args.ticker,
         bars,
-        now=datetime.now(),
+        now=datetime.now(tz=timezone.utc),
         params=params,
     )
 
@@ -126,7 +126,7 @@ def _cmd_historical(args: argparse.Namespace) -> QualityReport:
         args.ticker,
         bars,
         params=params,
-        now=datetime.now(),
+        now=datetime.now(tz=timezone.utc),
     )
 
 
