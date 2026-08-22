@@ -8,8 +8,13 @@ import sys
 
 import pytest
 
-# Force a DSN before importing the script
-os.environ.setdefault("ALPHARD_PG_DSN", "postgresql://test:test@localhost:5432/test")
+# Note: this module previously ran ``os.environ.setdefault("ALPHARD_PG_DSN", ...)``
+# at import time, which leaked into the rest of the test session and broke the
+# skip-gate in tests/test_pg_store_integration.py (issue #142). The DSN is no
+# longer needed at import time — scripts/mark_terminally_failed.py only reads it
+# inside ``_dsn()`` which is invoked from ``main()``. Tests that need a DSN use
+# ``monkeypatch.setenv`` per-test (e.g. test_live_run_updates_and_commits); tests
+# that need it absent use ``monkeypatch.delenv`` (e.g. test_dsn_missing_raises).
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 SCRIPT = os.path.join(os.path.dirname(__file__), "..", "scripts", "mark_terminally_failed.py")
@@ -92,6 +97,7 @@ def test_sql_picks_old_or_null_listed_at():
 
 
 def test_dry_run_prints_but_does_not_write(monkeypatch, capsys):
+    monkeypatch.setenv("ALPHARD_PG_DSN", "postgresql://test:test@localhost:5432/test")
     candidates = [("DELISTED1",), ("DELISTED2",), ("SPBXM_US",)]
     conn = FakeConn(FakeCursor(select_rows=candidates, update_rowcount=0))
     _patched_main(monkeypatch, conn)
@@ -109,6 +115,7 @@ def test_dry_run_prints_but_does_not_write(monkeypatch, capsys):
 
 
 def test_live_run_updates_and_commits(monkeypatch, capsys):
+    monkeypatch.setenv("ALPHARD_PG_DSN", "postgresql://test:test@localhost:5432/test")
     conn = FakeConn(FakeCursor(select_rows=[("T1",), ("T2",)], update_rowcount=2))
     _patched_main(monkeypatch, conn)
     monkeypatch.setattr("sys.argv", ["prog"])
@@ -123,6 +130,7 @@ def test_live_run_updates_and_commits(monkeypatch, capsys):
 
 
 def test_no_candidates_returns_zero(monkeypatch, capsys):
+    monkeypatch.setenv("ALPHARD_PG_DSN", "postgresql://test:test@localhost:5432/test")
     conn = FakeConn(FakeCursor(select_rows=[], update_rowcount=0))
     _patched_main(monkeypatch, conn)
     monkeypatch.setattr("sys.argv", ["prog"])
@@ -136,6 +144,7 @@ def test_no_candidates_returns_zero(monkeypatch, capsys):
 
 
 def test_custom_horizon_replaces_interval(monkeypatch, capsys):
+    monkeypatch.setenv("ALPHARD_PG_DSN", "postgresql://test:test@localhost:5432/test")
     conn = FakeConn(FakeCursor(select_rows=[("X",)], update_rowcount=1))
     _patched_main(monkeypatch, conn)
     monkeypatch.setattr("sys.argv", ["prog", "--horizon-days", "365"])
@@ -151,3 +160,19 @@ def test_dsn_missing_raises(monkeypatch):
     monkeypatch.delenv("ALPHARD_PG_DSN", raising=False)
     with pytest.raises(RuntimeError, match="ALPHARD_PG_DSN not set"):
         m._dsn()
+
+
+def test_module_import_does_not_leak_dsn_env(monkeypatch):
+    """Regression test for issue #142.
+
+    Importing this test module must NOT mutate ``os.environ["ALPHARD_PG_DSN"]``
+    — otherwise the env leaks into other test modules collected later in the
+    session and breaks the skip-gate in tests/test_pg_store_integration.py.
+    """
+    monkeypatch.delenv("ALPHARD_PG_DSN", raising=False)
+    # Re-importing the script module is a no-op (already loaded), so simulate
+    # the post-import state of a fresh interpreter by reading the env now.
+    assert os.environ.get("ALPHARD_PG_DSN") is None, (
+        "tests/test_mark_terminally_failed.py must not set ALPHARD_PG_DSN at "
+        "module-import time — it leaks into other test modules."
+    )
