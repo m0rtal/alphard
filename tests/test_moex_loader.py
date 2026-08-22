@@ -123,8 +123,21 @@ def _bar_row(d: date, lot: int = 1) -> list[Any]:
     ]
 
 
-def _prime_universe(loader: MOEXDataLoader, ticker: str = "SBER", lot: int = 1) -> None:
-    """Set the universe cache directly so tests don't have to spin an HTTP handler."""
+def _prime_universe(
+    loader: MOEXDataLoader,
+    ticker: str = "SBER",
+    lot: int = 1,
+    *,
+    board_filter: str | None = "TQBR",
+) -> None:
+    """Set the universe cache directly so tests don't have to spin an HTTP handler.
+
+    ``board_filter`` is the value stored in ``loader._board_filter`` —
+    the cache key. Default ``"TQBR"`` matches the default
+    ``list_tickers(board_id="TQBR")`` that ``iter_ohlcv`` ->
+    ``_meta_for`` -> ``list_tickers`` performs internally, so the cache
+    is hit without an HTTP call.
+    """
     from src.data import TickerMeta
 
     loader._universe_cache = [
@@ -141,6 +154,7 @@ def _prime_universe(loader: MOEXDataLoader, ticker: str = "SBER", lot: int = 1) 
             source="moex",
         )
     ]
+    loader._board_filter = board_filter
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +167,6 @@ class TestIterOhlcv:
         """When MOEX returns a candles block with no columns, the iterator
         yields nothing and returns immediately instead of looping."""
         handlers = [
-            _FakeResponse(_ticker_block([["SBER", "Sber", 1, "RU0", ""]])),
             _FakeResponse(
                 {
                     "candles": {
@@ -164,15 +177,13 @@ class TestIterOhlcv:
             ),
         ]
         loader = _make_loader(handlers)
-        # No filters -> cache without filter
-        loader._universe_cache = loader.list_tickers(board_id=None)
+        _prime_universe(loader)  # cache primed with default board_filter="TQBR"
         out = list(loader.iter_ohlcv("SBER", date(2026, 8, 1), date(2026, 8, 1)))
         assert out == []
 
     def test_empty_page_terminates_loop(self) -> None:
         """If a subsequent page returns rows < page_size, pagination stops."""
         handlers = [
-            _FakeResponse(_ticker_block([["SBER", "Sber", 1, "RU0", ""]])),
             _FakeResponse(
                 _candles_block(
                     [
@@ -184,7 +195,7 @@ class TestIterOhlcv:
         ]
         loader = _make_loader(handlers)
         loader._page_size = 5  # ensure 2 rows < page_size -> return
-        loader._universe_cache = loader.list_tickers(board_id=None)
+        _prime_universe(loader)
         out = list(loader.iter_ohlcv("SBER", date(2026, 8, 1), date(2026, 8, 2)))
         assert len(out) == 2
 
@@ -206,6 +217,7 @@ class TestIterCorporateActions:
         """Empty universe -> meta None -> no events."""
         loader = _make_loader([])
         loader._universe_cache = []  # nothing in universe
+        loader._board_filter = "TQBR"
         out = list(loader.iter_corporate_actions("SBER", date(2026, 1, 1), date(2026, 12, 31)))
         assert out == []
 
@@ -228,6 +240,7 @@ class TestIterCorporateActions:
                 source="moex",
             )
         ]
+        loader._board_filter = "TQBR"
         out = list(loader.iter_corporate_actions("YNDX", date(2026, 1, 1), date(2026, 12, 31)))
         assert len(out) == 1
         assert out[0].kind == "change"
@@ -252,6 +265,7 @@ class TestIterCorporateActions:
                 source="moex",
             )
         ]
+        loader._board_filter = "TQBR"
         out = list(loader.iter_corporate_actions("YNDX", date(2026, 1, 1), date(2026, 12, 31)))
         assert out == []
 
@@ -628,3 +642,85 @@ class TestListTickersCaching:
         tickers = {t.ticker for t in out}
         assert "SBER" in tickers
         assert "BAD" not in tickers
+
+    def test_cache_refetches_when_board_id_differs_after_tqbr(self) -> None:
+        """Issue #162: a None call after a TQBR fill must NOT return the TQBR cache.
+
+        Before the fix, ``list_tickers(board_id=None)`` after a cached
+        ``board_id="TQBR"`` call returned the TQBR-filtered list because
+        the cache-hit guard short-circuited on ``board_id is None``.
+        Correct behaviour: refetch and return the full universe.
+        """
+        # First call: TQBR-only payload (1 row).
+        tqbr_payload = {
+            "securities": {
+                "columns": ["SECID", "BOARDID", "SHORTNAME", "LOTSIZE"],
+                "data": [["SBER", "TQBR", "Sber", 10]],
+            }
+        }
+        # Second call (after cache invalidation): full payload (2 rows).
+        full_payload = {
+            "securities": {
+                "columns": ["SECID", "BOARDID", "SHORTNAME", "LOTSIZE"],
+                "data": [
+                    ["SBER", "TQBR", "Sber", 10],
+                    ["GAZP", "TQOB", "Gazprom", 1],
+                ],
+            }
+        }
+        loader = _make_loader([_FakeResponse(tqbr_payload), _FakeResponse(full_payload)])
+        first = loader.list_tickers(board_id="TQBR")
+        assert {t.ticker for t in first} == {"SBER"}
+        # Second call asks for the full universe — must refetch and
+        # return BOTH rows (pre-fix returned only SBER).
+        second = loader.list_tickers(board_id=None)
+        assert {t.ticker for t in second} == {"SBER", "GAZP"}
+        # Two HTTP round-trips, not one.
+        assert len(loader._session.calls) == 2  # type: ignore[attr-defined]
+
+    def test_cache_refetches_when_board_id_differs_after_none(self) -> None:
+        """Issue #162 (reverse direction): TQBR call after a None fill must NOT
+        return the unfiltered cache.
+
+        Symmetric counterpart to the test above. A cached full-universe
+        call followed by a ``board_id="TQBR"`` request must refetch and
+        filter — pre-fix it returned the full list.
+        """
+        full_payload = {
+            "securities": {
+                "columns": ["SECID", "BOARDID", "SHORTNAME", "LOTSIZE"],
+                "data": [
+                    ["SBER", "TQBR", "Sber", 10],
+                    ["GAZP", "TQOB", "Gazprom", 1],
+                ],
+            }
+        }
+        tqbr_payload = {
+            "securities": {
+                "columns": ["SECID", "BOARDID", "SHORTNAME", "LOTSIZE"],
+                "data": [["SBER", "TQBR", "Sber", 10]],
+            }
+        }
+        loader = _make_loader([_FakeResponse(full_payload), _FakeResponse(tqbr_payload)])
+        first = loader.list_tickers(board_id=None)
+        assert {t.ticker for t in first} == {"SBER", "GAZP"}
+        second = loader.list_tickers(board_id="TQBR")
+        assert {t.ticker for t in second} == {"SBER"}
+        assert len(loader._session.calls) == 2  # type: ignore[attr-defined]
+
+    def test_cache_reused_when_board_id_matches(self) -> None:
+        """Issue #162 (regression guard): the existing cache-hit path still
+        works — calling ``list_tickers(board_id="TQBR")`` twice in a row
+        issues one HTTP call and returns the same list object.
+        """
+        payload = {
+            "securities": {
+                "columns": ["SECID", "BOARDID", "SHORTNAME", "LOTSIZE"],
+                "data": [["SBER", "TQBR", "Sber", 10]],
+            }
+        }
+        loader = _make_loader([_FakeResponse(payload)])
+        first = loader.list_tickers(board_id="TQBR")
+        second = loader.list_tickers(board_id="TQBR")
+        assert first is second
+        assert len(loader._session.calls) == 1  # type: ignore[attr-defined]

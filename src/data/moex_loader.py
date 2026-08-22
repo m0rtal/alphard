@@ -93,12 +93,22 @@ class MOEXDataLoader(DataLoader):
 
         Default ``board_id="TQBR"`` returns ~770 live + ~1157 archived TQBR
         tickers (1927 total). Pass ``None`` for all boards.
+
+        Caching contract
+        ----------------
+        The cache key is the *exact* ``board_id`` value the cache was
+        filled with. A subsequent call with a different ``board_id``
+        (including None vs. a string) forces a refetch.
+
+        Issue #162: the previous version used the short-circuit
+        ``board_id is None or self._board_filter is None`` as a
+        cache-hit guard, which silently returned the wrong (cached)
+        list whenever the requested ``board_id`` and the cached
+        ``_board_filter`` differed. The fix is a single equality
+        comparison — any mismatch refetches.
         """
-        if self._universe_cache is not None:
-            if board_id is None or self._board_filter is None:
-                return self._universe_cache
-            if self._board_filter == board_id:
-                return self._universe_cache
+        if self._universe_cache is not None and self._board_filter == board_id:
+            return self._universe_cache
         url = f"{BASE_URL}/iss/engines/stock/markets/shares/securities.json"
         rows = self._fetch_all_rows(url, columns_metadata_key="securities")
         out: list[TickerMeta] = []
