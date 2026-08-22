@@ -337,6 +337,17 @@ class PostgresDataStore(DataStore):
         # BUGFIX (H-4): autocommit=True on connect means each execute() commits
         # independently. Wrap UPDATE + INSERT in a single transaction so they
         # either both succeed or both roll back — state stays in sync.
+        # Issue #160: normalise ticker to UPPERCASE so this method matches every
+        # other PostgresDataStore method (all of which call `ticker.upper()`)
+        # and matches the sqlite_store.mark_delisted implementation. Without
+        # this, ``mark_delisted("sber", ...)`` silently no-ops the UPDATE (no
+        # row matches the case-sensitive WHERE) but still writes a "sber" row
+        # to delisting_log, leaving ``ticker_universe`` and the audit log
+        # permanently inconsistent: ticker stays "active" in the universe
+        # while delisting_log claims it exited, and the age-aware backfill
+        # completion formula never marks the ticker complete (it still
+        # expects bars up to today).
+        ticker = ticker.upper()
         self._connect()
         with self._conn.transaction():
             with self._conn.cursor() as cur:
