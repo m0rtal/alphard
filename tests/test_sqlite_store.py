@@ -409,7 +409,11 @@ class TestCorporateActionStorage:
         sqlite_store.upsert_corporate_actions(sample_actions)
 
         # 2. Overwrite just the value (e.g., a dividend amount change)
-        updated_action = sample_actions[0].copy(update={"value": Decimal("3")})
+        # Issue #156: pydantic v2 deprecates `.copy()` in favour of
+        # `.model_copy()`. `.copy()` was scheduled for removal in pydantic v3.
+        # Functionally identical for `update=...` semantics; the only
+        # observable change is silencing the deprecation warning.
+        updated_action = sample_actions[0].model_copy(update={"value": Decimal("3")})
         sqlite_store.upsert_corporate_actions([updated_action])
 
         # 3. Verify update
