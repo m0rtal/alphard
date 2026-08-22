@@ -242,6 +242,20 @@ class TestMetricsServerLifecycle:
         s2.start()  # must not raise OSError(EADDRINUSE)
         s2.stop()
 
+    def test_port_property_reflects_construction_value(self) -> None:
+        """The ``port`` property must echo back the port passed to the constructor."""
+        port = _free_port()
+        s = MetricsServer(host="127.0.0.1", port=port)
+        assert s.port == port
+
+    def test_registry_property_returns_shared_instance(self) -> None:
+        """The ``registry`` property must always return the same MetricsRegistry."""
+        s = MetricsServer(host="127.0.0.1", port=_free_port())
+        assert s.registry is s.registry
+        # Mutations via the returned registry are visible on subsequent reads.
+        s.registry.inc_counter("smoke_total")
+        assert s.registry.get_counter("smoke_total") == 1.0
+
 
 # --- Conftest helpers / extension points for src.metrics_server ------------
 
@@ -266,3 +280,77 @@ def free_port_server() -> "Generator[MetricsServer, None, None]":
     s.start()
     yield s
     s.stop()
+
+
+# --- Domain counters / gauges -------------------------------------------------
+#
+# These tests exercise the specific counter/gauges that src/main.py and the
+# daemon threads actually emit (see docstring of src/metrics_server.py). They
+# guard against accidental renames or label-set changes that would silently
+# break Prometheus alerts and Grafana dashboards.
+
+
+class TestMetricsServerDomainMetrics:
+    def test_heartbeats_counter_accumulates_across_calls(self) -> None:
+        r = MetricsRegistry()
+        for _ in range(7):
+            r.inc_counter("alphard_heartbeats_total")
+        assert r.get_counter("alphard_heartbeats_total") == 7.0
+
+    def test_backfill_counter_supports_all_documented_result_labels(self) -> None:
+        r = MetricsRegistry()
+        for result in ("ok", "skip", "error", "delisted"):
+            r.inc_counter("alphard_backfill_total", {"result": result})
+        text = r.render()
+        for result in ("ok", "skip", "error", "delisted"):
+            assert f'result="{result}"' in text
+
+    def test_daily_sync_counter_supports_ok_failed_timeout(self) -> None:
+        r = MetricsRegistry()
+        r.inc_counter("alphard_daily_sync_total", {"result": "ok"})
+        r.inc_counter("alphard_daily_sync_total", {"result": "failed"})
+        r.inc_counter("alphard_daily_sync_total", {"result": "timeout"})
+        assert r.get_counter("alphard_daily_sync_total", {"result": "ok"}) == 1.0
+        assert r.get_counter("alphard_daily_sync_total", {"result": "failed"}) == 1.0
+        assert r.get_counter("alphard_daily_sync_total", {"result": "timeout"}) == 1.0
+
+    def test_backfill_progress_gauges_are_independent(self) -> None:
+        """Tickers-done, tickers-total, and bars-written must be tracked separately."""
+        r = MetricsRegistry()
+        r.set_gauge("alphard_backfill_progress_tickers_done", 42.0)
+        r.set_gauge("alphard_backfill_progress_tickers_total", 100.0)
+        r.set_gauge("alphard_backfill_progress_bars_written", 1500.0)
+        assert r.get_gauge("alphard_backfill_progress_tickers_done") == 42.0
+        assert r.get_gauge("alphard_backfill_progress_tickers_total") == 100.0
+        assert r.get_gauge("alphard_backfill_progress_bars_written") == 1500.0
+
+    def test_daily_sync_status_gauge_is_mutually_exclusive(self) -> None:
+        """Only one status label should be 1; others should be 0."""
+        r = MetricsRegistry()
+        r.set_gauge("alphard_daily_sync_last_run_status", 1.0, {"status": "ok"})
+        r.set_gauge("alphard_daily_sync_last_run_status", 0.0, {"status": "failed"})
+        r.set_gauge("alphard_daily_sync_last_run_status", 0.0, {"status": "timeout"})
+        assert r.get_gauge("alphard_daily_sync_last_run_status", {"status": "ok"}) == 1.0
+        assert r.get_gauge("alphard_daily_sync_last_run_status", {"status": "failed"}) == 0.0
+        assert r.get_gauge("alphard_daily_sync_last_run_status", {"status": "timeout"}) == 0.0
+
+    def test_open_positions_gauge_overwrites_previous_value(self) -> None:
+        r = MetricsRegistry()
+        r.set_gauge("alphard_open_positions", 3.0)
+        r.set_gauge("alphard_open_positions", 5.0)
+        assert r.get_gauge("alphard_open_positions") == 5.0
+
+    def test_render_uses_integer_format_for_counters(self) -> None:
+        """Counters must render without decimal fraction (``5`` not ``5.000``)."""
+        r = MetricsRegistry()
+        r.inc_counter("alphard_backfill_total", {"result": "ok"}, value=5.0)
+        text = r.render()
+        assert 'alphard_backfill_total{result="ok"} 5' in text
+        assert 'alphard_backfill_total{result="ok"} 5.000' not in text
+
+    def test_render_uses_three_decimal_format_for_gauges(self) -> None:
+        """Custom gauges (not the pre-emitted self-gauges) must render with 3 decimals."""
+        r = MetricsRegistry()
+        r.set_gauge("alphard_open_positions", 7.0)
+        text = r.render()
+        assert "alphard_open_positions 7.000" in text
