@@ -409,7 +409,7 @@ class TestCorporateActionStorage:
         sqlite_store.upsert_corporate_actions(sample_actions)
 
         # 2. Overwrite just the value (e.g., a dividend amount change)
-        updated_action = sample_actions[0].copy(update={"value": Decimal("3")})
+        updated_action = sample_actions[0].model_copy(update={"value": Decimal("3")})
         sqlite_store.upsert_corporate_actions([updated_action])
 
         # 3. Verify update
