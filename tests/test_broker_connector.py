@@ -1524,6 +1524,130 @@ class TestOrderFlow:
         assert not any("RISK_MARKET_ORDER_NO_QUOTE" in v for v in result.decision_violations)
         assert not broker.place_order.called
 
+    # ---------------------------------------------------------------
+    # Issue #168 — OrderFlow.submit_market must distinguish REJECTED
+    # from SUBMITTED so the audit log does not silently treat a
+    # silent failure as a real submit.
+    # ---------------------------------------------------------------
+
+    def test_final_status_rejected_when_slicer_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """OrderSlicer raises ValueError → no slice is ever submitted.
+
+        Issue #168: pre-fix, ``final_status`` returned SUBMITTED with
+        ``submitted == []`` because the only check was
+        ``all(s == FILLED for s in submitted)`` — vacuously True on an
+        empty list. Operators looking at the audit log saw a
+        SUBMITTED run that never touched the broker. Post-fix,
+        ``final_status == REJECTED`` and ``filled_count ==
+        rejected_count == 0`` makes the silent failure visible.
+        """
+        from src.broker import slicer as slicer_mod
+
+        def _raise(self):  # noqa: ANN001 — patching OrderSlicer.slice
+            raise ValueError("forced for issue #168 test")
+
+        monkeypatch.setattr(slicer_mod.OrderSlicer, "slice", _raise)
+
+        broker = MagicMock()
+        flow = OrderFlow(
+            broker=broker,
+            risk_gate=self._approved_gate(),
+            quote_provider=self._quote_provider(),
+        )
+        result = flow.submit_market("SBER", OrderSide.BUY, Decimal("100"), self._portfolio())
+        assert result.slice_count == 0
+        assert result.submitted == []
+        assert result.final_status == OrderStatus.REJECTED
+        assert result.filled_count == 0
+        assert result.rejected_count == 0
+        assert broker.place_order.call_count == 0
+
+    def test_final_status_rejected_when_all_slices_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Every slice is rejected by the broker → final_status == REJECTED.
+
+        Issue #168: pre-fix this case returned SUBMITTED (the
+        ``all(... == FILLED)`` test was False, so the else-branch set
+        SUBMITTED). Operators monitoring ``decision_log.broker_status
+        == SUBMITTED`` saw a phantom "in-flight" run that the broker
+        had actually fully refused.
+        """
+        broker = MagicMock()
+        broker.place_order.return_value = OrderStatus.REJECTED
+
+        flow = OrderFlow(
+            broker=broker,
+            risk_gate=self._approved_gate(),
+            quote_provider=self._quote_provider(),
+        )
+        result = flow.submit_market("SBER", OrderSide.BUY, Decimal("100"), self._portfolio())
+        assert result.slice_count >= 1
+        assert result.submitted and all(s == OrderStatus.REJECTED for s in result.submitted)
+        assert result.final_status == OrderStatus.REJECTED
+        assert result.filled_count == 0
+        assert result.rejected_count == len(result.submitted)
+
+    def test_final_status_filled_when_all_slices_filled(self) -> None:
+        """Regression guard for the all-FILLED path."""
+        broker = MagicMock()
+        broker.place_order.return_value = OrderStatus.FILLED
+
+        flow = OrderFlow(
+            broker=broker,
+            risk_gate=self._approved_gate(),
+            quote_provider=self._quote_provider(),
+        )
+        result = flow.submit_market("SBER", OrderSide.BUY, Decimal("100"), self._portfolio())
+        assert result.submitted and all(s == OrderStatus.FILLED for s in result.submitted)
+        assert result.final_status == OrderStatus.FILLED
+        assert result.filled_count == len(result.submitted)
+        assert result.rejected_count == 0
+
+    def test_final_status_submitted_on_partial_fill(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Mixed FILLED + REJECTED → final_status == SUBMITTED (legitimate partial).
+
+        Issue #168: this is the only path where ``final_status ==
+        SUBMITTED`` is the truthful answer — the broker is still
+        working on at least one slice. ``filled_count`` and
+        ``rejected_count`` let downstream consumers audit exactly how
+        many slices each outcome touched.
+        """
+        # ``OrderFlow.submit_market`` computes ``adv_shares = max(qty *
+        # 20, 100)`` (see integration.py:189), which makes 5%-ADV equal
+        # to ``qty`` for any qty ≥ 5. The slicer therefore yields exactly
+        # one chunk under normal inputs. To exercise a multi-slice
+        # scenario we shrink ``adv_shares`` post-construction via a
+        # monkeypatched ``OrderSlicer.__init__`` — equivalent to feeding
+        # OrderFlow a real ADV estimate, which is exactly what Phase 2
+        # will do once the data agent exposes it.
+        from src.broker.slicer import OrderSlicer
+
+        original_init = OrderSlicer.__init__
+
+        def _small_adv(self, adv_shares, parent_qty):  # noqa: ANN001 — patch
+            original_init(self, adv_shares=Decimal("100"), parent_qty=parent_qty)
+            # 5% ADV = qty/3 → 3 chunks of size ~qty/3.
+            self.adv_shares = parent_qty * Decimal("20") / Decimal("3")
+
+        monkeypatch.setattr(OrderSlicer, "__init__", _small_adv)
+
+        broker = MagicMock()
+        broker.place_order.side_effect = [
+            OrderStatus.FILLED,
+            OrderStatus.REJECTED,
+            OrderStatus.FILLED,
+        ]
+        flow = OrderFlow(
+            broker=broker,
+            risk_gate=self._approved_gate(),
+            quote_provider=self._quote_provider(),
+        )
+        result = flow.submit_market("SBER", OrderSide.BUY, Decimal("3000"), self._portfolio(cash="10000000"))
+        assert result.slice_count == 3
+        assert result.submitted == [OrderStatus.FILLED, OrderStatus.REJECTED, OrderStatus.FILLED]
+        assert result.final_status == OrderStatus.SUBMITTED
+        assert result.filled_count == 2
+        assert result.rejected_count == 1
+
 
 # ────────────────────────────────────────────
 # ABC contract
