@@ -1353,15 +1353,29 @@ class TestOrderFlow:
         assert broker.place_order.called
 
     def test_risk_gate_approved_broker_exception_still_records(self):
+        """Issue #170: bare ``Exception`` from ``place_order`` is a programming
+        error and must propagate — NOT be silently mapped to REJECTED.
+
+        Pre-#170 the integration layer caught ``Exception`` blanket and
+        wrote it to the audit log as ``OrderStatus.REJECTED``, hiding
+        real bugs (TypeError / KeyError / AttributeError looked
+        indistinguishable from a legitimate broker refusal). The fix
+        only catches ``BrokerError`` (technical broker failure) and
+        re-raises everything else so the supervisor / error tracker
+        sees it. ``BrokerError`` is covered separately in
+        ``test_broker_error_mapped_to_rejected_but_does_not_raise``.
+        """
+        from src.broker.tinkoff_account import BrokerError
+
         broker = MagicMock()
-        broker.place_order.side_effect = Exception("network down")
+        broker.place_order.side_effect = BrokerError("network down")
         flow = OrderFlow(
             broker=broker,
             risk_gate=self._approved_gate(),
             quote_provider=self._quote_provider(),
         )
         result = flow.submit_market("SBER", OrderSide.BUY, Decimal("100"), self._portfolio())
-        # Some slices REJECTED due to broker errors
+        # BrokerError is a known technical failure → REJECTED (warning log).
         assert OrderStatus.REJECTED in result.submitted
 
     def test_portfolio_to_state_conversion(self):
@@ -1647,6 +1661,130 @@ class TestOrderFlow:
         assert result.final_status == OrderStatus.SUBMITTED
         assert result.filled_count == 2
         assert result.rejected_count == 1
+
+    # ---------------------------------------------------------------
+    # Issue #170 — OrderFlow.submit_market must distinguish "broker
+    # technical failure" (BrokerError → REJECTED, warning log) from
+    # "programming error" (TypeError / KeyError / AttributeError →
+    # re-raise, NEVER silently REJECTED).
+    # ---------------------------------------------------------------
+
+    def test_broker_error_mapped_to_rejected_but_does_not_raise(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """BrokerError (technical broker failure) → per-slice REJECTED, no re-raise.
+
+        Pre-#170 this also covered bare ``Exception`` which silently
+        masked programming bugs. Now only ``BrokerError`` is caught —
+        a normal RuntimeError subclass signalling SDK / network /
+        malformed-response failures. The slice is recorded as
+        ``REJECTED`` so the three-tier ``final_status`` logic from
+        issue #168 keeps treating it as a broker refusal.
+        """
+        from src.broker.tinkoff_account import BrokerError
+        from src.broker.slicer import OrderSlicer
+
+        # Force multi-slice to make the assertion non-vacuous.
+        original_init = OrderSlicer.__init__
+
+        def _small_adv(self, adv_shares, parent_qty):  # noqa: ANN001
+            original_init(self, adv_shares=Decimal("100"), parent_qty=parent_qty)
+            self.adv_shares = parent_qty * Decimal("20") / Decimal("3")
+
+        monkeypatch.setattr(OrderSlicer, "__init__", _small_adv)
+
+        broker = MagicMock()
+        broker.place_order.side_effect = BrokerError("tinkoff 503")
+
+        flow = OrderFlow(
+            broker=broker,
+            risk_gate=self._approved_gate(),
+            quote_provider=self._quote_provider(),
+        )
+        result = flow.submit_market(
+            "SBER", OrderSide.BUY, Decimal("3000"), self._portfolio(cash="10000000")
+        )
+        assert result.slice_count == 3
+        assert result.submitted == [OrderStatus.REJECTED] * 3
+        # All slices rejected by broker → final_status REJECTED (issue #168 tier-2).
+        assert result.final_status == OrderStatus.REJECTED
+        assert result.rejected_count == 3
+        assert result.filled_count == 0
+
+    def test_programming_error_in_place_order_propagates(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """TypeError / KeyError / AttributeError → re-raised, NOT swallowed as REJECTED.
+
+        Pre-#170 the ``except Exception`` blanket caught these and
+        wrote them to the audit log as REJECTED, hiding bugs. The
+        supervisor would happily proceed and operators would chase a
+        phantom "broker refusal". Post-#170 the exception propagates so
+        error tracking / supervisor sees it.
+        """
+        from src.broker.slicer import OrderSlicer
+
+        original_init = OrderSlicer.__init__
+
+        def _small_adv(self, adv_shares, parent_qty):  # noqa: ANN001
+            original_init(self, adv_shares=Decimal("100"), parent_qty=parent_qty)
+            self.adv_shares = parent_qty * Decimal("20") / Decimal("3")
+
+        monkeypatch.setattr(OrderSlicer, "__init__", _small_adv)
+
+        broker = MagicMock()
+        broker.place_order.side_effect = TypeError(
+            "frozen model mutation attempt — issue #170 regression"
+        )
+
+        flow = OrderFlow(
+            broker=broker,
+            risk_gate=self._approved_gate(),
+            quote_provider=self._quote_provider(),
+        )
+        with pytest.raises(TypeError, match="frozen model mutation"):
+            flow.submit_market(
+                "SBER", OrderSide.BUY, Decimal("3000"), self._portfolio(cash="10000000")
+            )
+
+    def test_programming_error_after_partial_fills_propagates(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """2 slices FILLED, 1 raises AttributeError → AttributeError propagates.
+
+        Pre-#170 this would have been silently written as
+        ``[FILLED, FILLED, REJECTED]`` with ``final_status == SUBMITTED`` —
+        the operator sees "partial fill in progress" while in reality
+        one slice crashed our code. Post-#170 the AttributeError
+        propagates so the supervisor stops execution instead of
+        reporting a phantom in-flight run.
+        """
+        from src.broker.slicer import OrderSlicer
+
+        original_init = OrderSlicer.__init__
+
+        def _small_adv(self, adv_shares, parent_qty):  # noqa: ANN001
+            original_init(self, adv_shares=Decimal("100"), parent_qty=parent_qty)
+            self.adv_shares = parent_qty * Decimal("20") / Decimal("3")
+
+        monkeypatch.setattr(OrderSlicer, "__init__", _small_adv)
+
+        broker = MagicMock()
+        broker.place_order.side_effect = [
+            OrderStatus.FILLED,
+            OrderStatus.FILLED,
+            AttributeError("missing instrument metadata"),
+        ]
+
+        flow = OrderFlow(
+            broker=broker,
+            risk_gate=self._approved_gate(),
+            quote_provider=self._quote_provider(),
+        )
+        with pytest.raises(AttributeError, match="missing instrument metadata"):
+            flow.submit_market(
+                "SBER", OrderSide.BUY, Decimal("3000"), self._portfolio(cash="10000000")
+            )
 
 
 # ────────────────────────────────────────────

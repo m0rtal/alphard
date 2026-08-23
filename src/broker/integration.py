@@ -36,6 +36,7 @@ from src.broker.orders import (
     OrderStatus,
 )
 from src.broker.slicer import OrderSlicer
+from src.broker.tinkoff_account import BrokerError
 
 logger = logging.getLogger("alphard.broker.flow")
 
@@ -197,13 +198,28 @@ class OrderFlow:
             slices = []
 
         # 5. Submit
+        # Issue #170: the previous ``except Exception`` blanket caught
+        # programming errors (TypeError / KeyError / AttributeError) and
+        # wrote them to the audit log as ``OrderStatus.REJECTED`` — the
+        # same code used for a legitimate broker rejection. Operators
+        # could not tell apart "broker refused" (business) from "our code
+        # blew up" (system). The catch now distinguishes:
+        #   * BrokerError → technical broker failure. Logged at WARNING
+        #     (not ERROR — would flood alerts during a Tinkoff outage).
+        #     Mapped to REJECTED so the per-slice aggregate stays
+        #     consistent with case 1.
+        #   * Exception → programming error. Re-raised so it hits the
+        #     supervisor / error tracker. NEVER written to the audit
+        #     log as REJECTED.
         submitted: list[OrderStatus] = []
         for i, slc in enumerate(slices):
             order = MarketOrder(ticker=symbol, side=side, quantity=slc.quantity)
             try:
                 status = self._broker.place_order(order)
-            except Exception as e:
-                logger.error("Slice %d failed: %s", i, e)
+            except BrokerError as e:
+                logger.warning(
+                    "Slice %d broker failure (mapped to REJECTED): %s", i, e
+                )
                 status = OrderStatus.REJECTED
             submitted.append(status)
 
