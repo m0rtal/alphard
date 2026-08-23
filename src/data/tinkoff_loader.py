@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Iterator, cast
@@ -141,13 +142,45 @@ class TinkoffInvestDataLoader(DataLoader):
         self._universe_cache: dict[str, TickerMeta] | None = None
         self._bonds_cache: dict[str, TickerMeta] | None = None
         self._etfs_cache: dict[str, TickerMeta] | None = None
+        # BUGFIX (issue #174): each cache fill is guarded by a lock so two
+        # threads calling list_tickers() / list_bonds() / list_etfs() /
+        # list_shares_all(<cls>) concurrently don't both walk through the
+        # gRPC instruments.shares() / bonds() / etfs() harvest (which costs
+        # a self.bucket slot per call), race on the cache assignment, and
+        # silently discard the slow builder's results. Mirrors the
+        # self._universe_lock pattern from issue #152 in the sibling file
+        # src/data/tinkoff_md_loader.py:252. One lock per cache category
+        # (universe, bonds, etfs, shares_all-per-class) so that a gRPC
+        # harvest on one category doesn't serialise the others. Production
+        # today is sequential, so the bug is latent — no live failure —
+        # but apply_corporate_actions.py:240-260 already constructs many
+        # short-lived TinkoffInvestDataLoader instances and Phase 2.6 may
+        # parallelise backfills, at which point the race becomes live.
+        self._universe_lock = threading.Lock()
+        self._bonds_lock = threading.Lock()
+        self._etfs_lock = threading.Lock()
+        # Per-class_code shares_all cache lives in a dict (was: ad-hoc
+        # ``setattr(self, "_shares_all_<cls>", ...)`` attribute); guarded
+        # by a single lock that covers the whole dict so the
+        # "if cached: return" early-out stays consistent with the
+        # assignment under the same critical section.
+        self._shares_all_cache: dict[str, list[TickerMeta]] = {}
+        self._shares_all_lock = threading.Lock()
 
     # --------------------------------------------------------------- public
 
     def list_tickers(self) -> list[TickerMeta]:
+        # BUGFIX (issue #174): lock around the cache fill; see __init__
+        # for the full rationale. Double-check after acquiring the lock
+        # so the common case (cache already populated) skips the lock
+        # entirely on the second-and-later call.
         if self._universe_cache is not None:
             return list(self._universe_cache.values())
-        return list(self._ensure_universe().values())
+        with self._universe_lock:
+            if self._universe_cache is not None:
+                return list(self._universe_cache.values())
+            self._universe_cache = self._fill_universe()
+        return list(self._universe_cache.values())
 
     def list_shares_all(self, class_code: str = "TQBR") -> list[TickerMeta]:
         """Full share universe INCLUDING DELISTED (1772 + 150 live = 1927).
@@ -157,78 +190,19 @@ class TinkoffInvestDataLoader(DataLoader):
         the broker uses internally. Each TickerMeta has ``delisted`` set
         based on the SecurityTradingStatus enum value.
         """
-        cache_attr = f"_shares_all_{class_code}"
-        cached = cast(list[TickerMeta] | None, getattr(self, cache_attr, None))
-        if cached is not None:
-            return cached
-
-        from t_tech.invest import Client, SecurityTradingStatus
-
-        with Client(self._token) as client:
-            self.bucket.acquire()
-            response = client.instruments.shares()
-            out: list[TickerMeta] = []
-            for inst in response.instruments:
-                if inst.class_code != class_code:
-                    continue
-                ts_int = int(getattr(inst, "trading_status", 14) or 14)
-                try:
-                    status_name = SecurityTradingStatus(ts_int).name
-                except (ValueError, TypeError):
-                    status_name = "UNKNOWN"
-                delisted = (
-                    "NOT_AVAILABLE_FOR_TRADING" in status_name
-                    or "DELISTED" in status_name
-                    or "EXCLUDED" in status_name  # noqa: E501
-                )
-                # Date fields from Tinkoff Instrument:
-                # - ``first_1day_candle_date`` = first daily bar (proxy for listing)
-                # - ``ipo_date`` = IPO (may be pre-listing for some classes)
-                # - no explicit ``delisting_date`` on Instrument protobuf —
-                #   delisted_at stays None; delist_source.py fills it via MOEX ISS.
-                from datetime import date as _date
-
-                # Tinkoff proto emits timestamps as ``datetime`` objects
-                # (often tz-aware UTC), not as ISO strings. Normalise.
-                from datetime import datetime as _dt
-
-                listed_at_attr = None
-                for _attr in (
-                    "first_1day_candle_date",
-                    "first_1min_candle_date",
-                    "ipo_date",
-                ):
-                    _raw = getattr(inst, _attr, None)
-                    if _raw is None:
-                        continue
-                    try:
-                        if isinstance(_raw, _dt):
-                            listed_at_attr = _raw.date()
-                        elif isinstance(_raw, _date):
-                            listed_at_attr = _raw
-                        else:
-                            listed_at_attr = _date.fromisoformat(str(_raw)[:10])
-                        break
-                    except (TypeError, ValueError):
-                        continue
-
-                out.append(
-                    TickerMeta(
-                        ticker=inst.ticker,
-                        figi=getattr(inst, "figi", None) or None,
-                        name=inst.name,
-                        lot=inst.lot,
-                        isin=getattr(inst, "isin", None),
-                        currency="RUB",
-                        class_code=getattr(inst, "class_code", None),
-                        delisted=delisted,
-                        listed_at=listed_at_attr,
-                        delisted_at=None,  # populated by delist_source via MOEX ISS
-                        source=self.SOURCE,  # type: ignore[arg-type]
-                    )
-                )
-        setattr(self, cache_attr, out)
-        return out
+        # BUGFIX (issue #174): per-class_code cache is now a dict field
+        # (``_shares_all_cache``) rather than ad-hoc ``setattr(self,
+        # "_shares_all_<cls>", ...)`` attributes. The dict keeps the
+        # cache co-located for iteration by ``get_ticker()`` and the
+        # ``_shares_all_lock`` serialises both the early-return check and
+        # the assignment so two concurrent ``list_shares_all("TQBR")``
+        # callers can't both run the gRPC harvest.
+        with self._shares_all_lock:
+            cached = self._shares_all_cache.get(class_code)
+            if cached is not None:
+                return cached
+            self._shares_all_cache[class_code] = self._fill_shares_all(class_code)
+            return self._shares_all_cache[class_code]
 
     def list_bonds(self) -> list[TickerMeta]:
         """Return tradeable MOEX bonds (TQOB OFZ + TQCB corporate/muni).
@@ -236,11 +210,17 @@ class TinkoffInvestDataLoader(DataLoader):
         Cached on first call: the gRPC ``bonds()`` endpoint returns the full
         bond universe (~1601 instruments) in one round-trip. Both OFZ and
         corporate bonds are returned; callers that need the OFZ-only slice
-        should filter on the ``isin`` prefix (RU000A0..0).
+        should filter on the ``isin`` prefix (RU000A0..0 = OFZ).
         """
+        # BUGFIX (issue #174): lock around the cache fill. See
+        # list_tickers() for the rationale and the double-check pattern.
         if self._bonds_cache is not None:
             return list(self._bonds_cache.values())
-        return list(self._ensure_bonds().values())
+        with self._bonds_lock:
+            if self._bonds_cache is not None:
+                return list(self._bonds_cache.values())
+            self._bonds_cache = self._fill_bonds()
+        return list(self._bonds_cache.values())
 
     def list_etfs(self) -> list[TickerMeta]:
         """Return tradeable MOEX ETFs / BPIFs (TQTE class).
@@ -248,9 +228,15 @@ class TinkoffInvestDataLoader(DataLoader):
         Cached on first call. No class-code filter is required because the
         ``etfs()`` endpoint already returns only ETF instruments.
         """
+        # BUGFIX (issue #174): lock around the cache fill. See
+        # list_tickers() for the rationale and the double-check pattern.
         if self._etfs_cache is not None:
             return list(self._etfs_cache.values())
-        return list(self._ensure_etfs().values())
+        with self._etfs_lock:
+            if self._etfs_cache is not None:
+                return list(self._etfs_cache.values())
+            self._etfs_cache = self._fill_etfs()
+        return list(self._etfs_cache.values())
 
     def get_ticker(self, ticker: str) -> TickerMeta:
         """Find a ticker across all instrument universes (shares, bonds, etfs).
@@ -262,12 +248,19 @@ class TinkoffInvestDataLoader(DataLoader):
         history.
         """
         t = ticker.upper()
-        # 1) Full share universe (live + delisted) — try ALL cached class codes
-        for attr_name, attr_value in list(vars(self).items()):
-            if attr_name.startswith("_shares_all_") and isinstance(attr_value, list):
-                for meta in attr_value:
-                    if meta.ticker == t:
-                        return cast(TickerMeta, meta)
+        # 1) Full share universe (live + delisted) — try ALL cached class codes.
+        # BUGFIX (issue #174): iterate the per-class_code dict
+        # (``_shares_all_cache``) instead of ``vars(self)`` filtered by
+        # the ``_shares_all_`` prefix. The old code picked up any
+        # future attribute whose name happened to start with
+        # ``_shares_all_`` (e.g. a test fixture or a subclass attribute)
+        # and walked it as if it were a cached ticker list — a latent
+        # TypeError waiting to happen if anyone introduced such an
+        # attribute.
+        for metas in self._shares_all_cache.values():
+            for meta in metas:
+                if meta.ticker == t:
+                    return meta
         # 2) Live-only universe, bonds, ETFs
         for cache_getter in (self._ensure_universe, self._ensure_bonds, self._ensure_etfs):
             cache = cast(dict[str, TickerMeta], cache_getter())  # type: ignore[redundant-cast]
@@ -352,8 +345,120 @@ class TinkoffInvestDataLoader(DataLoader):
     # --------------------------------------------------------------- private
 
     def _ensure_universe(self) -> dict[str, TickerMeta]:
+        # BUGFIX (issue #174): _ensure_universe is now a thin wrapper around
+        # _fill_universe(); the lock lives in the public list_tickers()
+        # call site (and the lock-free variant is kept here for callers
+        # like get_ticker() that already hold no other lock and want
+        # one-shot access). When called outside the lock, _fill_universe()
+        # is still safe because the assignment happens here (not in the
+        # helper) and we set the cache before any other thread can
+        # observe a half-built dict.
         if self._universe_cache is not None:
             return self._universe_cache
+        self._universe_cache = self._fill_universe()
+        return self._universe_cache
+
+    def _fill_shares_all(self, class_code: str) -> list[TickerMeta]:
+        """Harvest one share class_code via a gRPC ``instruments.shares()`` call.
+
+        BUGFIX (issue #174): extracted from ``list_shares_all`` so the
+        caller holds ``self._shares_all_lock`` across the assignment
+        into ``_shares_all_cache``. Without this split, two threads
+        calling ``list_shares_all("TQBR")`` would both pass the cache
+        check (which was an ad-hoc ``getattr(self, "_shares_all_TQBR",
+        None)``), both pay one ``self.bucket`` slot for the gRPC
+        ``shares()`` harvest, and one would silently overwrite the
+        other's per-class_code result.
+
+        Includes delisted tickers (``delisted=True`` is set based on the
+        SecurityTradingStatus enum value: NOT_AVAILABLE_FOR_TRADING /
+        DELISTED / EXCLUDED). The ``listed_at`` field is the earliest
+        of first_1day_candle_date / first_1min_candle_date / ipo_date
+        that the proto exposes; delisted_at stays None because Tinkoff
+        does not surface a delisting date — ``delist_source.py`` fills
+        that separately via MOEX ISS.
+        """
+        from t_tech.invest import Client, SecurityTradingStatus
+
+        with Client(self._token) as client:
+            self.bucket.acquire()
+            response = client.instruments.shares()
+            out: list[TickerMeta] = []
+            for inst in response.instruments:
+                if inst.class_code != class_code:
+                    continue
+                ts_int = int(getattr(inst, "trading_status", 14) or 14)
+                try:
+                    status_name = SecurityTradingStatus(ts_int).name
+                except (ValueError, TypeError):
+                    status_name = "UNKNOWN"
+                delisted = (
+                    "NOT_AVAILABLE_FOR_TRADING" in status_name
+                    or "DELISTED" in status_name
+                    or "EXCLUDED" in status_name  # noqa: E501
+                )
+                # Date fields from Tinkoff Instrument:
+                # - ``first_1day_candle_date`` = first daily bar (proxy for listing)
+                # - ``ipo_date`` = IPO (may be pre-listing for some classes)
+                # - no explicit ``delisting_date`` on Instrument protobuf —
+                #   delisted_at stays None; delist_source.py fills it via MOEX ISS.
+                from datetime import date as _date
+
+                # Tinkoff proto emits timestamps as ``datetime`` objects
+                # (often tz-aware UTC), not as ISO strings. Normalise.
+                from datetime import datetime as _dt
+
+                listed_at_attr = None
+                for _attr in (
+                    "first_1day_candle_date",
+                    "first_1min_candle_date",
+                    "ipo_date",
+                ):
+                    _raw = getattr(inst, _attr, None)
+                    if _raw is None:
+                        continue
+                    try:
+                        if isinstance(_raw, _dt):
+                            listed_at_attr = _raw.date()
+                        elif isinstance(_raw, _date):
+                            listed_at_attr = _raw
+                        else:
+                            listed_at_attr = _date.fromisoformat(str(_raw)[:10])
+                        break
+                    except (TypeError, ValueError):
+                        continue
+
+                out.append(
+                    TickerMeta(
+                        ticker=inst.ticker,
+                        figi=getattr(inst, "figi", None) or None,
+                        name=inst.name,
+                        lot=inst.lot,
+                        isin=getattr(inst, "isin", None),
+                        currency="RUB",
+                        class_code=getattr(inst, "class_code", None),
+                        delisted=delisted,
+                        listed_at=listed_at_attr,
+                        delisted_at=None,  # populated by delist_source via MOEX ISS
+                        source=self.SOURCE,  # type: ignore[arg-type]
+                    )
+                )
+        return out
+
+    def _fill_universe(self) -> dict[str, TickerMeta]:
+        """Harvest the TQBR share universe via one gRPC ``instruments.shares()`` call.
+
+        BUGFIX (issue #174): extracted from ``_ensure_universe`` so the
+        fill can be assigned under ``self._universe_lock`` without the
+        gRPC client ``with`` block leaking the lock across the network
+        round-trip. The caller (``list_tickers``) is responsible for
+        holding the lock; this helper does no locking of its own.
+
+        Filter contract: keep class_code == "TQBR" with trading_status
+        in {5, 14, 15} (OPENING / NORMAL_TRADING / CLOSING) and
+        ``api_trade_available_flag is not False``. Everything else is
+        dropped — delisted/blocked, non-MOEX classes, exchange-internal.
+        """
         from t_tech.invest import Client
 
         with Client(self._token) as client:
@@ -385,12 +490,27 @@ class TinkoffInvestDataLoader(DataLoader):
                     delisted=False,
                     source=self.SOURCE,  # type: ignore[arg-type]
                 )
-        self._universe_cache = universe
         return universe
 
     def _ensure_bonds(self) -> dict[str, TickerMeta]:
+        # BUGFIX (issue #174): see _ensure_universe() rationale. Thin
+        # wrapper — the lock lives at the list_bonds() call site.
         if self._bonds_cache is not None:
             return self._bonds_cache
+        self._bonds_cache = self._fill_bonds()
+        return self._bonds_cache
+
+    def _fill_bonds(self) -> dict[str, TickerMeta]:
+        """Harvest the TQOB + TQCB bond universe via one gRPC ``instruments.bonds()`` call.
+
+        BUGFIX (issue #174): extracted from ``_ensure_bonds`` so the
+        caller (``list_bonds``) holds ``self._bonds_lock`` across the
+        assignment. See ``_fill_universe`` for the full pattern.
+
+        Filter contract: keep class_code in ``_BOND_CLASS_CODES``
+        (TQOB OFZ + TQCB corporate/muni) with trading_status in
+        {5, 14, 15} and ``api_trade_available_flag is not False``.
+        """
         from t_tech.invest import Client
 
         with Client(self._token) as client:
@@ -423,12 +543,26 @@ class TinkoffInvestDataLoader(DataLoader):
                     delisted=False,
                     source=self.SOURCE,  # type: ignore[arg-type]
                 )
-        self._bonds_cache = universe
         return universe
 
     def _ensure_etfs(self) -> dict[str, TickerMeta]:
+        # BUGFIX (issue #174): see _ensure_universe() rationale. Thin
+        # wrapper — the lock lives at the list_etfs() call site.
         if self._etfs_cache is not None:
             return self._etfs_cache
+        self._etfs_cache = self._fill_etfs()
+        return self._etfs_cache
+
+    def _fill_etfs(self) -> dict[str, TickerMeta]:
+        """Harvest the TQTE ETF universe via one gRPC ``instruments.etfs()`` call.
+
+        BUGFIX (issue #174): extracted from ``_ensure_etfs`` so the
+        caller (``list_etfs``) holds ``self._etfs_lock`` across the
+        assignment. See ``_fill_universe`` for the full pattern.
+
+        Filter contract: keep class_code == "TQTE" with trading_status
+        in {5, 14, 15} and ``api_trade_available_flag is not False``.
+        """
         from t_tech.invest import Client
 
         with Client(self._token) as client:
@@ -460,5 +594,4 @@ class TinkoffInvestDataLoader(DataLoader):
                     delisted=False,
                     source=self.SOURCE,  # type: ignore[arg-type]
                 )
-        self._etfs_cache = universe
         return universe

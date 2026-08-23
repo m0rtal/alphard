@@ -6,6 +6,7 @@ The new loader uses t-tech-investments (gRPC SDK) instead of REST HTTPS.
 
 from __future__ import annotations
 
+import threading
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from unittest.mock import MagicMock, patch
@@ -567,7 +568,7 @@ class TestTinkoffLoaderCoverage:
                 loader.get_ticker("NOPE")
 
     def test_get_ticker_finds_in_list_shares_all_cache(self) -> None:
-        """get_ticker() iterates _shares_all_TQBR cache before live universe."""
+        """get_ticker() iterates _shares_all_cache entries before live universe."""
         from src.data import TickerMeta
 
         loader = TinkoffDataLoader(token="t")
@@ -581,8 +582,11 @@ class TestTinkoffLoaderCoverage:
             source="tkf",
             delisted=True,
         )
-        # Pre-populate the list_shares_all cache (covers line 237-240).
-        loader._shares_all_TQBR = [meta]  # type: ignore[attr-defined]
+        # Pre-populate the list_shares_all cache (covers get_ticker's
+        # per-class_code lookup branch). Issue #174: the per-class_code
+        # cache is now a dict (``_shares_all_cache``), not an ad-hoc
+        # ``_shares_all_<cls>`` instance attribute.
+        loader._shares_all_cache["TQBR"] = [meta]
         # And the live caches are empty.
         loader._universe_cache = {}
         loader._bonds_cache = {}
@@ -1094,14 +1098,16 @@ class TestTinkoffLoaderCoverage:
         assert meta.class_code == "SPBXM"
 
     def test_get_ticker_searches_all_cached_universes(self) -> None:
-        """Ticker in any cached _shares_all_* list must be found."""
+        """Ticker in any cached _shares_all_cache entry must be found."""
         cls, _ = self._mock_client_for([], "shares")
         with patch("t_tech.invest.Client", cls):
             loader = TinkoffDataLoader(token="t")
-            loader._shares_all_SPBXM = [
+            # Issue #174: per-class_code cache is now a dict
+            # (``_shares_all_cache``) instead of ad-hoc instance attributes.
+            loader._shares_all_cache["SPBXM"] = [
                 self._share(ticker="TSLA", figi="BBG_TSLA", class_code="SPBXM"),
             ]
-            loader._shares_all_TQBR = [
+            loader._shares_all_cache["TQBR"] = [
                 self._share(ticker="SBER", figi="BBG_SBER", class_code="TQBR"),
             ]
             aapl = loader.get_ticker("TSLA")
@@ -1115,3 +1121,171 @@ class TestTinkoffLoaderCoverage:
             loader = TinkoffDataLoader(token="t")
             with pytest.raises(Exception, match="not found in Tinkoff universe"):
                 loader.get_ticker("NOPE")
+
+    # ---------------------------------------------------------- issue #174: thread-safe cache fills
+
+    def test_list_tickers_concurrent_fills_cache_once(self) -> None:
+        """N threads calling list_tickers() concurrently must trigger exactly one
+        gRPC ``instruments.shares()`` harvest.
+
+        Without the ``_universe_lock`` (issue #174), two threads entering
+        ``list_tickers()`` simultaneously both observed
+        ``_universe_cache is None``, both ran the gRPC harvest, and one
+        silently overwrote the other's cache with a half-built dict
+        (the late writer wins). This test fires 8 threads at once and
+        asserts that exactly one ``mock_client.instruments.shares()`` call
+        landed.
+        """
+        from threading import Barrier
+
+        shares = [self._share("SBER", "BBG1"), self._share("GAZP", "BBG2")]
+        cls, mock_client = self._mock_client_for(shares, "shares")
+        with patch("t_tech.invest.Client", cls):
+            loader = TinkoffDataLoader(token="t")
+            n_threads = 8
+            results: list[list] = [[] for _ in range(n_threads)]
+            barrier = Barrier(n_threads)
+
+            def worker(idx: int) -> None:
+                barrier.wait()  # release all threads simultaneously
+                results[idx] = loader.list_tickers()
+
+            threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_threads)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        # Exactly one gRPC harvest despite 8 concurrent callers.
+        assert mock_client.instruments.shares.call_count == 1
+        # Every thread sees the same final universe.
+        for r in results:
+            assert {m.ticker for m in r} == {"SBER", "GAZP"}
+
+    def test_list_bonds_concurrent_fills_cache_once(self) -> None:
+        """Same shape as test_list_tickers_concurrent_fills_cache_once for bonds."""
+        from threading import Barrier
+
+        bonds = [self._bond("OFZ1", "BBG_OFZ1"), self._bond("OFZ2", "BBG_OFZ2")]
+        cls, mock_client = self._mock_client_for(bonds, "bonds")
+        with patch("t_tech.invest.Client", cls):
+            loader = TinkoffDataLoader(token="t")
+            n_threads = 8
+            barrier = Barrier(n_threads)
+
+            def worker() -> None:
+                barrier.wait()
+                loader.list_bonds()
+
+            threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        assert mock_client.instruments.bonds.call_count == 1
+
+    def test_list_etfs_concurrent_fills_cache_once(self) -> None:
+        """Same shape as test_list_tickers_concurrent_fills_cache_once for etfs."""
+        from threading import Barrier
+
+        etfs = [self._etf("TMOS", "BBG_TMOS"), self._etf("FXUS", "BBG_FXUS")]
+        cls, mock_client = self._mock_client_for(etfs, "etfs")
+        with patch("t_tech.invest.Client", cls):
+            loader = TinkoffDataLoader(token="t")
+            n_threads = 8
+            barrier = Barrier(n_threads)
+
+            def worker() -> None:
+                barrier.wait()
+                loader.list_etfs()
+
+            threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        assert mock_client.instruments.etfs.call_count == 1
+
+    def test_list_shares_all_concurrent_per_class_cache_once(self) -> None:
+        """Per-class_code cache must also serialise — one harvest per (class_code)
+        even when N threads race on ``list_shares_all("TQBR")``.
+
+        Issue #174: the previous ``setattr(self, "_shares_all_TQBR", out)``
+        pattern had the same race as ``_universe_cache`` — two threads
+        both pass the ``getattr(self, cache_attr, None) is None`` check,
+        both run the gRPC harvest, and one overwrites the other.
+        """
+        from threading import Barrier
+
+        shares = [self._share("SBER", "BBG1"), self._share("GAZP", "BBG2")]
+        cls, mock_client = self._mock_client_for(shares, "shares")
+        with patch("t_tech.invest.Client", cls):
+            loader = TinkoffDataLoader(token="t")
+            n_threads = 8
+            results: list[list] = [[] for _ in range(n_threads)]
+            barrier = Barrier(n_threads)
+
+            def worker(idx: int) -> None:
+                barrier.wait()
+                results[idx] = loader.list_shares_all("TQBR")
+
+            threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_threads)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        # Exactly one gRPC harvest for TQBR.
+        assert mock_client.instruments.shares.call_count == 1
+        # Per-class_code cache has one entry, keyed by "TQBR".
+        assert list(loader._shares_all_cache.keys()) == ["TQBR"]
+        for r in results:
+            assert {m.ticker for m in r} == {"SBER", "GAZP"}
+
+    def test_list_shares_all_distinct_classes_serialise_independently(self) -> None:
+        """Concurrent ``list_shares_all("TQBR")`` and ``list_shares_all("SPBXM")``
+        must each get their own harvest, and the cache must end up with
+        two distinct entries.
+
+        Issue #174: one ``_shares_all_lock`` guards the whole
+        ``_shares_all_cache`` dict; the harvests themselves are NOT
+        parallelised (each ``_fill_shares_all`` takes one
+        ``self.bucket`` slot), but the per-class_code state stays
+        consistent because the early-return check and the assignment
+        both happen under the same lock.
+        """
+        from threading import Barrier
+
+        tqbr_shares = [self._share("SBER", "BBG1", class_code="TQBR")]
+        spbxm_shares = [self._share("AAPL", "BBG_AAPL", class_code="SPBXM")]
+        # Mock client returns BOTH sets regardless of which class is asked;
+        # the filter is done client-side in _fill_shares_all.
+        all_shares = tqbr_shares + spbxm_shares
+        cls, mock_client = self._mock_client_for(all_shares, "shares")
+        with patch("t_tech.invest.Client", cls):
+            loader = TinkoffDataLoader(token="t")
+            barrier = Barrier(2)
+
+            def get_tqbr() -> None:
+                barrier.wait()
+                loader.list_shares_all("TQBR")
+
+            def get_spbxm() -> None:
+                barrier.wait()
+                loader.list_shares_all("SPBXM")
+
+            t1 = threading.Thread(target=get_tqbr)
+            t2 = threading.Thread(target=get_spbxm)
+            t1.start()
+            t2.start()
+            t1.join()
+            t2.join()
+
+        # Each class_code got its own entry in the per-class_code cache.
+        assert set(loader._shares_all_cache.keys()) == {"TQBR", "SPBXM"}
+        tqbr_tickers = {m.ticker for m in loader._shares_all_cache["TQBR"]}
+        spbxm_tickers = {m.ticker for m in loader._shares_all_cache["SPBXM"]}
+        assert tqbr_tickers == {"SBER"}
+        assert spbxm_tickers == {"AAPL"}
