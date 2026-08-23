@@ -1391,6 +1391,112 @@ class TestOrderFlow:
         assert state.cash == Decimal("50000")
         assert len(state.positions) == 1
         assert state.positions[0].symbol == "SBER"
+        # Issue #180 regression guard: total_equity is NAV (which is what
+        # TinkoffAccount populates PortfolioSnapshot.cash with), NOT
+        # cash + sum(positions.value). For this fixture, PortfolioSnapshot.cash
+        # is 50_000 (acting as NAV in the Tinkoff contract), so
+        # total_equity must be 50_000, NOT 50_000 + 100*250 = 75_000.
+        assert state.total_equity == Decimal("50000")
+
+    def test_portfolio_to_state_does_not_double_count_positions(self) -> None:
+        """Issue #180: ``PortfolioSnapshot.cash`` is NAV, not free cash.
+
+        ``TinkoffAccount.get_portfolio()`` (src/broker/tinkoff_account.py:381-410)
+        fills ``PortfolioSnapshot.cash`` from ``total_amount_currencies``,
+        which is the Tinkoff SDK field that reports NAV (= cash + positions
+        at mark). ``OrderFlow._portfolio_to_state`` previously summed
+        ``portfolio.cash + sum(p.quantity * p.avg_price)`` on top of that,
+        which double-counts the positions and inflates ``total_equity`` by
+        the position book size. The downstream effect: ``RiskGate`` sees
+        a 2x equity denominator, computes ``position_pct`` at half the
+        real value, and silently approves positions up to 2x the configured
+        limit — same failure mode as the historical MarketOrder(price=1)
+        bypass (issues #11, #13) and frozen=False bypass (issue #98).
+
+        Regression net: a portfolio with $1.2M NAV (positions $1M, free
+        cash $200k per the Tinkoff contract where positions are valued
+        at avg_price) yields total_equity == 1.2M, NOT 2.2M.
+        """
+        portfolio = PortfolioSnapshot(
+            account_id="SB1",
+            cash=Decimal("1200000"),  # NAV — positions $1M + free $200k
+            positions=[
+                Position(ticker="SBER", quantity=Decimal("1000"), avg_price=Decimal("1000")),
+            ],
+            timestamp=datetime.utcnow(),
+        )
+        state = OrderFlow._portfolio_to_state(portfolio)
+        # Pre-fix: 1_200_000 + 1_000_000 = 2_200_000 (double-count bug).
+        # Post-fix: 1_200_000 (NAV only — portfolio.cash IS the NAV).
+        assert state.total_equity == Decimal("1200000")
+        assert state.peak_equity == Decimal("1200000")
+        # Positions are still passed through to RiskGate — the bug was
+        # only in the equity denominator, not in the position list.
+        assert len(state.positions) == 1
+        assert state.positions[0].symbol == "SBER"
+        assert state.positions[0].quantity == Decimal("1000")
+
+    def test_portfolio_to_state_empty_positions_total_equals_cash(self) -> None:
+        """Issue #180 (edge case): no positions → total_equity == cash.
+
+        Pre-fix this happened to work because the sum loop returned 0,
+        so ``total = cash + 0 = cash``. Post-fix it still works because
+        ``total = portfolio.cash`` directly. This test guards the
+        post-fix against future refactor regressions.
+        """
+        portfolio = PortfolioSnapshot(
+            account_id="SB1",
+            cash=Decimal("250000"),
+            positions=[],
+            timestamp=datetime.utcnow(),
+        )
+        state = OrderFlow._portfolio_to_state(portfolio)
+        assert state.total_equity == Decimal("250000")
+        assert state.peak_equity == Decimal("250000")
+        assert state.cash == Decimal("250000")
+        assert state.positions == []
+
+    def test_portfolio_to_state_risk_gate_position_pct_uses_real_equity(self) -> None:
+        """Issue #180 (end-to-end): position_pct uses real NAV, not 2x NAV.
+
+        Pre-fix OrderFlow double-counted positions in total_equity, so
+        RiskGate saw a 2x equity denominator and reported position_pct
+        at half the real value. A 10% BUY against a portfolio with 5%
+        existing exposure must surface position_pct = 10%, not 5%.
+        """
+        from src.risk.gate import RiskGate, RiskLimits, TradeIntent
+
+        portfolio = PortfolioSnapshot(
+            account_id="SB1",
+            cash=Decimal("1000000"),  # NAV (Tinkoff contract)
+            positions=[
+                # 50_000 / 1_000_000 = 5% of NAV.
+                Position(ticker="SBER", quantity=Decimal("500"), avg_price=Decimal("100")),
+            ],
+            timestamp=datetime.utcnow(),
+        )
+        limits = RiskLimits(
+            max_dd_pct=Decimal("100"),
+            max_position_pct=Decimal("100"),  # permissive — only equity ratio matters here
+            max_sector_pct=Decimal("100"),
+            max_daily_loss_pct=Decimal("100"),
+        )
+        gate = RiskGate(limits=limits)
+        state = OrderFlow._portfolio_to_state(portfolio)
+        # BUY 100_000 worth (10% of NAV) into NEW ticker so position_pct
+        # reflects the intent, not an existing position. Pre-fix this
+        # would compute position_pct = 100_000 / 2_000_000 = 5.0%. Post-fix
+        # it computes 100_000 / 1_000_000 = 10.0%.
+        intent = TradeIntent(
+            symbol="NEWPOS",
+            side="buy",
+            quantity=Decimal("1000"),
+            price=Decimal("100"),  # 1000 * 100 = 100_000 = 10% of NAV
+        )
+        decision = gate.evaluate(intent, state)
+        assert decision.allowed is True  # within the permissive limit
+        # The exact assertion: position_pct must be 10.0, not 5.0.
+        assert decision.meta["position_pct"] == pytest.approx(10.0)
 
     def test_order_slicer_value_error_handled(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """If OrderSlicer raises ValueError (e.g. negative qty slips through),
