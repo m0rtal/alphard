@@ -170,7 +170,13 @@ class InMemorySQLiteStore(DataStore):
             return
         params = [
             (
-                m.ticker,
+                # Issue #183: normalise ticker to UPPERCASE at the SQL boundary
+                # (defense-in-depth — TickerMeta._v_ticker in src/data/models.py:138-144
+                # already uppercases on construction, but model_construct bypasses
+                # validators and would leave mixed-case rows that list_tickers /
+                # mark_delisted cannot match). Mirrors the fix already applied in
+                # mark_delisted (issue #160).
+                m.ticker.upper(),
                 m.figi,
                 m.name,
                 m.lot,
@@ -258,7 +264,10 @@ class InMemorySQLiteStore(DataStore):
             return 0
         params = [
             (
-                r.ticker,
+                # Issue #183: normalise ticker at the SQL boundary (defense-in-depth;
+                # OHLCVRow._v_ticker in src/data/models.py:71-77 already uppercases on
+                # construction, but model_construct bypasses validators).
+                r.ticker.upper(),
                 r.ts.isoformat(),
                 r.source,
                 str(r.open),
@@ -323,7 +332,9 @@ class InMemorySQLiteStore(DataStore):
             return 0
         params = [
             (
-                r.ticker,
+                # Issue #183: normalise ticker at the SQL boundary
+                # (defense-in-depth; OHLCVRow._v_ticker already uppercases).
+                r.ticker.upper(),
                 r.ts.isoformat(),
                 str(r.open),
                 str(r.high),
@@ -389,7 +400,10 @@ class InMemorySQLiteStore(DataStore):
         rows = list(rows)
         if not rows:
             return 0
-        params = [(r.ticker, r.ts.isoformat(), r.kind, str(r.value), r.source) for r in rows]
+        # Issue #183: normalise ticker at the SQL boundary (defense-in-depth;
+        # CorporateAction._v_ticker in src/data/models.py:111-117 already
+        # uppercases on construction, but model_construct bypasses validators).
+        params = [(r.ticker.upper(), r.ts.isoformat(), r.kind, str(r.value), r.source) for r in rows]
         sql = """
             INSERT INTO corporate_actions
                 (ticker, ts, kind, value, source, updated_at)

@@ -538,9 +538,16 @@ class PostgresDataStore(DataStore):
                 adj_close  = EXCLUDED.adj_close,
                 updated_at = NOW()
         """
+        # Issue #183: normalise ticker to UPPERCASE at the SQL boundary so a
+        # model_construct(ticker="sber") bypass (which skips the pydantic
+        # ``_v_ticker`` validator in src/data/models.py:71-77) cannot leave a
+        # row invisible to the query_* methods that DO normalise (line 570).
+        # Mirrors the defense-in-depth style already used in mark_delisted
+        # (issue #160) and the sister pg_store.py upsert_ohlcv site whose
+        # ticker value arrives via the same OHLCVRow model.
         params = [
             (
-                r.ticker,
+                r.ticker.upper(),
                 r.ts,
                 str(r.open),
                 str(r.high),
