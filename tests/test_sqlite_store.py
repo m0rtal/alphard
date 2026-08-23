@@ -588,6 +588,129 @@ class TestAdjustedOhlcv:
       - query_ohlcv_adj raises StoreError on sqlite3.Error (lines 337-338)
     """
 
+
+# -----------------------------------------------------------------------------
+# Issue #183 — ticker-case asymmetry defense-in-depth
+# -----------------------------------------------------------------------------
+
+
+def _lowercase_ohlcv_row(ticker: str, ts: date) -> OHLCVRow:
+    """Construct an OHLCVRow with lowercase ticker via model_construct.
+
+    Bypasses ``OHLCVRow._v_ticker`` validator in src/data/models.py:71-77.
+    Returns an instance whose ``.ticker`` attribute is intentionally lowercase
+    so we can prove the upsert_* methods normalise it to UPPERCASE before
+    hitting SQL — sister fix to issue #160 (mark_delisted normalisation).
+    """
+    return OHLCVRow.model_construct(
+        ticker=ticker,
+        ts=ts,
+        open=Decimal("100"),
+        high=Decimal("101"),
+        low=Decimal("99"),
+        close=Decimal("100.5"),
+        volume=Decimal("1000"),
+        adj_close=Decimal("100.5"),
+        source="tkf",
+    )
+
+
+def _lowercase_ticker_meta(ticker: str) -> TickerMeta:
+    """Construct TickerMeta via model_construct with lowercase ticker.
+
+    Bypasses ``TickerMeta._v_ticker`` in src/data/models.py:138-144.
+    """
+    return TickerMeta.model_construct(
+        ticker=ticker,
+        figi="BBG000000000",
+        name=f"test-{ticker}",
+        lot=1,
+        isin="RU0000000000",
+        currency="RUB",
+        delisted=False,
+        delisted_at=None,
+        listed_at=date(2020, 1, 1),
+        source="tkf",
+    )
+
+
+def _seed_sber(store: InMemorySQLiteStore) -> None:
+    """Insert a SBER TickerMeta row to satisfy FK constraints on ohlcv_daily."""
+
+    store.upsert_tickers(
+        [
+            TickerMeta(
+                ticker="SBER",
+                figi="BBG000000000",
+                name="Sberbank",
+                lot=1,
+                isin="RU0000000000",
+                currency="RUB",
+                source="tkf",
+            )
+        ]
+    )
+
+
+class TestTickerCaseAsymmetry:
+    """Issue #183: defense-in-depth normalisation at the SQL boundary.
+
+    Every ``upsert_*`` method must normalise ``r.ticker.upper()`` so that
+    rows created via ``model_construct(ticker="sber")`` (which bypasses
+    the pydantic ``_v_ticker`` validator) are still findable by the
+    query_* methods that normalise via ``ticker.upper()``.
+    """
+
+    def test_upsert_ohlcv_adj_lowercase_roundtrip(self, sqlite_store: InMemorySQLiteStore) -> None:
+        """model_construct(ticker='sber') write must surface via query_ohlcv_adj('sber').
+
+        ohlcv_daily(_adj) FKs to ticker_universe, so seed SBER first (via
+        the public API which always uppercases).
+        """
+        _seed_sber(sqlite_store)
+        row = _lowercase_ohlcv_row("sber", date(2026, 1, 1))
+        n = sqlite_store.upsert_ohlcv_adj([row])
+        assert n == 1
+        # Query with the lowercase form — the symmetric contract of the issue.
+        rows = sqlite_store.query_ohlcv_adj("sber", date(2026, 1, 1), date(2026, 1, 1))
+        assert len(rows) == 1
+        assert rows[0].ticker == "SBER"  # we wrote ('sber', ts) → query normalises to ('SBER', ts)
+
+    def test_upsert_ohlcv_lowercase_roundtrip(self, sqlite_store: InMemorySQLiteStore) -> None:
+        """Same defence for the raw ohlcv_daily table (not just _adj)."""
+        _seed_sber(sqlite_store)
+        row = _lowercase_ohlcv_row("sber", date(2026, 1, 1))
+        n = sqlite_store.upsert_ohlcv([row])
+        assert n == 1
+        rows = sqlite_store.query_ohlcv("sber", date(2026, 1, 1), date(2026, 1, 1))
+        assert len(rows) == 1
+        assert rows[0].ticker == "SBER"
+
+    def test_upsert_corporate_actions_lowercase_roundtrip(self, sqlite_store: InMemorySQLiteStore) -> None:
+        """Same defence for splits/dividends storage."""
+        action = CorporateAction.model_construct(
+            ticker="sber",
+            ts=date(2025, 6, 1),
+            kind="split",
+            value=Decimal("2"),
+            source="moex",
+        )
+        n = sqlite_store.upsert_corporate_actions([action])
+        assert n == 1
+        rows = sqlite_store.query_corporate_actions("sber", date(2025, 1, 1), date(2025, 12, 31))
+        assert len(rows) == 1
+        assert rows[0].ticker == "SBER"
+
+    def test_upsert_tickers_lowercase_roundtrip(self, sqlite_store: InMemorySQLiteStore) -> None:
+        """Same defence for ticker_universe (mark_delisted already normalised
+        after issue #160; upsert_tickers was the missing pair)."""
+        meta = _lowercase_ticker_meta("sber")
+        sqlite_store.upsert_tickers([meta])
+        listed = sqlite_store.list_tickers(include_delisted=True)
+        tickers = {m.ticker for m in listed}
+        assert "SBER" in tickers
+        assert "sber" not in tickers  # no mixed-case row stored
+
     def _seed_sber(self, store: InMemorySQLiteStore) -> None:
         store.upsert_tickers(
             [
