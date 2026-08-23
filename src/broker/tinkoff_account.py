@@ -546,8 +546,15 @@ class TinkoffAccount(BrokerAccount):
     def _ticker_to_figi(client: Any, ticker: str) -> str:
         """Map ticker to FIGI via Tinkoff instruments API.
 
-        Accepts both TQBR (stocks) and TQOB (bonds) class codes so the
-        same helper works for the OFZ bond universe.
+        Issue #187: the previous whitelist ``("TQBR", "TQOB")`` excluded
+        TQTE ETFs, TQCB corporate/muni bonds, and every SPB foreign-share
+        class (SPBXM, TQBS, TQDE, TQNO, TQLV, TQPI). All of those are
+        tradable at the broker and supported by the data loaders, but
+        the broker was rejecting them at FIGI-mapping time with a
+        misleading ``"not found in TQBR/TQOB instrument universe"``
+        error. The whitelist now defers to ``_TRADABLE_CLASS_CODES`` in
+        ``src/data/tinkoff_loader.py`` — single source of truth shared
+        with the data layer.
 
         Issue #13 (C.1): the historical implementation had
         ``except Exception: pass`` followed by a silent fallback
@@ -562,20 +569,36 @@ class TinkoffAccount(BrokerAccount):
         descriptive message. Operators MUST see the actual failure
         reason (auth, network, instrument not found) in the logs.
         """
+        # Import here to keep the broker module loadable even if the
+        # data package is not on the path (e.g. CLI-only deploys).
+        from src.data.tinkoff_loader import _TRADABLE_CLASS_CODES
+
         try:
             response = client.instruments.find_instrument(query=ticker)
         except Exception as exc:
             raise BrokerError(f"instruments.find_instrument failed for {ticker}: {exc}") from exc
         for inst in getattr(response, "instruments", []):
-            if getattr(inst, "ticker", None) == ticker and getattr(inst, "class_code", None) in ("TQBR", "TQOB"):
+            if getattr(inst, "ticker", None) == ticker and getattr(inst, "class_code", None) in _TRADABLE_CLASS_CODES:
                 return str(inst.figi)
-        # No matching TQBR/TQOB instrument — refuse, do NOT silently
+        # No matching tradable instrument — refuse, do NOT silently
         # return the ticker (which would then be sent as a FIGI and
         # produce a confusing INVALID_ARGUMENT deep in the broker).
+        # The error message lists the class_codes Tinkoff actually
+        # returned so operators can distinguish "wrong ticker" from
+        # "right ticker in a class we don't trade" (the latter should
+        # never happen given _TRADABLE_CLASS_CODES mirrors the loader
+        # universe — if it does, the constant has drifted, file an
+        # issue).
+        seen_classes = sorted(
+            str(c)
+            for c in {getattr(inst, "class_code", None) for inst in getattr(response, "instruments", [])}
+            if c is not None
+        )
         raise BrokerError(
-            f"ticker {ticker!r} not found in TQBR/TQOB instrument "
-            f"universe (Tinkoff returned {len(getattr(response, 'instruments', []))} "
-            f"matches, none with the right class_code)"
+            f"ticker {ticker!r} not found in tradable instrument universe "
+            f"(Tinkoff returned {len(getattr(response, 'instruments', []))} "
+            f"matches with class_codes {seen_classes!r}; "
+            f"expected one of {sorted(_TRADABLE_CLASS_CODES)!r})"
         )
 
     @staticmethod
