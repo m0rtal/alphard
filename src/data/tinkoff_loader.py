@@ -260,7 +260,7 @@ class TinkoffInvestDataLoader(DataLoader):
         for metas in self._shares_all_cache.values():
             for meta in metas:
                 if meta.ticker == t:
-                    return cast(TickerMeta, meta)
+                    return meta
         # 2) Live-only universe, bonds, ETFs
         for cache_getter in (self._ensure_universe, self._ensure_bonds, self._ensure_etfs):
             cache = cast(dict[str, TickerMeta], cache_getter())  # type: ignore[redundant-cast]
