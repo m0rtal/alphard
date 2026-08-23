@@ -298,14 +298,29 @@ class TinkoffInvestMDDataLoader(DataLoader):
         under ``self._universe_lock`` (issue #152). Returns the final
         list to be assigned to ``self._universe_cache``.
         """
-        from .tinkoff_loader import TinkoffInvestDataLoader
+        # Lazy import both the gRPC loader and the shared class-code
+        # constants from ``tinkoff_loader`` to avoid a circular import
+        # at module load time (``tinkoff_loader`` itself imports the
+        # ``loader`` base module from this package, so we keep the
+        # sibling-module import out of the top-level scope here).
+        from .tinkoff_loader import (
+            TinkoffInvestDataLoader,
+            _BOND_CLASS_CODES,
+            _ETF_CLASS_CODE,
+            _TRADABLE_CLASS_CODES,
+        )
 
         grpc_loader = TinkoffInvestDataLoader(token=self._token)
         # Shares: full universe across all boards, no client filter.
-        # TQBR = MOEX main board Russian shares (incl. delisted/suspended).
-        # SPBXM = SPB Exchange US/foreign shares.
-        # TQBS/TQDE/TQNO/TQLV/TQPI = MOEX minor boards.
-        target_classes = ("TQBR", "SPBXM", "TQBS", "TQDE", "TQNO", "TQLV", "TQPI")
+        # Derive the share-only subset from the single source of truth
+        # ``_TRADABLE_CLASS_CODES`` (issue #187) and subtract the bond
+        # and ETF class_codes (which are walked via ``list_bonds()`` /
+        # ``list_etfs()`` below — they are NOT class_code-keyed on
+        # ``list_shares_all``). This keeps the share subset in lockstep
+        # with the broker's tradable whitelist so that adding a new
+        # tradable share class at the broker is picked up here
+        # automatically — see test_share_class_codes_match_tradable_constant.
+        target_classes: tuple[str, ...] = tuple(sorted(_TRADABLE_CLASS_CODES - _BOND_CLASS_CODES - {_ETF_CLASS_CODE}))
         seen: dict[str, TickerMeta] = {}
         # 1) Shares per class_code.
         for cls in target_classes:
