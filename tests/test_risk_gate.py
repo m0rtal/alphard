@@ -465,6 +465,226 @@ class TestSectorExposure:
         # Position-size check alone passes (10,000 = 1% of equity < 10%).
         assert decision.allowed is True
 
+    def test_sell_trim_reduces_sector_exposure_allowed(self, limits: RiskLimits) -> None:
+        """Issue #178: a SELL that trims an existing long position in the
+        same sector REDUCES aggregate sector exposure. Pre-fix logic
+        projected ``sector_value + intent.notional``, which over-counted
+        the trim portion and fired RISK_SECTOR on every trim-only SELL.
+
+        Portfolio holds 2500 SBER @ 100 = 250,000 (25% energy). Selling
+        2000 SBER @ 100 = 200,000 (pure trim) → projected energy exposure
+        drops from 25% to 5%. Must be allowed; the trim reduces risk.
+        """
+        state = PortfolioState(
+            total_equity=Decimal("1000000"),
+            cash=Decimal("0"),
+            positions=[
+                Position(
+                    symbol="SBER",
+                    quantity=Decimal("2500"),
+                    avg_price=Decimal("100"),
+                    sector="energy",
+                ),
+            ],
+            daily_pnl=Decimal("0"),
+            peak_equity=Decimal("1000000"),
+        )
+        intent = TradeIntent(
+            symbol="SBER",
+            side="sell",
+            quantity=Decimal("2000"),
+            price=Decimal("100"),
+            sector="energy",
+        )
+        gate = RiskGate(limits)
+
+        decision = gate.evaluate(intent, state)
+
+        assert decision.allowed is True
+        # Meta should report the trim/short decomposition so operators can
+        # confirm the path: trim_qty == intent.quantity (pure trim),
+        # short_qty == 0, sector_pct reflects the new (lower) projection.
+        assert decision.meta["sector_trim_qty"] == pytest.approx(2000.0)
+        assert decision.meta["sector_short_qty"] == pytest.approx(0.0)
+        assert decision.meta["sector_pct"] == pytest.approx(5.0)
+
+    def test_sell_partial_short_increases_sector_exposure_proportionally(self, limits: RiskLimits) -> None:
+        """Issue #178: a SELL that PARTIALLY opens a short must increase
+        sector exposure only by the SHORT portion's notional.
+
+        Portfolio holds 2500 SBER @ 100 = 250,000 (25% energy). Selling
+        3000 SBER @ 100 → trim 2500, short 500. Projected energy exposure
+        = 25% - 25% + 5% = 5%. Pre-fix this projected 25% + 30% = 55%
+        and rejected.
+        """
+        state = PortfolioState(
+            total_equity=Decimal("1000000"),
+            cash=Decimal("0"),
+            positions=[
+                Position(
+                    symbol="SBER",
+                    quantity=Decimal("2500"),
+                    avg_price=Decimal("100"),
+                    sector="energy",
+                ),
+            ],
+            daily_pnl=Decimal("0"),
+            peak_equity=Decimal("1000000"),
+        )
+        intent = TradeIntent(
+            symbol="SBER",
+            side="sell",
+            quantity=Decimal("3000"),
+            price=Decimal("100"),
+            sector="energy",
+        )
+        gate = RiskGate(limits)
+
+        decision = gate.evaluate(intent, state)
+
+        assert decision.allowed is True
+        assert decision.meta["sector_trim_qty"] == pytest.approx(2500.0)
+        assert decision.meta["sector_short_qty"] == pytest.approx(500.0)
+        assert decision.meta["sector_pct"] == pytest.approx(5.0)
+
+    def test_sell_pure_short_no_existing_position_increases_sector_exposure(
+        self, limits: RiskLimits, base_state: PortfolioState
+    ) -> None:
+        """Issue #178: a SELL with no existing position is 100% new short
+        exposure in the sector — must be counted as full notional, same
+        semantics as a BUY of equivalent size.
+        """
+        # 1000 SBER @ 100 = 100,000 = 10% of equity in 'energy' on empty book.
+        intent = TradeIntent(
+            symbol="SBER",
+            side="sell",
+            quantity=Decimal("1000"),
+            price=Decimal("100"),
+            sector="energy",
+        )
+        gate = RiskGate(limits)
+
+        decision = gate.evaluate(intent, base_state)
+
+        assert decision.allowed is True
+        assert decision.meta["sector_trim_qty"] == pytest.approx(0.0)
+        assert decision.meta["sector_short_qty"] == pytest.approx(1000.0)
+        assert decision.meta["sector_pct"] == pytest.approx(10.0)
+
+    def test_sell_short_above_sector_limit_rejected(self, limits: RiskLimits) -> None:
+        """Issue #178: a SELL whose SHORT portion alone exceeds the sector
+        limit must be rejected with RISK_SECTOR.
+
+        Portfolio holds 2500 SBER @ 100 = 25% energy (limit 30%). Selling
+        6000 SBER @ 100 → trim 2500, short 3500 = 35% new energy exposure.
+        Post-trim sector exposure = 25% - 25% + 35% = 35% > 30% → REJECT.
+        Pre-fix the projection was 25% + 60% = 85%, also rejected but
+        for the wrong reason.
+        """
+        state = PortfolioState(
+            total_equity=Decimal("1000000"),
+            cash=Decimal("0"),
+            positions=[
+                Position(
+                    symbol="SBER",
+                    quantity=Decimal("2500"),
+                    avg_price=Decimal("100"),
+                    sector="energy",
+                ),
+            ],
+            daily_pnl=Decimal("0"),
+            peak_equity=Decimal("1000000"),
+        )
+        intent = TradeIntent(
+            symbol="SBER",
+            side="sell",
+            quantity=Decimal("6000"),
+            price=Decimal("100"),
+            sector="energy",
+        )
+        gate = RiskGate(limits)
+
+        decision = gate.evaluate(intent, state)
+
+        assert decision.allowed is False
+        assert any("RISK_SECTOR" in v for v in decision.violations)
+        assert decision.meta["sector_trim_qty"] == pytest.approx(2500.0)
+        assert decision.meta["sector_short_qty"] == pytest.approx(3500.0)
+        assert decision.meta["sector_pct"] == pytest.approx(35.0)
+
+    def test_sell_trim_different_sector_only_short_counts(self, limits: RiskLimits) -> None:
+        """Issue #178 (edge case): intent.sector differs from the position's
+        sector. The trim_qty is bounded by existing qty in *intent.symbol*,
+        but the *position* in that symbol is in a DIFFERENT sector — so
+        the trim does NOT reduce intent.sector exposure at all. Only the
+        short portion should add to intent.sector.
+
+        Portfolio: 2500 SBER @ 100 = 25% in 'tech'. Intent: sell 2000 SBER
+        in 'energy'. trim_qty=2000 (SBER), short_qty=0; energy sector had
+        zero existing exposure, trim doesn't reduce it, so projected = 0.
+        Allowed (0% < 30%).
+        """
+        state = PortfolioState(
+            total_equity=Decimal("1000000"),
+            cash=Decimal("0"),
+            positions=[
+                Position(
+                    symbol="SBER",
+                    quantity=Decimal("2500"),
+                    avg_price=Decimal("100"),
+                    sector="tech",  # position is in tech, not energy
+                ),
+            ],
+            daily_pnl=Decimal("0"),
+            peak_equity=Decimal("1000000"),
+        )
+        intent = TradeIntent(
+            symbol="SBER",
+            side="sell",
+            quantity=Decimal("2000"),
+            price=Decimal("100"),
+            sector="energy",  # intent targets energy sector
+        )
+        gate = RiskGate(limits)
+
+        decision = gate.evaluate(intent, state)
+
+        assert decision.allowed is True
+        # Energy sector had no existing exposure; the trim of a TECH
+        # position doesn't subtract from energy exposure. sector_pct = 0.
+        assert decision.meta["sector_pct"] == pytest.approx(0.0)
+
+    def test_buy_sector_unchanged(self, limits: RiskLimits) -> None:
+        """Issue #178 regression guard: BUY semantics are unchanged.
+
+        Same fixture as test_sector_exposure_exceeded: existing 25%
+        energy, BUY 10% energy → projected 35% > 30% → reject.
+        """
+        state = PortfolioState(
+            total_equity=Decimal("1000000"),
+            cash=Decimal("600000"),
+            positions=[
+                Position(
+                    symbol="LKOH",
+                    quantity=Decimal("2500"),
+                    avg_price=Decimal("100"),
+                    sector="energy",
+                ),
+            ],
+            daily_pnl=Decimal("0"),
+            peak_equity=Decimal("1000000"),
+        )
+        intent = _intent(symbol="SBER", qty=1000, price="100", sector="energy")
+        gate = RiskGate(limits)
+
+        decision = gate.evaluate(intent, state)
+
+        assert decision.allowed is False
+        assert any("RISK_SECTOR" in v for v in decision.violations)
+        # No trim/short decomposition on BUY side — meta keys absent.
+        assert "sector_trim_qty" not in decision.meta
+        assert "sector_short_qty" not in decision.meta
+
 
 # ===========================================================================
 # Multi-violation & fail-safe
