@@ -300,9 +300,18 @@ class PostgresDataStore(DataStore):
                 source = EXCLUDED.source,
                 updated_at = NOW()
         """
+        # Issue #185: normalise ticker to UPPERCASE at the SQL boundary
+        # (defense-in-depth — TickerMeta._v_ticker in src/data/models.py:138-144
+        # already uppercases on construction, but model_construct bypasses
+        # validators and would leave mixed-case rows that list_tickers /
+        # mark_delisted / count_ohlcv cannot re-match because the corresponding
+        # query_* methods DO normalise to ticker.upper()). Mirrors the sister
+        # fixes in upsert_ohlcv_adj (line 550, issue #183), upsert_ohlcv /
+        # upsert_corporate_actions below (also issue #185), mark_delisted
+        # (issue #160), and the SQLite sibling sites fixed by PR #184.
         rows = [
             (
-                m.ticker,
+                m.ticker.upper(),
                 m.figi,
                 m.name,
                 m.lot,
@@ -390,9 +399,17 @@ class PostgresDataStore(DataStore):
             ON CONFLICT (ticker, ts, source) DO UPDATE SET
                 updated_at = NOW()
         """
+        # Issue #185: normalise ticker to UPPERCASE at the SQL boundary
+        # (defense-in-depth — OHLCVRow._v_ticker in src/data/models.py:71-77
+        # already uppercases on construction, but model_construct bypasses
+        # validators and would leave mixed-case rows invisible to query_ohlcv
+        # which normalises via ticker.upper() at line 503). Mirrors the sister
+        # fixes in upsert_ohlcv_adj (issue #183 / PR #184), upsert_tickers /
+        # upsert_corporate_actions above and below (also issue #185), and
+        # mark_delisted (issue #160).
         params = [
             (
-                r.ticker,
+                r.ticker.upper(),
                 r.ts,
                 r.source,
                 str(r.open),
@@ -594,7 +611,15 @@ class PostgresDataStore(DataStore):
                 value = EXCLUDED.value,
                 updated_at = NOW()
         """
-        params = [(r.ticker, r.ts, r.kind, str(r.value), r.source) for r in rows]
+        # Issue #185: normalise ticker to UPPERCASE at the SQL boundary
+        # (defense-in-depth — CorporateAction._v_ticker in
+        # src/data/models.py:111-117 already uppercases on construction, but
+        # model_construct bypasses validators and would leave mixed-case rows
+        # invisible to query_corporate_actions which normalises via
+        # ticker.upper() at line 610). Mirrors the sister fixes in
+        # upsert_ohlcv_adj (issue #183 / PR #184), upsert_tickers / upsert_ohlcv
+        # above (also issue #185), and mark_delisted (issue #160).
+        params = [(r.ticker.upper(), r.ts, r.kind, str(r.value), r.source) for r in rows]
         with self._conn.cursor() as cur:
             cur.executemany(sql, params)
         self._conn.commit()
