@@ -171,6 +171,85 @@ class TestTickerUniverse:
         assert sber.figi == "BIG_UPDATE"
         assert sber.lot == 20
 
+    def test_upsert_tickers_refreshes_listed_at_on_conflict(
+        self, sqlite_store: InMemorySQLiteStore
+    ):
+        """Issue #176: a re-upsert with a more accurate ``listed_at`` MUST update
+        the row (matching the Postgres ``upsert_tickers`` contract).
+
+        Sequence:
+        1. Insert SBER with ``listed_at=2000-01-01``.
+        2. Re-upsert SBER with ``listed_at=1999-06-15`` (Tinkoff ``ipo_date``
+           showed up late, more accurate).
+        3. Verify the stored row has the new date, not the stale one.
+
+        Pre-176: the ON CONFLICT clause did not write ``listed_at`` so the
+        old date silently persisted and ``trading_days(listed_at, ...)``
+        in the backfill completion formula computed the wrong denominator.
+        """
+        sber_v1 = TickerMeta(
+            ticker="SBER",
+            figi="RU0009029540",
+            name="Sberbank",
+            lot=10,
+            isin="RU0009029540",
+            currency="RUB",
+            delisted=False,
+            delisted_at=None,
+            listed_at=date(2000, 1, 1),
+            source="moex",
+        )
+        sqlite_store.upsert_tickers([sber_v1])
+        assert (
+            next(t for t in sqlite_store.list_tickers() if t.ticker == "SBER").listed_at
+            == date(2000, 1, 1)
+        )
+
+        sber_v2 = sber_v1.model_copy(update={"listed_at": date(1999, 6, 15)})
+        sqlite_store.upsert_tickers([sber_v2])
+
+        sber_after = next(t for t in sqlite_store.list_tickers() if t.ticker == "SBER")
+        assert sber_after.listed_at == date(1999, 6, 15), (
+            "ON CONFLICT clause must overwrite listed_at on re-upsert — "
+            "see issue #176 for the contract"
+        )
+
+    def test_upsert_tickers_refreshes_delisted_and_delisted_at_on_conflict(
+        self, sqlite_store: InMemorySQLiteStore
+    ):
+        """Issue #176: SQLite ``upsert_tickers`` MUST overwrite ``delisted`` and
+        ``delisted_at`` on conflict (unlike Postgres which has a separate
+        ``delist_source`` writer, SQLite has no such owner).
+
+        Sequence:
+        1. Insert VSMO with ``delisted=False, delisted_at=None``.
+        2. Re-upsert VSMO with ``delisted=True, delisted_at=2024-03-15``
+           (Tinkoff ``trading_status`` flipped after the first sync).
+        3. Verify the row reflects the new state.
+        """
+        vsmo_v1 = TickerMeta(
+            ticker="VSMO",
+            figi="RU000A0JP1N2",
+            name="VSMPO-AVISMA",
+            lot=1,
+            isin="RU000A0JP1N2",
+            currency="RUB",
+            delisted=False,
+            delisted_at=None,
+            listed_at=date(2005, 1, 1),
+            source="moex",
+        )
+        sqlite_store.upsert_tickers([vsmo_v1])
+
+        vsmo_v2 = vsmo_v1.model_copy(
+            update={"delisted": True, "delisted_at": date(2024, 3, 15)}
+        )
+        sqlite_store.upsert_tickers([vsmo_v2])
+
+        vsmo_after = next(t for t in sqlite_store.list_tickers() if t.ticker == "VSMO")
+        assert vsmo_after.delisted is True
+        assert vsmo_after.delisted_at == date(2024, 3, 15)
+
     def test_mark_delisted_success(self, sqlite_store: InMemorySQLiteStore, sample_metas: list[TickerMeta]):
         """Test marking a ticker as delisted and recording the event."""
         sqlite_store.upsert_tickers(sample_metas)

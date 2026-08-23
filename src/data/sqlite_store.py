@@ -183,18 +183,36 @@ class InMemorySQLiteStore(DataStore):
             )
             for m in rows
         ]
+        # BUGFIX (issue #176): the previous ON CONFLICT clause omitted
+        # ``listed_at`` / ``delisted`` / ``delisted_at``, so a re-upsert with
+        # a more-accurate ``listed_at`` (e.g. Tinkoff ``ipo_date`` showed up
+        # late) silently left the stale date on disk. Production Postgres
+        # (``pg_store.py:288-301``) correctly overwrites ``listed_at``; the
+        # SQLite contract is supposed to be identical, but the clause here
+        # had drifted.
+        #
+        # ``delisted`` / ``delisted_at`` semantics differ from Postgres by
+        # design — Postgres has ``delist_source.sync_universe_delisted`` as a
+        # dedicated owner of ``delisted_at`` after the initial set, so
+        # ``upsert_tickers`` deliberately does NOT overwrite it. SQLite has
+        # no such dedicated writer (mark_delisted is in-process and updates
+        # ``delisted_at`` itself), so writing EXCLUDED on conflict is the
+        # right contract here. See issue #176 for the full reasoning.
         sql = """
             INSERT INTO ticker_universe
                 (ticker, figi, name, lot, isin, currency, delisted,
                  delisted_at, listed_at, source, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
             ON CONFLICT (ticker) DO UPDATE SET
-                figi = excluded.figi,
-                name = excluded.name,
-                lot = excluded.lot,
-                isin = excluded.isin,
-                currency = excluded.currency,
-                source = excluded.source,
+                figi       = excluded.figi,
+                name       = excluded.name,
+                lot        = excluded.lot,
+                isin       = excluded.isin,
+                currency   = excluded.currency,
+                delisted   = excluded.delisted,
+                delisted_at = excluded.delisted_at,
+                listed_at  = excluded.listed_at,
+                source     = excluded.source,
                 updated_at = datetime('now')
         """
         try:
