@@ -1669,9 +1669,7 @@ class TestOrderFlow:
     # re-raise, NEVER silently REJECTED).
     # ---------------------------------------------------------------
 
-    def test_broker_error_mapped_to_rejected_but_does_not_raise(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_broker_error_mapped_to_rejected_but_does_not_raise(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """BrokerError (technical broker failure) → per-slice REJECTED, no re-raise.
 
         Pre-#170 this also covered bare ``Exception`` which silently
@@ -1701,9 +1699,7 @@ class TestOrderFlow:
             risk_gate=self._approved_gate(),
             quote_provider=self._quote_provider(),
         )
-        result = flow.submit_market(
-            "SBER", OrderSide.BUY, Decimal("3000"), self._portfolio(cash="10000000")
-        )
+        result = flow.submit_market("SBER", OrderSide.BUY, Decimal("3000"), self._portfolio(cash="10000000"))
         assert result.slice_count == 3
         assert result.submitted == [OrderStatus.REJECTED] * 3
         # All slices rejected by broker → final_status REJECTED (issue #168 tier-2).
@@ -1711,9 +1707,7 @@ class TestOrderFlow:
         assert result.rejected_count == 3
         assert result.filled_count == 0
 
-    def test_programming_error_in_place_order_propagates(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_programming_error_in_place_order_propagates(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """TypeError / KeyError / AttributeError → re-raised, NOT swallowed as REJECTED.
 
         Pre-#170 the ``except Exception`` blanket caught these and
@@ -1733,9 +1727,7 @@ class TestOrderFlow:
         monkeypatch.setattr(OrderSlicer, "__init__", _small_adv)
 
         broker = MagicMock()
-        broker.place_order.side_effect = TypeError(
-            "frozen model mutation attempt — issue #170 regression"
-        )
+        broker.place_order.side_effect = TypeError("frozen model mutation attempt — issue #170 regression")
 
         flow = OrderFlow(
             broker=broker,
@@ -1743,13 +1735,9 @@ class TestOrderFlow:
             quote_provider=self._quote_provider(),
         )
         with pytest.raises(TypeError, match="frozen model mutation"):
-            flow.submit_market(
-                "SBER", OrderSide.BUY, Decimal("3000"), self._portfolio(cash="10000000")
-            )
+            flow.submit_market("SBER", OrderSide.BUY, Decimal("3000"), self._portfolio(cash="10000000"))
 
-    def test_programming_error_after_partial_fills_propagates(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_programming_error_after_partial_fills_propagates(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """2 slices FILLED, 1 raises AttributeError → AttributeError propagates.
 
         Pre-#170 this would have been silently written as
@@ -1782,9 +1770,7 @@ class TestOrderFlow:
             quote_provider=self._quote_provider(),
         )
         with pytest.raises(AttributeError, match="missing instrument metadata"):
-            flow.submit_market(
-                "SBER", OrderSide.BUY, Decimal("3000"), self._portfolio(cash="10000000")
-            )
+            flow.submit_market("SBER", OrderSide.BUY, Decimal("3000"), self._portfolio(cash="10000000"))
 
 
 # ────────────────────────────────────────────

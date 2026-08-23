@@ -217,9 +217,7 @@ class OrderFlow:
             try:
                 status = self._broker.place_order(order)
             except BrokerError as e:
-                logger.warning(
-                    "Slice %d broker failure (mapped to REJECTED): %s", i, e
-                )
+                logger.warning("Slice %d broker failure (mapped to REJECTED): %s", i, e)
                 status = OrderStatus.REJECTED
             submitted.append(status)
 
