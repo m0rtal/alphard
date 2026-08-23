@@ -171,9 +171,7 @@ class TestTickerUniverse:
         assert sber.figi == "BIG_UPDATE"
         assert sber.lot == 20
 
-    def test_upsert_tickers_refreshes_listed_at_on_conflict(
-        self, sqlite_store: InMemorySQLiteStore
-    ):
+    def test_upsert_tickers_refreshes_listed_at_on_conflict(self, sqlite_store: InMemorySQLiteStore):
         """Issue #176: a re-upsert with a more accurate ``listed_at`` MUST update
         the row (matching the Postgres ``upsert_tickers`` contract).
 
@@ -200,23 +198,17 @@ class TestTickerUniverse:
             source="moex",
         )
         sqlite_store.upsert_tickers([sber_v1])
-        assert (
-            next(t for t in sqlite_store.list_tickers() if t.ticker == "SBER").listed_at
-            == date(2000, 1, 1)
-        )
+        assert next(t for t in sqlite_store.list_tickers() if t.ticker == "SBER").listed_at == date(2000, 1, 1)
 
         sber_v2 = sber_v1.model_copy(update={"listed_at": date(1999, 6, 15)})
         sqlite_store.upsert_tickers([sber_v2])
 
         sber_after = next(t for t in sqlite_store.list_tickers() if t.ticker == "SBER")
         assert sber_after.listed_at == date(1999, 6, 15), (
-            "ON CONFLICT clause must overwrite listed_at on re-upsert — "
-            "see issue #176 for the contract"
+            "ON CONFLICT clause must overwrite listed_at on re-upsert — " "see issue #176 for the contract"
         )
 
-    def test_upsert_tickers_refreshes_delisted_and_delisted_at_on_conflict(
-        self, sqlite_store: InMemorySQLiteStore
-    ):
+    def test_upsert_tickers_refreshes_delisted_and_delisted_at_on_conflict(self, sqlite_store: InMemorySQLiteStore):
         """Issue #176: SQLite ``upsert_tickers`` MUST overwrite ``delisted`` and
         ``delisted_at`` on conflict (unlike Postgres which has a separate
         ``delist_source`` writer, SQLite has no such owner).
@@ -241,9 +233,7 @@ class TestTickerUniverse:
         )
         sqlite_store.upsert_tickers([vsmo_v1])
 
-        vsmo_v2 = vsmo_v1.model_copy(
-            update={"delisted": True, "delisted_at": date(2024, 3, 15)}
-        )
+        vsmo_v2 = vsmo_v1.model_copy(update={"delisted": True, "delisted_at": date(2024, 3, 15)})
         sqlite_store.upsert_tickers([vsmo_v2])
 
         vsmo_after = next(t for t in sqlite_store.list_tickers() if t.ticker == "VSMO")
