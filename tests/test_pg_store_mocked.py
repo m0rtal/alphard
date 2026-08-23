@@ -1786,6 +1786,108 @@ class TestUpsertTickersListedAt:
 
 
 # ---------------------------------------------------------------------------
+# Ticker case-asymmetry (issue #185)
+# ---------------------------------------------------------------------------
+
+
+class TestTickerCaseAsymmetry:
+    """Issue #185: the three pg_store upsert_* sites pass ticker without
+    .upper(); normalisation, asymmetric with the corresponding query_*
+    methods which all normalise via ticker.upper() at the SQL boundary
+    (lines 503, 577, 610). Pydantic validators in src/data/models.py
+    catch lowercase on construction, but Model.model_construct bypasses
+    validators. These tests prove the SQL-boundary normalisation catches
+    that bypass path.
+
+    Sister to PR #184 (which fixed the four SQLite sibling sites plus
+    pg_store.upsert_ohlcv_adj — issue #183). PR #184 explicitly deferred
+    the three remaining pg_store upsert sites to a follow-up.
+    """
+
+    def test_upsert_ohlcv_lowercase_roundtrip(self, store: PostgresDataStore) -> None:
+        # model_construct bypasses the _v_ticker validator
+        row = OHLCVRow.model_construct(
+            ticker="sber",
+            ts=date(2026, 1, 1),
+            open=Decimal("100"),
+            high=Decimal("100"),
+            low=Decimal("100"),
+            close=Decimal("100"),
+            volume=Decimal("1"),
+            adj_close=Decimal("100"),
+            source="tkf",
+        )
+        store.upsert_ohlcv([row])
+        cur = store._conn.last_cursor()
+        _, params = cur.executemany_calls[0]
+        # Pre-fix: params[0][0] == 'sber'. Post-fix: 'SBER'.
+        assert params[0][0] == "SBER"
+
+    def test_upsert_ohlcv_uppercase_unchanged(self, store: PostgresDataStore) -> None:
+        # Regression: already-uppercase input passes through unchanged.
+        row = _bar(ticker="SBER")
+        store.upsert_ohlcv([row])
+        cur = store._conn.last_cursor()
+        _, params = cur.executemany_calls[0]
+        assert params[0][0] == "SBER"
+
+    def test_upsert_corporate_actions_lowercase_roundtrip(self, store: PostgresDataStore) -> None:
+        # model_construct bypasses the _v_ticker validator
+        row = CorporateAction.model_construct(
+            ticker="sber",
+            ts=date(2026, 6, 1),
+            kind="dividend",
+            value=Decimal("12.50"),
+            source="tkf",
+        )
+        store.upsert_corporate_actions([row])
+        cur = store._conn.last_cursor()
+        _, params = cur.executemany_calls[0]
+        # Pre-fix: params[0][0] == 'sber'. Post-fix: 'SBER'.
+        assert params[0][0] == "SBER"
+
+    def test_upsert_corporate_actions_uppercase_unchanged(self, store: PostgresDataStore) -> None:
+        row = CorporateAction(
+            ticker="SBER",
+            ts=date(2026, 6, 1),
+            kind="dividend",
+            value=Decimal("12.50"),
+            source="tkf",
+        )
+        store.upsert_corporate_actions([row])
+        cur = store._conn.last_cursor()
+        _, params = cur.executemany_calls[0]
+        assert params[0][0] == "SBER"
+
+    def test_upsert_tickers_lowercase_roundtrip(self, store: PostgresDataStore) -> None:
+        # model_construct bypasses the _v_ticker validator
+        meta = TickerMeta.model_construct(
+            ticker="sber",
+            figi="BBG004730N88",
+            name="Sberbank",
+            lot=10,
+            isin="RU0009029540",
+            currency="RUB",
+            class_code=None,
+            delisted=False,
+            delisted_at=None,
+            listed_at=date(2020, 1, 1),
+            source="tkf",
+        )
+        store.upsert_tickers([meta])
+        cur = store._conn.last_cursor()
+        _, params = cur.executemany_calls[0]
+        # Pre-fix: params[0][0] == 'sber'. Post-fix: 'SBER'.
+        assert params[0][0] == "SBER"
+
+    def test_upsert_tickers_uppercase_unchanged(self, store: PostgresDataStore) -> None:
+        store.upsert_tickers([_meta(ticker="SBER")])
+        cur = store._conn.last_cursor()
+        _, params = cur.executemany_calls[0]
+        assert params[0][0] == "SBER"
+
+
+# ---------------------------------------------------------------------------
 # init_schema: schema file content + ADD COLUMN migrations
 # ---------------------------------------------------------------------------
 
