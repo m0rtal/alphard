@@ -116,6 +116,156 @@ class TestPositionSize:
 
         assert decision.allowed is True
 
+    def test_sell_within_existing_long_allowed(self, limits: RiskLimits) -> None:
+        """Issue #172: a SELL that trims an existing long must not trip
+        RISK_POSITION. Pre-fix logic rejected it because it computed
+        ``position_pct = intent.notional / equity * 100`` regardless of
+        side, even though a SELL strictly reduces gross exposure.
+
+        Portfolio holds 500 SBER @ 100 = 5% of equity. Selling 200 SBER
+        @ 100 = 2% notional trims the position to 3% — a textbook de-risk.
+        """
+        state = PortfolioState(
+            total_equity=Decimal("1000000"),
+            cash=Decimal("0"),
+            positions=[
+                Position(
+                    symbol="SBER",
+                    quantity=Decimal("500"),
+                    avg_price=Decimal("100"),
+                )
+            ],
+            daily_pnl=Decimal("0"),
+            peak_equity=Decimal("1000000"),
+        )
+        intent = TradeIntent(
+            symbol="SBER",
+            side="sell",
+            quantity=Decimal("200"),
+            price=Decimal("100"),
+        )
+        gate = RiskGate(limits)
+
+        decision = gate.evaluate(intent, state)
+
+        assert decision.allowed is True
+        # Pure trim — effective_notional is zero, position_pct is reported
+        # as 0% in the audit log so operators can confirm the path.
+        assert decision.meta["existing_qty"] == pytest.approx(500.0)
+        assert decision.meta["trim_qty"] == pytest.approx(200.0)
+        assert decision.meta["short_qty"] == pytest.approx(0.0)
+        assert decision.meta["position_pct"] == 0.0
+
+    def test_sell_exceeding_long_counts_only_short_portion(self, limits: RiskLimits) -> None:
+        """Issue #172: when a SELL exceeds the existing long (opens a short),
+        only the SHORT portion counts toward the position limit, not the
+        full intent notional.
+
+        Portfolio holds 100 SBER. Selling 1100 SBER @ 100 → trims 100,
+        opens short of 1000 @ 100 = 10% of equity (exactly at limit → allowed).
+        """
+        state = PortfolioState(
+            total_equity=Decimal("1000000"),
+            cash=Decimal("0"),
+            positions=[
+                Position(
+                    symbol="SBER",
+                    quantity=Decimal("100"),
+                    avg_price=Decimal("100"),
+                )
+            ],
+            daily_pnl=Decimal("0"),
+            peak_equity=Decimal("1000000"),
+        )
+        intent = TradeIntent(
+            symbol="SBER",
+            side="sell",
+            quantity=Decimal("1100"),
+            price=Decimal("100"),
+        )
+        gate = RiskGate(limits)
+
+        decision = gate.evaluate(intent, state)
+
+        # 1000 shares short @ 100 = 100,000 = exactly 10% of equity → boundary allowed
+        assert decision.allowed is True
+        assert decision.meta["trim_qty"] == pytest.approx(100.0)
+        assert decision.meta["short_qty"] == pytest.approx(1000.0)
+        assert decision.meta["position_pct"] == pytest.approx(10.0)
+
+    def test_sell_opening_short_above_limit_rejected(self, limits: RiskLimits) -> None:
+        """Issue #172: a SELL that opens a short exceeding the position
+        limit must be rejected with RISK_POSITION, sized on the short portion.
+        """
+        state = PortfolioState(
+            total_equity=Decimal("1000000"),
+            cash=Decimal("0"),
+            positions=[
+                Position(
+                    symbol="SBER",
+                    quantity=Decimal("100"),
+                    avg_price=Decimal("100"),
+                )
+            ],
+            daily_pnl=Decimal("0"),
+            peak_equity=Decimal("1000000"),
+        )
+        # Sell 1200 SBER @ 100 → trim 100, short 1100 @ 100 = 11% of equity > 10%
+        intent = TradeIntent(
+            symbol="SBER",
+            side="sell",
+            quantity=Decimal("1200"),
+            price=Decimal("100"),
+        )
+        gate = RiskGate(limits)
+
+        decision = gate.evaluate(intent, state)
+
+        assert decision.allowed is False
+        assert any("RISK_POSITION" in v for v in decision.violations)
+        # Violation text must reference the SHORT notional (11,000-equivalent
+        # in position_pct), not the gross intent notional (120,000-equivalent
+        # = 12% which would be the pre-fix over-count).
+        assert decision.meta["position_pct"] == pytest.approx(11.0)
+        assert decision.meta["short_qty"] == pytest.approx(1100.0)
+
+    def test_sell_with_no_existing_position_counts_full_notional(
+        self, limits: RiskLimits, base_state: PortfolioState
+    ) -> None:
+        """Issue #172: a SELL against no existing position is 100% new
+        short — must be counted as full notional. Pre-fix this happened
+        to \"work\" because the old logic always counted full notional,
+        but it was wrong by accident; now the semantics are explicit.
+        """
+        intent = TradeIntent(
+            symbol="SBER",
+            side="sell",
+            quantity=Decimal("1100"),
+            price=Decimal("100"),
+        )
+        gate = RiskGate(limits)
+
+        decision = gate.evaluate(intent, base_state)
+
+        assert decision.allowed is False
+        assert any("RISK_POSITION" in v for v in decision.violations)
+        assert decision.meta["existing_qty"] == pytest.approx(0.0)
+        assert decision.meta["trim_qty"] == pytest.approx(0.0)
+        assert decision.meta["short_qty"] == pytest.approx(1100.0)
+        assert decision.meta["position_pct"] == pytest.approx(11.0)
+
+    def test_buy_position_check_unchanged(self, limits: RiskLimits, base_state: PortfolioState) -> None:
+        """Issue #172 regression guard: BUY semantics are unchanged —
+        a 9% BUY on empty book is allowed, an 11% BUY is rejected.
+        """
+        allowed_intent = _intent(qty=900, price="100")
+        rejected_intent = _intent(qty=1100, price="100")
+        gate = RiskGate(limits)
+
+        assert gate.evaluate(allowed_intent, base_state).allowed is True
+        assert gate.evaluate(rejected_intent, base_state).allowed is False
+        assert any("RISK_POSITION" in v for v in gate.evaluate(rejected_intent, base_state).violations)
+
 
 # ===========================================================================
 # Daily-loss check
