@@ -301,9 +301,18 @@ class RiskGate:
     ) -> None:
         """Single-position size must not exceed max_position_pct of equity.
 
-        Skeleton assumes the entire intent is a NEW position (no averaging
-        into an existing one). Phase 1.3 will project the post-trade
-        position size including the increment.
+        Issue #172: previously this check treated every intent as a BUY,
+        computing ``position_pct = intent.notional / equity * 100``. A SELL
+        intent that trims an existing long position was rejected as if it
+        had ADDED exposure — a sell of 20% of equity on a 30% position
+        would fail RISK_POSITION even though it DE-risks the book.
+
+        Corrected semantics:
+          * BUY  → counts the full intent notional (new exposure).
+          * SELL → only the portion that would OPEN a new short counts
+                   (qty exceeding the existing long position). The trim
+                   portion is allowed because it strictly reduces risk.
+        Sector-exposure / drawdown / daily-loss checks are unaffected.
         """
         if state.total_equity <= 0:
             # Defence-in-depth: PortfolioState validator already enforces
@@ -311,13 +320,37 @@ class RiskGate:
             violations.append("RISK_POSITION: invalid portfolio state (total_equity <= 0)")
             return
 
-        notional = intent.notional
-        position_pct = (notional / state.total_equity) * Decimal("100")
+        # Existing long quantity in this symbol. For SELL this is the
+        # amount we trim before we start opening a short.
+        existing_qty = sum(
+            (p.quantity for p in state.positions if p.symbol == intent.symbol),
+            Decimal("0"),
+        )
+        meta["existing_qty"] = float(existing_qty)
+
+        if intent.side == "sell":
+            trim_qty = min(intent.quantity, existing_qty)
+            short_qty = intent.quantity - trim_qty  # never < 0 here
+            # Only the short portion creates new exposure. The trim
+            # portion strictly reduces risk.
+            effective_notional = short_qty * intent.price
+            meta["trim_qty"] = float(trim_qty)
+            meta["short_qty"] = float(short_qty)
+        else:
+            # BUY (or anything else — fail-safe: treat as exposure-additive)
+            effective_notional = intent.notional
+
+        if effective_notional <= Decimal("0"):
+            # Pure trim — never trips position limit. Record zero.
+            meta["position_pct"] = 0.0
+            return
+
+        position_pct = (effective_notional / state.total_equity) * Decimal("100")
         meta["position_pct"] = float(position_pct)
 
         if position_pct > self.limits.max_position_pct:
             violations.append(
-                f"RISK_POSITION: intent notional {notional} = {position_pct:.4f}% of equity "
+                f"RISK_POSITION: intent notional {effective_notional} = {position_pct:.4f}% of equity "
                 f"exceeds limit {self.limits.max_position_pct}%"
             )
 
