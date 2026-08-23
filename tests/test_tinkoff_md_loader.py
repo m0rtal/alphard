@@ -659,3 +659,146 @@ class TestUniverse:
         for r in results[1:]:
             assert r is first, "each thread got a distinct list — fill ran more than once"
         assert call_count == 1, f"_fill_universe_cache called {call_count} times, expected 1"
+
+
+# ---------------------------------------------------------------------------
+# Single-source-of-truth invariant (issue #189)
+# ---------------------------------------------------------------------------
+
+
+class TestTradableClassCodesInvariant:
+    """Regression tests for the issue #189 single-source-of-truth contract.
+
+    The MD archive backfill loader must consume the same set of tradable
+    share class_codes as the broker whitelist, so that adding a new tradable
+    SHARE class_code to ``_TRADABLE_CLASS_CODES`` is automatically picked up
+    by ``TinkoffInvestMDDataLoader._fill_universe_cache``. Before this
+    invariant was enforced, drift between the two sources was silent
+    (ignoring a new class at the MD layer while accepting it at the broker).
+    """
+
+    def test_target_classes_derived_from_tradable_constant(self) -> None:
+        """``target_classes`` inside ``_fill_universe_cache`` must be a strict
+        function of ``_TRADABLE_CLASS_CODES`` minus bond/ETF classes — never a
+        hand-typed tuple. We assert by inspecting the source code.
+        """
+        import inspect
+
+        from src.data.tinkoff_md_loader import TinkoffInvestMDDataLoader
+
+        src = inspect.getsource(TinkoffInvestMDDataLoader._fill_universe_cache)
+        # Must consume the shared constant.
+        assert "_TRADABLE_CLASS_CODES" in src, (
+            "_fill_universe_cache must import and use _TRADABLE_CLASS_CODES "
+            "from tinkoff_loader (issue #189). Source:\n" + src
+        )
+        # Must subtract the bond and ETF subsets explicitly.
+        assert "_BOND_CLASS_CODES" in src, (
+            "_fill_universe_cache must subtract _BOND_CLASS_CODES so the "
+            "share subset excludes TQOB/TQCB. Source:\n" + src
+        )
+        assert "_ETF_CLASS_CODE" in src, (
+            "_fill_universe_cache must subtract _ETF_CLASS_CODE so the " "share subset excludes TQTE. Source:\n" + src
+        )
+        # Must not contain any hardcoded class_code tuple.
+        forbidden = ('"TQBR", "SPBXM"', '"SPBXM", "TQBR"')
+        for needle in forbidden:
+            assert needle not in src, (
+                f"Hardcoded class-code tuple {needle!r} found in "
+                f"_fill_universe_cache — must derive from "
+                f"_TRADABLE_CLASS_CODES instead. Source:\n" + src
+            )
+
+    def test_share_subset_matches_tradable_minus_bonds_minus_etf(self) -> None:
+        """Re-derive the share-only subset exactly the way
+        ``_fill_universe_cache`` does and assert it equals
+        ``_TRADABLE_CLASS_CODES - _BOND_CLASS_CODES - {_ETF_CLASS_CODE}``.
+
+        This is the runtime invariant from the issue's acceptance criteria:
+        if anyone adds a new SHARE class_code to ``_TRADABLE_CLASS_CODES``
+        without updating the MD loader, this test fails loudly.
+        """
+        from src.data.tinkoff_loader import (
+            _BOND_CLASS_CODES,
+            _ETF_CLASS_CODE,
+            _TRADABLE_CLASS_CODES,
+        )
+
+        # Recompute the share subset via the same expression used in
+        # _fill_universe_cache.
+        derived_share_subset = frozenset(sorted(_TRADABLE_CLASS_CODES - _BOND_CLASS_CODES - {_ETF_CLASS_CODE}))
+
+        # Sanity-check the constant itself: it is a frozenset and contains
+        # the documented shares/bonds/ETFs.
+        assert isinstance(_TRADABLE_CLASS_CODES, frozenset)
+        assert "TQBR" in _TRADABLE_CLASS_CODES  # MOEX main board
+        assert "TQOB" in _TRADABLE_CLASS_CODES  # OFZ
+        assert "TQCB" in _TRADABLE_CLASS_CODES  # corporate/muni bonds
+        assert "TQTE" in _TRADABLE_CLASS_CODES  # ETFs
+        assert "SPBXM" in _TRADABLE_CLASS_CODES  # SPB US/foreign
+
+        # Share subset must contain every SPB variant (the original hardcoded
+        # tuple at line 308 of the pre-fix file).
+        for spb_cls in ("SPBXM", "TQBS", "TQDE", "TQNO", "TQLV", "TQPI"):
+            assert spb_cls in derived_share_subset, (
+                f"share subset missing {spb_cls} — drift between broker " f"whitelist and MD loader"
+            )
+
+        # Share subset must NOT contain any bond or ETF class_code.
+        for excluded in _BOND_CLASS_CODES | {_ETF_CLASS_CODE}:
+            assert excluded not in derived_share_subset, (
+                f"share subset must exclude {excluded} (walked via " f"list_bonds/list_etfs instead)"
+            )
+
+    def test_target_classes_walks_every_share_class_code(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """End-to-end: every share class_code present in
+        ``_TRADABLE_CLASS_CODES`` must be passed to ``list_shares_all``
+        during a universe fill. This is the regression test that fails
+        loudly if a new tradable share class is added at the broker
+        whitelist but not honoured at the MD archive backfill layer.
+        """
+        monkeypatch.setenv("TINKOFF_SANDBOX_TOKEN", "fake-token-1234567890")
+        from src.data.token_bucket import TokenBucket
+        from src.data.tinkoff_loader import (
+            _BOND_CLASS_CODES,
+            _ETF_CLASS_CODE,
+            _TRADABLE_CLASS_CODES,
+        )
+
+        loader = TinkoffInvestMDDataLoader(bucket=TokenBucket(rate=1000.0, window_seconds=1.0))
+
+        expected_share_classes: frozenset[str] = frozenset(
+            sorted(_TRADABLE_CLASS_CODES - _BOND_CLASS_CODES - {_ETF_CLASS_CODE})
+        )
+
+        seen_classes: list[str] = []
+
+        def fake_list_shares_all(class_code: str = "") -> list[TickerMeta]:
+            seen_classes.append(class_code)
+            return [
+                TickerMeta(
+                    ticker=f"T_{class_code}",
+                    figi=f"FIGI_{class_code}",
+                    class_code=class_code,
+                    name=f"name-{class_code}",
+                    lot=1,
+                    source="tkf",
+                )
+            ]
+
+        with patch("src.data.tinkoff_loader.TinkoffInvestDataLoader") as mock_grpc:
+            mock_grpc.return_value.list_shares_all.side_effect = fake_list_shares_all
+            mock_grpc.return_value.list_bonds.return_value = []
+            mock_grpc.return_value.list_etfs.return_value = []
+            metas = loader.list_tickers_with_figi()
+
+        assert frozenset(seen_classes) == expected_share_classes, (
+            f"MD loader walked {sorted(seen_classes)} but the tradable share "
+            f"subset is {sorted(expected_share_classes)} — drift between "
+            f"broker whitelist and MD loader (issue #189)"
+        )
+        # Every share class produced a TickerMeta in the universe.
+        for cls in expected_share_classes:
+            assert any(m.class_code == cls for m in metas), (
+                f"share class {cls} was walked but no TickerMeta made it " f"into the universe"
+            )
