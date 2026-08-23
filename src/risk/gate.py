@@ -365,6 +365,13 @@ class RiskGate:
 
         Skeleton caveat: if `intent.sector` is None, we skip sector check.
         Phase 1.3 will require every instrument to have a sector.
+
+        Issue #178: the projection must mirror the side-aware decomposition
+        used in `_check_position_size`. A SELL that trims an existing long
+        position in the same sector REDUCES aggregate sector exposure — it
+        must not be counted as if it ADDED `intent.notional`. The trim
+        portion (qty up to existing long) lowers exposure; the short
+        portion (qty beyond existing long) raises exposure.
         """
         if intent.sector is None:
             # Skeleton: silent skip. Phase 1.3 will treat missing sector as
@@ -378,8 +385,35 @@ class RiskGate:
             if pos.sector == intent.sector:
                 sector_value += pos.market_value
 
-        # Add the proposed intent notional (assuming same sector)
-        projected_sector_value = sector_value + intent.notional
+        if intent.side == "sell":
+            # Symmetric to _check_position_size: only the SHORT portion of a
+            # SELL creates new exposure in the sector. The trim portion
+            # reduces exposure. Existing qty in the same symbol is the
+            # trim capacity; anything beyond it opens a short.
+            existing_qty_same_symbol = sum(
+                (p.quantity for p in state.positions if p.symbol == intent.symbol),
+                Decimal("0"),
+            )
+            trim_qty = min(intent.quantity, existing_qty_same_symbol)
+            short_qty = intent.quantity - trim_qty  # never < 0 here
+            # trim_qty * price reduces sector_value; short_qty * price adds.
+            projected_sector_value = sector_value - trim_qty * intent.price + short_qty * intent.price
+            meta["sector_trim_qty"] = float(trim_qty)
+            meta["sector_short_qty"] = float(short_qty)
+        else:
+            # BUY (or anything else — fail-safe: treat as exposure-additive)
+            projected_sector_value = sector_value + intent.notional
+
+        # Floor at zero — a defensive guard. With the trim decomposition,
+        # projected_sector_value should never be negative in practice
+        # (trim_qty <= existing_qty <= sector_value when positions in the
+        # same sector are all in the same symbol). But if positions in the
+        # sector are spread across symbols and the trim_qty is bounded by
+        # *this intent's* symbol only, the math could still go negative in
+        # pathological cases; clamp for audit-log stability.
+        if projected_sector_value < Decimal("0"):
+            projected_sector_value = Decimal("0")
+
         sector_pct = (projected_sector_value / state.total_equity) * Decimal("100")
         meta["sector_pct"] = float(sector_pct)
         meta["sector"] = intent.sector
