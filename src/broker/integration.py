@@ -270,9 +270,20 @@ class OrderFlow:
             )
             for p in portfolio.positions
         ]
-        total = portfolio.cash + sum(
-            (p.quantity * p.avg_price for p in portfolio.positions), Decimal("0")
-        )  # noqa: E501
+        # Issue #180: `portfolio.cash` is the full NAV, not free cash — see
+        # `src/broker/tinkoff_account.py:381-410`, where TinkoffAccount
+        # fills `PortfolioSnapshot.cash = total_amount_currencies` (the
+        # Tinkoff SDK field that reports NAV = cash + positions at mark).
+        # Adding `sum(p.quantity * p.avg_price)` on top double-counts the
+        # positions: `total = NAV + positions_value` inflates equity by
+        # the position book size, which makes RiskGate.position_pct half
+        # of its true value, which silently approves positions up to 2x
+        # the configured position limit (issue #11 class).
+        #
+        # Fix: use `portfolio.cash` as total_equity directly. It is
+        # already NAV (per the TinkoffAccount contract). Do not add
+        # positions.value on top.
+        total = portfolio.cash
         return PortfolioState(
             total_equity=total,
             cash=portfolio.cash,
