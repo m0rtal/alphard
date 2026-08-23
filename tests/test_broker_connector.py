@@ -963,11 +963,17 @@ class TestTinkoffAccount:
             a._ticker_to_figi(mock_client, "SBER")
 
     def test_ticker_to_figi_raises_when_not_in_tqbr_tqob(self, monkeypatch):
-        """Issue #13 (C.1): when the ticker is not in TQBR/TQOB
-        (e.g. unknown ticker), _ticker_to_figi MUST raise rather
-        than silently return the ticker string."""
+        """Issue #13 (C.1): when the ticker is not in any tradable
+        class_code (e.g. some non-MOEX instrument), _ticker_to_figi
+        MUST raise rather than silently return the ticker string.
+
+        Issue #187: error message now lists the actually-seen
+        class_codes and the expected tradable set so operators can
+        distinguish "wrong ticker" from "right ticker in a class
+        we don't trade".
+        """
         mock_client = MagicMock()
-        # Return a list of matches but none with TQBR/TQOB class.
+        # Return a list of matches but none with a tradable class_code.
         match = MagicMock()
         match.ticker = "SBER"
         match.class_code = "OTHER"
@@ -976,8 +982,118 @@ class TestTinkoffAccount:
         resp.instruments = [match]
         mock_client.instruments.find_instrument.return_value = resp
         a = TinkoffAccount(token="t.x")
-        with pytest.raises(BrokerError, match="not found in TQBR/TQOB"):
+        with pytest.raises(BrokerError, match="not found in tradable instrument universe"):
             a._ticker_to_figi(mock_client, "SBER")
+
+    def test_ticker_to_figi_accepts_tqte_etf(self):
+        """Issue #187: TQTE-class ETFs / BPIFs must map to a FIGI.
+
+        Regression for the latent gap where the broker whitelist
+        ``("TQBR", "TQOB")`` rejected every ETF order at FIGI-mapping
+        time with the misleading ``"not found in TQBR/TQOB instrument
+        universe"`` error, even though ``list_etfs()`` /
+        ``_ETF_CLASS_CODE`` already recognise TQTE in the data layer.
+        """
+        mock_client = MagicMock()
+        match = MagicMock()
+        match.ticker = "FXRL"
+        match.class_code = "TQTE"
+        match.figi = "FXRL_FIGI"
+        resp = MagicMock()
+        resp.instruments = [match]
+        mock_client.instruments.find_instrument.return_value = resp
+        a = TinkoffAccount(token="t.x")
+        assert a._ticker_to_figi(mock_client, "FXRL") == "FXRL_FIGI"
+
+    def test_ticker_to_figi_accepts_tqcb_corporate_bond(self):
+        """Issue #187: TQCB corporate / municipal bonds must map to a FIGI.
+
+        TQOB was already in the whitelist; TQCB was missing. The data
+        layer recognises both via ``_BOND_CLASS_CODES = {"TQOB", "TQCB"}``
+        in src/data/tinkoff_loader.py.
+        """
+        mock_client = MagicMock()
+        match = MagicMock()
+        match.ticker = "RU000A0JX0QJ"
+        match.class_code = "TQCB"
+        match.figi = "CORP_BOND_FIGI"
+        resp = MagicMock()
+        resp.instruments = [match]
+        mock_client.instruments.find_instrument.return_value = resp
+        a = TinkoffAccount(token="t.x")
+        assert a._ticker_to_figi(mock_client, "RU000A0JX0QJ") == "CORP_BOND_FIGI"
+
+    def test_ticker_to_figi_accepts_spbxm_foreign_share(self):
+        """Issue #187: SPBXM-listed foreign shares (AAPL, MSFT) must map.
+
+        Regression for the gap where the broker rejected every SPB
+        foreign-share order. ``TinkoffInvestDataLoader.get_ticker``
+        explicitly searches SPBXM as part of its cross-board
+        resolution; without the broker whitelist change, a
+        RiskGate-approved SPB order would fail with the same
+        misleading error.
+        """
+        mock_client = MagicMock()
+        match = MagicMock()
+        match.ticker = "AAPL"
+        match.class_code = "SPBXM"
+        match.figi = "AAPL_SPBXM_FIGI"
+        resp = MagicMock()
+        resp.instruments = [match]
+        mock_client.instruments.find_instrument.return_value = resp
+        a = TinkoffAccount(token="t.x")
+        assert a._ticker_to_figi(mock_client, "AAPL") == "AAPL_SPBXM_FIGI"
+
+    def test_ticker_to_figi_accepts_tqbs_tqde_tqno_tqlv_tqpi(self):
+        """Issue #187: every SPB foreign-share variant must be tradable.
+
+        Mirrors the per-class search in
+        ``TinkoffInvestMDDataLoader._collect_tickers``
+        (src/data/tinkoff_md_loader.py:308).
+        """
+        a = TinkoffAccount(token="t.x")
+        for class_code, ticker, figi in (
+            ("TQBS", "VOD", "VOD_TQBS_FIGI"),
+            ("TQDE", "BMW", "BMW_TQDE_FIGI"),
+            ("TQNO", "EQNR", "EQNR_TQNO_FIGI"),
+            ("TQLV", "LSM", "LSM_TQLV_FIGI"),
+            ("TQPI", "PEO", "PEO_TQPI_FIGI"),
+        ):
+            mock_client = MagicMock()
+            match = MagicMock()
+            match.ticker = ticker
+            match.class_code = class_code
+            match.figi = figi
+            resp = MagicMock()
+            resp.instruments = [match]
+            mock_client.instruments.find_instrument.return_value = resp
+            assert a._ticker_to_figi(mock_client, ticker) == figi, f"class_code={class_code} ticker={ticker} rejected"
+
+    def test_ticker_to_figi_rejects_unknown_class_with_diagnostic_message(self):
+        """Issue #187: error message lists seen vs expected class_codes.
+
+        When Tinkoff returns the right ticker but in a class we
+        don't trade (shouldn't happen in production since the data
+        layer mirrors the tradable set, but if it does, the
+        diagnostic should pinpoint the drift instead of saying
+        "wrong ticker").
+        """
+        mock_client = MagicMock()
+        match = MagicMock()
+        match.ticker = "ZZZZ"
+        match.class_code = "UNKNOWN"
+        match.figi = "ZZZ_FIGI"
+        resp = MagicMock()
+        resp.instruments = [match]
+        mock_client.instruments.find_instrument.return_value = resp
+        a = TinkoffAccount(token="t.x")
+        with pytest.raises(BrokerError) as exc_info:
+            a._ticker_to_figi(mock_client, "ZZZZ")
+        msg = str(exc_info.value)
+        # Diagnostic: lists what we saw vs what we expect.
+        assert "UNKNOWN" in msg
+        assert "TQBR" in msg  # expected set is enumerated
+        assert "tradable instrument universe" in msg
 
     def test_map_status_partiallyfill(self):
         s = TinkoffAccount._map_status("EXECUTION_REPORT_STATUS_PARTIALLYFILL")

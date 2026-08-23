@@ -94,6 +94,42 @@ _BOND_CLASS_CODES: frozenset[str] = frozenset({"TQOB", "TQCB"})
 # MOEX class code for exchange-traded funds (BPIFs included).
 _ETF_CLASS_CODE: str = "TQTE"
 
+# Single source of truth for every ``class_code`` that the bot treats as
+# tradable at the broker layer (issue #187). Both the data loaders and
+# the broker FIGI-mapping helper must agree on this set, otherwise
+# RiskGate-approved orders get rejected at the broker with a misleading
+# "not found in TQBR/TQOB instrument universe" error.
+#
+# Composition:
+#   TQBR  — main-board equities (Russian shares)
+#   TQOB  — OFZ federal bonds
+#   TQCB  — corporate / municipal / sub-federal bonds
+#   TQTE  — ETFs / BPIFs
+#   SPBXM — SPB Exchange US/foreign shares (AAPL, MSFT, etc.)
+#   TQBS  — SPB foreign shares, British style
+#   TQDE  — SPB foreign shares, German style
+#   TQNO  — SPB foreign shares, Norwegian style
+#   TQLV  — SPB foreign shares, Latvian style
+#   TQPI  — SPB foreign shares, Polish style
+#
+# Mirrors the per-class search in ``TinkoffInvestMDDataLoader._collect_tickers``
+# (src/data/tinkoff_md_loader.py:308) and ``TinkoffInvestDataLoader.get_ticker``
+# (src/data/tinkoff_loader.py:244).
+_TRADABLE_CLASS_CODES: frozenset[str] = frozenset(
+    {
+        "TQBR",
+        "TQOB",
+        "TQCB",
+        "TQTE",
+        "SPBXM",
+        "TQBS",
+        "TQDE",
+        "TQNO",
+        "TQLV",
+        "TQPI",
+    }
+)
+
 
 def _money_to_decimal(money: Any) -> Decimal:
     """Convert tinkoff invest ``Money`` (units + nano) to Decimal."""
