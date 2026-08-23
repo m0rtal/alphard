@@ -1150,9 +1150,7 @@ class TestTinkoffLoaderCoverage:
                 barrier.wait()  # release all threads simultaneously
                 results[idx] = loader.list_tickers()
 
-            threads = [
-                threading.Thread(target=worker, args=(i,)) for i in range(n_threads)
-            ]
+            threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_threads)]
             for t in threads:
                 t.start()
             for t in threads:
@@ -1233,9 +1231,7 @@ class TestTinkoffLoaderCoverage:
                 barrier.wait()
                 results[idx] = loader.list_shares_all("TQBR")
 
-            threads = [
-                threading.Thread(target=worker, args=(i,)) for i in range(n_threads)
-            ]
+            threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_threads)]
             for t in threads:
                 t.start()
             for t in threads:
