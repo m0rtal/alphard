@@ -347,7 +347,7 @@ services:
         # it root-owned, but prom/prometheus runs as in-image `nobody` (uid 65534).
         # Without chown, queries.active write fails with EPERM and container
         # restart-loops. Same userns-mapping trap as bind-mounts, different fix.
-        chown -R nobody:nogroup /prometheus
+        chown -R nobody:nobody /prometheus  # alpine uses nobody:nobody, not nogroup
         exec /bin/prometheus \
           --config.file=/etc/prometheus/prometheus.yml \
           --storage.tsdb.path=/prometheus \
