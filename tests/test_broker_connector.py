@@ -2091,6 +2091,151 @@ class TestOrderFlow:
         with pytest.raises(AttributeError, match="missing instrument metadata"):
             flow.submit_market("SBER", OrderSide.BUY, Decimal("3000"), self._portfolio(cash="10000000"))
 
+    # ────────────────────────────────────────────
+    # Issue #195: peak_equity_provider — RISK_DD guard via OrderFlow
+    # ────────────────────────────────────────────
+
+    def test_peak_equity_provider_pulls_persistent_peak(self) -> None:
+        """Issue #195: when a peak_equity_provider is configured, the
+        PortfolioState passed to RiskGate has ``peak_equity`` from the
+        provider (NOT the current NAV). This is what makes
+        ``_check_drawdown`` actually trip after a drawdown.
+
+        Pre-#195, ``_portfolio_to_state`` (static) hard-coded
+        ``peak_equity = total_equity``, so ``dd_pct = (peak - current)
+        / peak`` was always 0%% and the RISK_DD guard never fired via
+        the OrderFlow code path.
+        """
+        # Provider returns 200_000; portfolio NAV is 100_000. A 50%%
+        # drawdown. With a real peak provider, the RiskGate should
+        # observe peak=200_000 and report drawdown; we verify by
+        # capturing the state passed to the gate.
+        captured: dict[str, Any] = {}
+
+        def capturing_gate():
+            rg = MagicMock()
+            from src.risk.gate import RiskDecision
+
+            def _capture(intent, state):
+                captured["peak"] = state.peak_equity
+                captured["total"] = state.total_equity
+                return RiskDecision(allowed=True, violations=())
+
+            rg.evaluate.side_effect = _capture
+            return rg
+
+        flow = OrderFlow(
+            broker=MagicMock(),
+            risk_gate=capturing_gate(),
+            quote_provider=self._quote_provider(),
+            peak_equity_provider=lambda: Decimal("200000"),
+        )
+        flow.submit_market("SBER", OrderSide.BUY, Decimal("10"), self._portfolio(cash="100000"))
+
+        # Peak must come from the provider, NOT equal to total_equity.
+        assert captured["total"] == Decimal("100000")
+        assert captured["peak"] == Decimal("200000")
+
+    def test_peak_equity_provider_missing_warns_and_uses_legacy_fallback(self) -> None:
+        """Issue #195: when no peak_equity_provider is configured,
+        ``OrderFlow`` falls back to ``peak_equity = total_equity`` (the
+        pre-#195 behaviour) and emits a one-shot WARNING so operators
+        can see the gap. The order path must still succeed — backward
+        compatibility for callers that haven't wired in peak tracking.
+        """
+        flow = OrderFlow(
+            broker=MagicMock(),
+            risk_gate=self._approved_gate(),
+            quote_provider=self._quote_provider(),
+            # peak_equity_provider intentionally omitted
+        )
+        # First call: should succeed and not raise. The one-shot
+        # WARNING is logged but does not block the order path.
+        result = flow.submit_market("SBER", OrderSide.BUY, Decimal("10"), self._portfolio())
+        assert result.final_status != OrderStatus.REJECTED or "QUOTE_UNAVAILABLE" in result.decision_violations
+        # Second call: same outcome, no extra exceptions.
+        result2 = flow.submit_market("SBER", OrderSide.BUY, Decimal("10"), self._portfolio())
+        assert result2 is not None
+
+    def test_peak_equity_provider_below_total_is_bumped(self) -> None:
+        """Issue #195: if the persistent peak is BELOW current NAV
+        (cold start, deleted peak file, NAV jump), the validator at
+        ``src/risk/gate.py:168-171`` would reject. The instance method
+        bumps the peak to current NAV — a high-water mark by definition
+        only goes up — so the validator passes and the RiskGate sees a
+        coherent snapshot.
+        """
+        captured: dict[str, Any] = {}
+
+        def capturing_gate():
+            rg = MagicMock()
+            from src.risk.gate import RiskDecision
+
+            def _capture(intent, state):
+                captured["peak"] = state.peak_equity
+                captured["total"] = state.total_equity
+                return RiskDecision(allowed=True, violations=())
+
+            rg.evaluate.side_effect = _capture
+            return rg
+
+        flow = OrderFlow(
+            broker=MagicMock(),
+            risk_gate=capturing_gate(),
+            quote_provider=self._quote_provider(),
+            # Provider returns LESS than current NAV (e.g. fresh peak
+            # file with a stale small value, or a unit-test fixture).
+            peak_equity_provider=lambda: Decimal("50000"),
+        )
+        flow.submit_market("SBER", OrderSide.BUY, Decimal("10"), self._portfolio(cash="100000"))
+        # Peak must be bumped up to total_equity.
+        assert captured["total"] == Decimal("100000")
+        assert captured["peak"] == Decimal("100000")
+
+    def test_peak_equity_provider_exception_disables_and_continues(self) -> None:
+        """Issue #195: a peak_equity_provider that raises must NOT
+        break the order path. We log a WARNING, fall back to
+        ``peak=total`` for THIS call, and disable the provider for the
+        rest of the process so a flapping provider doesn't spam the
+        log on every submit_market.
+        """
+        captured: dict[str, Any] = {}
+        call_count = {"n": 0}
+
+        def flaky_provider():
+            call_count["n"] += 1
+            raise RuntimeError("disk full")
+
+        def capturing_gate():
+            rg = MagicMock()
+            from src.risk.gate import RiskDecision
+
+            def _capture(intent, state):
+                captured.setdefault("peaks", []).append(state.peak_equity)
+                captured.setdefault("totals", []).append(state.total_equity)
+                return RiskDecision(allowed=True, violations=())
+
+            rg.evaluate.side_effect = _capture
+            return rg
+
+        flow = OrderFlow(
+            broker=MagicMock(),
+            risk_gate=capturing_gate(),
+            quote_provider=self._quote_provider(),
+            peak_equity_provider=flaky_provider,
+        )
+        # First call: provider raises -> fallback to peak=total.
+        flow.submit_market("SBER", OrderSide.BUY, Decimal("10"), self._portfolio())
+        assert captured["totals"][-1] == Decimal("100000")
+        assert captured["peaks"][-1] == Decimal("100000")
+        # Provider was disabled after the first failure — the flaky
+        # callable must NOT have been invoked twice.
+        assert call_count["n"] == 1
+        # Second call: provider disabled, fallback path runs (no second
+        # call to flaky_provider).
+        flow.submit_market("SBER", OrderSide.BUY, Decimal("10"), self._portfolio())
+        assert call_count["n"] == 1
+
 
 # ────────────────────────────────────────────
 # ABC contract

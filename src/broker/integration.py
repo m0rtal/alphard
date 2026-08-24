@@ -74,6 +74,7 @@ class OrderFlow:
         risk_gate: Any,  # src.risk.gate.RiskGate (typed Any to satisfy --strict)
         quote_provider: QuoteProvider,
         universe_filter: Callable[[str], bool] | None = None,
+        peak_equity_provider: Callable[[], Decimal] | None = None,
     ):
         """
         Args:
@@ -86,6 +87,17 @@ class OrderFlow:
             universe_filter: Optional allow-list. Symbols for which the
                 filter returns False are short-circuited with
                 ``UNIVERSE_BLOCKED``.
+            peak_equity_provider: Optional callable returning the persistent
+                peak-equity high-water mark (issue #195). Without a
+                persistent peak, ``PortfolioState.peak_equity`` defaults
+                to the current NAV on every call, which makes
+                ``_check_drawdown`` in ``src/risk/gate.py`` always report
+                0%% drawdown — the RISK_DD guard never trips via the
+                OrderFlow path. Pass a callable (e.g.
+                ``lambda: tinker._peak_equity`` or a dedicated disk-backed
+                tracker) to wire in real peak tracking. ``None`` keeps the
+                legacy behaviour and logs a one-shot WARNING so the gap
+                is visible to operators.
 
         Raises:
             TypeError: if ``quote_provider`` is None. We require an explicit
@@ -103,6 +115,11 @@ class OrderFlow:
         self._risk_gate = risk_gate
         self._quote_provider = quote_provider
         self._universe_filter = universe_filter
+        self._peak_equity_provider = peak_equity_provider
+        # Issue #195: one-shot warning flag. We log the missing-peak
+        # WARNING on the FIRST submit_market call only, not on every
+        # call, so a busy session doesn't flood the log.
+        self._warned_missing_peak: bool = False
 
     def submit_market(
         self,
@@ -166,7 +183,11 @@ class OrderFlow:
         # 3. RiskGate
         from src.risk.gate import RiskDecision, TradeIntent
 
-        state = self._portfolio_to_state(portfolio)
+        # Issue #195: use the INSTANCE method so peak_equity is pulled
+        # from self._peak_equity_provider (when configured) rather than
+        # always equal to current NAV. The static _portfolio_to_state is
+        # kept as a back-compat alias for tests that call it directly.
+        state = self._portfolio_to_state_impl(portfolio)
         intent = TradeIntent(
             symbol=symbol.upper(),
             # BUGFIX (C-4): pass side through unchanged. The previous expression
@@ -311,4 +332,86 @@ class OrderFlow:
             cash=free_cash,
             positions=positions,
             peak_equity=total,
+        )
+
+    # ------------------------------------------------------------------
+    # Issue #195: peak_equity = current NAV on every call makes
+    # _check_drawdown always report 0%. Instance method below reads from
+    # self._peak_equity_provider when configured so the persistent peak
+    # semantics from TinkoffAccount._peak_equity carry over to the
+    # OrderFlow code path.
+    # ------------------------------------------------------------------
+
+    def _portfolio_to_state_impl(self, portfolio: PortfolioSnapshot) -> Any:
+        """Build ``PortfolioState`` with peak_equity from the provider.
+
+        Issue #195: ``_portfolio_to_state`` (static) hard-codes
+        ``peak_equity=total_equity`` so the ``RISK_DD`` guard in
+        ``src/risk/gate.py:452-474`` reports 0% drawdown forever. This
+        instance method pulls the high-water mark from
+        ``self._peak_equity_provider`` so real drawdown tracking works
+        through ``OrderFlow.submit_market``.
+
+        Backwards-compat: when ``self._peak_equity_provider is None``
+        (legacy call sites), we fall back to ``peak_equity=total_equity``
+        and emit a one-shot WARNING — the same behaviour as the static
+        method, but visible in logs.
+        """
+        from src.risk.gate import PortfolioState, Position as RiskPosition
+
+        positions = [
+            RiskPosition(
+                symbol=p.ticker,
+                quantity=p.quantity,
+                avg_price=p.avg_price,
+            )
+            for p in portfolio.positions
+        ]
+        total = portfolio.cash
+        positions_value = sum(
+            (p.quantity * p.avg_price for p in portfolio.positions),
+            Decimal("0"),
+        )
+        free_cash = portfolio.cash - positions_value
+        if free_cash < Decimal("0"):
+            free_cash = Decimal("0")
+
+        # Resolve peak: provider if configured, else legacy fallback.
+        if self._peak_equity_provider is not None:
+            try:
+                peak = self._peak_equity_provider()
+            except Exception as exc:  # noqa: BLE001 — provider errors must never break the order path
+                logger.warning(
+                    "OrderFlow._portfolio_to_state_impl: peak_equity_provider "
+                    "raised %s: %s — falling back to peak=total (issue #195)",
+                    type(exc).__name__,
+                    exc,
+                )
+                # Disable for the rest of the process — a flapping
+                # provider would otherwise spam the log every submit_market.
+                self._peak_equity_provider = None
+                peak = total
+        else:
+            peak = total
+            if not self._warned_missing_peak:
+                logger.warning(
+                    "OrderFlow._portfolio_to_state_impl: peak_equity_provider "
+                    "not configured — RISK_DD guard will report 0%% drawdown "
+                    "(issue #195). Pass a persistent peak tracker to enable "
+                    "real drawdown-based kill-switching."
+                )
+                self._warned_missing_peak = True
+
+        # The PortfolioState validator (src/risk/gate.py:168-171) requires
+        # ``peak_equity >= total_equity``. If the persistent peak is BELOW
+        # current NAV (cold start, deleted peak file, NAV jump), bump it
+        # to current NAV — a "high-water mark" by definition only goes up.
+        if peak < total:
+            peak = total
+
+        return PortfolioState(
+            total_equity=total,
+            cash=free_cash,
+            positions=positions,
+            peak_equity=peak,
         )
