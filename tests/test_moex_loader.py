@@ -28,6 +28,8 @@ Strategy
 from __future__ import annotations
 
 import json
+import queue
+import threading
 from datetime import date
 from decimal import Decimal
 from typing import Any
@@ -724,3 +726,194 @@ class TestListTickersCaching:
         second = loader.list_tickers(board_id="TQBR")
         assert first is second
         assert len(loader._session.calls) == 1  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# Concurrency — issue #193 (race-prone list_tickers cache fill)
+# ---------------------------------------------------------------------------
+
+
+class _ThreadSafeFakeSession:
+    """Thread-safe stand-in for ``requests.Session``.
+
+    Mirrors ``_FakeSession`` (above) but stores handlers in a
+    ``queue.Queue`` so concurrent ``get()`` callers can dequeue without
+    the ``list.pop(0)`` race that would corrupt ``_handlers`` and
+    surface as ``IndexError`` on the second thread.
+    """
+
+    def __init__(self, handlers: list[Any] | None = None) -> None:
+        self._handlers: queue.Queue[Any] = queue.Queue()
+        for h in handlers or []:
+            self._handlers.put(h)
+        self.calls: list[dict[str, Any]] = []
+        self._calls_lock = threading.Lock()
+
+    def get(self, url: str, params: dict[str, Any] | None = None, timeout: Any = None):
+        with self._calls_lock:
+            self.calls.append({"url": url, "params": params, "timeout": timeout})
+        try:
+            return self._handlers.get_nowait()
+        except queue.Empty as exc:
+            raise AssertionError(
+                "no handler configured for " + url + " (HTTP called more times than handlers)"
+            ) from exc
+
+    def post(self, url: str, **kw: Any):
+        with self._calls_lock:
+            self.calls.append({"url": url, **kw})
+        try:
+            return self._handlers.get_nowait()
+        except queue.Empty as exc:
+            raise AssertionError(
+                "no handler configured for " + url + " (HTTP called more times than handlers)"
+            ) from exc
+
+
+def _ts_loader(handlers: list[Any]) -> MOEXDataLoader:
+    """Build a ``MOEXDataLoader`` with a thread-safe ``_FakeSession``."""
+    return MOEXDataLoader(
+        session=_ThreadSafeFakeSession(handlers),  # type: ignore[arg-type]
+        rate_per_min=10000.0,
+    )
+
+
+class TestListTickersConcurrency:
+    """Issue #193 — ``MOEXDataLoader.list_tickers`` cache fill must be safe
+    under concurrent first-time callers.
+
+    Without the lock, two threads entering ``list_tickers(board_id)``
+    simultaneously would both observe ``self._universe_cache is None``
+    and both walk through ``_fetch_all_rows(...)`` — duplicating the
+    HTTP call, consuming two rate-limit slots, and silently discarding
+    the slow builder's results. With double-checked locking, only one
+    thread performs the fill; the rest observe the populated cache and
+    return immediately. Mirrors the contract already enforced for
+    ``TinkoffInvestDataLoader.list_tickers`` (issue #175) and
+    ``TinkoffInvestMDDataLoader.list_tickers`` (issue #152).
+    """
+
+    def test_concurrent_first_call_fills_cache_exactly_once(self) -> None:
+        """8 threads call ``list_tickers("TQBR")`` for the first time —
+        ``_fetch_all_rows`` (and therefore the underlying HTTP session)
+        must be invoked exactly once, and every thread must receive
+        the same list object (the canonical fill-then-return contract).
+        """
+        import time as _time
+
+        payload = {
+            "securities": {
+                "columns": ["SECID", "BOARDID", "SHORTNAME", "LOTSIZE"],
+                "data": [
+                    ["SBER", "TQBR", "Sber", 10],
+                    ["GAZP", "TQBR", "Gazprom", 1],
+                ],
+            }
+        }
+        loader = _ts_loader([_FakeResponse(payload)])
+
+        # Patch _fetch_all_rows to count calls and add a sleep so the
+        # race window is wide enough that 8 threads actually overlap
+        # inside the lock-free section on the buggy code. Without the
+        # lock, every thread that arrives during the sleep would
+        # increment call_count.
+        call_count = 0
+        original = loader._fetch_all_rows
+
+        def counting_fetch(url: str, *, columns_metadata_key: str) -> list[dict[str, Any]]:
+            nonlocal call_count
+            call_count += 1
+            _time.sleep(0.05)  # 50ms window — long enough to overlap 8 threads
+            return original(url, columns_metadata_key=columns_metadata_key)
+
+        loader._fetch_all_rows = counting_fetch  # type: ignore[method-assign]
+
+        results: list[list[Any]] = []
+        errors: list[BaseException] = []
+
+        def worker() -> None:
+            try:
+                results.append(loader.list_tickers(board_id="TQBR"))
+            except BaseException as exc:  # pragma: no cover — fail loud
+                errors.append(exc)
+
+        barrier = threading.Barrier(parties=8)
+
+        def worker_synced() -> None:
+            try:
+                barrier.wait(timeout=5.0)
+                results.append(loader.list_tickers(board_id="TQBR"))
+            except BaseException as exc:  # pragma: no cover — fail loud
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker_synced) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10.0)
+            assert not t.is_alive(), "thread hung — lock deadlock"
+
+        assert errors == [], f"unexpected exceptions: {errors}"
+        # The single-fill contract.
+        assert call_count == 1, (
+            f"_fetch_all_rows called {call_count} times, expected 1 — " "the cache fill is not protected by the lock"
+        )
+        # Every thread must observe the same list object.
+        first = results[0]
+        assert {t.ticker for t in first} == {"SBER", "GAZP"}
+        for r in results[1:]:
+            assert r is first, (
+                "each thread got a distinct list — the lock-less code "
+                "let concurrent builders race on the cache assignment"
+            )
+        # The session saw exactly one HTTP call.
+        assert len(loader._session.calls) == 1  # type: ignore[attr-defined]
+
+    def test_lock_is_present(self) -> None:
+        """Regression guard: ``__init__`` must install ``_universe_lock``.
+
+        This is the structural assertion — the lock object is the
+        mechanism that makes the concurrency test above meaningful. If
+        a future refactor removes the lock field (or renames it), this
+        test fails fast and the concurrency test stops being a
+        regression guard.
+        """
+        loader = _ts_loader([])
+        assert hasattr(loader, "_universe_lock"), "MOEXDataLoader.__init__ must install _universe_lock " "(issue #193)"
+        # Must be a real lock-like object with acquire/release.
+        lock = loader._universe_lock
+        assert hasattr(lock, "acquire") and hasattr(
+            lock, "release"
+        ), "_universe_lock must be a threading.Lock-like object"
+
+    def test_board_id_mismatch_still_refetches_under_lock(self) -> None:
+        """The issue #162 cache-key invariant survives the new lock.
+
+        A cached ``TQBR`` call followed by a ``None`` call must STILL
+        refetch (and vice versa). The lock added in issue #193 must
+        not collapse the equality check — both guards (cache-set AND
+        ``_board_filter == board_id``) are required.
+        """
+        tqbr_payload = {
+            "securities": {
+                "columns": ["SECID", "BOARDID", "SHORTNAME", "LOTSIZE"],
+                "data": [["SBER", "TQBR", "Sber", 10]],
+            }
+        }
+        full_payload = {
+            "securities": {
+                "columns": ["SECID", "BOARDID", "SHORTNAME", "LOTSIZE"],
+                "data": [
+                    ["SBER", "TQBR", "Sber", 10],
+                    ["GAZP", "TQOB", "Gazprom", 1],
+                ],
+            }
+        }
+        loader = _ts_loader([_FakeResponse(tqbr_payload), _FakeResponse(full_payload)])
+        first = loader.list_tickers(board_id="TQBR")
+        assert {t.ticker for t in first} == {"SBER"}
+        second = loader.list_tickers(board_id=None)
+        # Refetch must include the TQOB row — proving the new lock
+        # did not collapse the cache-key equality check.
+        assert {t.ticker for t in second} == {"SBER", "GAZP"}
+        assert len(loader._session.calls) == 2  # type: ignore[attr-defined]
