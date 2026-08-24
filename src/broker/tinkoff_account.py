@@ -163,6 +163,14 @@ class TinkoffAccount(BrokerAccount):
         # one file per ``account_id``, best-effort writes, missing file
         # is treated as "no history yet" (daily_pnl == 0, no violation).
         self._daily_pnl_basis_path: str = os.path.join(peak_store_dir, f"daily_pnl_basis_{account_id}.json")
+        # Issue #214: a sibling ``.bak`` mirror of the last-known-good
+        # basis. Same role as ``_peak_equity_bak_path``: if the primary
+        # file is corrupted by an interrupted write, the loader prefers
+        # the .bak over falling back to cold-start (cold-start zeroes
+        # ``previous_close_equity`` which silently disarms
+        # ``RISK_DAILY_LOSS`` — the very guard the basis store was added
+        # to enable per issues #197/#207).
+        self._daily_pnl_basis_bak_path: str = self._daily_pnl_basis_path + ".bak"
         # Issue #207: a persisted basis is "trusted" only if it was written
         # by this code path on a previous rollover AND the on-disk file is
         # structurally complete (schema_version + basis_valid). A missing
@@ -454,15 +462,111 @@ class TinkoffAccount(BrokerAccount):
             return
         except (json.JSONDecodeError, KeyError, ValueError) as e:
             logger.warning(
-                "Daily-PnL basis file %s is corrupt (%s); starting cold",
+                "Daily-PnL basis file %s is corrupt (%s); renaming aside for forensics and trying .bak",
                 self._daily_pnl_basis_path,
                 e,
             )
+            # Issue #214: before falling back to cold-start (which would
+            # silently disarm ``RISK_DAILY_LOSS`` for the rest of the
+            # session), try the ``.bak`` mirror. The .bak was the
+            # last-known-good basis that the previous successful save
+            # wrote, so it represents yesterday's trading day — better
+            # than zero, which would tell the kill-switch "we have
+            # never traded, anything is allowed".
             self._previous_close_equity = Decimal("0")
             self._last_trading_day = None
+            bak_basis = self._try_load_basis_from(self._daily_pnl_basis_bak_path)
+            if bak_basis is not None:
+                (
+                    bak_value,
+                    bak_day,
+                    bak_schema_version,
+                    bak_basis_valid,
+                ) = bak_basis
+                self._previous_close_equity = bak_value
+                self._last_trading_day = bak_day
+                self._basis_trusted = bool(
+                    isinstance(bak_schema_version, int)
+                    and bak_schema_version >= 1
+                    and bak_basis_valid is True
+                    and bak_day is not None
+                    and bak_value > 0
+                )
+                logger.warning(
+                    "Daily-PnL basis recovered from .bak mirror %s (value=%s, day=%s, trusted=%s)",
+                    self._daily_pnl_basis_bak_path,
+                    bak_value,
+                    bak_day,
+                    self._basis_trusted,
+                )
+                return
+            # No .bak either — true cold start. ``RISK_DAILY_LOSS``
+            # cannot trip until a real basis is recorded; this is the
+            # documented fail-safe behaviour.
+            return
+
+    def _try_load_basis_from(self, path: str) -> tuple[Decimal, "date | None", Any, Any] | None:
+        """Read a daily-PnL basis file. Return ``None`` on missing/corrupt.
+
+        On ``(json.JSONDecodeError, KeyError, ValueError)``, the file is
+        renamed aside as ``<path>.corrupt-<unix-ts>-<pid>`` for
+        post-mortem; on ``FileNotFoundError`` the path is left alone
+        (cold-start path). A successfully parsed file is returned as
+        ``(previous_close_equity, last_trading_day, schema_version,
+        basis_valid)``.
+
+        Issue #214: this helper is the basis-side analogue of
+        ``_try_load_peak_from`` so the same rename-aside-on-corrupt
+        behaviour applies uniformly across both persisted JSON files.
+        """
+        try:
+            with open(path, "r") as fh:
+                data = json.load(fh)
+            value = Decimal(str(data.get("previous_close_equity", "0")))
+            if value < 0:
+                logger.warning(
+                    "Daily-PnL basis file %s has negative value %s; treating as 0",
+                    path,
+                    value,
+                )
+                value = Decimal("0")
+            last_day_raw = data.get("last_trading_day")
+            parsed_day: date | None = None
+            if isinstance(last_day_raw, str):
+                try:
+                    parsed_day = date.fromisoformat(last_day_raw)
+                except ValueError:
+                    parsed_day = None
+            return (
+                value,
+                parsed_day,
+                data.get("schema_version"),
+                data.get("basis_valid"),
+            )
+        except FileNotFoundError:
+            return None
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            logger.warning(
+                "Daily-PnL basis file %s is corrupt (%s); renaming aside for forensics",
+                path,
+                e,
+            )
+            try:
+                ts = int(os.path.getmtime(path))
+                corrupt_target = f"{path}.corrupt-{ts}-{os.getpid()}"
+                if os.path.exists(corrupt_target):
+                    corrupt_target = f"{path}.corrupt-{ts}-{os.getpid()}-{id(e)}"
+                os.replace(path, corrupt_target)
+            except OSError as rename_err:
+                logger.debug(
+                    "Could not rename corrupt basis file %s aside: %s",
+                    path,
+                    rename_err,
+                )
+            return None
 
     def _save_daily_pnl_basis(self) -> None:
-        """Persist the current daily-P&L basis to disk (best-effort).
+        """Persist the current daily-P&L basis to disk (best-effort, atomic).
 
         Write is best-effort: a failure here logs a warning but does
         not raise. The in-memory basis is the source of truth for the
@@ -471,9 +575,54 @@ class TinkoffAccount(BrokerAccount):
         ``_check_daily_loss`` will then evaluate against 0 for one
         call (no violation possible), which is safer than crashing the
         order path.
+
+        Issue #214: the previous implementation used a non-atomic
+        ``open(path, "w") + json.dump(...)`` (truncate-then-write).
+        A SIGKILL, Docker healthcheck kill, or disk-full mid-write
+        leaves a 0-byte or partial-JSON file; the next start logs
+        'corrupt; starting cold' and ``_previous_close_equity``
+        stays at ``Decimal("0")``, silently disarming
+        ``RISK_DAILY_LOSS`` — the very guard the basis store was
+        added to enable (issues #197, #207). The fix mirrors the
+        issue #199 atomic-write pattern applied to
+        ``_save_peak_equity``:
+
+        1. Mirror previous-good value to ``.bak`` BEFORE the primary
+           write so a corrupt primary can fall back to the
+           last-known-good value rather than zero.
+        2. Write to a sibling temp file in the SAME directory
+           (same filesystem ⇒ ``os.replace`` is POSIX-atomic).
+        3. ``fh.flush()`` + ``os.fsync(fh.fileno())`` before close
+           so the bytes hit the platter before the rename publishes.
+        4. On load (``_load_daily_pnl_basis``), prefer ``.bak`` if
+           the primary is corrupt so a kill mid-write does not
+           silently disarm the daily-loss kill-switch.
         """
         try:
             os.makedirs(self._peak_store_dir, exist_ok=True)
+            # Mirror previous-good value to .bak BEFORE we touch the
+            # primary. We snapshot the *current* primary content (if
+            # any) — not the new value — so the .bak is always the
+            # last-known-good basis, not the basis we're about to
+            # lose. Same shape as the peak-equity .bak mirror.
+            if os.path.exists(self._daily_pnl_basis_path):
+                try:
+                    with open(self._daily_pnl_basis_path, "r") as src:
+                        prev = src.read()
+                    with open(self._daily_pnl_basis_bak_path, "w") as dst:
+                        dst.write(prev)
+                        dst.flush()
+                        os.fsync(dst.fileno())
+                except (OSError, ValueError) as backup_err:
+                    # Non-fatal: just log and continue. The primary
+                    # write is still atomic; we only lose the .bak
+                    # mirror, not the new value.
+                    logger.debug(
+                        "Daily-PnL basis .bak mirror failed for %s: %s",
+                        self._daily_pnl_basis_bak_path,
+                        backup_err,
+                    )
+
             payload: dict[str, Any] = {
                 "previous_close_equity": str(self._previous_close_equity),
             }
@@ -486,8 +635,26 @@ class TinkoffAccount(BrokerAccount):
             # which would re-disarm ``RISK_DAILY_LOSS`` on every restart.
             payload["schema_version"] = 1
             payload["basis_valid"] = True
-            with open(self._daily_pnl_basis_path, "w") as fh:
-                json.dump(payload, fh)
+
+            # Atomic write: temp file in same dir → os.replace.
+            tmp_path = self._daily_pnl_basis_path + ".tmp"
+            try:
+                with open(tmp_path, "w") as fh:
+                    json.dump(payload, fh)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp_path, self._daily_pnl_basis_path)
+            except (OSError, ValueError):
+                # Best-effort cleanup: if the tmp file was created but
+                # the rename never completed (mid-write crash, disk-full,
+                # etc.), remove the orphan so it doesn't accumulate
+                # across restarts and confuse the next loader.
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except OSError:
+                    pass
+                raise
         except OSError as e:
             logger.warning(
                 "Failed to persist daily-PnL basis to %s: %s",

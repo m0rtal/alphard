@@ -763,3 +763,155 @@ class TestOrderFlowDailyPnlWiring:
         assert captured_state["daily_pnl"] == Decimal(
             "0"
         ), f"Default daily_pnl must be 0, got {captured_state['daily_pnl']}"
+
+
+class TestDailyPnlBasisAtomicWrite:
+    """Issue #214: ``_save_daily_pnl_basis`` must be atomic (temp + replace)
+    and the load path must fall back to ``.bak`` on corrupt primary so a
+    SIGKILL mid-write does NOT silently disarm ``RISK_DAILY_LOSS``.
+
+    Mirrors the ``peak_equity`` test class introduced in issue #199.
+    """
+
+    def test_save_uses_tmp_file_then_replace(self, tmp_path):
+        """Successful save must publish via ``os.replace`` from a sibling
+        tmp file — never leave a half-written primary on disk."""
+        acct = _make_tinkoff_account_with_daily_dir(str(tmp_path))
+        # Snapshot a value, then save it.
+        acct._previous_close_equity = Decimal("987654")
+        from datetime import date as _date
+
+        acct._last_trading_day = _date(2026, 8, 24)
+        acct._save_daily_pnl_basis()
+
+        primary = Path(acct._daily_pnl_basis_path)
+        tmp = Path(str(primary) + ".tmp")
+
+        # Primary exists with the right payload; tmp does NOT linger.
+        assert primary.exists(), "primary basis file must exist after save"
+        assert not tmp.exists(), (
+            "tmp file must be renamed away (os.replace) — leaving a tmp "
+            "file behind means the publish step did not run"
+        )
+        data = json.loads(primary.read_text())
+        assert data["previous_close_equity"] == "987654"
+        assert data["last_trading_day"] == "2026-08-24"
+        assert data["schema_version"] == 1
+        assert data["basis_valid"] is True
+
+    def test_save_writes_bak_mirror_of_previous_primary(self, tmp_path):
+        """Before each save, the *current* primary content must be mirrored
+        to ``.bak`` so a corrupt primary can fall back to the
+        last-known-good value rather than zero."""
+        from datetime import date as _date
+
+        acct = _make_tinkoff_account_with_daily_dir(str(tmp_path))
+
+        # First save: only the primary is written (no .bak yet).
+        acct._previous_close_equity = Decimal("1000000")
+        acct._last_trading_day = _date(2026, 8, 23)
+        acct._save_daily_pnl_basis()
+
+        bak = Path(acct._daily_pnl_basis_bak_path)
+        assert not bak.exists(), "first save: .bak must NOT exist (nothing to mirror yet)"
+
+        # Second save: primary gets updated, .bak mirrors the OLD primary.
+        acct._previous_close_equity = Decimal("1050000")
+        acct._last_trading_day = _date(2026, 8, 24)
+        acct._save_daily_pnl_basis()
+
+        assert bak.exists(), (
+            "second save: .bak must contain a snapshot of the previous "
+            "primary so a corrupt primary can recover from it"
+        )
+        bak_data = json.loads(bak.read_text())
+        assert (
+            bak_data["previous_close_equity"] == "1000000"
+        ), f".bak must hold the previous primary value, got {bak_data!r}"
+        assert bak_data["last_trading_day"] == "2026-08-23"
+
+    def test_load_falls_back_to_bak_when_primary_corrupt(self, tmp_path):
+        """A corrupt primary (simulating SIGKILL mid-write) must NOT
+        silently disarm ``RISK_DAILY_LOSS`` — the loader must recover
+        from ``.bak`` instead of falling back to cold-start zero."""
+        from datetime import date as _date
+
+        # Lay down a valid primary, then run a save to create a .bak of
+        # the *previous* value (yesterday's close).
+        primary = Path(str(tmp_path)) / "daily_pnl_basis_SB1.json"
+        primary.write_text(
+            json.dumps(
+                {
+                    "previous_close_equity": "1000000",
+                    "last_trading_day": "2026-08-23",
+                    "schema_version": 1,
+                    "basis_valid": True,
+                }
+            )
+        )
+        bak = Path(str(primary) + ".bak")
+        bak.write_text(
+            json.dumps(
+                {
+                    "previous_close_equity": "950000",
+                    "last_trading_day": "2026-08-22",
+                    "schema_version": 1,
+                    "basis_valid": True,
+                }
+            )
+        )
+        # Corrupt the primary (simulating SIGKILL between truncate and
+        # the rest of json.dump).
+        primary.write_text("{" + '"previous_close_e')
+
+        acct = _make_tinkoff_account_with_daily_dir(str(tmp_path))
+        assert acct._previous_close_equity == Decimal("950000"), (
+            f"loader must recover from .bak (950000), not cold-start (0); " f"got {acct._previous_close_equity}"
+        )
+        assert acct._last_trading_day == _date(2026, 8, 22)
+        assert acct._basis_trusted is True, (
+            "recovered .bak has the v1 schema marker + basis_valid=True "
+            "→ basis must be trusted so the kill-switch can trip"
+        )
+
+    def test_corrupt_primary_with_no_bak_is_true_cold_start(self, tmp_path):
+        """If both primary and .bak are corrupt (catastrophic disk loss),
+        the loader falls back to cold-start — RISK_DAILY_LOSS is not
+        tripped for the first call of the session (documented behaviour,
+        see ``_load_daily_pnl_basis`` docstring). This is the ONLY case
+        where ``_previous_close_equity`` legitimately stays at 0."""
+        primary = Path(str(tmp_path)) / "daily_pnl_basis_SB1.json"
+        primary.write_text("garbage")
+        bak = Path(str(primary) + ".bak")
+        bak.write_text("also garbage")
+
+        acct = _make_tinkoff_account_with_daily_dir(str(tmp_path))
+        assert acct._previous_close_equity == Decimal("0")
+        assert acct._last_trading_day is None
+        assert acct._basis_trusted is False
+
+    def test_save_creates_tmp_only_in_same_directory(self, tmp_path):
+        """The atomic-write tmp file MUST be a sibling of the primary
+        file — otherwise ``os.replace`` is not atomic across filesystems
+        and a kill mid-rename would resurrect the original non-atomic
+        failure mode (issue #199)."""
+        acct = _make_tinkoff_account_with_daily_dir(str(tmp_path))
+        acct._previous_close_equity = Decimal("100")
+
+        # Monkey-patch ``os.replace`` to inspect the src/dst pair.
+        captured: dict[str, str] = {}
+        real_replace = os.replace
+
+        def spy_replace(src, dst):
+            captured["src_dir"] = os.path.dirname(os.fspath(src))
+            captured["dst_dir"] = os.path.dirname(os.fspath(dst))
+            return real_replace(src, dst)
+
+        with patch("os.replace", side_effect=spy_replace):
+            acct._save_daily_pnl_basis()
+
+        assert captured.get("src_dir") == captured.get("dst_dir"), (
+            f"os.replace must run within a single filesystem (same dir); "
+            f"src_dir={captured.get('src_dir')!r} dst_dir={captured.get('dst_dir')!r}"
+        )
+        assert captured["src_dir"] == str(tmp_path)
