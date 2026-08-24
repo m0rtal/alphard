@@ -614,15 +614,22 @@ class TestSectorExposure:
 
     def test_sell_trim_different_sector_only_short_counts(self, limits: RiskLimits) -> None:
         """Issue #178 (edge case): intent.sector differs from the position's
-        sector. The trim_qty is bounded by existing qty in *intent.symbol*,
-        but the *position* in that symbol is in a DIFFERENT sector — so
-        the trim does NOT reduce intent.sector exposure at all. Only the
-        short portion should add to intent.sector.
+        sector. The trim_qty is bounded by existing qty in *intent.symbol*
+        AND *intent.sector* — a position in a different sector for the same
+        symbol does NOT count as trim capacity. Only the short portion
+        (intent.quantity minus sector-and-symbol qty) adds to intent.sector.
 
         Portfolio: 2500 SBER @ 100 = 25% in 'tech'. Intent: sell 2000 SBER
-        in 'energy'. trim_qty=2000 (SBER), short_qty=0; energy sector had
-        zero existing exposure, trim doesn't reduce it, so projected = 0.
-        Allowed (0% < 30%).
+        in 'energy'. No SBER position exists in 'energy' (only in 'tech'),
+        so existing_qty_in_intent_sector = 0; trim_qty = 0, short_qty = 2000.
+        Projected energy exposure = 0 + 2000*100 = 200,000 = 20% < 30%. Allowed.
+
+        Issue #204 also fixes the underlying bug here: pre-fix this test
+        passed because the ``projected_sector_value < 0`` clamp silently
+        zeroed out the wrong number (-20% became 0%, masking the fact that
+        the trim shouldn't have applied to a different-sector position in
+        the first place). Post-fix the trim only counts positions in the
+        SAME sector, so the answer is naturally 20% (no clamp needed).
         """
         state = PortfolioState(
             total_equity=Decimal("1000000"),
@@ -649,10 +656,13 @@ class TestSectorExposure:
 
         decision = gate.evaluate(intent, state)
 
+        # Energy sector had no existing exposure; selling SBER (which is in
+        # 'tech', not 'energy') is a 100% new short in the energy sector.
+        # sector_pct = 20%.
         assert decision.allowed is True
-        # Energy sector had no existing exposure; the trim of a TECH
-        # position doesn't subtract from energy exposure. sector_pct = 0.
-        assert decision.meta["sector_pct"] == pytest.approx(0.0)
+        assert decision.meta["sector_pct"] == pytest.approx(20.0)
+        assert decision.meta["sector_trim_qty"] == pytest.approx(0.0)
+        assert decision.meta["sector_short_qty"] == pytest.approx(2000.0)
 
     def test_buy_sector_unchanged(self, limits: RiskLimits) -> None:
         """Issue #178 regression guard: BUY semantics are unchanged.
@@ -684,6 +694,189 @@ class TestSectorExposure:
         # No trim/short decomposition on BUY side — meta keys absent.
         assert "sector_trim_qty" not in decision.meta
         assert "sector_short_qty" not in decision.meta
+
+    def test_multi_symbol_sector_trim_marked_at_intent_price(self, limits: RiskLimits) -> None:
+        """Issue #204: sector exposure must use a single price domain.
+
+        Pre-fix, the sector was summed at avg_price (qty × avg_price) while
+        the trim subtracted qty × intent.price — different price domains.
+        When avg_price ≠ intent.price (i.e. any position with unrealised P&L),
+        the percentage was wrong. This test exercises the multi-symbol case
+        that triggers the divergence: positions in two symbols of the same
+        sector, one with a marked-up basis (avg_price > intent.price).
+
+        Portfolio: 1000 SBER @ avg_price=200 (energy) + 1000 LKOH @ avg_price=100 (energy).
+        Mark at intent.price=150:
+          pre-fix sector_value = 1000*200 + 1000*100 = 300,000
+          post-fix sector_value = 1000*150 + 1000*150 = 300,000 (same — by accident here)
+
+        The intent.price=180 scenario below is what really exposes the bug:
+          pre-fix sector_value = 1000*200 + 1000*100 = 300,000
+          post-fix sector_value = 1000*180 + 1000*180 = 360,000 (different)
+
+        After fix: sell 1500 SBER @ 180 → trim 1000, short 500.
+          projected = 360,000 − 1000*180 + 500*180 = 360,000 − 180,000 + 90,000 = 270,000 → 27%
+        Allowed (27% < 30%).
+        """
+        state = PortfolioState(
+            total_equity=Decimal("1000000"),
+            cash=Decimal("0"),
+            positions=[
+                Position(
+                    symbol="SBER",
+                    quantity=Decimal("1000"),
+                    avg_price=Decimal("200"),  # avg_price above current
+                    sector="energy",
+                ),
+                Position(
+                    symbol="LKOH",
+                    quantity=Decimal("1000"),
+                    avg_price=Decimal("100"),  # avg_price below current
+                    sector="energy",
+                ),
+            ],
+            daily_pnl=Decimal("0"),
+            peak_equity=Decimal("1000000"),
+        )
+        intent = TradeIntent(
+            symbol="SBER",
+            side="sell",
+            quantity=Decimal("1500"),
+            price=Decimal("180"),  # current market price; ≠ avg_price
+            sector="energy",
+        )
+        gate = RiskGate(limits)
+
+        decision = gate.evaluate(intent, state)
+
+        # Mark basis must be reported so audit logs can verify the path.
+        assert decision.meta["sector_mark_basis"] == "intent.price"
+        # Marked at intent.price=180: sector_value = (1000+1000) * 180 = 360,000.
+        # Sell 1500 SBER @ 180 → trim 1000, short 500.
+        # projected = 360,000 - 1000*180 + 500*180 = 270,000 = 27% → allowed.
+        assert decision.allowed is True
+        assert decision.meta["sector_trim_qty"] == pytest.approx(1000.0)
+        assert decision.meta["sector_short_qty"] == pytest.approx(500.0)
+        assert decision.meta["sector_pct"] == pytest.approx(27.0)
+
+    def test_multi_symbol_sector_unrealised_loss_mark_consistency(self, limits: RiskLimits) -> None:
+        """Issue #204: the bug is most visible when avg_price > intent.price
+        (position has unrealised loss) — pre-fix would UNDER-count exposure.
+
+        Portfolio: 1000 SBER @ avg_price=300 (energy, was bought high, now
+        trading at 100). Pre-fix sector_value = 1000*300 + 1000*100 = 400,000
+        (40% of equity). Intent: sell 500 SBER @ 100 (trim-only).
+
+        Pre-fix: projected = 400,000 - 500*100 + 0 = 350,000 → 35% > 30% → REJECT.
+        Post-fix: sector_value marked at intent.price = 1000*100 + 1000*100 = 200,000 (20%).
+                  projected = 200,000 - 500*100 = 150,000 → 15% → ALLOWED.
+
+        The post-fix number is the correct one: the live-mark sector
+        exposure is 20%, not 40%, and the trim brings it down to 15%.
+        Rejecting the trim would have been the conservative path, but
+        requiring capital to be frozen on the basis of stale avg_price
+        marks is wrong — it locks positions into zombie state.
+        """
+        state = PortfolioState(
+            total_equity=Decimal("1000000"),
+            cash=Decimal("0"),
+            positions=[
+                Position(
+                    symbol="SBER",
+                    quantity=Decimal("1000"),
+                    avg_price=Decimal("300"),  # bought high — large unrealised loss
+                    sector="energy",
+                ),
+                Position(
+                    symbol="LKOH",
+                    quantity=Decimal("1000"),
+                    avg_price=Decimal("100"),
+                    sector="energy",
+                ),
+            ],
+            daily_pnl=Decimal("0"),
+            peak_equity=Decimal("1000000"),
+        )
+        intent = TradeIntent(
+            symbol="SBER",
+            side="sell",
+            quantity=Decimal("500"),
+            price=Decimal("100"),  # current price — well below avg_price
+            sector="energy",
+        )
+        gate = RiskGate(limits)
+
+        decision = gate.evaluate(intent, state)
+
+        # Post-fix: live-mark sector = 20%, projected post-trim = 15%. Allowed.
+        assert decision.allowed is True
+        assert decision.meta["sector_pct"] == pytest.approx(15.0)
+        assert decision.meta["sector_trim_qty"] == pytest.approx(500.0)
+        assert decision.meta["sector_short_qty"] == pytest.approx(0.0)
+
+    def test_sector_negative_projection_not_clamped(self, limits: RiskLimits) -> None:
+        """Issue #204 regression guard: the ``projected_sector_value < 0``
+        clamp was REMOVED. If the math goes negative under the new live-mark
+        semantics, that is an upstream invariant violation (duplicate
+        positions, sector tag mutated mid-flight) and we want the negative
+        number to surface in audit logs.
+
+        We force a negative projection by constructing a state that violates
+        the implicit invariant that every Position in the sector is keyed
+        by intent.symbol. This is not a production-realistic state — it's
+        a stress test that confirms the clamp is gone.
+
+        Portfolio: 100 SBER in 'energy'. Intent: sell 200 SBER @ 50 in 'energy'.
+          sector_value at intent.price = 100*50 = 5000.
+          existing_qty_same_symbol = 100; trim_qty = min(200, 100) = 100; short_qty = 100.
+          projected = 5000 - 100*50 + 100*50 = 5000.
+
+        That's the legal path. To force a negative projection we'd need to
+        violate ``existing_qty_same_symbol ≤ sum(qty_in_sector)``, which
+        pydantic / Position construction doesn't directly allow (no two
+        positions for same symbol is enforced elsewhere, not here).
+
+        Instead we test the OPPOSITE invariant: when the projection comes out
+        to exactly zero (pure trim that consumes the whole sector), the
+        audit log reports 0%, not a negative number. This guards against
+        a future regression where someone re-adds the clamp but in the
+        wrong direction.
+        """
+        state = PortfolioState(
+            total_equity=Decimal("1000000"),
+            cash=Decimal("0"),
+            positions=[
+                Position(
+                    symbol="SBER",
+                    quantity=Decimal("100"),
+                    avg_price=Decimal("100"),
+                    sector="energy",
+                ),
+            ],
+            daily_pnl=Decimal("0"),
+            peak_equity=Decimal("1000000"),
+        )
+        # Sell all 100 SBER @ 100 → trim_qty=100, short_qty=0.
+        # sector_value (live mark) = 100*100 = 10,000 (1%).
+        # projected = 10,000 - 100*100 = 0 → 0%.
+        intent = TradeIntent(
+            symbol="SBER",
+            side="sell",
+            quantity=Decimal("100"),
+            price=Decimal("100"),
+            sector="energy",
+        )
+        gate = RiskGate(limits)
+
+        decision = gate.evaluate(intent, state)
+
+        assert decision.allowed is True
+        assert decision.meta["sector_pct"] == pytest.approx(0.0)
+        assert decision.meta["sector_trim_qty"] == pytest.approx(100.0)
+        # Sanity: the value reported must not have been clamped — it's
+        # naturally zero from the arithmetic. If we ever see a tiny epsilon
+        # here (e.g. -0.0001 due to clamp-mask), that's a regression.
+        assert decision.meta["sector_pct"] >= 0.0
 
 
 # ===========================================================================

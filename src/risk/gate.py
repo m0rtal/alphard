@@ -372,6 +372,19 @@ class RiskGate:
         must not be counted as if it ADDED `intent.notional`. The trim
         portion (qty up to existing long) lowers exposure; the short
         portion (qty beyond existing long) raises exposure.
+
+        Issue #204 (mark consistency): the sector value must be computed at
+        the SAME price domain as the trim/short projection. Pre-fix, existing
+        exposure was summed at `pos.market_value` (qty × avg_price) while
+        the trim subtracted `trim_qty × intent.price`. In multi-symbol sectors
+        — or any time a position has unrealised P&L so avg_price ≠ current
+        price — this mix produced wrong percentages (over- or under-counted)
+        and the ``projected_sector_value < 0`` clamp silently hid the
+        arithmetic violation. The fix marks the sector at `intent.price`
+        (the live mark the trade is being evaluated at) so both sides of
+        the equation use the same price domain. This matches
+        `_check_position_size`, which already evaluates the per-symbol
+        notional at `intent.price`.
         """
         if intent.sector is None:
             # Skeleton: silent skip. Phase 1.3 will treat missing sector as
@@ -379,24 +392,35 @@ class RiskGate:
             meta["sector_check"] = "skipped: intent.sector is None"
             return
 
-        # Sum current sector exposure in equity %
-        sector_value = Decimal("0")
-        for pos in state.positions:
-            if pos.sector == intent.sector:
-                sector_value += pos.market_value
+        # Mark the entire sector at the intent's live price. This is the
+        # same price domain the trim/short projection uses, so the math
+        # stays self-consistent regardless of how many symbols are in the
+        # sector or how far avg_price has drifted from current price.
+        sector_value = sum(
+            (p.quantity * intent.price for p in state.positions if p.sector == intent.sector),
+            Decimal("0"),
+        )
+        meta["sector_mark_basis"] = "intent.price"
 
         if intent.side == "sell":
-            # Symmetric to _check_position_size: only the SHORT portion of a
-            # SELL creates new exposure in the sector. The trim portion
-            # reduces exposure. Existing qty in the same symbol is the
-            # trim capacity; anything beyond it opens a short.
-            existing_qty_same_symbol = sum(
-                (p.quantity for p in state.positions if p.symbol == intent.symbol),
+            # Symmetric to _check_position_size but SECTOR-AWARE: only
+            # positions in *both* intent.symbol AND intent.sector count as
+            # trim capacity. A position in the same symbol but a different
+            # sector does NOT reduce intent.sector exposure (the trim
+            # affects a different risk bucket), so it cannot be subtracted
+            # from the sector projection. Issue #204: pre-fix this used
+            # `_check_position_size`'s symbol-only filter, which let the
+            # same-sector trim math interbreed with cross-sector positions.
+            existing_qty_in_intent_sector = sum(
+                (p.quantity for p in state.positions if p.symbol == intent.symbol and p.sector == intent.sector),
                 Decimal("0"),
             )
-            trim_qty = min(intent.quantity, existing_qty_same_symbol)
+            trim_qty = min(intent.quantity, existing_qty_in_intent_sector)
             short_qty = intent.quantity - trim_qty  # never < 0 here
             # trim_qty * price reduces sector_value; short_qty * price adds.
+            # With sector_value already marked at intent.price, this stays
+            # self-consistent across multi-symbol sectors and unrealised
+            # P&L — see issue #204.
             projected_sector_value = sector_value - trim_qty * intent.price + short_qty * intent.price
             meta["sector_trim_qty"] = float(trim_qty)
             meta["sector_short_qty"] = float(short_qty)
@@ -404,15 +428,15 @@ class RiskGate:
             # BUY (or anything else — fail-safe: treat as exposure-additive)
             projected_sector_value = sector_value + intent.notional
 
-        # Floor at zero — a defensive guard. With the trim decomposition,
-        # projected_sector_value should never be negative in practice
-        # (trim_qty <= existing_qty <= sector_value when positions in the
-        # same sector are all in the same symbol). But if positions in the
-        # sector are spread across symbols and the trim_qty is bounded by
-        # *this intent's* symbol only, the math could still go negative in
-        # pathological cases; clamp for audit-log stability.
-        if projected_sector_value < Decimal("0"):
-            projected_sector_value = Decimal("0")
+        # Note: issue #204 removed the ``projected_sector_value < 0`` clamp.
+        # With sector_value marked at intent.price, ``trim_qty * intent.price``
+        # is bounded by ``sum(qty_in_intent_symbol) * intent.price ≤
+        # sum(qty_in_sector) * intent.price = sector_value`` — so the
+        # projected value can never go negative for a valid SELL. If it ever
+        # does, that is an upstream invariant violation (a position's sector
+        # tag was changed mid-flight, or a duplicate Position was added for
+        # the same symbol) and we want the negative number to surface in
+        # audit logs, not be silently zeroed out.
 
         sector_pct = (projected_sector_value / state.total_equity) * Decimal("100")
         meta["sector_pct"] = float(sector_pct)
