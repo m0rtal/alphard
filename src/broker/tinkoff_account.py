@@ -16,7 +16,7 @@ import json
 import logging
 import os
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_DOWN, Decimal
 from typing import Any, Optional
 
@@ -31,6 +31,23 @@ from src.broker.orders import (
 from src.data.token_bucket import TokenBucket
 
 logger = logging.getLogger("alphard.broker.tinkoff")
+
+
+# Moscow-trading-day helper for daily P&L rollover (issue #197).
+# The Moscow Exchange (MOEX) trades Mon-Fri; weekends/holidays must
+# not split an "intraday" P&L into two separate days. We use
+# ``MSK`` (UTC+3) to align with the broker's trading-day boundary.
+_MSK = timezone(timedelta(hours=3))
+
+
+def _msk_today() -> date:
+    """Return the current date in Moscow time (UTC+3).
+
+    Used by ``_fetch_real_portfolio_state`` to detect a trading-day
+    rollover and refresh ``previous_close_equity``. Always returns a
+    ``date`` — never a datetime — so JSON serialisation is trivial.
+    """
+    return datetime.now(tz=_MSK).date()
 
 
 def _broker_position_to_gate_position(broker_pos: Any) -> Any:
@@ -131,6 +148,20 @@ class TinkoffAccount(BrokerAccount):
         self._peak_store_dir: str = peak_store_dir
         self._peak_equity_path: str = os.path.join(peak_store_dir, f"peak_equity_{account_id}.json")
         self._peak_equity: Decimal = self._load_peak_equity()
+        # Issue #197: persist a sibling "daily_pnl_basis" tracker alongside
+        # the peak-equity HWM so that ``PortfolioState.daily_pnl`` (which
+        # drives ``RiskGate._check_daily_loss``) reflects the realised
+        # today-vs-previous-close delta rather than defaulting to 0. The
+        # previous hardcoded ``Decimal("0")`` meant ``RISK_DAILY_LOSS``
+        # never tripped in production — same exploit class as issues
+        # #195 (peak_equity not wired) and #11 (placeholder price
+        # bypass). Same file-naming convention as the peak store:
+        # one file per ``account_id``, best-effort writes, missing file
+        # is treated as "no history yet" (daily_pnl == 0, no violation).
+        self._daily_pnl_basis_path: str = os.path.join(peak_store_dir, f"daily_pnl_basis_{account_id}.json")
+        self._previous_close_equity: Decimal = Decimal("0")
+        self._last_trading_day: date | None = None
+        self._load_daily_pnl_basis()
 
     def _load_peak_equity(self) -> Decimal:
         """Read the persisted peak-equity high-water mark from disk.
@@ -177,6 +208,81 @@ class TinkoffAccount(BrokerAccount):
             logger.warning(
                 "Failed to persist peak equity to %s: %s",
                 self._peak_equity_path,
+                e,
+            )
+
+    def _load_daily_pnl_basis(self) -> None:
+        """Read the persisted daily-P&L basis from disk.
+
+        The basis is a ``(previous_close_equity, last_trading_day)``
+        pair; on first read in a new trading day,
+        ``_fetch_real_portfolio_state`` rolls it over. A missing /
+        corrupt file is treated as "no history yet" — i.e.
+        ``previous_close_equity == 0`` and ``last_trading_day is None``
+        — so ``daily_pnl`` for the first call is 0 (no violation
+        possible) and the upcoming snapshot becomes the new basis.
+        """
+        try:
+            with open(self._daily_pnl_basis_path, "r") as fh:
+                data = json.load(fh)
+            value = Decimal(str(data.get("previous_close_equity", "0")))
+            if value < 0:
+                logger.warning(
+                    "Daily-PnL basis file %s has negative value %s; treating as 0",
+                    self._daily_pnl_basis_path,
+                    value,
+                )
+                value = Decimal("0")
+            self._previous_close_equity = value
+            last_day_raw = data.get("last_trading_day")
+            if isinstance(last_day_raw, str):
+                try:
+                    self._last_trading_day = date.fromisoformat(last_day_raw)
+                except ValueError:
+                    logger.warning(
+                        "Daily-PnL basis file %s has unparseable last_trading_day %r; "
+                        "ignoring and treating as cold-start",
+                        self._daily_pnl_basis_path,
+                        last_day_raw,
+                    )
+                    self._last_trading_day = None
+        except FileNotFoundError:
+            # Cold start: keep defaults — daily_pnl == 0 on the first
+            # call, no risk violation possible.
+            return
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            logger.warning(
+                "Daily-PnL basis file %s is corrupt (%s); starting cold",
+                self._daily_pnl_basis_path,
+                e,
+            )
+            self._previous_close_equity = Decimal("0")
+            self._last_trading_day = None
+
+    def _save_daily_pnl_basis(self) -> None:
+        """Persist the current daily-P&L basis to disk (best-effort).
+
+        Write is best-effort: a failure here logs a warning but does
+        not raise. The in-memory basis is the source of truth for the
+        current process; on the next start the basis is reloaded from
+        disk. The worst case is losing one trading day of basis —
+        ``_check_daily_loss`` will then evaluate against 0 for one
+        call (no violation possible), which is safer than crashing the
+        order path.
+        """
+        try:
+            os.makedirs(self._peak_store_dir, exist_ok=True)
+            payload: dict[str, str] = {
+                "previous_close_equity": str(self._previous_close_equity),
+            }
+            if self._last_trading_day is not None:
+                payload["last_trading_day"] = self._last_trading_day.isoformat()
+            with open(self._daily_pnl_basis_path, "w") as fh:
+                json.dump(payload, fh)
+        except OSError as e:
+            logger.warning(
+                "Failed to persist daily-PnL basis to %s: %s",
+                self._daily_pnl_basis_path,
                 e,
             )
 
@@ -298,6 +404,18 @@ class TinkoffAccount(BrokerAccount):
         even after a 20-30% drawdown. Persisting the high-water mark
         means a single bad order in one cycle triggers the guard in the
         next.
+
+        Issue #197: ``daily_pnl`` is computed as
+        ``current_nav − previous_close_equity`` (where
+        ``previous_close_equity`` is the NAV observed on the last
+        trading day's rollover), persisted per-process via a sibling
+        JSON file. Cold-start (no file) → ``daily_pnl == 0`` (no
+        violation possible). Day rollover (today's MSK date != stored
+        ``last_trading_day``) → stamp the new basis with the current
+        NAV and report ``daily_pnl == 0`` (the new trading day just
+        started). Without this wiring, ``_check_daily_loss`` defaults
+        to ``daily_pnl == 0`` and ``RISK_DAILY_LOSS`` never trips —
+        same kill-switch dead-code pattern as issue #195.
         """
         from src.risk.gate import PortfolioState
 
@@ -338,11 +456,34 @@ class TinkoffAccount(BrokerAccount):
             # synthetic snapshot could exceed it; clamp rather than let
             # `PortfolioState.cash` ValidationError (`ge=Decimal("0")`).
             free_cash = Decimal("0")
+        # Issue #197: compute ``daily_pnl`` from the persisted basis
+        # before constructing ``PortfolioState``. Two cases:
+        #
+        # 1. Trading-day rollover (stored ``last_trading_day`` differs
+        #    from today's MSK date OR the basis is cold): stamp
+        #    ``previous_close_equity = current_nav`` and report
+        #    ``daily_pnl == 0``. This is the "first snapshot of the
+        #    new day" semantics — the kill-switch is silent until we
+        #    have a real intraday delta to evaluate.
+        #
+        # 2. Same trading day: ``daily_pnl = current_nav −
+        #    previous_close_equity``. A negative value trips
+        #    ``_check_daily_loss`` when it exceeds
+        #    ``RiskLimits.max_daily_loss_pct``.
+        today = _msk_today()
+        if self._last_trading_day != today:
+            self._previous_close_equity = snapshot.cash
+            self._last_trading_day = today
+            self._save_daily_pnl_basis()
+            daily_pnl = Decimal("0")
+        else:
+            daily_pnl = snapshot.cash - self._previous_close_equity
         return PortfolioState(
             total_equity=snapshot.cash,  # Tinkoff returns total_amount_currencies as cash-side NAV
             cash=free_cash,
             positions=[_broker_position_to_gate_position(p) for p in snapshot.positions],
             peak_equity=self._peak_equity,
+            daily_pnl=daily_pnl,
         )
 
     def get_portfolio(self) -> PortfolioSnapshot:

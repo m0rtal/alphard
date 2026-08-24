@@ -127,6 +127,22 @@ class OrderFlow:
         side: OrderSide,
         quantity: Decimal,
         portfolio: PortfolioSnapshot,
+        # Issue #197: optional ``daily_pnl`` forwarded into the
+        # ``PortfolioState`` built by ``_portfolio_to_state``. Defaults
+        # to ``Decimal("0")`` so callers that don't have a daily-P&L
+        # source (e.g. test fixtures, or static risk-only runs) keep
+        # working unchanged. Production paths that have access to a
+        # ``TinkoffAccount`` should pass the real value from
+        # ``account._previous_close_equity`` /
+        # ``account._last_trading_day`` so the daily-loss kill-switch
+        # can actually fire. Defaulting to 0 is fail-safe at THIS
+        # layer (the live ``TinkoffAccount.place_order`` → broker
+        # gate wiring doesn't go through OrderFlow), but it's also
+        # latent-dead — the production order path is
+        # ``TinkoffAccount._build_intent_and_state`` →
+        # ``_fetch_real_portfolio_state`` which now computes a real
+        # ``daily_pnl`` (issue #197 fix).
+        daily_pnl: Decimal = Decimal("0"),
     ) -> OrderFlowResult:
         # 1. Universe filter
         if self._universe_filter and not self._universe_filter(symbol):
@@ -187,7 +203,10 @@ class OrderFlow:
         # from self._peak_equity_provider (when configured) rather than
         # always equal to current NAV. The static _portfolio_to_state is
         # kept as a back-compat alias for tests that call it directly.
-        state = self._portfolio_to_state_impl(portfolio)
+        # Issue #197: forward ``daily_pnl`` so ``RiskGate._check_daily_loss``
+        # can actually fire on the OrderFlow path when a caller passes a
+        # real value.
+        state = self._portfolio_to_state_impl(portfolio, daily_pnl=daily_pnl)
         intent = TradeIntent(
             symbol=symbol.upper(),
             # BUGFIX (C-4): pass side through unchanged. The previous expression
@@ -280,7 +299,7 @@ class OrderFlow:
         )
 
     @staticmethod
-    def _portfolio_to_state(portfolio: PortfolioSnapshot) -> Any:
+    def _portfolio_to_state(portfolio: PortfolioSnapshot, daily_pnl: Decimal = Decimal("0")) -> Any:
         from src.risk.gate import PortfolioState, Position as RiskPosition
 
         positions = [
@@ -327,11 +346,19 @@ class OrderFlow:
         free_cash = portfolio.cash - positions_value
         if free_cash < Decimal("0"):
             free_cash = Decimal("0")
+        # Issue #197: forward ``daily_pnl`` into ``PortfolioState`` so
+        # ``RiskGate._check_daily_loss`` actually fires when an intraday
+        # loss exceeds ``RiskLimits.max_daily_loss_pct``. Defaults to
+        # ``Decimal("0")`` when the caller doesn't have a basis; that's
+        # the same fail-open behaviour the field has always had, but
+        # production callers (``TinkoffAccount._fetch_real_portfolio_state``
+        # or any other account-aware caller) should pass the real value.
         return PortfolioState(
             total_equity=total,
             cash=free_cash,
             positions=positions,
             peak_equity=total,
+            daily_pnl=daily_pnl,
         )
 
     # ------------------------------------------------------------------
@@ -342,7 +369,7 @@ class OrderFlow:
     # OrderFlow code path.
     # ------------------------------------------------------------------
 
-    def _portfolio_to_state_impl(self, portfolio: PortfolioSnapshot) -> Any:
+    def _portfolio_to_state_impl(self, portfolio: PortfolioSnapshot, daily_pnl: Decimal = Decimal("0")) -> Any:
         """Build ``PortfolioState`` with peak_equity from the provider.
 
         Issue #195: ``_portfolio_to_state`` (static) hard-codes
@@ -356,6 +383,11 @@ class OrderFlow:
         (legacy call sites), we fall back to ``peak_equity=total_equity``
         and emit a one-shot WARNING — the same behaviour as the static
         method, but visible in logs.
+
+        Issue #197: also forwards ``daily_pnl`` into ``PortfolioState`` so
+        ``RiskGate._check_daily_loss`` actually fires when an intraday
+        loss exceeds ``RiskLimits.max_daily_loss_pct``. Default 0 keeps
+        legacy callers compiling unchanged.
         """
         from src.risk.gate import PortfolioState, Position as RiskPosition
 
@@ -409,9 +441,12 @@ class OrderFlow:
         if peak < total:
             peak = total
 
+        # Issue #197: forward ``daily_pnl`` so the daily-loss kill-switch
+        # can fire. Same back-compat default (0) as the static method.
         return PortfolioState(
             total_equity=total,
             cash=free_cash,
             positions=positions,
             peak_equity=peak,
+            daily_pnl=daily_pnl,
         )
