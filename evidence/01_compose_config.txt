@@ -1,21 +1,66 @@
-evidence/01_compose_config.txt
-===========================
-Command: docker-safe compose --profile observability -p qa-healthchecks \
-         --env-file /root/projects/alphard/.env config
-Result: exit 0 — rendered 5 services with healthcheck blocks
-  alphard-bot     → test: python3 -c '...urlopen(http://127.0.0.1:8765/health)...' 30s/10s/3/60s
-  prometheus      → test: wget -q -O /dev/null http://127.0.0.1:9090/-/healthy      30s/10s/3/60s
-  grafana         → test: wget -q -O /dev/null http://127.0.0.1:3300/api/health     30s/10s/3/120s
-  postgres        → existing pg_isready + psql SELECT 1 (untouched)
-  redis           → existing redis-cli ping (untouched)
+=== docker-safe compose config (profile observability) ===
+rc=0
+--- prometheus block ---
+  prometheus:
+    profiles:
+      - observability
+    container_name: alphard-prometheus
+    entrypoint:
+      - sh
+      - -c
+      - |
+        set -e
+        mkdir -p /etc/prometheus /prometheus
+        echo "$$PROM_YML_B64" | base64 -d > /etc/prometheus/prometheus.yml
+        # BUGFIX (issue #209): /prometheus is a named volume — Docker creates
+        # it root-owned, but prom/prometheus runs as in-image `nobody` (uid 65534).
+        # Without chown, queries.active write fails with EPERM and container
+        # restart-loops. Same userns-mapping trap as bind-mounts, different fix.
+        chown -R nobody:nogroup /prometheus
+        exec /bin/prometheus \
+          --config.file=/etc/prometheus/prometheus.yml \
+          --storage.tsdb.path=/prometheus \
+          --storage.tsdb.retention.time=30d \
+          --web.listen-address=0.0.0.0:9090 \
+          --web.enable-lifecycle
+    environment:
+      PROM_YML_B64: ""
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget -q -O /dev/null http://127.0.0.1:9090/-/healthy
+      timeout: 10s
+      interval: 30s
+      retries: 3
+      start_period: 1m0s
+    image: prom/prometheus:latest
+    networks:
+      alphard-net:
+        aliases:
+          - prometheus
+          - alphard-prometheus
+    ports:
+      - mode: ingress
+        target: 9090
+        published: "9090"
+        protocol: tcp
+    restart: unless-stopped
+    security_opt:
+      - apparmor=unconfined
+    volumes:
+      - type: volume
+        source: alphard-prometheus-data
+        target: /prometheus
+        volume: {}
 
-Binary availability verification (run on 2026-08-24):
-  prom/prometheus:latest       → /bin/wget present
-  grafana/grafana:latest       → /usr/bin/wget → /bin/busybox present
-  ghcr.io/m0rtal/alphard:latest → /usr/local/bin/python3 + urllib.request import OK
-
-Deviation from task body:
-  body specifies grafana healthcheck on port 3000.
-  Implementation uses port 3300 because GF_SERVER_HTTP_PORT=3300
-  (docker-compose.yaml line 393) and network_mode: host (line 390).
-  Port 3000 on .107 resolves to forgejo; grafana is bound to 3300.
+--- top-level volumes ---
+volumes:
+  alphard-postgres-data:
+    name: alphard-209_alphard-postgres-data
+    driver: local
+  alphard-prometheus-data:
+    name: alphard-209_alphard-prometheus-data
+    driver: local
+  alphard-redis-data:
+    name: alphard-209_alphard-redis-data
+    driver: local

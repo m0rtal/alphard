@@ -626,66 +626,91 @@ class TestPrometheusLXC:
         for v in mounts:
             if isinstance(v, str) and ":" in v:
                 _src, _, dst = v.partition(":")
-                assert dst.split(":")[0] != "/prometheus", (
-                    f"legacy bind-mount to /prometheus must NOT survive "
-                    f"(re-introduces .107 userns-mapping restart-loop): {v!r}"
-                )
+                if dst.split(":")[0] == "/prometheus":
+                    # Short-form: "src:dst[:ro]". Compose treats this as:
+                    #   - bind mount if src is an absolute host path
+                    #   - named volume if src is a volume name (no leading "/")
+                    # Allow volumes (issue #209), reject bind mounts (issue #147).
+                    assert not _src.startswith("/"), (
+                        f"legacy bind-mount to /prometheus must NOT survive "
+                        f"(re-introduces .107 userns-mapping restart-loop): {v!r}"
+                    )
             elif isinstance(v, dict) and v.get("target") == "/prometheus":
                 assert v.get("type") != "bind", (
                     f"legacy bind-mount to /prometheus must NOT survive "
                     f"(re-introduces .107 userns-mapping restart-loop): {v!r}"
                 )
 
-    def test_prometheus_data_is_tmpfs(self) -> None:
-        """Issue #120-style fix: /prometheus must be mounted as tmpfs so
-        the in-image `nobody` user (or any user — tmpfs is root-owned)
-        can write its WAL. Mirrors the alphard-bot /app/logs fix from
-        PR #119, extended to the observability stack.
+    def test_prometheus_data_is_named_volume(self) -> None:
+        """Issue #209: /prometheus must be a named volume (not tmpfs,
+        not bind-mount). tmpfs created by compose on .107 PVE LXC ends up
+        owned by userns-mapped nobody, and the in-image `nobody` still
+        can't write through the same userns boundary — same trap as bind.
+        Named volumes are root-owned in the mount namespace, so the
+        container entrypoint can chown nobody before exec'ing prometheus.
+        Volume also persists across Watchtower recreates.
         """
         mounts = self._prometheus_mounts()
-        tmpfs_mounts = [
-            v for v in mounts if isinstance(v, dict) and v.get("type") == "tmpfs" and v.get("target") == "/prometheus"
-        ]
-        assert (
-            tmpfs_mounts
-        ), "prometheus must mount /prometheus as tmpfs (LXC .107 " "userns-mapping fix). Found volumes: " + repr(mounts)
+        ok = False
+        for v in mounts:
+            if isinstance(v, dict) and v.get("type") == "volume" and v.get("target") == "/prometheus":
+                ok = True
+            elif isinstance(v, str):
+                src, _, dst = v.partition(":")
+                if dst.split(":")[0] == "/prometheus" and src and not src.startswith("/"):
+                    ok = True
+        assert ok, f"prometheus must mount /prometheus as a named volume (issue #209); " f"got mounts={mounts!r}"
+        for v in mounts:
+            if isinstance(v, dict) and v.get("target") == "/prometheus":
+                assert (
+                    v.get("type") != "tmpfs"
+                ), f"/prometheus as tmpfs re-introduces userns restart-loop (issue #209): {v!r}"
+                assert v.get("type") != "bind", f"/prometheus as bind re-introduces LXC EPERM (issue #147): {v!r}"
+
+    def test_prometheus_named_volume_declared_top_level(self) -> None:
+        """alphard-prometheus-data must be declared in top-level volumes:
+        so compose creates it on first up. Without this declaration,
+        stack up fails with "volume alphard-prometheus-data not found".
+        """
+        data = _load_compose()
+        vols = data.get("volumes", {}) or {}
+        assert "alphard-prometheus-data" in vols, (
+            f"alphard-prometheus-data must be declared in top-level volumes:; " f"found: {sorted(vols.keys())}"
+        )
+
+    def test_prometheus_entrypoint_chowns_nobody(self) -> None:
+        """Prometheus entrypoint MUST `chown -R nobody:nogroup /prometheus`
+        after creating the dir. Without this, in-image nobody (uid 65534)
+        cannot write /prometheus/queries.active and the container
+        restart-loops every 30s (issue #209). Even on a root-owned
+        named volume the file ownership is root:root until chown runs.
+        """
+        data = _load_compose()
+        ep = data["services"]["prometheus"].get("entrypoint")
+        cmd = data["services"]["prometheus"].get("command", "")
+
+        def _flatten(x):
+            return "\n".join(str(p) for p in x) if isinstance(x, list) else str(x)
+
+        joined = _flatten(ep) + "\n" + _flatten(cmd)
+        assert "chown" in joined and "nobody" in joined, (
+            f"prometheus entrypoint must chown nobody on /prometheus (issue #209); "
+            f"got entrypoint/command={joined[:600]!r}"
+        )
 
     def test_prometheus_data_tmpfs_size_documented(self) -> None:
-        """The /prometheus tmpfs size must be ≥ 1 GiB so a 30-day
-        retention (configured via --storage.tsdb.retention.time=30d)
-        has headroom. Below ~500 MiB the active head + WAL replay
-        budget collapses and Prometheus restarts itself with
-        ``corruption in the WAL: out of order series`` after a few
-        hours of normal traffic.
-        """
-        import re
+        """Backward-compat stub for issue #209.
 
-        mounts = self._prometheus_mounts()
-        tmpfs_mounts = [
-            v for v in mounts if isinstance(v, dict) and v.get("type") == "tmpfs" and v.get("target") == "/prometheus"
-        ]
-        assert tmpfs_mounts, "missing /prometheus tmpfs mount (regression — see test_prometheus_data_is_tmpfs)"
-        spec = tmpfs_mounts[0].get("tmpfs", {})
-        size_raw = spec.get("size")
-        assert size_raw, (
-            f"/prometheus tmpfs must declare an explicit `size` to prevent "
-            f"unbounded growth on .107 LXC; got tmpfs={spec!r}"
-        )
-        m = re.fullmatch(r"\s*(\d+)\s*([KMG]?)\s*", str(size_raw))
-        assert m, f"/prometheus tmpfs.size must be a Docker byte-quantity (e.g. '2G'), got: {size_raw!r}"
-        n = int(m.group(1))
-        unit = m.group(2) or ""
-        factor = {"": 1, "K": 1024, "M": 1024 * 1024, "G": 1024**3}[unit]
-        bytes_ = n * factor
-        # Lower bound: 1 GiB. TSDB + WAL for 30d retention + heartbeat-style
-        # scrape @ 15s of a single 3-metric bot is well under 100 MiB, but
-        # we want headroom for label churn and Grafana recording rules in
-        # Phase 3+. A future shrink to e.g. 256M would risk WAL corruption
-        # under the 30d retention budget and fail loudly here.
-        assert bytes_ >= 1024 * 1024 * 1024, (
-            f"/prometheus tmpfs size must be ≥ 1 GiB to hold 30d retention "
-            f"+ WAL replay budget; got {size_raw} = {bytes_} bytes"
-        )
+        tmpfs.size was the original (broken on LXC) fix from PR #147.
+        Issue #209 switches /prometheus to a named volume (Docker-created,
+        root-owned, persists across recreates). The two tests above
+        (test_prometheus_data_is_named_volume + the new
+        test_prometheus_named_volume_declared_top_level) replace this one.
+        Keep a no-op here so anyone referencing the old method name
+        gets a clear "this fix was superseded" signal instead of an
+        AttributeError if they only run a partial test subset.
+        """
+        return None
 
     def test_prometheus_config_inlined_via_b64_env(self) -> None:
         """The /etc/prometheus/prometheus.yml bind-mount is also broken
