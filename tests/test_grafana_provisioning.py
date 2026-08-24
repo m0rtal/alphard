@@ -48,6 +48,15 @@ class TestGrafanaProviderPath:
         to. Pre-fix the provider scanned /etc/grafana/provisioning/dashboards
         while compose mounted the JSONs at /var/lib/grafana/dashboards, so
         Grafana loaded zero dashboards.
+
+        Issue #216: the compose grafana service binds
+        ``${APPDATA_DIR:-/srv/alphard}/grafana/dashboards`` →
+        ``/var/lib/grafana/dashboards`` (sister-fix to PR #148 which
+        parameterised the /var/lib/grafana data bind). The provider
+        ``path: /var/lib/grafana/dashboards`` is unchanged because
+        that is the in-container target, not the host-side source.
+        So the contract still holds: provider scans target T, compose
+        mounts to target T.
         """
         provider = _load_provider()
         provider_path = provider["providers"][0]["options"]["path"]
@@ -57,31 +66,37 @@ class TestGrafanaProviderPath:
         mounts = grafana.get("volumes", [])
 
         # The compose grafana service must mount the dashboards directory
-        # somewhere — find the bind-mount whose source ends with
-        # /docker/grafana/dashboards and capture the host-side target path.
-        # Compose volume syntax is `src:dst[:mode]` (short) or
-        # `{source, target, ...}` (long). Parse both shapes.
+        # somewhere — find the bind-mount whose container-side target is
+        # /var/lib/grafana/dashboards (the provider scan target) and
+        # capture it. Issue #216 switched the host source from a
+        # relative ./docker/grafana/dashboards path to the
+        # parameterised ${APPDATA_DIR:-/srv/alphard}/grafana/dashboards,
+        # so we match on the container TARGET, not the host source.
         dashboard_mount_targets = []
         for v in mounts:
             if isinstance(v, str):
-                # Strip optional trailing mode (":ro" / ":rw") so the dst
-                # is always the 2nd field.
-                parts = v.split(":")
-                if len(parts) < 2:
+                # Strip optional trailing mode (":ro" / ":rw") so the
+                # dst is always the last field. The host path may
+                # itself contain ":" (the APPDATA_DIR default), so we
+                # rsplit on the LAST ":" rather than split(":")[1].
+                stripped = v
+                if v.endswith(":ro") or v.endswith(":rw"):
+                    stripped = v[:-3]
+                if ":" not in stripped:
                     continue
-                src = parts[0]
-                target = parts[1]
+                _src, target = stripped.rsplit(":", 1)
             else:
-                src = v.get("source", "")
                 target = v.get("target", "")
-            # Match the dashboards directory OR any ancestor path that ends
-            # with /docker/grafana/dashboards (handles bind mounts with or
-            # without leading ./).
-            if src.rstrip("/").endswith("docker/grafana/dashboards"):
+            if target == "/var/lib/grafana/dashboards":
                 dashboard_mount_targets.append(target)
 
         assert dashboard_mount_targets, (
-            "compose grafana service must mount docker/grafana/dashboards " "at a target path the provider scans"
+            "compose grafana service must mount a dashboards directory "
+            "at /var/lib/grafana/dashboards (the provider scan target); "
+            "no such bind-mount found (issue #216: APPDATA_DIR "
+            "parameterisation must keep /var/lib/grafana/dashboards as "
+            "the in-container target so the provider scans the right "
+            "directory). Mounts: " + repr(mounts)
         )
         for target in dashboard_mount_targets:
             assert provider_path == target, (
