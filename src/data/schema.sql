@@ -297,6 +297,32 @@ CREATE INDEX IF NOT EXISTS idx_decision_log_created
     ON decision_log (created_at);
 
 -- ---------------------------------------------------------------------------
+-- sizing_audit_log  (Phase 2.2: Position Sizing Matrix — kanban t_e55e2168)
+-- ---------------------------------------------------------------------------
+-- Append-only audit trail of compute_position_size() decisions. Replay tool:
+-- scripts/replay_sizing.py reads this table or the JSONL mirror to
+-- reproduce a sizing decision bit-identically. The DDL is duplicated in
+-- src/data/migrations/0003_sizing_audit_log.sql for already-deployed
+-- volumes; both files are idempotent (CREATE TABLE IF NOT EXISTS).
+CREATE TABLE IF NOT EXISTS sizing_audit_log (
+    id              BIGSERIAL PRIMARY KEY,
+    ts              TIMESTAMPTZ NOT NULL,
+    ticker          VARCHAR(12) NOT NULL,
+    side            VARCHAR(8) NOT NULL,
+    inputs          JSONB NOT NULL,
+    scalars         JSONB NOT NULL,
+    output          JSONB NOT NULL,
+    formula_version VARCHAR(8) NOT NULL DEFAULT 'v1',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_sizing_audit_log_ticker_ts
+    ON sizing_audit_log (ticker, ts DESC);
+
+CREATE INDEX IF NOT EXISTS idx_sizing_audit_log_version_ts
+    ON sizing_audit_log (formula_version, ts DESC);
+
+-- ---------------------------------------------------------------------------
 -- seed sample data (optional — comment out for clean install)
 -- ---------------------------------------------------------------------------
 -- INSERT INTO ticker_universe (ticker, figi, name, lot, isin, source)
