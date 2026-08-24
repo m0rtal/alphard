@@ -163,6 +163,15 @@ class TinkoffAccount(BrokerAccount):
         # one file per ``account_id``, best-effort writes, missing file
         # is treated as "no history yet" (daily_pnl == 0, no violation).
         self._daily_pnl_basis_path: str = os.path.join(peak_store_dir, f"daily_pnl_basis_{account_id}.json")
+        # Issue #207: a persisted basis is "trusted" only if it was written
+        # by this code path on a previous rollover AND the on-disk file is
+        # structurally complete (schema_version + basis_valid). A missing
+        # ``schema_version`` field means the file predates this issue and
+        # must NOT be trusted without an explicit upgrade — otherwise a
+        # legacy corrupt file would silently disarm ``RISK_DAILY_LOSS``
+        # for the rest of the session. ``_load_daily_pnl_basis`` sets
+        # this to True only on a fully-validated read.
+        self._basis_trusted: bool = False
         self._previous_close_equity: Decimal = Decimal("0")
         self._last_trading_day: date | None = None
         self._load_daily_pnl_basis()
@@ -371,9 +380,18 @@ class TinkoffAccount(BrokerAccount):
         pair; on first read in a new trading day,
         ``_fetch_real_portfolio_state`` rolls it over. A missing /
         corrupt file is treated as "no history yet" — i.e.
-        ``previous_close_equity == 0`` and ``last_trading_day is None``
-        — so ``daily_pnl`` for the first call is 0 (no violation
-        possible) and the upcoming snapshot becomes the new basis.
+        ``previous_close_equity == 0``, ``last_trading_day is None``
+        AND ``_basis_trusted == False`` — so ``daily_pnl`` for the
+        first call is 0 (no violation possible) and the upcoming
+        snapshot becomes the new basis.
+
+        Issue #207: an on-disk basis is only trusted when its payload
+        carries ``schema_version >= 1`` AND ``basis_valid == True``.
+        Legacy files written before this issue lack these fields and
+        are treated as cold-start (basis untrusted → fail-closed in
+        ``_fetch_real_portfolio_state`` if the day has rolled over,
+        so a corrupted/stale file cannot silently disarm
+        ``RISK_DAILY_LOSS``).
         """
         try:
             with open(self._daily_pnl_basis_path, "r") as fh:
@@ -388,9 +406,10 @@ class TinkoffAccount(BrokerAccount):
                 value = Decimal("0")
             self._previous_close_equity = value
             last_day_raw = data.get("last_trading_day")
+            parsed_day: date | None = None
             if isinstance(last_day_raw, str):
                 try:
-                    self._last_trading_day = date.fromisoformat(last_day_raw)
+                    parsed_day = date.fromisoformat(last_day_raw)
                 except ValueError:
                     logger.warning(
                         "Daily-PnL basis file %s has unparseable last_trading_day %r; "
@@ -398,7 +417,37 @@ class TinkoffAccount(BrokerAccount):
                         self._daily_pnl_basis_path,
                         last_day_raw,
                     )
-                    self._last_trading_day = None
+                    parsed_day = None
+            self._last_trading_day = parsed_day
+            # Issue #207: trust gate. A payload is fully valid only when
+            # schema_version >= 1 and basis_valid == True. Anything else
+            # (legacy file, missing marker, explicit False) → untrusted
+            # basis. The caller (issue #207 fix in _fetch_real_portfolio_state)
+            # will then fail-closed: refuse to overwrite basis on a
+            # calendar mismatch, and instead surface the prior loss
+            # (or raise BrokerError when prior loss is unmeasurable).
+            schema_version = data.get("schema_version")
+            basis_valid_flag = data.get("basis_valid")
+            self._basis_trusted = bool(
+                isinstance(schema_version, int)
+                and schema_version >= 1
+                and basis_valid_flag is True
+                and parsed_day is not None
+                and value > 0
+            )
+            if not self._basis_trusted and parsed_day is not None and value > 0:
+                # Legacy file with valid fields but missing schema marker —
+                # keep the values readable for diagnostics, but flag as
+                # untrusted so the next rollover refuses to use them as
+                # the rollover source.
+                logger.warning(
+                    "Daily-PnL basis file %s predates issue #207 schema "
+                    "(schema_version=%r, basis_valid=%r); basis loaded "
+                    "but will be treated as untrusted on next mismatch",
+                    self._daily_pnl_basis_path,
+                    schema_version,
+                    basis_valid_flag,
+                )
         except FileNotFoundError:
             # Cold start: keep defaults — daily_pnl == 0 on the first
             # call, no risk violation possible.
@@ -425,11 +474,18 @@ class TinkoffAccount(BrokerAccount):
         """
         try:
             os.makedirs(self._peak_store_dir, exist_ok=True)
-            payload: dict[str, str] = {
+            payload: dict[str, Any] = {
                 "previous_close_equity": str(self._previous_close_equity),
             }
             if self._last_trading_day is not None:
                 payload["last_trading_day"] = self._last_trading_day.isoformat()
+            # Issue #207: stamp the basis as a v1 valid record so a future
+            # process restart can trust the rollover source. Without this
+            # marker, the load path would treat any persisted basis as
+            # legacy/untrusted and refuse to use it as the rollover source,
+            # which would re-disarm ``RISK_DAILY_LOSS`` on every restart.
+            payload["schema_version"] = 1
+            payload["basis_valid"] = True
             with open(self._daily_pnl_basis_path, "w") as fh:
                 json.dump(payload, fh)
         except OSError as e:
@@ -613,8 +669,8 @@ class TinkoffAccount(BrokerAccount):
         # before constructing ``PortfolioState``. Two cases:
         #
         # 1. Trading-day rollover (stored ``last_trading_day`` differs
-        #    from today's MSK date OR the basis is cold): stamp
-        #    ``previous_close_equity = current_nav`` and report
+        #    from today's MSK date AND the persisted basis is trusted):
+        #    stamp ``previous_close_equity = current_nav`` and report
         #    ``daily_pnl == 0``. This is the "first snapshot of the
         #    new day" semantics — the kill-switch is silent until we
         #    have a real intraday delta to evaluate.
@@ -623,10 +679,45 @@ class TinkoffAccount(BrokerAccount):
         #    previous_close_equity``. A negative value trips
         #    ``_check_daily_loss`` when it exceeds
         #    ``RiskLimits.max_daily_loss_pct``.
+        #
+        # Issue #207: a third case — calendar mismatch with an
+        # UNTRUSTED basis (corrupt file, legacy payload missing the
+        # ``schema_version`` marker, partial / inconsistent state).
+        # In that case we MUST NOT silently overwrite the basis with
+        # today's NAV, because that would re-disarm
+        # ``RISK_DAILY_LOSS`` for the rest of the session even though
+        # a prior-day loss may still be in flight. Instead we raise
+        # ``BrokerError`` so the caller fails-closed: OrderFlow
+        # propagates the rejection up the pipeline and trading is
+        # blocked until the operator intervenes (or the next clean
+        # restart resolves the corruption). The kill-switch is a
+        # financial safety control; an over-permissive fallback here
+        # would be a release blocker.
         today = _msk_today()
         if self._last_trading_day != today:
+            # Cold start (no basis file ever) is a known-valid state: the
+            # previous trading session simply has no persisted anchor, so
+            # stamping today's NAV as the new basis is correct — there is
+            # no prior loss to preserve. Distinguish it from a corrupt /
+            # stale persisted basis (issue #207): if ``_last_trading_day``
+            # is None the file was either absent or unrecoverable, and the
+            # rollover is safe.
+            if not self._basis_trusted and self._last_trading_day is not None:
+                # Stale/corrupt basis on a calendar mismatch — refuse to
+                # overwrite and refuse to silently zero ``daily_pnl``.
+                raise BrokerError(
+                    f"Untrusted daily-P&L basis for account {self._account_id} "
+                    f"on calendar mismatch (stored={self._last_trading_day}, "
+                    f"today={today}, previous_close={self._previous_close_equity}, "
+                    "basis_trusted=False). Refusing to silently disarm "
+                    "RISK_DAILY_LOSS. Inspect the basis file at "
+                    f"{self._daily_pnl_basis_path} and either restore a "
+                    "known-good payload or delete it to force a fresh "
+                    "cold-start on the next snapshot."
+                )
             self._previous_close_equity = snapshot.cash
             self._last_trading_day = today
+            self._basis_trusted = True
             self._save_daily_pnl_basis()
             daily_pnl = Decimal("0")
         else:

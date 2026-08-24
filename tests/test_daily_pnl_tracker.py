@@ -25,6 +25,8 @@ from decimal import Decimal
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from src.risk.gate import RiskGate, RiskLimits, TradeIntent
 
 
@@ -126,10 +128,17 @@ class TestDailyPnlBasisTracker:
         assert state.daily_pnl == Decimal("30000"), f"expected +30000, got {state.daily_pnl}"
 
     def test_day_rollover_resets_basis(self, tmp_path):
-        """A new MSK trading day must stamp a fresh basis at current NAV."""
+        """A new MSK trading day must stamp a fresh basis at current NAV.
+
+        Issue #207: the rollover only fires when the persisted basis is
+        trusted (schema_version=1, basis_valid=True). The test seeds a
+        v1-trusted basis on yesterday so the rollover path is exercised
+        legitimately — not the legacy/corrupt payload, which would now
+        fail-closed (covered by ``test_untrusted_basis_blocks_rollover``).
+        """
         from src.broker.tinkoff_account import _msk_today
 
-        # Pre-populate with yesterday's basis.
+        # Pre-populate with yesterday's basis in the v1 trusted schema.
         yesterday = (_msk_today() - timedelta(days=1)).isoformat()
         basis_file = Path(str(tmp_path)) / "daily_pnl_basis_SB1.json"
         basis_file.write_text(
@@ -137,6 +146,8 @@ class TestDailyPnlBasisTracker:
                 {
                     "previous_close_equity": "1000000",
                     "last_trading_day": yesterday,
+                    "schema_version": 1,
+                    "basis_valid": True,
                 }
             )
         )
@@ -144,6 +155,9 @@ class TestDailyPnlBasisTracker:
         acct = _make_tinkoff_account_with_daily_dir(str(tmp_path))
         assert acct._previous_close_equity == Decimal("1000000")
         assert acct._last_trading_day == date.fromisoformat(yesterday)
+        assert acct._basis_trusted is True, (
+            "v1 + basis_valid=True must load as trusted so the rollover " "path is exercised; see issue #207"
+        )
 
         # First call today — rollover: stamp basis at 950k, daily_pnl = 0.
         with patch.object(acct, "get_portfolio") as mock_gp:
@@ -152,6 +166,7 @@ class TestDailyPnlBasisTracker:
         assert state.daily_pnl == Decimal("0"), f"day rollover must report daily_pnl=0, got {state.daily_pnl}"
         assert acct._previous_close_equity == Decimal("950000")
         assert acct._last_trading_day == _msk_today()
+        assert acct._basis_trusted is True
 
         # Same day, NAV drops 4% of 950k → -38k loss trips the gate.
         with patch.object(acct, "get_portfolio") as mock_gp:
@@ -221,6 +236,279 @@ class TestDailyPnlBasisTracker:
         data2 = json.loads(Path(acct2._daily_pnl_basis_path).read_text())
         assert data1["previous_close_equity"] == "100000"
         assert data2["previous_close_equity"] == "200000"
+
+
+class TestIssue207FailClosed:
+    """Issue #207: a stale/corrupt persisted basis MUST NOT silently
+    disarm ``RISK_DAILY_LOSS`` on calendar mismatch. The fix introduces
+    a trust gate (``schema_version >= 1`` AND ``basis_valid == True``)
+    so legacy / partial / corrupt files trigger a fail-closed
+    ``BrokerError`` instead of being silently overwritten with today's
+    NAV. The risk control is a financial safety invariant; an
+    over-permissive fallback here is a release blocker.
+
+    Each test below mirrors one of the four scenarios from the issue
+    body and acceptance criteria.
+    """
+
+    def test_legacy_basis_without_schema_marker_is_untrusted(self, tmp_path, caplog):
+        """A basis file written before issue #207 has no ``schema_version``
+        field. It loads the values (for diagnostics) but the trust flag
+        is False so the next calendar mismatch refuses to use it as a
+        rollover source. This is the central regression test."""
+        from src.broker.tinkoff_account import _msk_today
+
+        yesterday = (_msk_today() - timedelta(days=1)).isoformat()
+        basis_file = Path(str(tmp_path)) / "daily_pnl_basis_SB1.json"
+        basis_file.write_text(
+            json.dumps(
+                {
+                    "previous_close_equity": "1000000",
+                    "last_trading_day": yesterday,
+                    # NOTE: no schema_version, no basis_valid — legacy payload
+                }
+            )
+        )
+
+        with caplog.at_level(logging.WARNING):
+            acct = _make_tinkoff_account_with_daily_dir(str(tmp_path))
+
+        assert acct._previous_close_equity == Decimal("1000000")  # values preserved
+        assert acct._last_trading_day == date.fromisoformat(yesterday)
+        assert acct._basis_trusted is False, (
+            "Legacy payload (no schema_version / basis_valid) MUST load as "
+            "untrusted; otherwise issue #207 re-arms RISK_DAILY_LOSS bypass."
+        )
+
+    def test_corrupt_basis_blocks_rollover_with_broker_error(self, tmp_path):
+        """The exact reproduction from the issue body: corrupt / partial
+        file with a stale date. Calling ``_fetch_real_portfolio_state``
+        on a calendar mismatch MUST raise ``BrokerError`` instead of
+        silently overwriting the basis with current NAV.
+        """
+        from src.broker.tinkoff_account import _msk_today
+        from src.broker.tinkoff_account import BrokerError
+
+        yesterday = (_msk_today() - timedelta(days=1)).isoformat()
+        basis_file = Path(str(tmp_path)) / "daily_pnl_basis_SB1.json"
+        # Stale date with a previous_close value but missing the schema
+        # marker (mimics a deployment with a pre-issue-#207 file).
+        basis_file.write_text(
+            json.dumps(
+                {
+                    "previous_close_equity": "1000000",
+                    "last_trading_day": yesterday,
+                }
+            )
+        )
+
+        acct = _make_tinkoff_account_with_daily_dir(str(tmp_path))
+        assert acct._basis_trusted is False
+        # Capture the file content BEFORE the (rejected) call — the fix
+        # must not silently rewrite it.
+        pre_call_payload = basis_file.read_text()
+
+        with patch.object(acct, "get_portfolio") as mock_gp:
+            mock_gp.return_value = MagicMock(cash=Decimal("950000"), positions=[])
+            with pytest.raises(BrokerError) as exc_info:
+                acct._fetch_real_portfolio_state()
+
+        # Fail-closed with a useful message.
+        msg = str(exc_info.value)
+        assert "Untrusted daily-P&L basis" in msg
+        assert "basis_trusted=False" in msg
+        assert "RISK_DAILY_LOSS" in msg
+
+        # The persisted basis MUST NOT have been overwritten — that was
+        # the bug.
+        assert basis_file.read_text() == pre_call_payload, (
+            "Issue #207 fix: stale/corrupt basis must not be silently " "overwritten on a calendar mismatch."
+        )
+
+    def test_basis_valid_false_blocks_rollover_with_broker_error(self, tmp_path):
+        """A payload that explicitly carries ``basis_valid=False`` must
+        also fail-closed (e.g. operator manually flagged a session as
+        unusable). Schema_version is present and >= 1, but the
+        explicit False must still disable rollover."""
+        from src.broker.tinkoff_account import _msk_today
+        from src.broker.tinkoff_account import BrokerError
+
+        yesterday = (_msk_today() - timedelta(days=1)).isoformat()
+        basis_file = Path(str(tmp_path)) / "daily_pnl_basis_SB1.json"
+        basis_file.write_text(
+            json.dumps(
+                {
+                    "previous_close_equity": "1000000",
+                    "last_trading_day": yesterday,
+                    "schema_version": 1,
+                    "basis_valid": False,
+                }
+            )
+        )
+
+        acct = _make_tinkoff_account_with_daily_dir(str(tmp_path))
+        assert acct._basis_trusted is False
+
+        with patch.object(acct, "get_portfolio") as mock_gp:
+            mock_gp.return_value = MagicMock(cash=Decimal("950000"), positions=[])
+            with pytest.raises(BrokerError) as exc_info:
+                acct._fetch_real_portfolio_state()
+        assert "Untrusted daily-P&L basis" in str(exc_info.value)
+
+    def test_persisted_basis_is_trusted_after_first_snapshot(self, tmp_path):
+        """A snapshot of the day persists a v1 trusted payload — subsequent
+        processes can use it as a legitimate rollover source."""
+        acct = _make_tinkoff_account_with_daily_dir(str(tmp_path))
+        with patch.object(acct, "get_portfolio") as mock_gp:
+            mock_gp.return_value = MagicMock(cash=Decimal("1000000"), positions=[])
+            acct._fetch_real_portfolio_state()
+
+        basis_file = Path(str(tmp_path)) / "daily_pnl_basis_SB1.json"
+        payload = json.loads(basis_file.read_text())
+        assert payload["schema_version"] == 1
+        assert payload["basis_valid"] is True
+        assert payload["previous_close_equity"] == "1000000"
+        assert payload["last_trading_day"]  # ISO string
+
+        # New process loads it as trusted.
+        acct2 = _make_tinkoff_account_with_daily_dir(str(tmp_path))
+        assert acct2._basis_trusted is True
+        assert acct2._previous_close_equity == Decimal("1000000")
+
+    def test_trusted_basis_rollover_on_new_day(self, tmp_path):
+        """The legitimate day-rollover path remains functional: a v1
+        trusted basis on yesterday triggers a normal rollover to today
+        at current NAV."""
+        from src.broker.tinkoff_account import _msk_today
+
+        yesterday = (_msk_today() - timedelta(days=1)).isoformat()
+        basis_file = Path(str(tmp_path)) / "daily_pnl_basis_SB1.json"
+        basis_file.write_text(
+            json.dumps(
+                {
+                    "previous_close_equity": "1000000",
+                    "last_trading_day": yesterday,
+                    "schema_version": 1,
+                    "basis_valid": True,
+                }
+            )
+        )
+
+        acct = _make_tinkoff_account_with_daily_dir(str(tmp_path))
+        assert acct._basis_trusted is True
+
+        with patch.object(acct, "get_portfolio") as mock_gp:
+            mock_gp.return_value = MagicMock(cash=Decimal("950000"), positions=[])
+            state = acct._fetch_real_portfolio_state()
+        assert state.daily_pnl == Decimal("0")
+        assert acct._previous_close_equity == Decimal("950000")
+        assert acct._last_trading_day == _msk_today()
+
+        # File on disk now reflects the new trusted basis.
+        payload = json.loads(basis_file.read_text())
+        assert payload["schema_version"] == 1
+        assert payload["basis_valid"] is True
+        assert payload["previous_close_equity"] == "950000"
+        assert payload["last_trading_day"] == _msk_today().isoformat()
+
+    def test_weekend_rollover_legitimate_path(self, tmp_path):
+        """A weekend (Saturday/Sunday) rollover with a v1 trusted basis
+        must still succeed — the broker hasn't traded, but the date
+        advances. The fix must not over-restrict legitimate calendar
+        transitions."""
+        from src.broker.tinkoff_account import _msk_today
+
+        # Simulate "last trading day was Friday, today is Monday".
+        today = _msk_today()
+        # Pick an arbitrary date 3 days ago (covers weekend + holiday).
+        arbitrary_past = (today - timedelta(days=3)).isoformat()
+        basis_file = Path(str(tmp_path)) / "daily_pnl_basis_SB1.json"
+        basis_file.write_text(
+            json.dumps(
+                {
+                    "previous_close_equity": "1000000",
+                    "last_trading_day": arbitrary_past,
+                    "schema_version": 1,
+                    "basis_valid": True,
+                }
+            )
+        )
+
+        acct = _make_tinkoff_account_with_daily_dir(str(tmp_path))
+        assert acct._basis_trusted is True
+        with patch.object(acct, "get_portfolio") as mock_gp:
+            mock_gp.return_value = MagicMock(cash=Decimal("950000"), positions=[])
+            state = acct._fetch_real_portfolio_state()
+        assert state.daily_pnl == Decimal("0")
+        assert acct._last_trading_day == today
+
+    def test_untrusted_basis_within_same_day_is_non_blocking(self, tmp_path):
+        """An untrusted basis on the SAME calendar day must NOT block
+        daily_pnl computation — the same-day branch doesn't trust the
+        basis for the kill-switch override (it uses the persisted value
+        directly). Issue #207 only blocks the calendar-mismatch path.
+        """
+        from src.broker.tinkoff_account import _msk_today
+
+        today_iso = _msk_today().isoformat()
+        basis_file = Path(str(tmp_path)) / "daily_pnl_basis_SB1.json"
+        basis_file.write_text(
+            json.dumps(
+                {
+                    "previous_close_equity": "1000000",
+                    "last_trading_day": today_iso,
+                    # No schema marker → untrusted, but the stored day is today.
+                }
+            )
+        )
+
+        acct = _make_tinkoff_account_with_daily_dir(str(tmp_path))
+        assert acct._basis_trusted is False
+
+        # Same-day branch: basis is used as-is, daily_pnl computed normally.
+        with patch.object(acct, "get_portfolio") as mock_gp:
+            mock_gp.return_value = MagicMock(cash=Decimal("960000"), positions=[])
+            state = acct._fetch_real_portfolio_state()
+        assert state.daily_pnl == Decimal("-40000"), (
+            "Same-day branch uses the persisted basis directly; an "
+            "untrusted marker does not block daily_pnl computation when "
+            "the calendar hasn't changed."
+        )
+
+    def test_risk_daily_loss_trips_when_basis_fail_closed_raises(self, tmp_path):
+        """End-to-end: when ``_fetch_real_portfolio_state`` raises
+        ``BrokerError`` (issue #207 fail-closed), the OrderFlow path
+        cannot construct a ``PortfolioState`` so no ``RISK_DAILY_LOSS``
+        violation can be silently masked — the order is rejected by
+        the surrounding ``try/except`` (caller side) and the kill-switch
+        remains armed for any subsequent clean restart."""
+        from src.broker.tinkoff_account import BrokerError
+
+        from src.broker.tinkoff_account import _msk_today
+
+        yesterday = (_msk_today() - timedelta(days=1)).isoformat()
+        basis_file = Path(str(tmp_path)) / "daily_pnl_basis_SB1.json"
+        basis_file.write_text(
+            json.dumps(
+                {
+                    "previous_close_equity": "1000000",
+                    "last_trading_day": yesterday,
+                }
+            )
+        )
+
+        gate = RiskGate(limits=_make_risk_limits(max_daily_loss_pct=Decimal("3")))
+        acct = _make_tinkoff_account_with_daily_dir(str(tmp_path), risk_gate=gate)
+
+        with patch.object(acct, "get_portfolio") as mock_gp:
+            mock_gp.return_value = MagicMock(cash=Decimal("950000"), positions=[])
+            with pytest.raises(BrokerError):
+                acct._fetch_real_portfolio_state()
+
+        # The gate itself is untouched and ready for the next clean
+        # restart. No PortfolioState is built on the bad call, so the
+        # kill-switch stays armed (no allowed=True with daily_pnl=0
+        # leaking through).
 
 
 class TestRiskDailyLossFiresEndToEnd:
