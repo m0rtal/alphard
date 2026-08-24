@@ -33,7 +33,7 @@ class OrderSlicer:
     Slice into 5%-of-ADV chunks. Total time = quantity / (5% ADV) minutes.
     """
 
-    CHUNK_PCT = Decimal("5")  # each chunk = 5% of parent
+    CHUNK_PCT = Decimal("5")  # each chunk = 5% of ADV (not of parent)
     MAX_DURATION = timedelta(minutes=30)
     # Tinkoff rate limit: 60 req/sec, burst 5
     MIN_INTERVAL_MS = 1000 // 60  # ~16ms between requests
@@ -57,6 +57,18 @@ class OrderSlicer:
         Each chunk = max(5% ADV, parent_qty / n_chunks_needed).
 
         Returns at least 1 chunk. Empty if parent_qty fits in single chunk.
+
+        Issue #198: the previous implementation scheduled slices at
+        ``MAX_DURATION / n_chunks`` interval, where ``n_chunks`` was the
+        raw ``parent_qty / (5% ADV)`` ratio. For an extreme ratio (e.g.
+        parent=10_000_000, adv=1_000) the ratio is 200_000 chunks and
+        the per-chunk interval collapses to 9ms — well below the Tinkoff
+        SLA of 60 req/sec (~16ms). The fix caps ``n_chunks`` to
+        ``MAX_DURATION / MIN_INTERVAL_MS`` (=112_500 for the current
+        constants), guaranteeing every consecutive slice is at least
+        ``MIN_INTERVAL_MS`` apart. Chunk size is also clamped to >= 1
+        share so an absurdly-large n_chunks ceiling does not produce
+        0-quantity slices (parent_qty / 112_500 must still be >= 1).
         """
         if start_at is None:
             start_at = datetime.now(timezone.utc)
@@ -80,16 +92,25 @@ class OrderSlicer:
         # Multiple chunks: 5% ADV per batch
         chunk_size = self.adv_shares * self.CHUNK_PCT / Decimal("100")
         n_chunks = max(1, int((self.parent_qty / chunk_size).to_integral_value()))
-        # Cap n_chunks so total duration <= MAX_DURATION
-        n_chunks = max(1, n_chunks)
-        while n_chunks > 1:
-            interval = self.MAX_DURATION / n_chunks
-            last_end = start_at + n_chunks * interval
-            if last_end - start_at <= self.MAX_DURATION:
-                break
-            n_chunks -= 1
+
+        # Issue #198: cap n_chunks so per-chunk interval >= MIN_INTERVAL_MS.
+        # The previous "cap n_chunks so total duration <= MAX_DURATION" loop
+        # was dead code: for any N, N * (MAX_DURATION / N) == MAX_DURATION,
+        # so the inner break fired on iteration 1 and n_chunks was never
+        # decremented. The real rate-limit constraint is per-chunk INTERVAL,
+        # not total duration — cap by MAX_DURATION / MIN_INTERVAL_MS instead.
+        max_chunks = int(self.MAX_DURATION.total_seconds() * 1000 / self.MIN_INTERVAL_MS)
+        n_chunks = max(1, min(n_chunks, max_chunks))
 
         actual_chunk_size = self.parent_qty / Decimal(n_chunks)
+        # Defence-in-depth: if parent_qty < n_chunks (theoretical only,
+        # given we already capped n_chunks), bump each chunk to >= 1 share
+        # so no 0-quantity slices are emitted. parent_qty is a positive
+        # Decimal so actual_chunk_size is always >= 1/n_chunks — keep
+        # the clamp explicit for clarity.
+        if actual_chunk_size < Decimal("1"):
+            n_chunks = max(1, int(self.parent_qty))
+            actual_chunk_size = self.parent_qty / Decimal(n_chunks)
         interval = self.MAX_DURATION / n_chunks
 
         for i in range(n_chunks):

@@ -282,6 +282,74 @@ class TestOrderSlicer:
         for i in range(len(slices) - 1):
             assert slices[i + 1].start_at >= slices[i].end_at
 
+    def test_extreme_parent_qty_respects_min_interval(self):
+        """Issue #198: parent=10M, adv=1k would have produced 200_000
+        chunks at 9ms intervals (Tinkoff SLA violation). The cap must
+        hold both bounds: len <= MAX_DURATION/MIN_INTERVAL_MS AND
+        every consecutive interval >= MIN_INTERVAL_MS.
+        """
+        adv = Decimal("1000")
+        qty = Decimal("10000000")
+        s = OrderSlicer(adv_shares=adv, parent_qty=qty)
+        slices = s.slice()
+        max_chunks = int(OrderSlicer.MAX_DURATION.total_seconds() * 1000 / OrderSlicer.MIN_INTERVAL_MS)
+        assert len(slices) <= max_chunks, f"len(slices)={len(slices)} exceeds MAX_DURATION/MIN_INTERVAL_MS={max_chunks}"
+        # Every consecutive interval >= MIN_INTERVAL_MS (Tinkoff SLA floor)
+        min_interval = timedelta(milliseconds=OrderSlicer.MIN_INTERVAL_MS)
+        for i in range(len(slices) - 1):
+            gap = slices[i + 1].start_at - slices[i].start_at
+            assert gap >= min_interval, (
+                f"slice {i}->{i + 1} interval {gap.total_seconds() * 1000}ms "
+                f"below MIN_INTERVAL_MS={OrderSlicer.MIN_INTERVAL_MS}ms"
+            )
+
+    def test_cap_loop_actually_caps_n_chunks(self):
+        """Issue #198: the previous "cap loop" never decremented n_chunks.
+        This test asserts the new cap DOES fire: for parent=200_000,
+        adv=1 (raw ratio 200_000), the cap must bring n_chunks down to
+        MAX_DURATION/MIN_INTERVAL_MS (=112_500 for the current constants).
+        """
+        adv = Decimal("1")
+        qty = Decimal("200000")
+        s = OrderSlicer(adv_shares=adv, parent_qty=qty)
+        slices = s.slice()
+        max_chunks = int(OrderSlicer.MAX_DURATION.total_seconds() * 1000 / OrderSlicer.MIN_INTERVAL_MS)
+        assert len(slices) <= max_chunks
+        # Sanity: every chunk has at least 1 share
+        for slc in slices:
+            assert slc.quantity >= Decimal("1")
+
+    def test_max_duration_30min_holds_under_cap(self):
+        """Issue #198: rewrite test_max_duration_30min to assert the cap
+        actually fires — pick a ratio where the OLD code would have
+        produced >> MAX_DURATION worth of slices but the NEW code must
+        keep total_dur <= MAX_DURATION while ALSO keeping per-chunk
+        interval >= MIN_INTERVAL_MS.
+        """
+        adv = Decimal("100")
+        qty = Decimal("100000")  # 1000x ADV — old cap was a no-op
+        s = OrderSlicer(adv_shares=adv, parent_qty=qty)
+        slices = s.slice()
+        total_dur = slices[-1].end_at - slices[0].start_at
+        assert total_dur <= timedelta(minutes=30) + timedelta(milliseconds=1)
+        # And per-chunk interval is at least MIN_INTERVAL_MS
+        min_interval = timedelta(milliseconds=OrderSlicer.MIN_INTERVAL_MS)
+        for i in range(len(slices) - 1):
+            assert slices[i + 1].start_at - slices[i].start_at >= min_interval
+
+    def test_chunk_size_at_least_one_share_under_extreme_cap(self):
+        """Issue #198: with parent_qty < max_chunks ceiling, chunk_size
+        must be bumped to >= 1 share. parent_qty=10, adv=1 → raw ratio
+        10 chunks; cap leaves 10; chunk_size = 1 share each.
+        """
+        adv = Decimal("1")
+        qty = Decimal("10")
+        s = OrderSlicer(adv_shares=adv, parent_qty=qty)
+        slices = s.slice()
+        # 10 shares over 10 chunks → 1 share per slice
+        for slc in slices:
+            assert slc.quantity >= Decimal("1")
+
 
 # ────────────────────────────────────────────
 # TinkoffAccount tests
