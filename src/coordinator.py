@@ -103,6 +103,13 @@ class CoordinatorConfig:
     portfolio_equity: Decimal
     portfolio_cash: Decimal
     portfolio_peak: Decimal
+    # Issue #197: ``portfolio_daily_pnl`` feeds ``RiskGate._check_daily_loss``.
+    # Previously the Coordinator built a ``PortfolioState`` without this
+    # field, leaving it at the default ``Decimal("0")`` — so the daily-loss
+    # kill-switch never tripped in the example_main path. Production
+    # (``TinkoffAccount._fetch_real_portfolio_state``) now wires a real
+    # value; this field lets the Coordinator's example path do the same.
+    portfolio_daily_pnl: Decimal = Decimal("0")
 
     # Data loader parameters
     fetch_lookback_days: int = 5 * 365
@@ -451,6 +458,7 @@ class Coordinator:
             cash=self.config.portfolio_cash,
             positions=[],
             peak_equity=self.config.portfolio_peak,
+            daily_pnl=self.config.portfolio_daily_pnl,
         )
         decision = self._gate.evaluate(intent, state)
         return decision.allowed, decision.violations
