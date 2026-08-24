@@ -436,3 +436,179 @@ class TestZeroNavPortfolioState:
                 acct._fetch_real_portfolio_state()
 
         assert "SB1" in str(exc_info.value)
+
+
+# ────────────────────────────────────────────
+# Issue #199 — atomic write + non-destructive corruption recovery
+# ────────────────────────────────────────────
+
+
+class TestPeakEquityAtomicWrite:
+    """Issue #199 — atomic _save_peak_equity + .bak fallback + non-destructive
+    corruption recovery. The peak file is the single source of truth for the
+    RISK_DD guard across process restarts; a SIGKILL, Docker healthcheck kill,
+    or disk-full mid-write must NOT silently disarm the guard.
+    """
+
+    def test_save_uses_atomic_rename(self, tmp_path):
+        """The primary write must go through tmp + os.replace, not a
+        raw truncate-then-write. After the save, no ``.tmp`` file may
+        remain in the peak store dir.
+        """
+        peak_dir = tmp_path
+        acct = _make_tinkoff_account_with_peak_dir(str(peak_dir))
+        with patch.object(acct, "get_portfolio") as mock_gp:
+            mock_gp.return_value = MagicMock(cash=Decimal("100000"), positions=[])
+            acct._fetch_real_portfolio_state()
+        # Primary file exists
+        peak_file = Path(str(peak_dir)) / "peak_equity_SB1.json"
+        assert peak_file.exists()
+        # No leftover .tmp from the atomic rename
+        leftover = list(Path(str(peak_dir)).glob("*.tmp"))
+        assert leftover == [], f"leftover tmp files: {leftover}"
+
+    def test_save_writes_bak_before_overwriting_primary(self, tmp_path):
+        """Each save must mirror the previous-good primary into ``.bak``
+        before overwriting. After two saves (100k then 150k), ``.bak``
+        should hold 100k (the value before the second save) and the
+        primary should hold 150k.
+        """
+        peak_dir = tmp_path
+        acct = _make_tinkoff_account_with_peak_dir(str(peak_dir))
+        with patch.object(acct, "get_portfolio") as mock_gp:
+            mock_gp.return_value = MagicMock(cash=Decimal("100000"), positions=[])
+            acct._fetch_real_portfolio_state()
+            mock_gp.return_value = MagicMock(cash=Decimal("150000"), positions=[])
+            acct._fetch_real_portfolio_state()
+        primary = Path(str(peak_dir)) / "peak_equity_SB1.json"
+        bak = Path(str(peak_dir)) / "peak_equity_SB1.json.bak"
+        assert primary.exists()
+        assert bak.exists(), "second save must have mirrored primary into .bak"
+        primary_data = json.loads(primary.read_text())
+        bak_data = json.loads(bak.read_text())
+        assert primary_data["peak_equity"] == "150000"
+        # .bak mirrors the value BEFORE the second save, i.e. 100000.
+        assert bak_data["peak_equity"] == "100000"
+
+    def test_save_does_not_create_bak_on_cold_start(self, tmp_path):
+        """On the very first save (cold start, no prior primary file)
+        there is no previous-good to mirror — ``.bak`` should not be
+        created (no spurious empty file).
+        """
+        peak_dir = tmp_path
+        acct = _make_tinkoff_account_with_peak_dir(str(peak_dir))
+        with patch.object(acct, "get_portfolio") as mock_gp:
+            mock_gp.return_value = MagicMock(cash=Decimal("100000"), positions=[])
+            acct._fetch_real_portfolio_state()
+        bak = Path(str(peak_dir)) / "peak_equity_SB1.json.bak"
+        assert not bak.exists(), "cold-start must not create .bak"
+
+    def test_corrupt_primary_recovers_from_bak(self, tmp_path):
+        """If the primary is corrupt, the loader must fall back to
+        the .bak file (last-known-good) rather than silently reset to 0.
+        """
+        peak_dir = tmp_path
+        primary = Path(str(peak_dir)) / "peak_equity_SB1.json"
+        bak = Path(str(peak_dir)) / "peak_equity_SB1.json.bak"
+        primary.write_text("not valid json {{", encoding="utf-8")
+        bak.write_text(json.dumps({"peak_equity": "175000"}), encoding="utf-8")
+
+        acct = _make_tinkoff_account_with_peak_dir(str(peak_dir))
+        assert acct._peak_equity == Decimal("175000"), "loader must recover from .bak when primary is corrupt"
+        # Corrupt primary was renamed aside, not silently overwritten
+        corrupt_files = list(Path(str(peak_dir)).glob("peak_equity_SB1.json.corrupt-*"))
+        assert len(corrupt_files) == 1, f"corrupt primary must be renamed aside, found {corrupt_files}"
+        # Original corrupt file no longer at primary path
+        assert not primary.exists()
+
+    def test_corrupt_primary_with_no_bak_returns_zero_with_forensic(self, tmp_path):
+        """When BOTH primary and .bak are corrupt, fall back to 0 with
+        both files renamed aside for forensics.
+        """
+        peak_dir = tmp_path
+        primary = Path(str(peak_dir)) / "peak_equity_SB1.json"
+        bak = Path(str(peak_dir)) / "peak_equity_SB1.json.bak"
+        primary.write_text("garbage", encoding="utf-8")
+        bak.write_text("also garbage", encoding="utf-8")
+
+        acct = _make_tinkoff_account_with_peak_dir(str(peak_dir))
+        assert acct._peak_equity == Decimal("0")
+        # Both files moved aside (primary forensics + .bak forensics)
+        corrupt_files = sorted(Path(str(peak_dir)).glob("peak_equity_SB1.json*.corrupt-*"))
+        # One for primary + one for .bak
+        assert len(corrupt_files) >= 2, f"expected 2+ corrupt-forensic files, got {corrupt_files}"
+
+    def test_good_primary_does_not_leave_corrupt_files(self, tmp_path):
+        """A successful primary load must prune any stale
+        ``.corrupt-*`` forensic file from a previous recovery.
+        """
+        peak_dir = tmp_path
+        # Simulate leftover forensic from a previous recovery
+        leftover = Path(str(peak_dir)) / "peak_equity_SB1.json.corrupt-1700000000"
+        leftover.write_text("stale evidence", encoding="utf-8")
+        primary = Path(str(peak_dir)) / "peak_equity_SB1.json"
+        primary.write_text(json.dumps({"peak_equity": "100000"}), encoding="utf-8")
+
+        acct = _make_tinkoff_account_with_peak_dir(str(peak_dir))
+        assert acct._peak_equity == Decimal("100000")
+        # Forensics file pruned after a clean load
+        assert not leftover.exists(), "successful load must prune stale forensic"
+
+    def test_save_peak_equity_survives_disk_full(self, tmp_path):
+        """Issue #199 acceptance: simulate a write failure mid-write
+        (e.g. disk-full, which raises OSError, NOT KeyboardInterrupt)
+        by monkeypatching ``json.dump`` to raise OSError after the
+        file is opened. The best-effort outer try/except must catch
+        it, the primary file must remain unchanged (no truncation),
+        and no .tmp file may be left behind.
+        """
+        peak_dir = tmp_path
+        acct = _make_tinkoff_account_with_peak_dir(str(peak_dir))
+        with patch.object(acct, "get_portfolio") as mock_gp:
+            mock_gp.return_value = MagicMock(cash=Decimal("100000"), positions=[])
+            acct._fetch_real_portfolio_state()
+        # Pre-crash state: primary has 100000
+        primary = Path(str(peak_dir)) / "peak_equity_SB1.json"
+        pre_crash = primary.read_text()
+
+        # Simulate disk-full mid-write (OSError, not KI)
+        with patch.object(acct, "_peak_equity", Decimal("200000")):
+
+            def crashing_dump(obj, fh, *args, **kwargs):  # noqa: ANN001
+                # Write a few bytes to simulate partial write, then
+                # fail with disk-full (OSError, caught by best-effort).
+                fh.write('{"peak_equity": "200000"')  # incomplete
+                raise OSError(28, "No space left on device")
+
+            with patch("src.broker.tinkoff_account.json.dump", side_effect=crashing_dump):
+                # Must NOT propagate — best-effort catch
+                acct._save_peak_equity()
+
+        # Primary must be unchanged from the pre-crash state because
+        # the atomic-rename never completed (tmp + os.replace never
+        # reached). Old "open('w')" code would have truncated to 0
+        # here and then crashed on the partial-write.
+        post_crash = primary.read_text()
+        assert post_crash == pre_crash, "atomic write must leave primary intact when json.dump " "raises mid-write"
+        # And no stale .tmp file is left behind
+        leftover = list(Path(str(peak_dir)).glob("*.tmp"))
+        assert leftover == [], f"failure must not leave .tmp behind: {leftover}"
+
+    def test_load_peak_equity_recovers_from_simulated_crash(self, tmp_path):
+        """Issue #199 acceptance: simulate a SIGKILL mid-write by
+        leaving the primary at 0 bytes (the classic failure mode of
+        the old ``open('w') + json.dump`` code). Recovery on next
+        load must NOT silently reset to 0 — must use .bak if present,
+        or fall back to 0 only if both primary and .bak are missing.
+        """
+        peak_dir = tmp_path
+        primary = Path(str(peak_dir)) / "peak_equity_SB1.json"
+        bak = Path(str(peak_dir)) / "peak_equity_SB1.json.bak"
+        # Mid-write crash left primary at 0 bytes; .bak survived.
+        primary.write_bytes(b"")
+        bak.write_text(json.dumps({"peak_equity": "210000"}), encoding="utf-8")
+
+        acct = _make_tinkoff_account_with_peak_dir(str(peak_dir))
+        assert acct._peak_equity == Decimal("210000"), (
+            "loader must recover last-known-good from .bak after a " "zero-byte primary caused by mid-write crash"
+        )
