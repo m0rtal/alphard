@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import urllib.parse
 from datetime import date, timedelta
 from decimal import Decimal
@@ -85,6 +86,22 @@ class MOEXDataLoader(DataLoader):
         # many times per session (store init, scheduler, etc.).
         self._universe_cache: list[TickerMeta] | None = None
         self._board_filter: str | None | bool = None  # None|True if cached without filter
+        # BUGFIX (issue #193): lock around the cache fill so two threads
+        # calling ``list_tickers(board_id)`` concurrently don't both walk
+        # through ``_fetch_all_rows(...)`` (which costs a self.bucket slot
+        # per call), race on the cache assignment, and silently discard
+        # the slow builder's results. Mirrors the per-category lock
+        # pattern from issue #175 in the sibling file
+        # ``src/data/tinkoff_loader.py:195-204`` and the universe_lock
+        # from issue #152 in ``src/data/tinkoff_md_loader.py:252``.
+        # Production today is sequential per-loader-instance, so the bug
+        # is latent — no live failure — but ``fallback_loader.py:68``
+        # composes MOEX into chains and Phase 2.6 may parallelise the
+        # chain, at which point the race becomes live. The
+        # ``self._board_filter == board_id`` invariant from issue #162
+        # stays inside both guards (cache-set AND filter-match), because
+        # a mismatched board_id must still force a refetch.
+        self._universe_lock = threading.Lock()
 
     # --------------------------------------------------------------- public
 
@@ -106,22 +123,34 @@ class MOEXDataLoader(DataLoader):
         list whenever the requested ``board_id`` and the cached
         ``_board_filter`` differed. The fix is a single equality
         comparison — any mismatch refetches.
+
+        Issue #193: the read at ``self._universe_cache is not None``
+        and the write at ``self._universe_cache = out`` were not
+        protected by a lock, so two concurrent first-time callers
+        both walked through ``_fetch_all_rows(...)`` (duplicate HTTP
+        traffic, duplicate bucket-slot consumption, slow builder's
+        results silently discarded). Fixed with double-checked
+        locking around the fill — same pattern as issue #175 in
+        ``tinkoff_loader.py:208-219``.
         """
         if self._universe_cache is not None and self._board_filter == board_id:
             return self._universe_cache
-        url = f"{BASE_URL}/iss/engines/stock/markets/shares/securities.json"
-        rows = self._fetch_all_rows(url, columns_metadata_key="securities")
-        out: list[TickerMeta] = []
-        for row in rows:
-            # MOEX ISS returns one row per (secid, boardid). Filter by board.
-            if board_id is not None and row.get("BOARDID") != board_id:
-                continue
-            meta = self._row_to_ticker_meta(row)
-            if meta is not None:
-                out.append(meta)
-        self._universe_cache = out
-        self._board_filter = board_id
-        return out
+        with self._universe_lock:
+            if self._universe_cache is not None and self._board_filter == board_id:
+                return self._universe_cache
+            url = f"{BASE_URL}/iss/engines/stock/markets/shares/securities.json"
+            rows = self._fetch_all_rows(url, columns_metadata_key="securities")
+            out: list[TickerMeta] = []
+            for row in rows:
+                # MOEX ISS returns one row per (secid, boardid). Filter by board.
+                if board_id is not None and row.get("BOARDID") != board_id:
+                    continue
+                meta = self._row_to_ticker_meta(row)
+                if meta is not None:
+                    out.append(meta)
+            self._universe_cache = out
+            self._board_filter = board_id
+            return out
 
     def iter_ohlcv(
         self,
