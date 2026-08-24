@@ -1,0 +1,21 @@
+evidence/01_compose_config.txt
+===========================
+Command: docker-safe compose --profile observability -p qa-healthchecks \
+         --env-file /root/projects/alphard/.env config
+Result: exit 0 — rendered 5 services with healthcheck blocks
+  alphard-bot     → test: python3 -c '...urlopen(http://127.0.0.1:8765/health)...' 30s/10s/3/60s
+  prometheus      → test: wget -q -O /dev/null http://127.0.0.1:9090/-/healthy      30s/10s/3/60s
+  grafana         → test: wget -q -O /dev/null http://127.0.0.1:3300/api/health     30s/10s/3/120s
+  postgres        → existing pg_isready + psql SELECT 1 (untouched)
+  redis           → existing redis-cli ping (untouched)
+
+Binary availability verification (run on 2026-08-24):
+  prom/prometheus:latest       → /bin/wget present
+  grafana/grafana:latest       → /usr/bin/wget → /bin/busybox present
+  ghcr.io/m0rtal/alphard:latest → /usr/local/bin/python3 + urllib.request import OK
+
+Deviation from task body:
+  body specifies grafana healthcheck on port 3000.
+  Implementation uses port 3300 because GF_SERVER_HTTP_PORT=3300
+  (docker-compose.yaml line 393) and network_mode: host (line 390).
+  Port 3000 on .107 resolves to forgejo; grafana is bound to 3300.

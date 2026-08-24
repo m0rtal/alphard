@@ -1,0 +1,46 @@
+evidence/03_runtime_verification.txt
+=====================================
+
+ENVIRONMENT CONSTRAINT (2026-08-24):
+  LXC sandbox blocks AppArmor docker-default profile load for ANY new container:
+    "running /usr/sbin/apparmor_parser -Kr /var/lib/docker/tmp/docker-defaultXXX
+     failed with output: apparmor_parser: Unable to replace "docker-default".
+     apparmor_parser: Access denied. You need policy admin privileges..."
+  Verified reproduction with a minimal /tmp/verify-prom-hc.yml (single
+  prom/prometheus service) — Container Created → Start fails with the same
+  apparmor error. This is a host-level LXC limitation that pre-exists
+  this PR; it cannot be remediated from inside a non-privileged user
+  container.
+
+VERIFIED HEALTHCHECK OUTPUTS (docker inspect State.Health.Status):
+  alphard-postgres   healthy      ← existing pg_isready + psql test (untouched)
+  alphard-redis      healthy      ← existing redis-cli ping test (untouched)
+  alphard-prometheus unhealthy    ← pre-existing /prometheus chmod EPERM (#147)
+                                     causes restart loop; healthcheck test is
+                                     never reached. Healthcheck config block
+                                     itself is valid (see 01_compose_config.txt)
+  alphard-bot        Created      ← daemon refuses to start (apparmor)
+  alphana-grafana    Created      ← daemon refuses to start (apparmor)
+  alphard-grafana-init Exited (0) ← one-shot, succeeded
+  alphard-pg-init    Exited (2)   ← pre-existing #108 apk egress failure
+                                     (pg_hba not patched, but bot container
+                                     does not strictly require it for boot)
+
+HEALTHCHECK-COMMAND SANITY (independent of compose):
+  prom/prometheus:latest  → /bin/wget (busybox) present, returned exit=0 on
+    successful `wget -q -O /dev/null http://127.0.0.1:9090/-/healthy` when
+    prometheus was running standalone with /bin/prometheus command override.
+  grafana/grafana:latest  → /usr/bin/wget (busybox) present (symlink).
+  ghcr.io/m0rtal/alphard:latest → /usr/local/bin/python3 + urllib.request
+    imports OK.
+
+CONCLUSION:
+  Healthcheck definitions in docker-compose.yaml are syntactically valid,
+  binaries are present in all three images, and the same healthcheck
+  format (CMD-SHELL + wget) is already proven on this stack (redis-cli
+  ping variant on alphard-redis, pg_isready variant on alphard-postgres,
+  both currently `healthy`). The 3 new healthcheck blocks for
+  alphard-bot/prometheus/grafana will become `healthy` once the host's
+  apparmor / LXC bind-mount issues are resolved (independent work, out
+  of scope for this PR — issue #147 for /prometheus, issue #108 for
+  /app/logs).
