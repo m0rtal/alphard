@@ -147,6 +147,10 @@ class TinkoffAccount(BrokerAccount):
             peak_store_dir = os.environ.get("ALPHARD_PEAK_STORE_DIR", "/var/lib/alphard")
         self._peak_store_dir: str = peak_store_dir
         self._peak_equity_path: str = os.path.join(peak_store_dir, f"peak_equity_{account_id}.json")
+        # Issue #199: keep a sibling .bak file holding the
+        # last-known-good peak so a corrupt primary can fall back to
+        # it instead of silently resetting to zero (RISK_DD disarm).
+        self._peak_equity_bak_path: str = self._peak_equity_path + ".bak"
         self._peak_equity: Decimal = self._load_peak_equity()
         # Issue #197: persist a sibling "daily_pnl_basis" tracker alongside
         # the peak-equity HWM so that ``PortfolioState.daily_pnl`` (which
@@ -166,44 +170,193 @@ class TinkoffAccount(BrokerAccount):
     def _load_peak_equity(self) -> Decimal:
         """Read the persisted peak-equity high-water mark from disk.
 
-        Returns Decimal("0") if the file does not exist (cold start)
-        or is unparseable (corrupted). A zero peak means "no history
-        yet" — the next snapshot's value will be the new peak.
+        Returns Decimal("0") if neither the primary nor the .bak file
+        exists (cold start) or both are unparseable (corrupted).
+
+        Issue #199: the previous implementation silently reset the peak
+        to 0 on JSONDecodeError and overwrote the corrupt file on the
+        next save — turning a recoverable corruption (e.g. trailing null
+        byte from a partial write) into a permanent zero-reset that
+        disarms the RISK_DD guard. The fix:
+
+        1. Try the primary file first. On success, return its parsed
+           value (and remove any stale .corrupt-* forensics file left
+           by a previous load — clean state).
+        2. If the primary is corrupt, rename it aside as
+           ``peak_equity_{account_id}.corrupt-{ts}.json`` for
+           post-mortem, then fall back to the .bak file. If the .bak
+           parses, return its value (last-known-good). If neither
+           parses, return 0 with a warning.
+        3. Negative values are still clamped to 0 (defence-in-depth
+           from issue #32 era).
+        """
+        value = self._try_load_peak_from(self._peak_equity_path)
+        if value is not None:
+            # Clean up any leftover .corrupt-* forensics file from a
+            # previous recovery; the primary is now good so the
+            # evidence has served its purpose.
+            self._prune_corrupt_forensics()
+            return value
+
+        # Primary corrupt / missing — try .bak (last-known-good mirror).
+        bak_value = self._try_load_peak_from(self._peak_equity_bak_path)
+        if bak_value is not None:
+            logger.warning(
+                "Peak equity primary %s was missing/unparse; " "recovered from .bak mirror %s (value=%s)",
+                self._peak_equity_path,
+                self._peak_equity_bak_path,
+                bak_value,
+            )
+            return bak_value
+
+        # Both missing / corrupt. Preserved corruption moved aside
+        # by _try_load_peak_from; fall back to zero.
+        return Decimal("0")
+
+    def _try_load_peak_from(self, path: str) -> Decimal | None:
+        """Read a peak-equity file. Return None on missing/corrupt.
+
+        On JSONDecodeError, the file is renamed aside as
+        ``<path>.corrupt-<unix-ts>`` for post-mortem; on FileNotFound
+        the path is left alone (cold-start path). A successfully
+        parsed file with a negative value is clamped to 0.
         """
         try:
-            with open(self._peak_equity_path, "r") as fh:
+            with open(path, "r") as fh:
                 data = json.load(fh)
             value = Decimal(str(data.get("peak_equity", "0")))
             if value < 0:
                 logger.warning(
                     "Peak equity file %s has negative value %s; treating as 0",
-                    self._peak_equity_path,
+                    path,
                     value,
                 )
                 return Decimal("0")
             return value
         except FileNotFoundError:
-            return Decimal("0")
+            return None
         except (json.JSONDecodeError, KeyError, ValueError) as e:
             logger.warning(
-                "Peak equity file %s is corrupt (%s); starting from 0",
-                self._peak_equity_path,
+                "Peak equity file %s is corrupt (%s); renaming aside for forensics",
+                path,
                 e,
             )
-            return Decimal("0")
+            # Non-destructive: rename the corrupt file aside rather
+            # than letting the next save silently overwrite it. Two
+            # files with the same mtime (rare but possible — both
+            # written in the same millisecond by a backup mirror) must
+            # NOT clobber each other's forensics; always suffix with
+            # pid + a per-call counter.
+            try:
+                ts = int(os.path.getmtime(path))
+                corrupt_target = f"{path}.corrupt-{ts}-{os.getpid()}"
+                # If a stale forensics file at this exact target
+                # already exists (re-recovery), suffix again so we
+                # never clobber evidence.
+                if os.path.exists(corrupt_target):
+                    corrupt_target = f"{path}.corrupt-{ts}-{os.getpid()}-{id(e)}"
+                os.replace(path, corrupt_target)
+            except OSError as rename_err:
+                logger.debug(
+                    "Could not rename corrupt peak file %s aside: %s",
+                    path,
+                    rename_err,
+                )
+            return None
+
+    def _prune_corrupt_forensics(self) -> None:
+        """Remove stale .corrupt-* forensics files left by a previous
+        recovery. Best-effort: a failure here is logged at DEBUG and
+        does not propagate.
+        """
+        try:
+            for entry in os.listdir(self._peak_store_dir):
+                if entry.startswith(os.path.basename(self._peak_equity_path) + ".corrupt-"):
+                    try:
+                        os.remove(os.path.join(self._peak_store_dir, entry))
+                    except OSError as prune_err:
+                        logger.debug(
+                            "Could not prune corrupt-forensic %s: %s",
+                            entry,
+                            prune_err,
+                        )
+        except OSError as list_err:
+            logger.debug(
+                "Could not list peak store dir %s for forensics prune: %s",
+                self._peak_store_dir,
+                list_err,
+            )
 
     def _save_peak_equity(self) -> None:
-        """Persist the current peak-equity to disk (best-effort).
+        """Persist the current peak-equity to disk (best-effort, atomic).
 
         Write is best-effort: a failure here logs a warning but does
         not raise. The in-memory peak is the source of truth for the
         current process; on the next start the peak is reloaded from
         disk. The worst case is losing one cycle of drawdown tracking.
+
+        Issue #199: the previous implementation used a non-atomic
+        ``open(path, "w") + json.dump(...)`` (truncate-then-write).
+        a SIGKILL, Docker healthcheck kill, or disk-full mid-write
+        leaves a 0-byte or partial-JSON file; the next start logs
+        'corrupt; starting from 0' and RISK_DD silently loses all
+        drawdown history — the very guard the peak store was added
+        to enable (issues #32, #195). The fix:
+
+        1. Write to a sibling temp file in the SAME directory
+           (same filesystem ⇒ ``os.replace`` is POSIX-atomic).
+        2. ``fh.flush()`` + ``os.fsync(fh.fileno())`` before close
+           so the bytes hit the platter before the rename publishes.
+        3. Mirror the previous-good value into ``.bak`` BEFORE each
+           successful write so a corrupt primary can fall back to
+           the last-known-good value rather than zero.
+        4. On load, if the primary is corrupt, rename it aside for
+           forensics rather than silently overwriting on the next
+           save; if a ``.bak`` is present and parseable, prefer it.
         """
         try:
             os.makedirs(self._peak_store_dir, exist_ok=True)
-            with open(self._peak_equity_path, "w") as fh:
-                json.dump({"peak_equity": str(self._peak_equity)}, fh)
+            # Mirror previous-good value to .bak BEFORE we touch the
+            # primary. We snapshot the *current* primary content (if
+            # any) — not the new value — so the .bak is always the
+            # last-known-good peak, not the peak we're about to lose.
+            if os.path.exists(self._peak_equity_path):
+                try:
+                    with open(self._peak_equity_path, "r") as src:
+                        prev = src.read()
+                    with open(self._peak_equity_bak_path, "w") as dst:
+                        dst.write(prev)
+                        dst.flush()
+                        os.fsync(dst.fileno())
+                except (OSError, ValueError) as backup_err:
+                    # Non-fatal: just log and continue. The primary
+                    # write is still atomic; we only lose the .bak
+                    # mirror, not the new value.
+                    logger.debug(
+                        "Peak equity .bak mirror failed for %s: %s",
+                        self._peak_equity_bak_path,
+                        backup_err,
+                    )
+
+            # Atomic write: temp file in same dir → os.replace.
+            tmp_path = self._peak_equity_path + ".tmp"
+            try:
+                with open(tmp_path, "w") as fh:
+                    json.dump({"peak_equity": str(self._peak_equity)}, fh)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp_path, self._peak_equity_path)
+            except (OSError, ValueError):
+                # Best-effort cleanup: if the tmp file was created but
+                # the rename never completed (mid-write crash, disk-full,
+                # etc.), remove the orphan so it doesn't accumulate
+                # across restarts and confuse the next loader.
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except OSError:
+                    pass
+                raise
         except OSError as e:
             logger.warning(
                 "Failed to persist peak equity to %s: %s",
