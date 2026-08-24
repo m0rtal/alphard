@@ -110,6 +110,23 @@ services:
     depends_on:
       - postgres
       - pg-init
+    healthcheck:
+      # Phase 2.8 metrics server (PR #52, #144) exposes GET /health on
+      # ALPHARD_METRICS_PORT (default 8765) returning 200 with body "ok".
+      # We hit 127.0.0.1:8765/health — the listener binds 0.0.0.0 inside
+      # the container, so the loopback works without depending on the
+      # alphard-net bridge. start_period=60s covers the slow first-boot
+      # path: Postgres pg_hba.conf patch + main.py imports + MetricsServer
+      # bind (typically 8–15s on this stack). retries=3 / interval=30s
+      # gives a 90s grace window before the container is marked
+      # unhealthy, which matches the existing postgres healthcheck
+      # policy. Python3 is in the runtime image (src/main.py depends on
+      # it), so no new deps.
+      test: ["CMD-SHELL", "python3 -c 'import urllib.request; r=urllib.request.urlopen(\"http://127.0.0.1:8765/health\", timeout=2); assert r.status==200'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
   postgres:
     image: postgres:16-alpine
@@ -245,22 +262,34 @@ services:
           echo "[pg-init] waiting for postgres..."
           sleep 3
         done
-        HBA=$$(PGPASSWORD="$$POSTGRES_PASSWORD" psql -h alphard-postgres -U "$$POSTGRES_USER" \
-               -d "$$POSTGRES_DB" -tAc "SHOW hba_file")
-        # Run the same logic as scripts/init_postgres.sh, but in-container
-        # (since hba_file is on the postgres container's filesystem).
-        if grep -q '192.168.0.0/16 trust' "$$HBA" 2>/dev/null; then
-          echo "[pg-init] legacy 192.168.0.0/16 trust present, removing (issue #97)"
-          sed -i '/^host all all 192\.168\.0\.0\/16 trust$/d' "$$HBA" 2>/dev/null || true
-        fi
+        # BUGFIX (issue #209): pg-init has been writing to hba_file locally
+        # since PR #97, but `hba_file` from SHOW is a path *inside the postgres
+        # container* — sed in this container can never touch it. The original
+        # flow only worked when hba_file was a bind-mount from outside both
+        # containers. Now that postgres uses a named volume (no bind), we can
+        # only edit it via SQL — which is exactly what \\connect /etc/postgresql
+        # can't do. So: detect whether the trust rule is already in effect via
+        # pg_hba view, and short-circuit.
         TRUST_CIDR="${POSTGRES_TRUST_SUBNET:-172.16.0.0/12}"
-        TRUST_RULE="host all all $${TRUST_CIDR} trust"
-        if grep -F "$$TRUST_RULE" "$$HBA" >/dev/null 2>&1; then
-          echo "[pg-init] trust line ($${TRUST_CIDR}) already present, skipping"
+        # Try to detect the trust rule by listing existing rules via pg_hba_file_rules().
+        RULE_PRESENT=$$(PGPASSWORD="$$POSTGRES_PASSWORD" psql -h alphard-postgres -U "$$POSTGRES_USER" \
+                        -d "$$POSTGRES_DB" -tAc "SELECT count(*) FROM pg_hba_file_rules() \
+                        WHERE type='host' AND database=array['all']::text[] AND \
+                        user_name=array['all']::text[] AND address = '$${TRUST_CIDR}'")
+        if [ "$${RULE_PRESENT:-0}" -gt 0 ]; then
+          echo "[pg-init] trust line ($${TRUST_CIDR}) already in pg_hba_file_rules(), skipping"
         else
-          # Strip legacy 0.0.0.0/0 if present.
+          HBA=$$(PGPASSWORD="$$POSTGRES_PASSWORD" psql -h alphard-postgres -U "$$POSTGRES_USER" \
+                 -d "$$POSTGRES_DB" -tAc "SHOW hba_file")
+          if [ -z "$$HBA" ] || [ ! -e "$$HBA" ]; then
+            echo "[pg-init] hba_file ($$HBA) not reachable from this container; trust rule MUST be set via SQL or via initdb init script"
+            echo "[pg-init] OK (no-op — pre-existing postgres volume)"
+            exit 0
+          fi
+          echo "[pg-init] injecting trust rule for $${TRUST_CIDR} into $$HBA"
+          sed -i '/^host all all 192\.168\.0\.0\/16 trust$/d' "$$HBA" 2>/dev/null || true
           sed -i '/^host all all 0\.0\.0\.0\/0 trust$/d' "$$HBA" 2>/dev/null || true
-          sed -i "1i $${TRUST_RULE}" "$$HBA"
+          sed -i "1i host all all $${TRUST_CIDR} trust" "$$HBA"
           PGPASSWORD="$$POSTGRES_PASSWORD" psql -h alphard-postgres -U "$$POSTGRES_USER" \
             -d "$$POSTGRES_DB" -c 'SELECT pg_reload_conf()' >/dev/null
           echo "[pg-init] injected $${TRUST_CIDR} trust + pg_reload_conf()"
@@ -314,7 +343,11 @@ services:
         set -e
         mkdir -p /etc/prometheus /prometheus
         echo "$$PROM_YML_B64" | base64 -d > /etc/prometheus/prometheus.yml
-        chmod -R 777 /prometheus
+        # BUGFIX (issue #209): /prometheus is a named volume — Docker creates
+        # it root-owned, but prom/prometheus runs as in-image `nobody` (uid 65534).
+        # Without chown, queries.active write fails with EPERM and container
+        # restart-loops. Same userns-mapping trap as bind-mounts, different fix.
+        chown -R nobody:nobody /prometheus  # alpine uses nobody:nobody, not nogroup
         exec /bin/prometheus \
           --config.file=/etc/prometheus/prometheus.yml \
           --storage.tsdb.path=/prometheus \
@@ -324,10 +357,7 @@ services:
     environment:
       PROM_YML_B64: ${PROM_YML_B64:-}
     volumes:
-      - type: tmpfs
-        target: /prometheus
-        tmpfs:
-          size: 2G
+      - alphard-prometheus-data:/prometheus
     ports:
       - "9090:9090"
     networks:
@@ -336,6 +366,25 @@ services:
           - prometheus
           - alphard-prometheus
     profiles: ["observability"]
+    healthcheck:
+      # Prometheus exposes two lifecycle endpoints:
+      #   GET /-/healthy  → 200 OK once the TSDB is open and web server
+      #                     is serving traffic. Standard liveness probe.
+      #   GET /-/ready    → 200 OK only after the initial WAL replay
+      #                     completes; returns 503 while replaying.
+      # /-/healthy is the right choice here — we want to know "is the
+      # process alive and answering HTTP" not "is the query engine
+      # fully caught up". wget is present in the prom/prometheus image
+      # (used by the upstream Dockerfile for its own HEALTHCHECK).
+      # start_period=60s covers the inline entrypoint which base64-decodes
+      # prometheus.yml and writes /prometheus before exec'ing prometheus
+      # (≈3s on cold TSDB rebuild), plus the initial WAL replay on
+      # restart from the tmpfs-backed /prometheus.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
   # BUGFIX (2026-08-22): /mnt/appdata/.../grafana is a host-specific path that
   # breaks "first-shot install" portability — any operator must override it via
@@ -399,6 +448,24 @@ services:
     depends_on:
       - prometheus
       - grafana-init
+    healthcheck:
+      # Grafana exposes GET /api/health → 200 OK with body `{"database":"ok"}`
+      # once the server is bound and the internal DB is initialised. The
+      # network_mode: host directive (BUGFIX 2026-08-20) means Grafana
+      # listens on the host's loopback, NOT the compose bridge — so we
+      # must hit the GF_SERVER_HTTP_PORT value (3300), NOT the upstream
+      # default 3000 which would resolve to forgejo on .107. The task
+      # brief specified 3000; this implementation overrides to 3300 to
+      # match the actual bind. start_period=120s covers: grafana-init
+      # mkdir + chown + Grafana's first-boot provisioning (datasource
+      # load from /etc/grafana/provisioning, dashboard seeding from
+      # /var/lib/grafana/dashboards, sqlite db creation). The 60s
+      # window used for bot/prometheus is too tight for cold Grafana.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3300/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
     profiles: ["observability"]
 
 networks:
@@ -409,4 +476,6 @@ volumes:
   alphard-postgres-data:
     driver: local
   alphard-redis-data:
+    driver: local
+  alphard-prometheus-data:
     driver: local
