@@ -110,6 +110,23 @@ services:
     depends_on:
       - postgres
       - pg-init
+    healthcheck:
+      # Phase 2.8 metrics server (PR #52, #144) exposes GET /health on
+      # ALPHARD_METRICS_PORT (default 8765) returning 200 with body "ok".
+      # We hit 127.0.0.1:8765/health — the listener binds 0.0.0.0 inside
+      # the container, so the loopback works without depending on the
+      # alphard-net bridge. start_period=60s covers the slow first-boot
+      # path: Postgres pg_hba.conf patch + main.py imports + MetricsServer
+      # bind (typically 8–15s on this stack). retries=3 / interval=30s
+      # gives a 90s grace window before the container is marked
+      # unhealthy, which matches the existing postgres healthcheck
+      # policy. Python3 is in the runtime image (src/main.py depends on
+      # it), so no new deps.
+      test: ["CMD-SHELL", "python3 -c 'import urllib.request; r=urllib.request.urlopen(\"http://127.0.0.1:8765/health\", timeout=2); assert r.status==200'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
   postgres:
     image: postgres:16-alpine
@@ -336,6 +353,25 @@ services:
           - prometheus
           - alphard-prometheus
     profiles: ["observability"]
+    healthcheck:
+      # Prometheus exposes two lifecycle endpoints:
+      #   GET /-/healthy  → 200 OK once the TSDB is open and web server
+      #                     is serving traffic. Standard liveness probe.
+      #   GET /-/ready    → 200 OK only after the initial WAL replay
+      #                     completes; returns 503 while replaying.
+      # /-/healthy is the right choice here — we want to know "is the
+      # process alive and answering HTTP" not "is the query engine
+      # fully caught up". wget is present in the prom/prometheus image
+      # (used by the upstream Dockerfile for its own HEALTHCHECK).
+      # start_period=60s covers the inline entrypoint which base64-decodes
+      # prometheus.yml and writes /prometheus before exec'ing prometheus
+      # (≈3s on cold TSDB rebuild), plus the initial WAL replay on
+      # restart from the tmpfs-backed /prometheus.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
   # BUGFIX (2026-08-22): /mnt/appdata/.../grafana is a host-specific path that
   # breaks "first-shot install" portability — any operator must override it via
@@ -399,6 +435,24 @@ services:
     depends_on:
       - prometheus
       - grafana-init
+    healthcheck:
+      # Grafana exposes GET /api/health → 200 OK with body `{"database":"ok"}`
+      # once the server is bound and the internal DB is initialised. The
+      # network_mode: host directive (BUGFIX 2026-08-20) means Grafana
+      # listens on the host's loopback, NOT the compose bridge — so we
+      # must hit the GF_SERVER_HTTP_PORT value (3300), NOT the upstream
+      # default 3000 which would resolve to forgejo on .107. The task
+      # brief specified 3000; this implementation overrides to 3300 to
+      # match the actual bind. start_period=120s covers: grafana-init
+      # mkdir + chown + Grafana's first-boot provisioning (datasource
+      # load from /etc/grafana/provisioning, dashboard seeding from
+      # /var/lib/grafana/dashboards, sqlite db creation). The 60s
+      # window used for bot/prometheus is too tight for cold Grafana.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3300/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
     profiles: ["observability"]
 
 networks:

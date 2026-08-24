@@ -1,0 +1,7 @@
+alphard-bot Created
+alphard-grafana Created
+alphard-grafana-init Exited (0) 2 minutes ago
+alphard-pg-init Exited (2) 32 seconds ago
+alphard-postgres Up 2 minutes (healthy)
+alphard-prometheus Restarting (1) 39 seconds ago
+alphard-redis Up 2 minutes (healthy)
