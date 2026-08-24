@@ -75,6 +75,7 @@ class OrderFlow:
         quote_provider: QuoteProvider,
         universe_filter: Callable[[str], bool] | None = None,
         peak_equity_provider: Callable[[], Decimal] | None = None,
+        daily_pnl_provider: Callable[[], Decimal] | None = None,
     ):
         """
         Args:
@@ -98,6 +99,17 @@ class OrderFlow:
                 tracker) to wire in real peak tracking. ``None`` keeps the
                 legacy behaviour and logs a one-shot WARNING so the gap
                 is visible to operators.
+            daily_pnl_provider: Optional callable returning the current
+                realised + unrealised daily P&L as ``Decimal`` (issue
+                #197). Without a provider, ``PortfolioState.daily_pnl``
+                defaults to ``Decimal("0")`` on every call, which makes
+                ``_check_daily_loss`` short-circuit (``daily_pnl >= 0``
+                early-return) — the daily-loss kill-switch is silently a
+                no-op via the OrderFlow path. Pass a callable (e.g.
+                ``lambda: tinker._fetch_daily_pnl(nav)`` or a dedicated
+                disk-backed tracker) to wire in real daily-pnl
+                tracking. ``None`` keeps the legacy behaviour and logs a
+                one-shot WARNING so the gap is visible to operators.
 
         Raises:
             TypeError: if ``quote_provider`` is None. We require an explicit
@@ -116,10 +128,16 @@ class OrderFlow:
         self._quote_provider = quote_provider
         self._universe_filter = universe_filter
         self._peak_equity_provider = peak_equity_provider
-        # Issue #195: one-shot warning flag. We log the missing-peak
-        # WARNING on the FIRST submit_market call only, not on every
-        # call, so a busy session doesn't flood the log.
+        # Issue #197: same defensive pattern as peak_equity_provider
+        # above. The provider returns ``Decimal("0")`` if no real daily
+        # P&L is wired up, which makes _check_daily_loss short-circuit
+        # rather than trip on stale data.
+        self._daily_pnl_provider = daily_pnl_provider
         self._warned_missing_peak: bool = False
+        # Issue #197: one-shot warning flag for missing daily_pnl
+        # provider. Logged on the first submit_market call so a busy
+        # session doesn't flood the log.
+        self._warned_missing_daily_pnl: bool = False
 
     def submit_market(
         self,
@@ -343,7 +361,7 @@ class OrderFlow:
     # ------------------------------------------------------------------
 
     def _portfolio_to_state_impl(self, portfolio: PortfolioSnapshot) -> Any:
-        """Build ``PortfolioState`` with peak_equity from the provider.
+        """Build ``PortfolioState`` with peak_equity + daily_pnl from providers.
 
         Issue #195: ``_portfolio_to_state`` (static) hard-codes
         ``peak_equity=total_equity`` so the ``RISK_DD`` guard in
@@ -351,6 +369,13 @@ class OrderFlow:
         instance method pulls the high-water mark from
         ``self._peak_equity_provider`` so real drawdown tracking works
         through ``OrderFlow.submit_market``.
+
+        Issue #197: same fix for ``daily_pnl``. The static helper
+        leaves it at the pydantic default (``Decimal("0")``) so the
+        ``_check_daily_loss`` short-circuit (``daily_pnl >= 0``) trips
+        on every call — the daily-loss kill-switch is silently a no-op
+        via OrderFlow. Pull from ``self._daily_pnl_provider`` when
+        configured; otherwise fall back to 0 with a one-shot WARNING.
 
         Backwards-compat: when ``self._peak_equity_provider is None``
         (legacy call sites), we fall back to ``peak_equity=total_equity``
@@ -402,6 +427,33 @@ class OrderFlow:
                 )
                 self._warned_missing_peak = True
 
+        # Issue #197: same pattern for daily_pnl. Provider if
+        # configured, else legacy fallback (0) with one-shot WARNING.
+        if self._daily_pnl_provider is not None:
+            try:
+                daily_pnl = self._daily_pnl_provider()
+            except Exception as exc:  # noqa: BLE001 — provider errors must never break the order path
+                logger.warning(
+                    "OrderFlow._portfolio_to_state_impl: daily_pnl_provider "
+                    "raised %s: %s — falling back to daily_pnl=0 (issue #197)",
+                    type(exc).__name__,
+                    exc,
+                )
+                # Disable for the rest of the process — a flapping
+                # provider would otherwise spam the log every submit_market.
+                self._daily_pnl_provider = None
+                daily_pnl = Decimal("0")
+        else:
+            daily_pnl = Decimal("0")
+            if not self._warned_missing_daily_pnl:
+                logger.warning(
+                    "OrderFlow._portfolio_to_state_impl: daily_pnl_provider "
+                    "not configured — RISK_DAILY_LOSS guard will short-circuit "
+                    "to 0%% (issue #197). Pass a persistent daily-pnl tracker "
+                    "to enable real daily-loss-based kill-switching."
+                )
+                self._warned_missing_daily_pnl = True
+
         # The PortfolioState validator (src/risk/gate.py:168-171) requires
         # ``peak_equity >= total_equity``. If the persistent peak is BELOW
         # current NAV (cold start, deleted peak file, NAV jump), bump it
@@ -414,4 +466,5 @@ class OrderFlow:
             cash=free_cash,
             positions=positions,
             peak_equity=peak,
+            daily_pnl=daily_pnl,
         )

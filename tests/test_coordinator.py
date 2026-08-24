@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 from decimal import Decimal
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -360,6 +361,31 @@ class TestCoordinatorRiskCheck:
 
         assert allowed is True
         assert violations == ()
+
+    def test_risk_check_passes_daily_pnl_to_state(self) -> None:
+        """Issue #197: ``CoordinatorConfig.portfolio_daily_pnl`` must
+        flow into the ``PortfolioState`` passed to ``RiskGate``. The
+        pre-#197 production code built ``PortfolioState`` without
+        ``daily_pnl``, leaving it at the pydantic default of 0 and
+        silently short-circuiting ``_check_daily_loss``.
+        """
+        with patch("src.coordinator.RiskGate") as mock_gate_class:
+            mock_gate = MagicMock()
+            captured: dict[str, Any] = {}
+
+            def _capture(intent, state):
+                captured["daily_pnl"] = state.daily_pnl
+                captured["total_equity"] = state.total_equity
+                return MagicMock(allowed=True, violations=())
+
+            mock_gate.evaluate.side_effect = _capture
+            mock_gate_class.return_value = mock_gate
+
+            cfg = _config(portfolio_daily_pnl=Decimal("-4500"))
+            coord = Coordinator(cfg)
+            coord._risk_check()
+
+        assert captured["daily_pnl"] == Decimal("-4500")
 
 
 # -----------------------------------------------------------------------------

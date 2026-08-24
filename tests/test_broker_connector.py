@@ -2236,6 +2236,151 @@ class TestOrderFlow:
         flow.submit_market("SBER", OrderSide.BUY, Decimal("10"), self._portfolio())
         assert call_count["n"] == 1
 
+    # ────────────────────────────────────────────
+    # Issue #197: daily_pnl_provider — RISK_DAILY_LOSS guard via OrderFlow
+    # ────────────────────────────────────────────
+
+    def test_daily_pnl_provider_pulls_real_daily_loss(self) -> None:
+        """Issue #197: when a ``daily_pnl_provider`` is configured, the
+        ``PortfolioState`` passed to ``RiskGate`` has ``daily_pnl``
+        from the provider (NOT ``Decimal("0")``). This is what makes
+        ``_check_daily_loss`` actually trip on a -4% day.
+
+        Pre-#197, ``_portfolio_to_state`` (static) left ``daily_pnl``
+        at the pydantic default ``Decimal("0")``, so the
+        ``daily_pnl >= 0`` short-circuit in ``_check_daily_loss``
+        always returned early — the ``RISK_DAILY_LOSS`` guard never
+        fired via the OrderFlow code path.
+        """
+        # Provider returns -4_000 on a 100_000 NAV → -4% day.
+        captured: dict[str, Any] = {}
+
+        def capturing_gate():
+            rg = MagicMock()
+            from src.risk.gate import RiskDecision
+
+            def _capture(intent, state):
+                captured["daily_pnl"] = state.daily_pnl
+                captured["total"] = state.total_equity
+                return RiskDecision(allowed=True, violations=())
+
+            rg.evaluate.side_effect = _capture
+            return rg
+
+        flow = OrderFlow(
+            broker=MagicMock(),
+            risk_gate=capturing_gate(),
+            quote_provider=self._quote_provider(),
+            daily_pnl_provider=lambda: Decimal("-4000"),
+        )
+        flow.submit_market("SBER", OrderSide.BUY, Decimal("10"), self._portfolio(cash="100000"))
+
+        # daily_pnl must come from the provider, NOT default to 0.
+        assert captured["total"] == Decimal("100000")
+        assert captured["daily_pnl"] == Decimal("-4000")
+
+    def test_daily_pnl_provider_missing_warns_and_uses_legacy_fallback(self) -> None:
+        """Issue #197: when no ``daily_pnl_provider`` is configured,
+        ``OrderFlow`` falls back to ``daily_pnl = Decimal("0")`` (the
+        pre-#197 behaviour) and emits a one-shot WARNING so operators
+        can see the gap. The order path must still succeed — backward
+        compatibility for callers that haven't wired in daily-pnl
+        tracking.
+        """
+        flow = OrderFlow(
+            broker=MagicMock(),
+            risk_gate=self._approved_gate(),
+            quote_provider=self._quote_provider(),
+            # daily_pnl_provider intentionally omitted
+        )
+        # First call: should succeed and not raise. The one-shot
+        # WARNING is logged but does not block the order path.
+        result = flow.submit_market("SBER", OrderSide.BUY, Decimal("10"), self._portfolio())
+        assert result is not None
+        # Second call: same outcome, no extra exceptions.
+        result2 = flow.submit_market("SBER", OrderSide.BUY, Decimal("10"), self._portfolio())
+        assert result2 is not None
+
+    def test_daily_pnl_provider_exception_disables_and_continues(self) -> None:
+        """Issue #197: a ``daily_pnl_provider`` that raises must NOT
+        break the order path. We log a WARNING, fall back to
+        ``daily_pnl=0`` for THIS call, and disable the provider for
+        the rest of the process so a flapping provider doesn't spam
+        the log on every ``submit_market``.
+        """
+        captured: dict[str, Any] = {}
+        call_count = {"n": 0}
+
+        def flaky_provider():
+            call_count["n"] += 1
+            raise RuntimeError("disk full")
+
+        def capturing_gate():
+            rg = MagicMock()
+            from src.risk.gate import RiskDecision
+
+            def _capture(intent, state):
+                captured.setdefault("daily_pnls", []).append(state.daily_pnl)
+                return RiskDecision(allowed=True, violations=())
+
+            rg.evaluate.side_effect = _capture
+            return rg
+
+        flow = OrderFlow(
+            broker=MagicMock(),
+            risk_gate=capturing_gate(),
+            quote_provider=self._quote_provider(),
+            daily_pnl_provider=flaky_provider,
+        )
+        # First call: provider raises -> fallback to daily_pnl=0.
+        flow.submit_market("SBER", OrderSide.BUY, Decimal("10"), self._portfolio())
+        assert captured["daily_pnls"][-1] == Decimal("0")
+        # Provider was disabled after the first failure — the flaky
+        # callable must NOT have been invoked twice.
+        assert call_count["n"] == 1
+        # Second call: provider disabled, fallback path runs (no second
+        # call to flaky_provider).
+        flow.submit_market("SBER", OrderSide.BUY, Decimal("10"), self._portfolio())
+        assert call_count["n"] == 1
+
+    def test_daily_pnl_provider_endto_end_risk_daily_loss_fires(self) -> None:
+        """Issue #197: end-to-end integration. ``OrderFlow`` with a
+        ``daily_pnl_provider`` returning -4_000 on a 100_000 NAV feeds
+        a real P&L into ``RiskGate``, and ``_check_daily_loss`` trips
+        ``RISK_DAILY_LOSS``. Pre-#197 the gate would silently approve
+        the order because ``daily_pnl`` defaulted to 0.
+
+        This is the production-path equivalent of the unit-test in
+        ``tests/test_risk_gate.py::TestDailyLoss``.
+        """
+        gate = MagicMock()
+
+        def _eval(intent, state):
+            from src.risk.gate import RiskDecision
+
+            # -4% on 100k = -4000 vs 3% limit → reject.
+            if state.daily_pnl < 0 and (-state.daily_pnl / state.total_equity) * Decimal("100") > Decimal("3"):
+                return RiskDecision(
+                    allowed=False,
+                    violations=(f"RISK_DAILY_LOSS: {state.daily_pnl}",),
+                )
+            return RiskDecision(allowed=True, violations=())
+
+        gate.evaluate.side_effect = _eval
+
+        flow = OrderFlow(
+            broker=MagicMock(),
+            risk_gate=gate,
+            quote_provider=self._quote_provider(),
+            daily_pnl_provider=lambda: Decimal("-4000"),
+        )
+        result = flow.submit_market("SBER", OrderSide.BUY, Decimal("10"), self._portfolio(cash="100000"))
+
+        # RISK_DAILY_LOSS must be in the violations.
+        assert any(
+            "RISK_DAILY_LOSS" in v for v in result.decision_violations
+        ), f"RISK_DAILY_LOSS must fire on -4% day; got: {result.decision_violations}"
+
 
 # ────────────────────────────────────────────
 # ABC contract

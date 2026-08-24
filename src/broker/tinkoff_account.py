@@ -16,7 +16,7 @@ import json
 import logging
 import os
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import ROUND_DOWN, Decimal
 from typing import Any, Optional
 
@@ -103,6 +103,12 @@ class TinkoffAccount(BrokerAccount):
         # read once on construction and written on every successful
         # _fetch_real_portfolio_state() call (monotonically non-decreasing).
         peak_store_dir: Optional[str] = None,
+        # Issue #197: optional clock callable returning a tz-aware
+        # ``datetime``. Used by the daily-pnl tracker to compute
+        # "today" without patching the immutable ``datetime.datetime``
+        # module attribute. Tests inject a fixed clock; production
+        # callers leave it None (default: ``datetime.now(UTC)``).
+        clock: Optional[Any] = None,
     ):
         self._token = token
         self._account_id = account_id
@@ -131,6 +137,22 @@ class TinkoffAccount(BrokerAccount):
         self._peak_store_dir: str = peak_store_dir
         self._peak_equity_path: str = os.path.join(peak_store_dir, f"peak_equity_{account_id}.json")
         self._peak_equity: Decimal = self._load_peak_equity()
+        # Issue #197: daily-pnl tracker. Holds (previous_close_equity,
+        # previous_close_date) so _check_daily_loss in src/risk/gate.py
+        # can compute daily_pnl = current_NAV - previous_close_equity
+        # and trip the kill-switch on a -3% day. Without this, every
+        # production PortfolioState built for RiskGate has daily_pnl=0
+        # (the pydantic default), so the daily-loss guard never trips —
+        # same defect class as issue #195 (peak_equity) and issue #11
+        # (placeholder price). The file is best-effort: corrupt /
+        # missing / cold-start files all fall back to "no history yet",
+        # which means daily_pnl=0 for the first snapshot of the day and
+        # the guard kicks in starting with the second snapshot.
+        self._daily_pnl_path: str = os.path.join(peak_store_dir, f"daily_pnl_{account_id}.json")
+        self._daily_pnl_state: tuple[Decimal, date] = self._load_daily_pnl_state()
+        # Issue #197: tz-aware clock callable used for daily-pnl
+        # rollover decisions. Production: None → datetime.now(UTC).
+        self._clock = clock
 
     def _load_peak_equity(self) -> Decimal:
         """Read the persisted peak-equity high-water mark from disk.
@@ -179,6 +201,144 @@ class TinkoffAccount(BrokerAccount):
                 self._peak_equity_path,
                 e,
             )
+
+    # ------------------------------------------------------------------
+    # Issue #197: daily-pnl tracker — pairs with `_peak_equity` above.
+    # ------------------------------------------------------------------
+
+    def _load_daily_pnl_state(self) -> tuple[Decimal, date]:
+        """Read the persisted ``(previous_close_equity, previous_close_date)`` tuple.
+
+        Returns ``(Decimal("0"), date.min)`` on cold start, missing
+        file, corrupt JSON, or future date — the same defensive
+        behaviour as ``_load_peak_equity``. The sentinel
+        ``date.min`` is intentionally not equal to today, so the very
+        first call after a cold start will take the
+        "stamp previous_close = current NAV" branch (see
+        ``_compute_daily_pnl``) instead of computing a bogus P&L.
+        """
+        try:
+            with open(self._daily_pnl_path, "r") as fh:
+                data = json.load(fh)
+            equity = Decimal(str(data.get("previous_close_equity", "0")))
+            date_str = data.get("previous_close_date")
+            if not date_str or not isinstance(date_str, str):
+                return Decimal("0"), date.min
+            parsed_date = date.fromisoformat(date_str)
+            if equity < 0:
+                logger.warning(
+                    "Daily-pnl file %s has negative equity %s; treating as 0",
+                    self._daily_pnl_path,
+                    equity,
+                )
+                return Decimal("0"), date.min
+            return equity, parsed_date
+        except FileNotFoundError:
+            return Decimal("0"), date.min
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.warning(
+                "Daily-pnl file %s is corrupt (%s); starting from cold",
+                self._daily_pnl_path,
+                e,
+            )
+            return Decimal("0"), date.min
+
+    def _save_daily_pnl_state(self, equity: Decimal, stamp_date: date) -> None:
+        """Persist the ``(previous_close_equity, previous_close_date)`` tuple.
+
+        Best-effort: an OSError here is logged but does not raise. The
+        in-memory tuple is the source of truth for the current
+        process; on the next start it's reloaded from disk.
+        """
+        try:
+            os.makedirs(self._peak_store_dir, exist_ok=True)
+            with open(self._daily_pnl_path, "w") as fh:
+                json.dump(
+                    {
+                        "previous_close_equity": str(equity),
+                        "previous_close_date": stamp_date.isoformat(),
+                    },
+                    fh,
+                )
+        except OSError as e:
+            logger.warning(
+                "Failed to persist daily-pnl state to %s: %s",
+                self._daily_pnl_path,
+                e,
+            )
+
+    def _compute_daily_pnl(self, current_equity: Decimal, today: date) -> tuple[Decimal, bool]:
+        """Compute ``daily_pnl`` for the gate, refreshing the on-disk pivot.
+
+        Returns ``(daily_pnl, refreshed)`` where ``refreshed=True`` means
+        the tracker stamped a new ``previous_close_equity`` (either a
+        cold start or a calendar rollover) and the call that triggered
+        this should treat ``daily_pnl == 0`` as "no history for today
+        yet" rather than as a real profit.
+
+        Calendar model (issue #197):
+          - On the first snapshot of a new trading day, the previous
+            trading day's closing NAV becomes the new
+            ``previous_close_equity``. ``daily_pnl = 0`` for that
+            snapshot — we have no "yesterday close" reference yet, so
+            the kill-switch is intentionally silent on the very first
+            tick of the day (same as the existing ``daily_pnl >= 0``
+            short-circuit in ``_check_daily_loss``).
+          - On every subsequent snapshot of the same day,
+            ``daily_pnl = current_equity - previous_close_equity``. A
+            -3% day will trip the kill-switch on the second snapshot
+            onward, as designed.
+          - A weekend / holiday rollover means the gap may be larger
+            than a single day, but the math still holds — any P&L
+            since the last close is what ``_check_daily_loss`` needs.
+
+        Trading-hour granularity: the file's stamp is calendar-date,
+        not minute-level. Intra-day ``previous_close_equity`` rolls
+        forward once per calendar date, matching the gate's intent
+        ("kill if today's drawdown vs. yesterday's close > limit").
+        """
+        prev_equity, prev_date = self._daily_pnl_state
+        # Calendar rollover or cold start: stamp a new pivot.
+        # On a cold start, prev_equity == 0 and prev_date == date.min,
+        # so the comparison `prev_date != today` is True and we take
+        # the "first snapshot of the day" path.
+        if prev_date != today:
+            self._daily_pnl_state = (current_equity, today)
+            # Best-effort persist. ``_save_daily_pnl_state`` already
+            # catches OSError, but a JSONEncodeError / programming
+            # bug in the dump path must NOT break the order — log
+            # and continue. The in-memory state is already updated
+            # above, so the current process sees the new pivot;
+            # the next process startup may re-load an older pivot
+            # from disk and re-stamp on the first call.
+            try:
+                self._save_daily_pnl_state(current_equity, today)
+            except Exception as exc:  # noqa: BLE001 — best-effort persist, see issue #197
+                logger.warning(
+                    "Failed to persist daily-pnl pivot (issue #197): %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
+            return Decimal("0"), True
+        # Same-day subsequent snapshot: real P&L vs. the stamped pivot.
+        return current_equity - prev_equity, False
+
+    def _fetch_daily_pnl(self, current_equity: Decimal) -> Decimal:
+        """Public wrapper used by integration tests / OrderFlow path.
+
+        Uses ``datetime.now(timezone.utc).date()`` as the trading-day
+        key. Callers that need a deterministic date for testing can
+        drive ``_compute_daily_pnl`` directly. This wrapper exists so
+        that ``OrderFlow.daily_pnl_provider`` can call
+        ``tinker._fetch_daily_pnl(nav)`` and stay agnostic of the
+        rollover semantics.
+        """
+        if self._clock is not None:
+            today = self._clock().date()
+        else:
+            today = datetime.now(timezone.utc).date()
+        pnl, _refreshed = self._compute_daily_pnl(current_equity, today)
+        return pnl
 
     def is_sandbox(self) -> bool:
         """Sandbox if token starts with 't.' (Tinkoff convention)."""
@@ -319,6 +479,19 @@ class TinkoffAccount(BrokerAccount):
         if snapshot.cash > self._peak_equity:
             self._peak_equity = snapshot.cash
             self._save_peak_equity()
+        # Issue #197: compute daily_pnl from the persisted
+        # ``previous_close_equity`` so ``_check_daily_loss`` in
+        # ``src/risk/gate.py`` actually has a real P&L figure to
+        # evaluate. Without this, ``state.daily_pnl`` defaults to
+        # ``Decimal("0")`` and the gate short-circuits — the daily-loss
+        # kill-switch is silently a no-op in production.
+        # Use ``self._clock`` if configured (test injection), else
+        # fall back to ``datetime.now(UTC).date()`` in production.
+        if self._clock is not None:
+            today = self._clock().date()
+        else:
+            today = datetime.now(timezone.utc).date()
+        daily_pnl = self._compute_daily_pnl(snapshot.cash, today)[0]
         # Issue #191: derive free cash as `NAV − Σ(quantity × avg_price)`
         # so `PortfolioState.cash` reflects tradeable cash, not NAV. The
         # bug is latent today (no `_check_*` in `src/risk/gate.py` reads
@@ -343,6 +516,7 @@ class TinkoffAccount(BrokerAccount):
             cash=free_cash,
             positions=[_broker_position_to_gate_position(p) for p in snapshot.positions],
             peak_equity=self._peak_equity,
+            daily_pnl=daily_pnl,
         )
 
     def get_portfolio(self) -> PortfolioSnapshot:

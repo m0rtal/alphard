@@ -103,6 +103,10 @@ class CoordinatorConfig:
     portfolio_equity: Decimal
     portfolio_cash: Decimal
     portfolio_peak: Decimal
+    # Issue #197: today realised + unrealised P&L, defaults to 0 so
+    # the example_main pre-trade risk check evaluates a real figure
+    # rather than silently tripping the daily-loss short-circuit.
+    portfolio_daily_pnl: Decimal = Decimal("0")
 
     # Data loader parameters
     fetch_lookback_days: int = 5 * 365
@@ -451,6 +455,11 @@ class Coordinator:
             cash=self.config.portfolio_cash,
             positions=[],
             peak_equity=self.config.portfolio_peak,
+            # Issue #197: pass daily_pnl through to the gate so the
+            # daily-loss check is wired up. CoordinatorConfig now
+            # carries the field; production entry points should set
+            # it from TinkoffAccount._fetch_daily_pnl.
+            daily_pnl=self.config.portfolio_daily_pnl,
         )
         decision = self._gate.evaluate(intent, state)
         return decision.allowed, decision.violations
