@@ -447,6 +447,41 @@ class Coordinator:
         # RiskLimits are applied to both the gate stage and the broker
         # stage. Previously each stage constructed its own gate, which
         # caused drift if the config changed between stages.
+        #
+        # Maintainer fix (issue #211): pre-validate ``limit_price > 0``
+        # BEFORE constructing ``TradeIntent``. ``TradeIntent.price`` is
+        # declared ``gt=Decimal("0")`` in ``src/risk/gate.py`` so a
+        # market-order-style ``limit_price=Decimal("0")`` would raise
+        # ``pydantic_core.ValidationError`` from inside the gate
+        # construction — which is then caught by the broad
+        # ``except Exception`` in ``run_once()`` and reported as
+        # ``RISK_EXCEPTION``. That conflates a programmer / config
+        # error with a gate crash: a downstream operator looking at the
+        # audit log cannot tell whether the gate misbehaved or the
+        # CoordinatorConfig was wired with the wrong field.
+        #
+        # Same exploit class as historical issues #11 / #13 / #98:
+        # a sentinel value (here ``limit_price=0``) silently bypassing
+        # a structural check because the failure mode is too generic.
+        # We now surface it as a structured ``RISK_LIMIT_PRICE_INVALID``
+        # violation, and the gate's normal decision pipeline stays
+        # untouched for valid inputs.
+        #
+        # Future (not in this fix): ``Coordinator`` always submits a
+        # ``MarketOrder`` to the broker, which fetches a live quote
+        # before evaluating risk. Aligning the Coordinator's pre-broker
+        # risk check with the live quote is a separate Phase 2.10 task
+        # (see ``docs/decisions/``); for now we require an explicit,
+        # positive limit price at the Coordinator layer and let the
+        # broker-side live quote override at execution time.
+        if self.config.limit_price <= Decimal("0"):
+            return False, (
+                "RISK_LIMIT_PRICE_INVALID: CoordinatorConfig.limit_price "
+                f"={self.config.limit_price!s} is not > 0; TradeIntent.price "
+                "requires a positive limit/market reference price. "
+                "Operator must supply a real price or wire a live-quote "
+                "provider (see Phase 2.10).",
+            )
         intent = TradeIntent(
             symbol=self.config.ticker,
             side=self.config.side.value,
