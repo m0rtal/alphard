@@ -909,6 +909,233 @@ class TestGrafanaPortability:
         )
 
 
+class TestGrafanaProvisioning:
+    """Issue #216 — sister-bug to PR #148. PR #148 parameterised the
+    ``/var/lib/grafana`` data bind-mount via ``APPDATA_DIR`` (default
+    ``/srv/alphard``) and added a one-shot ``grafana-init`` leaf-prep
+    service. But two more grafana bind-mounts were LEFT on relative
+    paths:
+
+      * ``./docker/grafana/provisioning:/etc/grafana/provisioning:ro``
+      * ``./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro``
+
+    Why this breaks Portainer standalone StackUpdate: Portainer's REST
+    render strips the cwd prefix from relative bind paths, so the
+    resulting container-level bind resolves against the wrong host
+    directory. On .107 that meant the bind-mount leaves disappeared,
+    grafana's provisioning loader read an empty directory inside the
+    container, and ``/api/search?type=dash-db`` returned ``[]`` —
+    health=ok, datasource=Prometheus online, but zero dashboards
+    visible to operators.
+
+    The fix mirrors #148 exactly: parameterise both bind sources via
+    ``${APPDATA_DIR:-/srv/alphard}/grafana/{provisioning,dashboards}``
+    and extend ``grafana-init`` to mkdir + chown 472:472 the two new
+    leaves before grafana starts.
+
+    Why the leaves MUST be seeded (not just declared):
+      On a fresh host the ``${APPDATA_DIR}/grafana/provisioning`` and
+      ``${APPDATA_DIR}/grafana/dashboards`` paths don't exist yet —
+      docker creates the bind-mount but grafana can't read/write an
+      empty dir tree owned by root. Same leaf-prep contract as
+      ``/var/lib/grafana``: a one-shot init container owns the
+      directory creation + ownership fix; idempotent on re-runs.
+    """
+
+    def _grafana_volumes(self) -> list:
+        data = _load_compose()
+        grafana = data["services"]["grafana"]
+        return grafana.get("volumes", [])
+
+    @staticmethod
+    def _split_mount(v: str) -> tuple[str, str] | None:
+        """Split a short-form compose volume string ``src:dst[:ro|rw]``
+        into ``(src, dst)``.
+
+        Important: the host path can itself contain ``:`` (the
+        ``${APPDATA_DIR:-/srv/alphard}`` default has one). So
+        ``partition(":")`` is wrong — it splits on the FIRST colon.
+        Strategy: strip a trailing mode flag (``:ro`` or ``:rw``) if
+        present, then rsplit with maxsplit=1 on the remaining string.
+        """
+        if not isinstance(v, str) or ":" not in v:
+            return None
+        # Strip optional mode flag at the tail — only ":ro" or ":rw".
+        stripped = v
+        if v.endswith(":ro") or v.endswith(":rw"):
+            stripped = v[:-3]
+        # Now the last colon separates src from dst.
+        src, _, dst = stripped.rpartition(":")
+        if not src or not dst:
+            return None
+        return src, dst
+
+    def test_provisioning_bind_uses_appdata_dir(self) -> None:
+        """The grafana ``/etc/grafana/provisioning`` bind-mount source
+        MUST flow through ``${APPDATA_DIR:-/srv/alphard}/grafana/provisioning``
+        — never a relative ``./docker/grafana/provisioning`` path.
+
+        Relative bind-mounts break Portainer standalone StackUpdate
+        because the REST render strips the cwd prefix (issue #216
+        production observation on .107: ``/api/search?type=dash-db``
+        returned ``[]`` after StackUpdate from main HEAD).
+        """
+        volumes = self._grafana_volumes()
+        provisioning_mounts = []
+        for v in volumes:
+            if isinstance(v, str):
+                parts = self._split_mount(v)
+                if parts and parts[1] == "/etc/grafana/provisioning":
+                    provisioning_mounts.append(v)
+            elif isinstance(v, dict) and v.get("target") == "/etc/grafana/provisioning":
+                provisioning_mounts.append(v)
+        assert provisioning_mounts, (
+            "grafana must mount /etc/grafana/provisioning; cannot test "
+            "APPDATA_DIR parameterisation without a mount target"
+        )
+        mount_strs = [str(v) for v in provisioning_mounts]
+        relative = [v for v in mount_strs if "./docker/" in v or v.startswith("./")]
+        appdata_param = [v for v in mount_strs if "APPDATA_DIR" in v]
+        assert not relative, (
+            f"grafana /etc/grafana/provisioning mount source is relative "
+            f"('./docker/grafana/provisioning') — breaks Portainer "
+            f"standalone StackUpdate. Use "
+            f"${{APPDATA_DIR:-/srv/alphard}}/grafana/provisioning instead. "
+            f"Found: {relative}"
+        )
+        assert appdata_param, (
+            f"grafana /etc/grafana/provisioning mount must use "
+            f"${{APPDATA_DIR:-/srv/alphard}} as the source. "
+            f"Found: {mount_strs}"
+        )
+
+    def test_dashboards_bind_uses_appdata_dir(self) -> None:
+        """The grafana ``/var/lib/grafana/dashboards`` bind-mount source
+        MUST flow through ``${APPDATA_DIR:-/srv/alphard}/grafana/dashboards``
+        — same Portainer standalone contract as provisioning (issue #216).
+        """
+        volumes = self._grafana_volumes()
+        dashboards_mounts = []
+        for v in volumes:
+            if isinstance(v, str):
+                parts = self._split_mount(v)
+                if parts and parts[1] == "/var/lib/grafana/dashboards":
+                    dashboards_mounts.append(v)
+            elif isinstance(v, dict) and v.get("target") == "/var/lib/grafana/dashboards":
+                dashboards_mounts.append(v)
+        assert dashboards_mounts, (
+            "grafana must mount /var/lib/grafana/dashboards; cannot "
+            "test APPDATA_DIR parameterisation without a mount target"
+        )
+        mount_strs = [str(v) for v in dashboards_mounts]
+        relative = [v for v in mount_strs if "./docker/" in v or v.startswith("./")]
+        appdata_param = [v for v in mount_strs if "APPDATA_DIR" in v]
+        assert not relative, (
+            f"grafana /var/lib/grafana/dashboards mount source is relative "
+            f"('./docker/grafana/dashboards') — breaks Portainer "
+            f"standalone StackUpdate. Use "
+            f"${{APPDATA_DIR:-/srv/alphard}}/grafana/dashboards instead. "
+            f"Found: {relative}"
+        )
+        assert appdata_param, (
+            f"grafana /var/lib/grafana/dashboards mount must use "
+            f"${{APPDATA_DIR:-/srv/alphard}} as the source. "
+            f"Found: {mount_strs}"
+        )
+
+    def test_no_relative_docker_grafana_volumes(self) -> None:
+        """Wider regression guard: NO service in the compose may
+        bind-mount from ``./docker/grafana/...`` (issue #216).
+
+        Any such bind that lands inside the grafana container is a
+        silent footgun: relative paths resolve against the cwd at the
+        moment of compose render, which Portainer standalone does NOT
+        preserve across StackUpdate. The fix is to funnel every
+        grafana-side bind through ``${APPDATA_DIR}`` so an operator
+        can override via a single stack Env.
+        """
+        data = _load_compose()
+        offenders = []
+        for svc_name, svc in data["services"].items():
+            for v in svc.get("volumes", []):
+                src = None
+                if isinstance(v, str):
+                    parts = self._split_mount(v)
+                    if parts:
+                        src = parts[0]
+                elif isinstance(v, dict):
+                    src = v.get("source")
+                if isinstance(src, str) and ("./docker/grafana" in src or src.startswith("./docker/grafana")):
+                    offenders.append((svc_name, src))
+        assert not offenders, (
+            "No service may bind-mount from ./docker/grafana/... — "
+            "relative paths break Portainer standalone StackUpdate "
+            "(issue #216: /api/search?type=dash-db returned []). "
+            "Use ${APPDATA_DIR:-/srv/alphard}/grafana/... instead. "
+            f"Found offenders: {offenders}"
+        )
+
+    def test_grafana_init_seeds_provisioning_and_dashboards_leaves(self) -> None:
+        """grafana-init must mkdir + chown 472:472 the provisioning
+        and dashboards leaves, not just the data leaf.
+
+        Sister-check to ``test_grafana_init_service_exists`` from
+        ``TestGrafanaPortability``: that test only verifies the data
+        leaf. Issue #216 proves we need the same leaf-prep contract
+        for provisioning/ and dashboards/ — otherwise on first-shot
+        install the bind-mounts bind to non-existent host paths and
+        Docker creates empty directories owned by root, which grafana
+        (running as 472) can't read.
+        """
+        data = _load_compose()
+        init_svc = data["services"].get("grafana-init")
+        assert init_svc is not None, "grafana-init service must exist"
+        # Compose inline entrypoint is loaded as a list whose last
+        # element is the shell script body. Walk every entrypoint arg
+        # and grep the script body for the required mkdir + chown calls.
+        entrypoint = init_svc.get("entrypoint", [])
+        # entrypoint is shaped ["sh", "-c", "<script>"] — script is the
+        # last element. YAML may also collapse to a single string under
+        # some edge loaders; handle both.
+        script = ""
+        if isinstance(entrypoint, list) and entrypoint:
+            script = str(entrypoint[-1])
+        elif isinstance(entrypoint, str):
+            script = entrypoint
+        assert script, f"grafana-init.entrypoint must include a shell script; got: {entrypoint!r}"
+        # Required mkdir targets — these are the new leaves introduced
+        # by issue #216. The original $APPDATA_DIR/grafana mkdir is
+        # already covered by TestGrafanaPortability so we don't re-check
+        # it here.
+        required_dirs = (
+            "$APPDATA_DIR/grafana/provisioning",
+            "$APPDATA_DIR/grafana/provisioning/dashboards",
+            "$APPDATA_DIR/grafana/provisioning/datasources",
+            "$APPDATA_DIR/grafana/dashboards",
+        )
+        missing = [d for d in required_dirs if d not in script]
+        assert not missing, (
+            f"grafana-init script must mkdir each bind-mount leaf so "
+            f"the bind target exists on first-shot install. Missing: "
+            f"{missing}. Script:\n{script}"
+        )
+        # Required chown: at minimum the two new leaves (provisioning
+        # and dashboards) must be chown'd to 472:472 — that's what
+        # grafana needs to read its provisioning config + dashboard
+        # JSONs as the grafana user. Recursive chown of the data leaf
+        # is already verified by TestGrafanaPortability's
+        # test_grafana_init_service_exists.
+        required_chowns = (
+            "$APPDATA_DIR/grafana/provisioning",
+            "$APPDATA_DIR/grafana/dashboards",
+        )
+        missing_chowns = [c for c in required_chowns if c not in script]
+        assert not missing_chowns, (
+            f"grafana-init script must chown 472:472 each bind-mount "
+            f"leaf. Missing: {missing_chowns}. Script:\n{script}"
+        )
+
+
 class TestPortainerStandaloneEnv:
     """Issue 2026-08-22 #149 — Portainer standalone does NOT propagate
     stack-level Env vars into service-level environment unless the

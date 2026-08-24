@@ -416,10 +416,27 @@ services:
         # selfhosted fleet: honcho, forgejo, immich, paperclip, bitmagnet,
         # minecraft, etc.). Default /srv/alphard works for any LXC/VM.
         mkdir -p "$$APPDATA_DIR/grafana"
+        # BUGFIX (issue #216): sister-bug to PR #148. The /var/lib/grafana
+        # bind was parameterised in #148, but provisioning/ and dashboards/
+        # were still on relative ./docker/grafana/... bind-mounts. Portainer
+        # standalone StackUpdate drops cwd → bind-mount leaves disappear
+        # → /api/search returns []. Seed both leaves here so the bind
+        # targets exist with the right ownership BEFORE grafana starts.
+        mkdir -p "$$APPDATA_DIR/grafana/provisioning/dashboards" \
+                 "$$APPDATA_DIR/grafana/provisioning/datasources" \
+                 "$$APPDATA_DIR/grafana/dashboards"
         # UID/GID 472 = grafana user inside the grafana/grafana image;
-        # only chown the leaf root, not the contents (preserves any
-        # dashboards the operator provisioned by hand).
-        chown 472:472 "$$APPDATA_DIR/grafana"
+        # only chown the leaf roots, not the contents (preserves any
+        # dashboards / provisioning the operator provisioned by hand).
+        # Recursive chown on the leaves is safe — they were just mkdir'd
+        # empty by this very script on first-shot install; on subsequent
+        # deploys the operator-owned content is preserved (already correct
+        # UID:GID because grafana writes as 472).
+        chown 472:472 "$$APPDATA_DIR/grafana" \
+                      "$$APPDATA_DIR/grafana/provisioning" \
+                      "$$APPDATA_DIR/grafana/provisioning/dashboards" \
+                      "$$APPDATA_DIR/grafana/provisioning/datasources" \
+                      "$$APPDATA_DIR/grafana/dashboards"
         echo "[grafana-init] OK: $$APPDATA_DIR/grafana owned by 472:472"
     volumes:
       - ${APPDATA_DIR_HOST:-/srv/alphard}:${APPDATA_DIR:-/srv/alphard}
@@ -443,8 +460,18 @@ services:
     user: "472:472"
     volumes:
       - ${APPDATA_DIR:-/srv/alphard}/grafana:/var/lib/grafana
-      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      # BUGFIX (issue #216): sister-bug to PR #148. The /var/lib/grafana
+      # data dir was parameterised in #148, but provisioning/ and
+      # dashboards/ were still on relative ./docker/grafana/... bind-mounts.
+      # Portainer standalone StackUpdate drops cwd (REST render strips the
+      # relative path prefix), so the bind-mounts resolved against the
+      # wrong host directory → provisioning reads an empty directory
+      # inside the container → /api/search?type=dash-db returns [].
+      # Mirroring the /var/lib/grafana fix: parameterise via APPDATA_DIR
+      # and seed the leaves from grafana-init so they exist with the
+      # correct UID:GID (472:472) on first-shot install.
+      - ${APPDATA_DIR:-/srv/alphard}/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ${APPDATA_DIR:-/srv/alphard}/grafana/dashboards:/var/lib/grafana/dashboards:ro
     depends_on:
       - prometheus
       - grafana-init
