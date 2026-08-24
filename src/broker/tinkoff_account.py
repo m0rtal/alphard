@@ -319,9 +319,28 @@ class TinkoffAccount(BrokerAccount):
         if snapshot.cash > self._peak_equity:
             self._peak_equity = snapshot.cash
             self._save_peak_equity()
+        # Issue #191: derive free cash as `NAV − Σ(quantity × avg_price)`
+        # so `PortfolioState.cash` reflects tradeable cash, not NAV. The
+        # bug is latent today (no `_check_*` in `src/risk/gate.py` reads
+        # `state.cash`), but the field's semantic contract is "tradeable
+        # cash"; a future cash-adequacy / buy-in-cash cap would silently
+        # over-approve against NAV if this fix is missing. Use the same
+        # `quantity × avg_price` formula already used by
+        # `Position.market_value` at `src/risk/gate.py:135-137` so the
+        # math stays consistent with `_check_sector_exposure`.
+        positions_value = sum(
+            (p.quantity * p.avg_price for p in snapshot.positions),
+            Decimal("0"),
+        )
+        free_cash = snapshot.cash - positions_value
+        if free_cash < Decimal("0"):
+            # Tinkoff contract guarantees positions ≤ NAV, but a partial /
+            # synthetic snapshot could exceed it; clamp rather than let
+            # `PortfolioState.cash` ValidationError (`ge=Decimal("0")`).
+            free_cash = Decimal("0")
         return PortfolioState(
             total_equity=snapshot.cash,  # Tinkoff returns total_amount_currencies as cash-side NAV
-            cash=snapshot.cash,
+            cash=free_cash,
             positions=[_broker_position_to_gate_position(p) for p in snapshot.positions],
             peak_equity=self._peak_equity,
         )

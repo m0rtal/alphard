@@ -270,23 +270,45 @@ class OrderFlow:
             )
             for p in portfolio.positions
         ]
-        # Issue #180: `portfolio.cash` is the full NAV, not free cash — see
+        # Issue #180 + #191: `portfolio.cash` is the full NAV, not free cash — see
         # `src/broker/tinkoff_account.py:381-410`, where TinkoffAccount
         # fills `PortfolioSnapshot.cash = total_amount_currencies` (the
         # Tinkoff SDK field that reports NAV = cash + positions at mark).
-        # Adding `sum(p.quantity * p.avg_price)` on top double-counts the
-        # positions: `total = NAV + positions_value` inflates equity by
-        # the position book size, which makes RiskGate.position_pct half
-        # of its true value, which silently approves positions up to 2x
-        # the configured position limit (issue #11 class).
         #
-        # Fix: use `portfolio.cash` as total_equity directly. It is
-        # already NAV (per the TinkoffAccount contract). Do not add
-        # positions.value on top.
+        # Issue #180 fix: use `portfolio.cash` as `total_equity` directly.
+        # Do not add `sum(p.quantity * p.avg_price)` on top — that would
+        # double-count positions and inflate equity by the position book
+        # size, silently approving positions up to 2x the configured
+        # position limit (issue #11 class).
+        #
+        # Issue #191 fix: derive `cash` as **free cash** (NAV minus the
+        # value of open positions at avg_price). The previous code passed
+        # NAV straight through into `PortfolioState.cash`, which conflates
+        # NAV with free cash. The bug is latent today (no `_check_*` in
+        # `src/risk/gate.py` reads `state.cash`), but any future check that
+        # treats `state.cash` as tradeable cash (cash-adequacy gate,
+        # buy-in-cash cap, audit log) would silently over-approve by
+        # treating NAV as the actually-tradeable amount. Use the same
+        # `quantity * avg_price` formula already used by
+        # `Position.market_value` at `src/risk/gate.py:135-137` so the
+        # math stays consistent with `_check_sector_exposure`.
         total = portfolio.cash
+        positions_value = sum(
+            (p.quantity * p.avg_price for p in portfolio.positions),
+            Decimal("0"),
+        )
+        # Free cash cannot be negative by the Tinkoff contract (positions
+        # are always ≤ NAV), but a synthetic snapshot with positions
+        # exceeding NAV would produce a negative value. PortfolioState.cash
+        # is `Field(..., ge=Decimal("0"))`, so clamp to zero rather than
+        # letting pydantic raise ValidationError — the clamp also makes
+        # the audit log stable.
+        free_cash = portfolio.cash - positions_value
+        if free_cash < Decimal("0"):
+            free_cash = Decimal("0")
         return PortfolioState(
             total_equity=total,
-            cash=portfolio.cash,
+            cash=free_cash,
             positions=positions,
             peak_equity=total,
         )

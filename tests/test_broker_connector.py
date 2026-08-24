@@ -1495,6 +1495,14 @@ class TestOrderFlow:
         assert OrderStatus.REJECTED in result.submitted
 
     def test_portfolio_to_state_conversion(self):
+        """Issue #180 + #191: PortfolioState.cash is free cash, not NAV.
+
+        PortfolioSnapshot.cash carries the Tinkoff NAV (cash + positions at mark).
+        The cash field of PortfolioState is free cash = NAV − Σ(positions.value).
+        For a NAV of 50_000 with one position worth 25_000, free cash is 25_000.
+        Issue #180 fix sets `total_equity == NAV` (not NAV + positions.value, which
+        would double-count); issue #191 fix sets `cash == NAV − positions.value`.
+        """
         portfolio = PortfolioSnapshot(
             account_id="SB1",
             cash=Decimal("50000"),
@@ -1504,7 +1512,8 @@ class TestOrderFlow:
             timestamp=datetime.utcnow(),
         )
         state = OrderFlow._portfolio_to_state(portfolio)
-        assert state.cash == Decimal("50000")
+        # Issue #191: free cash, not NAV.
+        assert state.cash == Decimal("25000")  # 50_000 NAV − 100*250 = 25_000
         assert len(state.positions) == 1
         assert state.positions[0].symbol == "SBER"
         # Issue #180 regression guard: total_equity is NAV (which is what
@@ -1513,6 +1522,7 @@ class TestOrderFlow:
         # is 50_000 (acting as NAV in the Tinkoff contract), so
         # total_equity must be 50_000, NOT 50_000 + 100*250 = 75_000.
         assert state.total_equity == Decimal("50000")
+        assert state.peak_equity == Decimal("50000")
 
     def test_portfolio_to_state_does_not_double_count_positions(self) -> None:
         """Issue #180: ``PortfolioSnapshot.cash`` is NAV, not free cash.
@@ -1551,6 +1561,93 @@ class TestOrderFlow:
         assert len(state.positions) == 1
         assert state.positions[0].symbol == "SBER"
         assert state.positions[0].quantity == Decimal("1000")
+
+    def test_portfolio_to_state_cash_equals_nav_when_no_positions(self) -> None:
+        """Issue #191: when positions is empty, free cash == NAV (positions.value == 0).
+
+        Edge case for the new `cash = NAV − positions_value` formula.
+        Guards the post-fix against a future refactor that drops the empty-positions
+        fast-path.
+        """
+        portfolio = PortfolioSnapshot(
+            account_id="SB1",
+            cash=Decimal("250000"),
+            positions=[],
+            timestamp=datetime.utcnow(),
+        )
+        state = OrderFlow._portfolio_to_state(portfolio)
+        # Empty book → positions_value = 0 → free_cash = NAV.
+        assert state.total_equity == Decimal("250000")
+        assert state.peak_equity == Decimal("250000")
+        assert state.cash == Decimal("250000")
+        assert state.positions == []
+
+    def test_portfolio_to_state_cash_zero_when_positions_fill_nav(self) -> None:
+        """Issue #191: positions exactly equal NAV → free cash == 0 (fully invested).
+
+        Operator-meaningful: 100% invested book → no free cash to deploy on a new BUY.
+        A future `_check_cash_adequacy` would correctly reject any BUY with non-zero
+        notional against this state. Pre-fix #191, `state.cash` wrongly reported
+        NAV (1_000_000), so a cap like "BUY ≤ 50% of cash" would silently allow
+        a BUY up to 500_000 against a fully-invested book.
+        """
+        portfolio = PortfolioSnapshot(
+            account_id="SB1",
+            cash=Decimal("1000000"),  # NAV
+            positions=[
+                Position(ticker="SBER", quantity=Decimal("1000"), avg_price=Decimal("1000")),
+            ],
+            timestamp=datetime.utcnow(),
+        )
+        state = OrderFlow._portfolio_to_state(portfolio)
+        assert state.total_equity == Decimal("1000000")
+        assert state.cash == Decimal("0")  # 1_000_000 − 1_000*1_000 = 0
+
+    def test_portfolio_to_state_cash_clamped_when_positions_exceed_nav(self) -> None:
+        """Issue #191: positions_value > NAV (synthetic) → free cash clamped at 0.
+
+        Tinkoff contract guarantees positions ≤ NAV, but a partial / mock snapshot
+        (or a stale avg_price from a pre-split mark) can produce a transient
+        positions_value > NAV. Without clamping, ``PortfolioState.cash`` would
+        raise ``pydantic.ValidationError`` (``ge=Decimal("0")``); the clamp keeps
+        the audit log stable and surfaces the over-invested state with cash == 0.
+        """
+        portfolio = PortfolioSnapshot(
+            account_id="SB1",
+            cash=Decimal("1000000"),  # NAV
+            positions=[
+                # 1500 * 1000 = 1_500_000 > 1_000_000 — synthetic over-invested state.
+                Position(ticker="SBER", quantity=Decimal("1500"), avg_price=Decimal("1000")),
+            ],
+            timestamp=datetime.utcnow(),
+        )
+        state = OrderFlow._portfolio_to_state(portfolio)
+        # total_equity stays at NAV; only the free-cash field is clamped.
+        assert state.total_equity == Decimal("1000000")
+        assert state.cash == Decimal("0")  # clamped, not -500_000
+
+    def test_portfolio_to_state_cash_aggregates_multiple_positions(self) -> None:
+        """Issue #191: free cash sums across all positions, not just one symbol.
+
+        A multi-symbol book must produce `free_cash = NAV − Σ(qty*price)` over
+        every position, matching the `_check_sector_exposure` accumulation in
+        `src/risk/gate.py:386`. Catches a regression where the new formula
+        windowed by `min(positions, 1)` and silently dropped the rest.
+        """
+        portfolio = PortfolioSnapshot(
+            account_id="SB1",
+            cash=Decimal("1000000"),  # NAV
+            positions=[
+                Position(ticker="SBER", quantity=Decimal("100"), avg_price=Decimal("300")),  # 30_000
+                Position(ticker="GAZP", quantity=Decimal("200"), avg_price=Decimal("150")),  # 30_000
+                Position(ticker="YNDX", quantity=Decimal("50"), avg_price=Decimal("800")),  # 40_000
+            ],
+            timestamp=datetime.utcnow(),
+        )
+        state = OrderFlow._portfolio_to_state(portfolio)
+        # 1_000_000 − 30_000 − 30_000 − 40_000 = 900_000.
+        assert state.cash == Decimal("900000")
+        assert len(state.positions) == 3
 
     def test_portfolio_to_state_empty_positions_total_equals_cash(self) -> None:
         """Issue #180 (edge case): no positions → total_equity == cash.
