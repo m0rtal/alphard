@@ -1,0 +1,12 @@
+============================= test session starts ==============================
+collecting ... collected 7 items
+
+tests/test_compose_structure.py::TestPrometheusLXC::test_prometheus_no_legacy_bind_mount_on_data PASSED [ 14%]
+tests/test_compose_structure.py::TestPrometheusLXC::test_prometheus_data_is_named_volume PASSED [ 28%]
+tests/test_compose_structure.py::TestPrometheusLXC::test_prometheus_named_volume_declared_top_level PASSED [ 42%]
+tests/test_compose_structure.py::TestPrometheusLXC::test_prometheus_entrypoint_chowns_nobody PASSED [ 57%]
+tests/test_compose_structure.py::TestPrometheusLXC::test_prometheus_data_tmpfs_size_documented PASSED [ 71%]
+tests/test_compose_structure.py::TestPrometheusLXC::test_prometheus_config_inlined_via_b64_env PASSED [ 85%]
+tests/test_compose_structure.py::TestPrometheusLXC::test_prometheus_exposes_port_9090 PASSED [100%]
+
+============================== 7 passed in 0.60s ===============================

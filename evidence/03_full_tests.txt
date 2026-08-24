@@ -1,0 +1,40 @@
+y", line 1955, in _execute_child
+      raise child_exception_type(errno_num, err_msg, err_filename)
+  FileNotFoundError: [Errno 2] No such file or directory: '/app'
+  
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+    warnings.warn(pytest.PytestUnhandledThreadExceptionWarning(msg))
+
+tests/test_peak_equity_tracker.py::TestZeroNavPortfolioState::test_missing_total_amount_currencies_logs_warning
+tests/test_peak_equity_tracker.py::TestZeroNavPortfolioState::test_missing_total_amount_currencies_logs_warning
+  <string>:10: DeprecationWarning: GetCandlesRequest.figi is deprecated
+
+tests/test_peak_equity_tracker.py::TestZeroNavPortfolioState::test_missing_total_amount_currencies_logs_warning
+tests/test_peak_equity_tracker.py::TestZeroNavPortfolioState::test_missing_total_amount_currencies_logs_warning
+  <string>:6: DeprecationWarning: GetOrderBookRequest.figi is deprecated
+
+tests/test_peak_equity_tracker.py::TestZeroNavPortfolioState::test_missing_total_amount_currencies_logs_warning
+tests/test_peak_equity_tracker.py::TestZeroNavPortfolioState::test_missing_total_amount_currencies_logs_warning
+  <string>:5: DeprecationWarning: GetTradingStatusRequest.figi is deprecated
+
+tests/test_peak_equity_tracker.py::TestZeroNavPortfolioState::test_missing_total_amount_currencies_logs_warning
+tests/test_peak_equity_tracker.py::TestZeroNavPortfolioState::test_missing_total_amount_currencies_logs_warning
+  <string>:8: DeprecationWarning: GetLastTradesRequest.figi is deprecated
+
+tests/test_peak_equity_tracker.py::TestZeroNavPortfolioState::test_missing_total_amount_currencies_logs_warning
+tests/test_peak_equity_tracker.py::TestZeroNavPortfolioState::test_missing_total_amount_currencies_logs_warning
+tests/test_peak_equity_tracker.py::TestZeroNavPortfolioState::test_missing_total_amount_currencies_logs_warning
+tests/test_peak_equity_tracker.py::TestZeroNavPortfolioState::test_missing_total_amount_currencies_logs_warning
+  <string>:20: DeprecationWarning: PostStopOrderRequest.figi is deprecated
+
+tests/test_peak_equity_tracker.py::TestZeroNavPortfolioState::test_missing_total_amount_currencies_logs_warning
+tests/test_peak_equity_tracker.py::TestZeroNavPortfolioState::test_missing_total_amount_currencies_logs_warning
+tests/test_peak_equity_tracker.py::TestZeroNavPortfolioState::test_missing_total_amount_currencies_logs_warning
+tests/test_peak_equity_tracker.py::TestZeroNavPortfolioState::test_missing_total_amount_currencies_logs_warning
+  <string>:14: DeprecationWarning: PostOrderRequest.figi is deprecated
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+SKIPPED [1] tests/test_quality_integration.py:48: IngestionGate uses z-score, not absolute threshold; crafting CRITICAL via synthetic data is brittle.
+1227 passed, 1 skipped, 20 warnings in 50.62s

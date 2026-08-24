@@ -262,22 +262,34 @@ services:
           echo "[pg-init] waiting for postgres..."
           sleep 3
         done
-        HBA=$$(PGPASSWORD="$$POSTGRES_PASSWORD" psql -h alphard-postgres -U "$$POSTGRES_USER" \
-               -d "$$POSTGRES_DB" -tAc "SHOW hba_file")
-        # Run the same logic as scripts/init_postgres.sh, but in-container
-        # (since hba_file is on the postgres container's filesystem).
-        if grep -q '192.168.0.0/16 trust' "$$HBA" 2>/dev/null; then
-          echo "[pg-init] legacy 192.168.0.0/16 trust present, removing (issue #97)"
-          sed -i '/^host all all 192\.168\.0\.0\/16 trust$/d' "$$HBA" 2>/dev/null || true
-        fi
+        # BUGFIX (issue #209): pg-init has been writing to hba_file locally
+        # since PR #97, but `hba_file` from SHOW is a path *inside the postgres
+        # container* — sed in this container can never touch it. The original
+        # flow only worked when hba_file was a bind-mount from outside both
+        # containers. Now that postgres uses a named volume (no bind), we can
+        # only edit it via SQL — which is exactly what \\connect /etc/postgresql
+        # can't do. So: detect whether the trust rule is already in effect via
+        # pg_hba view, and short-circuit.
         TRUST_CIDR="${POSTGRES_TRUST_SUBNET:-172.16.0.0/12}"
-        TRUST_RULE="host all all $${TRUST_CIDR} trust"
-        if grep -F "$$TRUST_RULE" "$$HBA" >/dev/null 2>&1; then
-          echo "[pg-init] trust line ($${TRUST_CIDR}) already present, skipping"
+        # Try to detect the trust rule by listing existing rules via pg_hba_file_rules().
+        RULE_PRESENT=$$(PGPASSWORD="$$POSTGRES_PASSWORD" psql -h alphard-postgres -U "$$POSTGRES_USER" \
+                        -d "$$POSTGRES_DB" -tAc "SELECT count(*) FROM pg_hba_file_rules() \
+                        WHERE type='host' AND database=array['all']::text[] AND \
+                        user_name=array['all']::text[] AND address = '$${TRUST_CIDR}'")
+        if [ "$${RULE_PRESENT:-0}" -gt 0 ]; then
+          echo "[pg-init] trust line ($${TRUST_CIDR}) already in pg_hba_file_rules(), skipping"
         else
-          # Strip legacy 0.0.0.0/0 if present.
+          HBA=$$(PGPASSWORD="$$POSTGRES_PASSWORD" psql -h alphard-postgres -U "$$POSTGRES_USER" \
+                 -d "$$POSTGRES_DB" -tAc "SHOW hba_file")
+          if [ -z "$$HBA" ] || [ ! -e "$$HBA" ]; then
+            echo "[pg-init] hba_file ($$HBA) not reachable from this container; trust rule MUST be set via SQL or via initdb init script"
+            echo "[pg-init] OK (no-op — pre-existing postgres volume)"
+            exit 0
+          fi
+          echo "[pg-init] injecting trust rule for $${TRUST_CIDR} into $$HBA"
+          sed -i '/^host all all 192\.168\.0\.0\/16 trust$/d' "$$HBA" 2>/dev/null || true
           sed -i '/^host all all 0\.0\.0\.0\/0 trust$/d' "$$HBA" 2>/dev/null || true
-          sed -i "1i $${TRUST_RULE}" "$$HBA"
+          sed -i "1i host all all $${TRUST_CIDR} trust" "$$HBA"
           PGPASSWORD="$$POSTGRES_PASSWORD" psql -h alphard-postgres -U "$$POSTGRES_USER" \
             -d "$$POSTGRES_DB" -c 'SELECT pg_reload_conf()' >/dev/null
           echo "[pg-init] injected $${TRUST_CIDR} trust + pg_reload_conf()"
@@ -331,7 +343,11 @@ services:
         set -e
         mkdir -p /etc/prometheus /prometheus
         echo "$$PROM_YML_B64" | base64 -d > /etc/prometheus/prometheus.yml
-        chmod -R 777 /prometheus
+        # BUGFIX (issue #209): /prometheus is a named volume — Docker creates
+        # it root-owned, but prom/prometheus runs as in-image `nobody` (uid 65534).
+        # Without chown, queries.active write fails with EPERM and container
+        # restart-loops. Same userns-mapping trap as bind-mounts, different fix.
+        chown -R nobody:nogroup /prometheus
         exec /bin/prometheus \
           --config.file=/etc/prometheus/prometheus.yml \
           --storage.tsdb.path=/prometheus \
@@ -341,10 +357,7 @@ services:
     environment:
       PROM_YML_B64: ${PROM_YML_B64:-}
     volumes:
-      - type: tmpfs
-        target: /prometheus
-        tmpfs:
-          size: 2G
+      - alphard-prometheus-data:/prometheus
     ports:
       - "9090:9090"
     networks:
@@ -463,4 +476,6 @@ volumes:
   alphard-postgres-data:
     driver: local
   alphard-redis-data:
+    driver: local
+  alphard-prometheus-data:
     driver: local
