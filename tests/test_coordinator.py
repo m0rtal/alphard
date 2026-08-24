@@ -361,6 +361,111 @@ class TestCoordinatorRiskCheck:
         assert allowed is True
         assert violations == ()
 
+    def test_risk_check_zero_limit_price_returns_structured_violation(self) -> None:
+        """Issue #211: ``limit_price=0`` (market-order-style input) must NOT
+        raise a pydantic ``ValidationError`` from inside ``TradeIntent``
+        construction. Pre-fix, the exception escaped into
+        ``run_once()``'s broad ``except Exception`` and surfaced as
+        ``RISK_EXCEPTION`` — masking a config error as a gate crash.
+        The fix pre-validates ``limit_price > 0`` and returns a
+        structured ``RISK_LIMIT_PRICE_INVALID`` violation instead, so
+        the gate is never even constructed and the audit log carries
+        a precise cause.
+        """
+        # gate must NOT be called at all on this path.
+        with patch("src.risk.gate.RiskGate") as mock_gate_class:
+            mock_gate = MagicMock()
+            mock_gate_class.return_value = mock_gate
+
+            coord = Coordinator(_config(limit_price=Decimal("0")))
+            allowed, violations = coord._risk_check()
+
+        assert allowed is False
+        assert len(violations) == 1
+        assert "RISK_LIMIT_PRICE_INVALID" in violations[0]
+        assert "limit_price" in violations[0]
+        # Gate was never asked to evaluate — fail-safe: the validation
+        # error is local to the Coordinator layer, so the gate can't
+        # have been invoked.
+        mock_gate.evaluate.assert_not_called()
+
+    def test_risk_check_negative_limit_price_returns_structured_violation(self) -> None:
+        """Issue #211: same path as zero price — negative limit_price
+        also fails ``TradeIntent.price gt=0``. We pre-validate at the
+        Coordinator layer so the gate stays in a clean state."""
+        with patch("src.risk.gate.RiskGate") as mock_gate_class:
+            mock_gate = MagicMock()
+            mock_gate_class.return_value = mock_gate
+
+            coord = Coordinator(_config(limit_price=Decimal("-5")))
+            allowed, violations = coord._risk_check()
+
+        assert allowed is False
+        assert "RISK_LIMIT_PRICE_INVALID" in violations[0]
+        mock_gate.evaluate.assert_not_called()
+
+    def test_risk_check_zero_price_does_not_raise_validation_error(self) -> None:
+        """Issue #211 (regression guard): ``_risk_check`` must NEVER
+        raise a pydantic ``ValidationError`` regardless of
+        ``limit_price`` value. Pre-fix, ``Decimal('0')`` propagated
+        out of ``TradeIntent(...)`` and was caught by ``run_once()``'s
+        blanket ``except Exception`` — silent masking of a
+        programmer / config error as a runtime risk failure.
+        """
+        coord = Coordinator(_config(limit_price=Decimal("0")))
+        # The call must return normally, not raise.
+        result = coord._risk_check()
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        allowed, violations = result
+        assert allowed is False
+        assert isinstance(violations, tuple)
+
+    def test_run_once_zero_limit_price_records_RISK_LIMIT_PRICE_INVALID(
+        self,
+    ) -> None:
+        """Issue #211 (end-to-end): the full pipeline, with
+        ``limit_price=0``, must short-circuit at the RISK stage with
+        ``RISK_LIMIT_PRICE_INVALID`` (not the generic
+        ``RISK_EXCEPTION``), and the broker must NOT be called with
+        ``risk_allowed=True``. This is the regression guard for the
+        original symptom: a market-order CoordinatorConfig leaking
+        through every layer until it crashed at TradeIntent
+        construction.
+        """
+        with patch.object(Coordinator, "_fetch", return_value=[_bar()]):
+            with patch.object(Coordinator, "_validate", return_value=True):
+                with patch.object(Coordinator, "_execute") as mock_execute:
+                    result = Coordinator(_config(limit_price=Decimal("0"), live_trading=True)).run_once()
+
+        assert result.risk_allowed is False
+        assert len(result.risk_violations) == 1
+        assert "RISK_LIMIT_PRICE_INVALID" in result.risk_violations[0]
+        # The pipeline reached ``_execute`` with ``risk_allowed=False``
+        # — that's the short-circuit. ``_execute`` itself is the
+        # layer that refuses the broker call when ``risk_allowed``
+        # is False, so the assertion below is the regression guard
+        # against accidentally passing ``risk_allowed=True`` through
+        # to the broker. Without the fix, ``run_once`` would never
+        # reach ``_execute`` (it would crash at TradeIntent
+        # construction with ValidationError, surfacing as
+        # ``RISK_EXCEPTION``).
+        mock_execute.assert_called_once_with(False)
+        # The pipeline recorded the normal stages (FETCH/VALIDATE/RISK/
+        # EXECUTE/AUDIT/DONE) — the refusal happened *inside* the
+        # risk stage via a structured violation code, not as an
+        # exception that would have produced SKIPPED. This is the
+        # whole point of the fix: we no longer fail-open with a
+        # masked ValidationError; we surface a precise refusal.
+        assert result.stages_completed == (
+            PipelineStage.FETCH,
+            PipelineStage.VALIDATE,
+            PipelineStage.RISK,
+            PipelineStage.EXECUTE,
+            PipelineStage.AUDIT,
+            PipelineStage.DONE,
+        )
+
 
 # -----------------------------------------------------------------------------
 # Coordinator.run_once() — risk-gate exception path (issue #15)
