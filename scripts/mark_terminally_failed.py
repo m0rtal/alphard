@@ -26,8 +26,6 @@ import logging
 import os
 from datetime import date
 
-import psycopg
-
 logger = logging.getLogger("alphard.mark_terminally_failed")
 
 
@@ -90,7 +88,15 @@ def main() -> int:
 
     sql = _heuristic_sql().replace("INTERVAL '2 years'", f"INTERVAL '{args.horizon_days} days'")
 
-    with psycopg.connect(_dsn(), autocommit=False) as conn:
+    # Issue #232: use the shared timeout helper so a Postgres network
+    # stall cannot wedge this Phase 1.6 daily admin run indefinitely
+    # (same deadlock class as PR #46's H-NETWORK-DETECT fix). The
+    # explicit ``autocommit=False`` is preserved — the script controls
+    # transaction boundaries with explicit ``conn.commit()`` calls and
+    # the original psycopg.connect also opened with autocommit=False.
+    from src.data.pg_store import connect_with_timeouts
+
+    with connect_with_timeouts(_dsn(), autocommit=False) as conn:
         with conn.cursor() as cur:
             cur.execute(sql)
             candidates = [row[0] for row in cur.fetchall()]

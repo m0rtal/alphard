@@ -128,13 +128,18 @@ class PostgresAuditLog:
             return
         if not self._dsn:
             raise RuntimeError("PostgresAuditLog requires a DSN: pass dsn=... or set $ALPHARD_PG_DSN")  # noqa: E501
-        try:
-            import psycopg
-        except ImportError as e:  # pragma: no cover — environment-dependent
-            raise RuntimeError(
-                "PostgresAuditLog needs psycopg: install with `pip install psycopg[binary]`"
-            ) from e  # noqa: E501
-        self._conn = psycopg.connect(self._dsn)
+        # Issue #232: psycopg.connect without connect_timeout + statement_timeout
+        # is the same deadlock class as PR #46's H-NETWORK-DETECT fix. The
+        # quality audit log is a runtime hot path (every write_event() from
+        # the ingestion gate) — without these guards a Postgres network
+        # stall hangs the gate indefinitely. Uses the shared
+        # ``connect_with_timeouts`` helper so all three Postgres surfaces
+        # (pg_store, coordinator, quality audit) fail in the same way.
+        # The connect_with_timeouts helper does a local ``import psycopg``
+        # so we don't import it at module scope here.
+        from src.data.pg_store import connect_with_timeouts
+
+        self._conn = connect_with_timeouts(self._dsn)
         self._cursor = self._conn.cursor()
 
     def write_event(self, issue: Issue, *, ticker: str, gate: str) -> None:

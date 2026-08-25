@@ -544,8 +544,6 @@ class Coordinator:
         try:
             import json
 
-            import psycopg
-
             payload = json.dumps(
                 {
                     "ticker": self.config.ticker,
@@ -562,7 +560,17 @@ class Coordinator:
                 default=str,
             )
 
-            with psycopg.connect(self.config.store_dsn) as conn:
+            # Issue #232: psycopg.connect without connect_timeout +
+            # statement_timeout is the same deadlock class as PR #46's
+            # H-NETWORK-DETECT fix. _audit() runs inside run_once() on every
+            # pipeline iteration; a Postgres network stall would otherwise hang
+            # the whole coordinator indefinitely. We use the shared helper
+            # from src.data.pg_store so coordinator, quality/audit, and the
+            # three cron/admin scripts all fail in the same way at the same
+            # cadence (single source of truth for the kwargs).
+            from src.data.pg_store import connect_with_timeouts
+
+            with connect_with_timeouts(self.config.store_dsn) as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         "INSERT INTO decision_log (kind, ticker, decision, source) "

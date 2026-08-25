@@ -82,8 +82,20 @@ class FakeConn:
 
 
 def _patched_main(monkeypatch, conn):
-    """Patch psycopg.connect in the m module and return a context manager."""
-    return monkeypatch.setattr(m.psycopg, "connect", lambda *a, **kw: conn)
+    """Patch psycopg.connect at the call site used by the script.
+
+    Issue #232: scripts/mark_terminally_failed.py no longer calls
+    ``psycopg.connect`` directly — it routes through
+    ``src.data.pg_store.connect_with_timeouts``. We patch the helper's
+    import target (``src.data.pg_store`` does a local ``import psycopg``
+    inside the helper, but the test fake targets the loaded psycopg
+    module's ``connect`` attribute). That captures every consumer of
+    the helper in one place (coordinator, quality/audit, all three
+    scripts) — see tests/test_psycopg_timeout_coverage.py.
+    """
+    import psycopg
+
+    return monkeypatch.setattr(psycopg, "connect", lambda *a, **kw: conn)
 
 
 def test_sql_picks_old_or_null_listed_at():
