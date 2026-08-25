@@ -2389,13 +2389,9 @@ class TestPeakStoreIsolation:
             "ALPHARD_PEAK_STORE_DIR leaked into the real /var/lib/alphard "
             "(issue #220). The autouse fixture in tests/conftest.py is missing."
         )
-        assert peak_dir.exists(), (
-            f"expected tmp peak-store dir {peak_dir} to exist (issue #220)"
-        )
+        assert peak_dir.exists(), f"expected tmp peak-store dir {peak_dir} to exist (issue #220)"
 
-    def test_tinkoff_account_does_not_write_into_real_path(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_tinkoff_account_does_not_write_into_real_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Build a ``TinkoffAccount`` and trigger a basis-write via
         ``_save_daily_pnl_basis``; the file MUST land in the isolated
         peak-dir. The check that it never reaches ``/var/lib/alphard``
@@ -2428,8 +2424,7 @@ class TestPeakStoreIsolation:
         peak_dir = Path(os.environ["ALPHARD_PEAK_STORE_DIR"])
         basis_file = peak_dir / "daily_pnl_basis_SB1.json"
         assert basis_file.exists(), (
-            f"basis file should land in {peak_dir} (issue #220); "
-            "isolated dir does not contain expected basis file"
+            f"basis file should land in {peak_dir} (issue #220); " "isolated dir does not contain expected basis file"
         )
         # Read it back: the payload must contain the values we just
         # primed. If the autouse isolation regresses, the file would
