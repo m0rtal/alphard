@@ -101,14 +101,15 @@ def encode_one(path: Path) -> str:
     return encoded.replace("\n", "")
 
 
-def emit_block(check_only: bool = False) -> str:
+def emit_block() -> str:
     """Encode all sources and return the .env block.
 
-    Parameters
-    ----------
-    check_only : bool
-        If True, raise instead of writing. Used by CI to verify the
-        committed .env.example matches what bake would produce.
+    Reads each source file under ``docker/grafana/`` (see ``SOURCES``),
+    base64-encodes it, and emits the ``KEY="VALUE"`` lines that drop
+    into a ``.env`` file. Exits non-zero on a missing source so the
+    operator notices immediately rather than silently producing a
+    half-populated env file (which would surface in production as a
+    grafana container restart-loop with empty provisioning).
     """
     lines: list[str] = []
     lines.append("# ---- Grafana provisioning + dashboards (compose refactor 2.0) ----")
@@ -123,8 +124,6 @@ def emit_block(check_only: bool = False) -> str:
     for key, path in SOURCES:
         if not path.exists():
             print(f"ERROR: source file missing: {path}", file=sys.stderr)
-            if check_only:
-                return ""  # signal failure
             sys.exit(1)
         encoded = encode_one(path)
         # Wrap value in double quotes for shell-safety; base64 alphabet
@@ -146,14 +145,9 @@ def main(argv: list[str]) -> int:
         action="store_true",
         help="exit non-zero if any source file is missing or empty (CI mode)",
     )
-    parser.add_argument(
-        "--stdout",
-        action="store_true",
-        help="print to stdout (default — just print)",
-    )
-    _ = parser.parse_args(argv)
+    args = parser.parse_args(argv)
 
-    if "--check" in argv:
+    if args.check:
         # CI use: verify all sources exist + encode. Non-zero on failure.
         for _key, path in SOURCES:
             if not path.exists():
