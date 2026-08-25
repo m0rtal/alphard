@@ -1165,6 +1165,39 @@ class TestTinkoffAccount:
         assert "TQBR" in msg  # expected set is enumerated
         assert "tradable instrument universe" in msg
 
+    def test_ticker_to_figi_accepts_lowercase_input(self):
+        """Issue #236: defence-in-depth ticker normalisation.
+
+        ``find_instrument`` is case-insensitive at Tinkoff (returns
+        canonical UPPERCASE instruments), so the broker must
+        normalise the input before the post-filter comparison.
+        Otherwise a lowercase operator input (``--ticker sber``)
+        resolves to an instrument in the API response but is then
+        rejected by the case-sensitive filter with a misleading
+        "ticker not found" error. Mirrors the sister data-layer
+        fixes in #183, #185, #224, #234.
+        """
+        mock_client = MagicMock()
+        match = MagicMock()
+        match.ticker = "SBER"  # canonical UPPERCASE from Tinkoff
+        match.class_code = "TQBR"
+        match.figi = "BBG004730N88"
+        resp = MagicMock()
+        resp.instruments = [match]
+        mock_client.instruments.find_instrument.return_value = resp
+        a = TinkoffAccount(token="t.x")
+        # lowercase input — must resolve to the same FIGI
+        assert a._ticker_to_figi(mock_client, "sber") == "BBG004730N88"
+        # mixed-case input — same
+        assert a._ticker_to_figi(mock_client, "Sber") == "BBG004730N88"
+        # whitespace-padded — same
+        assert a._ticker_to_figi(mock_client, "  sber  ") == "BBG004730N88"
+        # verify the API call used the normalised query (defensive
+        # sanity check — Tinkoff doesn't care, but operators reading
+        # logs shouldn't see lowercase either).
+        called = mock_client.instruments.find_instrument.call_args
+        assert called.kwargs.get("query") == "SBER" or called.args and called.args[0] == "SBER"
+
     def test_map_status_partiallyfill(self):
         s = TinkoffAccount._map_status("EXECUTION_REPORT_STATUS_PARTIALLYFILL")
         assert s == OrderStatus.FILLED

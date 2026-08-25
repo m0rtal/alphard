@@ -1144,12 +1144,26 @@ class TinkoffAccount(BrokerAccount):
         # data package is not on the path (e.g. CLI-only deploys).
         from src.data.tinkoff_loader import _TRADABLE_CLASS_CODES
 
+        # Issue #236: defence-in-depth normalisation. ``find_instrument``
+        # is case-insensitive at Tinkoff (returns canonical UPPERCASE
+        # instruments), but the post-filter below was case-sensitive and
+        # rejected any lowercase caller input with a misleading "ticker
+        # not found" error. Mirrors the sister fixes in the data layer
+        # (issues #183, #185, #224, #234) which all normalise to
+        # ``ticker.upper()`` at the store/query boundary. The
+        # ``CoordinatorConfig.ticker`` field has no validation, so an
+        # operator typo (``--ticker sber``) flows straight through.
+        ticker_norm = ticker.upper().strip()
+
         try:
-            response = client.instruments.find_instrument(query=ticker)
+            response = client.instruments.find_instrument(query=ticker_norm)
         except Exception as exc:
-            raise BrokerError(f"instruments.find_instrument failed for {ticker}: {exc}") from exc
+            raise BrokerError(f"instruments.find_instrument failed for {ticker_norm}: {exc}") from exc
         for inst in getattr(response, "instruments", []):
-            if getattr(inst, "ticker", None) == ticker and getattr(inst, "class_code", None) in _TRADABLE_CLASS_CODES:
+            if (
+                getattr(inst, "ticker", None) == ticker_norm
+                and getattr(inst, "class_code", None) in _TRADABLE_CLASS_CODES
+            ):
                 return str(inst.figi)
         # No matching tradable instrument — refuse, do NOT silently
         # return the ticker (which would then be sent as a FIGI and
