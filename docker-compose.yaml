@@ -551,10 +551,14 @@ services:
     # 2. Read-only mount (:ro) means the script can't be tampered with
     #    inside the container — defence-in-depth against a hypothetical
     #    grafana RCE that tries to backdoor the entrypoint.
-    # 3. We do NOT need chownfix for this — the file is read-only
-    #    for grafana (472), and we chmod 0755 + chown 472:472 at
-    #    bake time via tools/install_entrypoint.sh (run once before
-    #    the first deploy, idempotent).
+    # 3. We do NOT need chownfix for this — the file is bind-mounted
+    #    read-only from the repo source tree
+    #    (./docker/entrypoint_grafana.sh). Operators only need to keep
+    #    the source file executable in the repo (mode 0755 is committed;
+    #    `git ls-tree HEAD docker/entrypoint_grafana.sh` shows the bit).
+    #    No on-host install step is required, and no `tools/install_*.sh`
+    #    helper exists for this script — `compose` itself mounts the file
+    #    directly. (See kanban t_884fec4a for the full rationale.)
     volumes:
       - ${APPDATA_DIR:-/srv/alphard}/grafana:/var/lib/grafana
       - ./docker/entrypoint_grafana.sh:/entrypoint_grafana.sh:ro
