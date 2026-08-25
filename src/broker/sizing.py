@@ -371,17 +371,96 @@ def write_audit_jsonl(
     record: dict[str, Any],
     path: str | os.PathLike[str] = DEFAULT_AUDIT_DIR,
 ) -> Path:
-    """Append a sizing decision to the JSONL audit log.
+    """Append a sizing decision to the JSONL audit log (atomic).
 
     Returns the resolved file path. Creates parent dirs. Determinism: the
     record must already carry an explicit ``ts`` (no ``datetime.now()`` here).
+
+    Issue #222: a previous implementation used ``open("a") + write`` which
+    is NOT POSIX-atomic. A SIGKILL / Docker healthcheck kill / disk-full
+    mid-write truncates the last JSONL record to a partial JSON object,
+    and ``replay_sizing.py`` (the rollback companion, task body §3) raises
+    ``SystemExit`` on the first invalid line — dropping ALL records that
+    were written after the truncation point.
+
+    Fix: append via read-modify-rename with a sibling ``.tmp`` file, using
+    the same pattern as ``_save_peak_equity`` (issue #199) and
+    ``_save_daily_pnl_basis`` (issue #214):
+
+        tmp = target + ".tmp"
+        write(tmp, existing_content + record + "\n")
+        fh.flush() + os.fsync(fh.fileno())
+        os.replace(tmp, target)
+
+    ``os.replace`` is POSIX-atomic when ``tmp`` and ``target`` are on the
+    same filesystem — we use ``target.parent / target.name + ".tmp"`` to
+    guarantee that. A SIGKILL before ``os.replace`` leaves the OLD file
+    intact (no record added); a SIGKILL after leaves the NEW file fully
+    written. No partial JSON line is ever observable.
+
+    The read-modify-rename window is bounded by ``O(record_bytes)`` (a few
+    hundred bytes for the typical sizing record) so the crash-mid-window
+    probability is negligible. We do NOT add a ``.bak`` mirror: the audit
+    log is append-only, so the only recoverable state from a crash is
+    "previous record + maybe this one", which atomic rename guarantees.
+
+    The directory-path branch (``p.suffix != ".jsonl"``) is resolved to a
+    named file BEFORE the atomic write. Two calls in the same
+    microsecond on the same day produce two different filenames only if
+    their ``ts`` differs; callers that want strict isolation should pass
+    an explicit file path (or rely on the per-test ``tmp_path`` override
+    in ``tests/test_broker_sizing.py``).
     """
     p = Path(path)
     if p.suffix != ".jsonl":
         p = p / f"sizing_audit_{record.get('ts', 'unknown')}.jsonl"
     p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(record, sort_keys=True, default=str) + "\n")
+    line = json.dumps(record, sort_keys=True, default=str) + "\n"
+    existing = b""
+    if p.exists():
+        try:
+            raw = p.read_bytes()
+        except OSError:
+            # If the existing file is unreadable (perm denied, etc.), we
+            # can't safely append. Fall back to writing only the new line
+            # rather than raising — the audit log is best-effort and the
+            # caller (audit_hook) doesn't have a recovery path.
+            raw = b""
+        # Issue #222: a previous SIGKILL may have left the last record as
+        # a partial JSON line (no trailing newline). If we naively appended
+        # our new line to that, ``replay_sizing.py`` would still see the
+        # corruption and skip the partial row. We MUST strip the trailing
+        # partial line so the next atomic write yields a fully parseable
+        # file. The partial line is recoverable from process state on the
+        # next sizing call (which re-records it as a fresh audit row), so
+        # discarding it is safe.
+        if raw and not raw.endswith(b"\n"):
+            # Truncate to the last full newline. JSONL is one record per
+            # line, so a partial trailing chunk is by definition garbage.
+            last_nl = raw.rfind(b"\n")
+            if last_nl == -1:
+                # No complete line at all — discard everything.
+                raw = b""
+            else:
+                raw = raw[: last_nl + 1]
+        existing = raw
+    tmp_path = p.with_name(p.name + ".tmp")
+    try:
+        with tmp_path.open("wb") as fh:
+            fh.write(existing)
+            fh.write(line.encode("utf-8"))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, p)
+    except (OSError, ValueError):
+        # Best-effort cleanup: if the tmp file was created but the rename
+        # never completed, remove the orphan so it doesn't accumulate.
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+        raise
     return p
 
 

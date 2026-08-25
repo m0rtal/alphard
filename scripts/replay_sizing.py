@@ -52,11 +52,21 @@ from src.broker.sizing import (  # noqa: E402  (path tweak above)
 from src.macro.models import MacroRegime, RegimeLabel  # noqa: E402
 
 
-def load_records(path: Path) -> list[dict[str, Any]]:
-    """Load all JSONL records. Each line MUST be a complete JSON object."""
+def load_records(path: Path, strict: bool = False) -> list[dict[str, Any]]:
+    """Load all JSONL records.
+
+    Issue #222: a SIGKILL mid-write of ``write_audit_jsonl`` used to leave
+    the last record as a partial JSON line. The previous implementation
+    raised ``SystemExit`` on the first invalid line, which DROPPED every
+    record that came after it. New behaviour: skip truncated trailing
+    lines with a stderr WARNING so the operator still sees the corruption
+    but can replay everything that survived. Pass ``strict=True`` to
+    restore the old ``SystemExit`` semantics (useful for CI / lint gates).
+    """
     if not path.exists():
         raise SystemExit(f"audit log not found: {path}")
     records: list[dict[str, Any]] = []
+    skipped: list[tuple[int, str]] = []
     with path.open("r", encoding="utf-8") as fh:
         for ln_no, line in enumerate(fh, start=1):
             line = line.strip()
@@ -65,7 +75,20 @@ def load_records(path: Path) -> list[dict[str, Any]]:
             try:
                 rec = json.loads(line)
             except json.JSONDecodeError as exc:
-                raise SystemExit(f"line {ln_no}: invalid JSON: {exc}") from exc
+                if strict:
+                    raise SystemExit(f"line {ln_no}: invalid JSON: {exc}") from exc
+                # Tolerate truncated trailing records. We only skip
+                # non-parseable lines; the rest of the audit log replays
+                # as normal. The warning goes to stderr so it shows up in
+                # CI logs and operator shells without polluting stdout.
+                print(
+                    f"WARNING: replay_sizing: skipping line {ln_no} "
+                    f"(invalid JSON: {exc}); the audit log may be truncated. "
+                    f"Use --strict to fail on this instead.",
+                    file=sys.stderr,
+                )
+                skipped.append((ln_no, str(exc)))
+                continue
             rec["_line"] = ln_no
             records.append(rec)
     return records
@@ -219,12 +242,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("ts", nargs="?", help="Exact ISO ts to replay (e.g. 2026-08-22T09:30:00+00:00)")
     parser.add_argument("--ticker", help="Replay latest row for ticker")
     parser.add_argument("--all", action="store_true", help="Replay every row")
+    # Issue #222: default to tolerant (skip truncated trailing lines).
+    # --strict restores the pre-fix behaviour for CI / lint gates.
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Fail (exit 1) on any non-parseable JSONL line. Default: skip with WARNING.",
+    )
     args = parser.parse_args(argv)
 
     if args.ts is None and args.ticker is None and not args.all:
         parser.error("provide ts positional arg, or --ticker / --all")
 
-    records = load_records(args.audit_log)
+    records = load_records(args.audit_log, strict=args.strict)
     selected = select_records(records, args.ts, args.ticker, args.all)
     reports = (replay_record(r) for r in selected)
     return render(reports)
