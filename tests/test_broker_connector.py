@@ -10,8 +10,10 @@
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -2355,3 +2357,88 @@ class TestBrokerABC:
         assert gate_pos.quantity == Decimal("100")
         assert gate_pos.avg_price == Decimal("250")
         assert gate_pos.sector is None
+
+
+# ────────────────────────────────────────────
+# Issue #220 — peak-store isolation regression
+# ────────────────────────────────────────────
+
+
+class TestPeakStoreIsolation:
+    """Regression for issue #220: tests in this file used to instantiate
+    ``TinkoffAccount`` without overriding ``ALPHARD_PEAK_STORE_DIR``, so
+    ``_save_daily_pnl_basis`` would persist ``/var/lib/alphard/daily_pnl_basis_*.json``
+    into the real filesystem. On any subsequent test run (any calendar day
+    later) the issue #207 fail-closed gate refuses to silently disarm
+    ``RISK_DAILY_LOSS`` and ``place_order`` raises
+    ``BrokerError("Untrusted daily-P&L basis ... calendar mismatch")``
+    *before* the broker SDK is consulted — leaving 11 dependent tests
+    in ERROR with ``AttributeError: 'NoneType' object has no attribute
+    'kwargs'`` because ``client.orders.post_order.call_args`` is ``None``.
+
+    The shared autouse fixture in ``tests/conftest.py`` redirects
+    ``ALPHARD_PEAK_STORE_DIR`` to a per-test tmpdir, so these assertions
+    prove the isolation is wired and survives across runs.
+    """
+
+    def test_peak_store_dir_is_isolated_to_tmp(self) -> None:
+        """The conftest autouse fixture must have set ``ALPHARD_PEAK_STORE_DIR``
+        to a non-default tmp path before this test ran."""
+        peak_dir = Path(os.environ["ALPHARD_PEAK_STORE_DIR"])
+        assert peak_dir != Path("/var/lib/alphard"), (
+            "ALPHARD_PEAK_STORE_DIR leaked into the real /var/lib/alphard "
+            "(issue #220). The autouse fixture in tests/conftest.py is missing."
+        )
+        assert peak_dir.exists(), (
+            f"expected tmp peak-store dir {peak_dir} to exist (issue #220)"
+        )
+
+    def test_tinkoff_account_does_not_write_into_real_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Build a ``TinkoffAccount`` and trigger a basis-write via
+        ``_save_daily_pnl_basis``; the file MUST land in the isolated
+        peak-dir. The check that it never reaches ``/var/lib/alphard``
+        is implicit: the same file CANNOT be in two places at once, and
+        we verify the basis landed in the isolated tmpdir.
+        """
+        from src.broker.tinkoff_account import TinkoffAccount
+
+        client = _make_mock_tinkoff_client(
+            cash=Decimal("1000000"),
+            last_prices={"SBER": Decimal("300")},
+        )
+        _install_mock_sdk(monkeypatch, client)
+
+        a = TinkoffAccount(token="t.x", risk_gate=MagicMock())
+
+        # First snapshot establishes the basis. This exercises the same
+        # write path that leaked into /var/lib/alphard before the fix.
+        # _save_daily_pnl_basis() is a no-arg helper that reads
+        # self._previous_close_equity / self._last_trading_day and
+        # writes the basis file to disk; we prime the in-memory state
+        # so the save is non-trivial.
+        a._previous_close_equity = Decimal("1000000")
+        from datetime import date as _date
+
+        a._last_trading_day = _date.today()
+        a._basis_trusted = True
+        a._save_daily_pnl_basis()
+
+        peak_dir = Path(os.environ["ALPHARD_PEAK_STORE_DIR"])
+        basis_file = peak_dir / "daily_pnl_basis_SB1.json"
+        assert basis_file.exists(), (
+            f"basis file should land in {peak_dir} (issue #220); "
+            "isolated dir does not contain expected basis file"
+        )
+        # Read it back: the payload must contain the values we just
+        # primed. If the autouse isolation regresses, the file would
+        # have been written to /var/lib/alphard instead and this
+        # assertion would fail because peak_dir would be a different
+        # (or empty) location.
+        import json
+
+        payload = json.loads(basis_file.read_text())
+        assert payload["previous_close_equity"] == "1000000"
+        assert payload["basis_valid"] is True
+        assert payload["schema_version"] == 1
