@@ -44,66 +44,80 @@ class TestGrafanaProviderPath:
         assert len(data["providers"]) >= 1
 
     def test_provider_path_matches_compose_mount(self) -> None:
-        """The provider must scan the SAME path that compose mounts dashboards
-        to. Pre-fix the provider scanned /etc/grafana/provisioning/dashboards
-        while compose mounted the JSONs at /var/lib/grafana/dashboards, so
-        Grafana loaded zero dashboards.
+        """The provider must scan a path that actually contains
+        dashboards. Pre-fix the provider scanned
+        ``/etc/grafana/provisioning/dashboards`` while compose mounted
+        the JSONs at ``/var/lib/grafana/dashboards``, so Grafana
+        loaded zero dashboards.
 
-        Issue #216: the compose grafana service binds
-        ``${APPDATA_DIR:-/srv/alphard}/grafana/dashboards`` →
-        ``/var/lib/grafana/dashboards`` (sister-fix to PR #148 which
-        parameterised the /var/lib/grafana data bind). The provider
-        ``path: /var/lib/grafana/dashboards`` is unchanged because
-        that is the in-container target, not the host-side source.
-        So the contract still holds: provider scans target T, compose
-        mounts to target T.
+        Compose refactor 2.0 (kanban t_884fec4a): the grafana
+        service no longer bind-mounts ``/var/lib/grafana/dashboards``
+        from the host. Instead, the docker/entrypoint_grafana.sh
+        wrapper decodes DASHBOARD_*_JSON_B64 env vars and writes
+        the JSON files into ``/var/lib/grafana/dashboards`` at
+        container startup. The provider's ``path: /var/lib/grafana/dashboards``
+        remains the in-container scan target — just now it's
+        populated by the entrypoint rather than a host bind.
+
+        Why this still satisfies the issue #56 contract:
+          - Pre-refactor: provider scans target T, compose mounts
+            dashboards at target T from the host. ✅
+          - Post-refactor: provider scans target T, entrypoint writes
+            dashboards into target T from B64 env vars. ✅
+          - Same provider path, same in-container target — just a
+            different population mechanism.
+
+        This test verifies the entrypoint decodes at least one
+        DASHBOARD_*_B64 variable into ``/var/lib/grafana/dashboards``
+        and that the provider path matches.
         """
         provider = _load_provider()
         provider_path = provider["providers"][0]["options"]["path"]
 
         compose = _load_compose()
         grafana = compose["services"].get("grafana", {})
-        mounts = grafana.get("volumes", [])
 
-        # The compose grafana service must mount the dashboards directory
-        # somewhere — find the bind-mount whose container-side target is
-        # /var/lib/grafana/dashboards (the provider scan target) and
-        # capture it. Issue #216 switched the host source from a
-        # relative ./docker/grafana/dashboards path to the
-        # parameterised ${APPDATA_DIR:-/srv/alphard}/grafana/dashboards,
-        # so we match on the container TARGET, not the host source.
-        dashboard_mount_targets = []
-        for v in mounts:
-            if isinstance(v, str):
-                # Strip optional trailing mode (":ro" / ":rw") so the
-                # dst is always the last field. The host path may
-                # itself contain ":" (the APPDATA_DIR default), so we
-                # rsplit on the LAST ":" rather than split(":")[1].
-                stripped = v
-                if v.endswith(":ro") or v.endswith(":rw"):
-                    stripped = v[:-3]
-                if ":" not in stripped:
-                    continue
-                _src, target = stripped.rsplit(":", 1)
-            else:
-                target = v.get("target", "")
-            if target == "/var/lib/grafana/dashboards":
-                dashboard_mount_targets.append(target)
-
-        assert dashboard_mount_targets, (
-            "compose grafana service must mount a dashboards directory "
-            "at /var/lib/grafana/dashboards (the provider scan target); "
-            "no such bind-mount found (issue #216: APPDATA_DIR "
-            "parameterisation must keep /var/lib/grafana/dashboards as "
-            "the in-container target so the provider scans the right "
-            "directory). Mounts: " + repr(mounts)
+        # 1. Provider path must be /var/lib/grafana/dashboards (the
+        # upstream-default in-container target). Refactor 2.0 keeps
+        # this path — we just populate it via the entrypoint rather
+        # than a host bind-mount.
+        assert provider_path == "/var/lib/grafana/dashboards", (
+            f"provider path must be /var/lib/grafana/dashboards "
+            f"(matches the entrypoint write target + upstream "
+            f"default). Got: {provider_path!r}"
         )
-        for target in dashboard_mount_targets:
-            assert provider_path == target, (
-                f"provider scans {provider_path!r} but compose mounts "
-                f"dashboards at {target!r}; pick one path and align both. "
-                f"See issue #56."
-            )
+
+        # 2. The grafana service's entrypoint MUST write dashboards
+        # to the provider path. We grep the entrypoint script for
+        # the decode call + the provider path.
+        entrypoint = grafana.get("entrypoint")
+        assert entrypoint is not None, (
+            "grafana service must declare an entrypoint (compose "
+            "refactor 2.0 wraps the upstream /run.sh with our decoder)"
+        )
+        if isinstance(entrypoint, list):
+            entrypoint_str = " ".join(str(x) for x in entrypoint)
+        else:
+            entrypoint_str = str(entrypoint)
+        assert "/entrypoint_grafana.sh" in entrypoint_str, (
+            f"grafana entrypoint must point at /entrypoint_grafana.sh "
+            f"(our wrapper that decodes *_B64 env vars). Got: {entrypoint_str!r}"
+        )
+        # Read the entrypoint script and verify it writes to the
+        # provider path AND decodes at least one DASHBOARD_*_JSON_B64.
+        entrypoint_script = REPO / "docker" / "entrypoint_grafana.sh"
+        assert entrypoint_script.is_file(), (
+            f"docker/entrypoint_grafana.sh must exist at the repo root. " f"Got path: {entrypoint_script}"
+        )
+        script_text = entrypoint_script.read_text()
+        assert provider_path in script_text, (
+            f"entrypoint_grafana.sh must write to {provider_path} "
+            f"(the provider scan target). Got script:\n{script_text[:800]}"
+        )
+        assert "DASHBOARD_" in script_text and "_B64" in script_text, (
+            f"entrypoint_grafana.sh must decode at least one "
+            f"DASHBOARD_*_B64 env var. Got script:\n{script_text[:800]}"
+        )
 
     def test_dashboard_jsons_exist(self) -> None:
         """Sanity: at least one alphard dashboard JSON must exist under
