@@ -146,6 +146,50 @@ class TestAdvProvider:
         else:
             assert call.args[3] is None
 
+    def test_lowercase_input_is_normalised_at_boundary(self) -> None:
+        """Issue #234: defense-in-depth — normalise ticker before query_ohlcv.
+
+        ``CachingAdvProvider`` already upper-cases the cache key, but
+        ``AdvProvider.__call__`` passed the raw ticker straight through.
+        Today the stores re-normalise inside ``query_ohlcv`` (issue #185
+        sister-bug class), so the bug is latent — but documenting the
+        contract at the boundary protects against future wrappers that
+        don't re-normalise (multi-source loader, CSV fallback, debug
+        script). This test pins the contract.
+        """
+        store = MagicMock()
+        store.query_ohlcv.return_value = [_bar("SBER", 1, 1000)]
+        adv = AdvProvider(store, lookback_days=20)
+        adv("sber")
+        # The first positional arg to query_ohlcv must be the upper-cased ticker.
+        ticker_passed = store.query_ohlcv.call_args.args[0]
+        assert ticker_passed == "SBER"
+
+    def test_strip_whitespace_at_boundary(self) -> None:
+        """Issue #234: ``.strip()`` mirrors the pattern used by
+        ``MOEXDataLoader.iter_ohlcv`` and other data loaders — external
+        callers (CLI args, ad-hoc scripts) sometimes pass
+        ``"  SBER  "`` with surrounding whitespace.
+        """
+        store = MagicMock()
+        store.query_ohlcv.return_value = [_bar("SBER", 1, 1000)]
+        adv = AdvProvider(store, lookback_days=20)
+        adv("  SBER  ")
+        ticker_passed = store.query_ohlcv.call_args.args[0]
+        assert ticker_passed == "SBER"
+
+    def test_adv_unavailable_message_uses_normalised_ticker(self) -> None:
+        """Issue #234: the error message must reflect the normalised ticker,
+        not the raw input — operators debugging ``ADV_UNAVAILABLE`` should
+        see the same ticker the store query used.
+        """
+        store = MagicMock()
+        store.query_ohlcv.return_value = []  # no rows
+        adv = AdvProvider(store, lookback_days=20)
+        with pytest.raises(AdvProviderError) as exc:
+            adv("sber")
+        assert "no ohlcv_daily rows for SBER" in str(exc.value)
+
 
 # ────────────────────────────────────────────
 # CachingAdvProvider

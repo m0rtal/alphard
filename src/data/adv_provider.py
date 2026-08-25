@@ -87,6 +87,19 @@ class AdvProvider:
             raise ValueError("lookback_days must be > 0")
 
     def __call__(self, ticker: str) -> Decimal:
+        # Issue #234: normalise at the boundary so the input contract is
+        # symmetric with ``CachingAdvProvider.__call__`` (which already
+        # upper-cases the cache key) and with the row-uppercase behaviour
+        # of ``PostgresDataStore.query_ohlcv`` / ``SQLiteStore.query_ohlcv``.
+        # Today the stores re-normalise inside the query, so this is a
+        # pure defense-in-depth fix — but it documents the contract
+        # explicitly and protects against future wrappers that don't
+        # (sister-bug class of issues #183/#185/#224). Sister-bug class
+        # matters because if a future caller (multi-source loader, CSV
+        # fallback, debug script) reaches ``query_ohlcv`` through a path
+        # that DOESN'T normalise, ``AdvProvider`` would silently report
+        # ``ADV_UNAVAILABLE`` for a ticker that does have rows.
+        ticker = ticker.upper().strip()
         # ``ohlcv_daily`` PK is (ticker, ts); ``query_ohlcv`` is the
         # canonical read path (PostgresDataStore + SQLiteStore both
         # implement it).
