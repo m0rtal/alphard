@@ -142,7 +142,7 @@ def test_liq_scalar_when_adv_is_zero_returns_max(tmp_path: Path) -> None:
     cfg = SizingConfig()
     q = Quote(ticker="Y", side="buy", confidence=Decimal("1"), timestamp=TS, reference_price=Decimal("100"))
     p = PortfolioState(cash=Decimal("100000"), peak_equity=Decimal("100000"), total_equity=Decimal("100000"))
-    # Bars with zero high-low range ⇒ ADV ≈ 0.
+    # Bars with zero high-low range (default volume=0) ⇒ ADV = 0.
     zero_bars = tuple(Bar(high=Decimal("100"), low=Decimal("100"), close=Decimal("100")) for _ in range(20))
     m = MarketData(ticker="Y", bars=zero_bars)
     r = MacroRegime(regime="neutral", multiplier=Decimal("1"), reason="t")
@@ -150,6 +150,72 @@ def test_liq_scalar_when_adv_is_zero_returns_max(tmp_path: Path) -> None:
     spec = compute_position_size(q, p, m, r, audit_hook=captured.append)
     # liq_scalar must be MAX_LIQ_SCALAR (2.0)
     assert Decimal(spec.meta["liq_scalar"]) == cfg.max_liq_scalar
+    # meta.adv reports 0 (no volume data); audit logs are honest about it.
+    assert Decimal(spec.meta["adv"]) == Decimal("0")
+
+
+def test_liq_scalar_uses_real_volume_not_high_low_range() -> None:
+    """Regression for issue #225: ADV must come from ``Bar.volume``, not ``(high-low)``.
+
+    Previously the formula used ``sum(b.high - b.low)`` — dimensionless range,
+    not traded volume — so the cap saturated at MAX_LIQ_SCALAR for any
+    realistic bar window. With real ``Bar.volume`` we can now hit interior
+    scalar values: ``adv < target_shares`` ⇒ scalar < 1.0 (throttle);
+    ``adv > target_shares`` ⇒ scalar approaches MAX (cap).
+    """
+    cfg = SizingConfig()
+    q = Quote(ticker="V", side="buy", confidence=Decimal("1"), timestamp=TS, reference_price=Decimal("100"))
+    p = PortfolioState(cash=Decimal("100000"), peak_equity=Decimal("100000"), total_equity=Decimal("100000"))
+    r = MacroRegime(regime="neutral", multiplier=Decimal("1"), reason="t")
+
+    # With cfg defaults: position_shares = cash * risk_per_trade_pct / price
+    #                  = 100000 * 0.01 / 100 = 10
+    # target_shares     = position_shares * max_adv_pct
+    #                  = 10 * 0.05 = 0.5
+    # raw scalar        = adv / 0.5, then clamped to [0, max_liq_scalar=2.0].
+    target_shares = (p.cash * cfg.risk_per_trade_pct / Decimal("100")) * cfg.max_adv_pct
+
+    # 1) adv = 0 → MAX_LIQ_SCALAR (already covered above; kept for symmetry)
+    bars_zero = tuple(
+        Bar(high=Decimal("100"), low=Decimal("100"), close=Decimal("100"), volume=Decimal("0")) for _ in range(20)
+    )
+    spec_zero = compute_position_size(q, p, MarketData(ticker="V", bars=bars_zero), r)
+    assert Decimal(spec_zero.meta["liq_scalar"]) == cfg.max_liq_scalar
+    assert Decimal(spec_zero.meta["adv"]) == Decimal("0")
+
+    # 2) adv = target_shares/2 ⇒ raw = 0.5 ⇒ scalar is 0.5 (interior, throttles).
+    illiquid_total = target_shares / Decimal("2")
+    per_bar = illiquid_total / Decimal("20")
+    bars_ill = tuple(
+        Bar(high=Decimal("100"), low=Decimal("100"), close=Decimal("100"), volume=per_bar) for _ in range(20)
+    )
+    spec_ill = compute_position_size(q, p, MarketData(ticker="V", bars=bars_ill), r)
+    expected = illiquid_total / target_shares  # = 0.5
+    assert Decimal(spec_ill.meta["liq_scalar"]) == expected
+    assert Decimal(spec_ill.meta["adv"]) == illiquid_total
+
+    # 3) adv = target_shares * 2 ⇒ raw = 2.0 ⇒ scalar is 2.0 (capped).
+    #    This is the smallest adv value where the cap engages.
+    mid_total = target_shares * Decimal("2")
+    per_bar_mid = mid_total / Decimal("20")
+    bars_mid = tuple(
+        Bar(high=Decimal("100"), low=Decimal("100"), close=Decimal("100"), volume=per_bar_mid) for _ in range(20)
+    )
+    spec_mid = compute_position_size(q, p, MarketData(ticker="V", bars=bars_mid), r)
+    assert Decimal(spec_mid.meta["liq_scalar"]) == cfg.max_liq_scalar
+    assert Decimal(spec_mid.meta["adv"]) == mid_total
+
+    # 4) Sanity: a 5pct-range bar with ZERO volume still has adv == 0 (the
+    #    previous behaviour used range as a proxy; range must NOT leak through
+    #    into the metric any more).
+    bars_range_no_vol = tuple(
+        Bar(high=Decimal("102.5"), low=Decimal("97.5"), close=Decimal("100"), volume=Decimal("0")) for _ in range(20)
+    )
+    spec_range = compute_position_size(q, p, MarketData(ticker="V", bars=bars_range_no_vol), r)
+    assert Decimal(spec_range.meta["adv"]) == Decimal(
+        "0"
+    ), "adv must come from bar.volume, not (high - low); issue #225 regression guard"
+    assert Decimal(spec_range.meta["liq_scalar"]) == cfg.max_liq_scalar
 
 
 # ---------------------------------------------------------------------------

@@ -177,13 +177,23 @@ class PortfolioState(BaseModel):
 
 
 class Bar(BaseModel):
-    """Single OHLCV bar in market_data."""
+    """Single OHLCV bar in market_data.
+
+    ``volume`` is optional (defaults to ``Decimal("0")``) for back-compat with
+    callers that don't carry a real traded-volume series (e.g. ``replay_sizing``
+    which reconstructs bars from stored audit-log fields). When ``volume`` is
+    zero across the window the ADV-based liquidity scalar falls back to
+    ``MAX_LIQ_SCALAR`` (see ``_liquidity_scalar``) — callers that *do* have
+    real volume should populate the field so the liquidity-aware cap actually
+    engages.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     high: Decimal = Field(..., gt=Decimal("0"))
     low: Decimal = Field(..., ge=Decimal("0"))
     close: Decimal = Field(..., gt=Decimal("0"))
+    volume: Decimal = Field(default=Decimal("0"), ge=Decimal("0"))
 
 
 class MarketData(BaseModel):
@@ -620,10 +630,11 @@ def compute_position_size(
     vol_s = min(cfg.target_atr_frac / eff_atr, cfg.max_vol_scalar)
     vol_s = max(vol_s, Decimal("0"))  # negative guard (paranoid)
 
-    # ADV: sum of volumes from the bar window. The task body uses raw
-    # "adv" as a single number; we compute it from the window so the
-    # function stays pure given MarketData.
-    adv = sum(((b.high - b.low) for b in market_data.bars[-cfg.atr_lookback :]), Decimal("0"))
+    # ADV: sum of traded volumes from the bar window. ``Bar.volume`` defaults
+    # to ``Decimal("0")`` for callers that don't carry a real volume series
+    # (e.g. ``replay_sizing``), so this sum is zero there and the
+    # ``_liquidity_scalar`` falls back to ``MAX_LIQ_SCALAR`` as documented.
+    adv = sum((b.volume for b in market_data.bars[-cfg.atr_lookback :]), Decimal("0"))
     liq_s = _liquidity_scalar(adv, portfolio.cash, price, cfg)
 
     dd_pct = portfolio.drawdown_pct
