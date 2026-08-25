@@ -446,7 +446,14 @@ class PostgresDataStore(DataStore):
         if not new_bars:
             return {"inserted": 0, "skipped": 0}
 
-        pairs = list({(r.ticker, r.ts) for r in new_bars})
+        # Issue #224: normalise ticker at the SELECT-key boundary AND the
+        # in-memory filter, mirroring the sister fix in upsert_ohlcv
+        # (issue #185). OHLCVRow._v_ticker uppercases on construction, but
+        # model_construct bypasses validators; a row with ticker="sber"
+        # would be stored uppercase in the DB by upsert_ohlcv but look up
+        # as "sber" here → dedup misses → duplicate row inserted under the
+        # (SBER, ts) key (cross-source dup defeats Phase 2.6 step 3).
+        pairs = list({(r.ticker.upper(), r.ts) for r in new_bars})
         self._connect()
         with self._conn.cursor() as cur:
             cur.execute(
@@ -458,7 +465,9 @@ class PostgresDataStore(DataStore):
             )
             covered = {(row[0], row[1]) for row in cur.fetchall()}
 
-        filtered = [r for r in new_bars if (r.ticker, r.ts) not in covered]
+        # Compare against the NORMALISED pair; otherwise the filter sees
+        # ("sber", ts) not in {("SBER", ts)} and the row is wrongly kept.
+        filtered = [r for r in new_bars if (r.ticker.upper(), r.ts) not in covered]
         skipped = len(new_bars) - len(filtered)
         if filtered:
             self.upsert_ohlcv(filtered)
