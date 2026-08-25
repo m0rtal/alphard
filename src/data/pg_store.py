@@ -37,6 +37,42 @@ logger = logging.getLogger(__name__)
 # Must start with a letter or underscore.
 _IDENTIFIER_RE = re.compile(r"^[a-z_][a-z0-9_]*(?:\s*,\s*[a-z_][a-z0-9_]*)*$")
 
+# Issue #232: shared psycopg connection kwargs. PR #46 (commit 1e3b6dd)
+# introduced these two guards after H-NETWORK-DETECT — backfill PID 19
+# sat idle 17 hours against alphard-postgres:5432 because Python held
+# an open connection without a query bound. Mirrored by every psycopg
+# consumer in the repo (coordinator.py, quality/audit.py, three cron/
+# admin scripts) so a single Postgres network stall cannot hang any
+# caller indefinitely. The defaults match pg_store._connect() exactly:
+#   - connect_timeout=10s caps TCP+startup handshake so we fail fast on
+#     unreachable Postgres (instead of OS-default ~2 minutes).
+#   - statement_timeout=60000ms forces Postgres to cancel any hung
+#     individual query within 60s. The real deadlock-buster: a single
+#     bad query no longer wedges the daemon.
+_PG_CONNECT_KWARGS: dict[str, Any] = {
+    "connect_timeout": 10,
+    "options": "-c statement_timeout=60000",
+}
+
+
+def connect_with_timeouts(dsn: str, **overrides: Any) -> Any:
+    """Issue #232: shared psycopg.connect entry point with the H-NETWORK-DETECT
+    guards baked in. Centralises ``connect_timeout`` + ``statement_timeout`` so
+    every caller (coordinator audit, quality audit, three cron/admin scripts)
+    fails fast in the same way as ``pg_store._connect()``. Pass extra kwargs to
+    override (e.g. ``autocommit=False``); pass ``overrides=False`` semantics by
+    mutating ``_PG_CONNECT_KWARGS`` is NOT supported — callers should override
+    per-call.
+
+    Local import keeps callers (and ``pg_store`` itself) importable without
+    psycopg installed at module-load time.
+    """
+    import psycopg  # local import — see module docstring NOT WIRED IN TESTS
+
+    kwargs = dict(_PG_CONNECT_KWARGS)
+    kwargs.update(overrides)
+    return psycopg.connect(dsn, **kwargs)
+
 
 class PostgresDataStore(DataStore):
     """PostgreSQL implementation of the DataStore contract.

@@ -26,7 +26,6 @@ import sys
 import time
 from datetime import date, timedelta
 
-import psycopg
 from src.data.models import TickerMeta
 from src.data.pg_store import PostgresDataStore
 from src.data.tinkoff_loader import TinkoffInvestDataLoader
@@ -46,7 +45,10 @@ def _missing_tickers(start_after: str | None = None) -> list[str]:
 
     Sorted by ticker ASC for resumability.
     """
-    with psycopg.connect(_dsn()) as conn:
+    # Issue #232: shared timeout helper (PR #46 / H-NETWORK-DETECT).
+    from src.data.pg_store import connect_with_timeouts
+
+    with connect_with_timeouts(_dsn()) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """

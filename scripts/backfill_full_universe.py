@@ -23,7 +23,6 @@ import sys
 import time
 from datetime import date, datetime, timedelta, timezone
 
-import psycopg
 from src.data.models import OHLCVRow, TickerMeta
 from src.data.moex_loader import MOEXDataLoader
 from src.data.pg_store import PostgresDataStore
@@ -48,7 +47,12 @@ def _dsn() -> str:
 
 def _ensure_class_code_column(store: PostgresDataStore) -> None:
     """Create class_code column if missing (idempotent)."""
-    with psycopg.connect(_dsn()) as conn:
+    # Issue #232: use the shared timeout helper so a Postgres network
+    # stall cannot wedge this backfill script indefinitely (same
+    # deadlock class as PR #46's H-NETWORK-DETECT fix).
+    from src.data.pg_store import connect_with_timeouts
+
+    with connect_with_timeouts(_dsn()) as conn:
         with conn.cursor() as cur:
             cur.execute("ALTER TABLE ticker_universe ADD COLUMN IF NOT EXISTS class_code VARCHAR(12)")  # noqa: E501
             cur.execute(
@@ -63,7 +67,10 @@ def _persist_universe_meta(store: PostgresDataStore, ticker_meta: TickerMeta) ->
     """Upsert ticker into ticker_universe with class_code=TQBR and delisted flag."""
     store.upsert_ticker(ticker_meta)
     # Patch class_code + delisted (upsert_ticker doesn't write those)
-    with psycopg.connect(_dsn()) as conn:
+    # Issue #232: shared timeout helper, same reason as above.
+    from src.data.pg_store import connect_with_timeouts
+
+    with connect_with_timeouts(_dsn()) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """UPDATE ticker_universe
