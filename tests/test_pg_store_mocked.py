@@ -958,6 +958,45 @@ class TestBackfillWithDedup:
         result = store.backfill_with_dedup([_bar()], source="moex")
         assert result["inserted"] == 1
 
+    def test_lowercase_ticker_via_model_construct_dedups(self, store: PostgresDataStore) -> None:
+        """Issue #224: a row built via model_construct with lowercase ticker must
+        still be detected as covered by an existing uppercase row in the DB.
+
+        Prior to the fix, backfill_with_dedup built its dedup key as
+        ``(r.ticker, r.ts)`` — i.e. ("sber", ts) — but the DB stores rows under
+        ("SBER", ts) (upsert_ohlcv normalises via r.ticker.upper()). The SELECT
+        against ohlcv_daily therefore missed the existing row, and the new row
+        was silently re-inserted, defeating the cross-source dedup contract.
+        """
+        # Pre-mark (SBER, 2026-08-14) as covered by an existing source.
+        store._conn.next_fetchall.append([("SBER", date(2026, 8, 14))])
+        # Build a row with lowercase ticker via model_construct (bypasses
+        # OHLCVRow._v_ticker validator).
+        row = OHLCVRow.model_construct(
+            ticker="sber",
+            ts=date(2026, 8, 14),
+            open=Decimal("100.00"),
+            high=Decimal("110.00"),
+            low=Decimal("95.00"),
+            close=Decimal("105.00"),
+            volume=Decimal("1000000"),
+            adj_close=Decimal("105.00"),
+            source="moex",
+        )
+        cursors_before = len(store._conn.cursors)
+        result = store.backfill_with_dedup([row])
+        # The dedup contract is honoured: lowercase input is matched against
+        # the uppercase existing row → skip.
+        assert result == {"inserted": 0, "skipped": 1}
+        # No follow-up upsert → no new cursor opened beyond the SELECT.
+        assert len(store._conn.cursors) == cursors_before + 1
+        assert store._conn.last_cursor().executemany_calls == []
+        # The SELECT was issued with the NORMALISED ticker ("SBER", not "sber").
+        cur = store._conn.cursors[-1]
+        _, params = cur.calls[0]
+        assert params[0] == "SBER"
+        assert params[1] == date(2026, 8, 14)
+
 
 class TestMigrateDeduplicate:
     def test_returns_rowcount(self, store: PostgresDataStore) -> None:
