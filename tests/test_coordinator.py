@@ -66,6 +66,26 @@ class TestCoordinatorConfig:
         assert cfg.quantity == Decimal("1")
         assert cfg.live_trading is False
 
+    # Issue #238 — defense-in-depth ticker normalisation at construction.
+    # Sister of #234/#236 (per-function normalisation in AdvProvider /
+    # _ticker_to_figi). The audit-log writer was the ONE path that
+    # persisted the raw ticker, breaking the grep-by-ticker invariant
+    # for the canonical compliance trail.
+    def test_config_normalises_lowercase_ticker(self) -> None:
+        """Lowercase operator input → UPPERCASE canonical form."""
+        cfg = _config(ticker="sber")
+        assert cfg.ticker == "SBER"
+
+    def test_config_normalises_whitespace_around_ticker(self) -> None:
+        """Surrounding whitespace is stripped during normalisation."""
+        cfg = _config(ticker="  gaZp\n")
+        assert cfg.ticker == "GAZP"
+
+    def test_config_rejects_empty_ticker_after_normalisation(self) -> None:
+        """Whitespace-only ticker is rejected at construction."""
+        with pytest.raises(ValueError, match="must be non-empty"):
+            _config(ticker="   ")
+
 
 # -----------------------------------------------------------------------------
 # Coordinator.run_once() — full mocked paths
@@ -287,6 +307,40 @@ class TestCoordinatorAudit:
             )
         assert result == 42
         mock_psycopg.connect.assert_called_once()
+
+    # Issue #238 — the audit-log payload must use the canonical
+    # UPPERCASE ticker even if the operator constructed the config
+    # with a lowercase string. This is the audit-log grep invariant
+    # that the rest of the system enforces (#234, #236).
+    def test_audit_persists_normalised_ticker_when_config_built_lowercase(self) -> None:
+        import json
+
+        from unittest.mock import MagicMock
+
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = (7,)
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+        mock_psycopg = MagicMock()
+        mock_psycopg.connect.return_value.__enter__.return_value = mock_conn
+
+        with patch.dict("sys.modules", {"psycopg": mock_psycopg}):
+            coord = Coordinator(_config(store_dsn="postgresql://fake", ticker="sber"))
+            coord._audit(
+                stages=[PipelineStage.FETCH, PipelineStage.DONE],
+                bars_loaded=1,
+                risk_allowed=True,
+                risk_violations=(),
+                broker_status="FILLED",
+            )
+
+        # The INSERT must carry ticker="SBER", never "sber".
+        exec_call = mock_cursor.execute.call_args
+        insert_args = exec_call.args[1]  # (ticker, payload)
+        persisted_ticker = insert_args[0]
+        persisted_payload = json.loads(insert_args[1])
+        assert persisted_ticker == "SBER"
+        assert persisted_payload["ticker"] == "SBER"
 
 
 # -----------------------------------------------------------------------------

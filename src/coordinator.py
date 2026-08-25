@@ -126,6 +126,19 @@ class CoordinatorConfig:
     # tests can use a generous value while production uses a tight one.
     toctou_max_seconds: float = 0.100
 
+    def __post_init__(self) -> None:
+        # Issue #238 — defense-in-depth ticker normalisation at the
+        # canonical construction point. All downstream consumers
+        # (AdvProvider, _ticker_to_figi, ...) re-normalise, but the
+        # audit log writer (decision_log) was the ONE path that
+        # persisted the raw value, breaking the grep-by-ticker
+        # invariant. Normalising here closes ALL 13 self.config.ticker
+        # sites at once. frozen=True → must use object.__setattr__.
+        normalised = self.ticker.upper().strip()
+        if not normalised:
+            raise ValueError("CoordinatorConfig.ticker must be non-empty after normalisation")
+        object.__setattr__(self, "ticker", normalised)
+
 
 # Issue #99: alphard-internal refusal markers returned by _execute() when
 # the pipeline blocks before/at the broker. These do NOT count as a
