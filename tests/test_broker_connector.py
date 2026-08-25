@@ -14,7 +14,7 @@ import os
 from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from unittest.mock import MagicMock
 
 import pytest
@@ -2305,6 +2305,228 @@ class TestOrderFlow:
         # call to flaky_provider).
         flow.submit_market("SBER", OrderSide.BUY, Decimal("10"), self._portfolio())
         assert call_count["n"] == 1
+
+
+# ────────────────────────────────────────────
+# Issue #230 — OrderFlow must take an adv_provider; the previous
+# ``max(qty*20, 100)`` placeholder shipped as dead code (OrderSlicer
+# always returned 1 chunk for any qty ≥ 5). These tests exercise the
+# new adv_provider path WITHOUT any monkeypatch of OrderSlicer.
+# ────────────────────────────────────────────
+
+
+class TestOrderFlowAdvProvider:
+    """Issue #230 regression suite.
+
+    The whole point of ``OrderFlow.submit_market`` is to enforce the
+    5%-ADV-chunk / TWAP policy from ``src/broker/slicer.py``. Before
+    issue #230, the function constructed ``adv_shares =
+    max(qty*20, 100)`` — a hardcoded placeholder unrelated to real
+    ADV — which made the slicer's ``chunk_size = adv_shares * 5%``
+    equal ``qty`` for every qty ≥ 5. The slicer's "single chunk"
+    early-return always fired and ``OrderFlow`` shipped as a wrapper
+    around a single MarketOrder. These tests prove the new
+    ``adv_provider`` argument actually drives the slicer.
+
+    All tests construct ``OrderFlow`` with ``adv_provider`` and verify
+    slice math WITHOUT monkey-patching ``OrderSlicer.__init__`` — the
+    exact thing the previous test contract had to do (see
+    test_broker_connector.py:2017-2048 for the old workaround).
+    """
+
+    def _portfolio(self, cash: str = "100000") -> PortfolioSnapshot:
+        return PortfolioSnapshot(
+            account_id="SB1",
+            cash=Decimal(cash),
+            positions=[],
+            timestamp=datetime.utcnow(),
+        )
+
+    def _approved_gate(self) -> Any:
+        rg = MagicMock()
+        from src.risk.gate import RiskDecision
+
+        rg.evaluate.return_value = RiskDecision(allowed=True, violations=())
+        return rg
+
+    def _quote_provider(self, price: Decimal = Decimal("250")):
+        def _qp(_symbol: str) -> Decimal:
+            return price
+
+        return _qp
+
+    def _adv_provider(self, adv_shares: Decimal) -> Callable[[str], Decimal]:
+        """Return an ``adv_provider`` callable returning a constant.
+
+        Mimics the production ``AdvProvider`` (``src/data/adv_provider.py``)
+        but without the database — the slice math is what we're proving.
+        """
+
+        def _ap(_symbol: str) -> Decimal:
+            return adv_shares
+
+        return _ap
+
+    def _raising_adv_provider(self, exc: Exception | None = None) -> Callable[[str], Decimal]:
+        def _ap(_symbol: str) -> Decimal:
+            raise exc if exc is not None else ConnectionError("ohlcv_daily store down")
+
+        return _ap
+
+    # --- happy path: real ADV actually slices ---
+
+    def test_adv_provider_drives_multi_slice_without_monkeypatch(self) -> None:
+        """Pre-#230, this exact scenario yielded ``slice_count == 1`` because
+        ``adv_shares = max(3000*20, 100) = 60000`` made ``chunk_size = 3000``
+        (5% of 60000), which equals ``parent_qty`` and tripped the
+        single-chunk early-return.
+
+        With ``adv_provider`` returning ``Decimal("500")`` (a realistic
+        ADV for an illiquid ticker), 5%-ADV = 25 shares, so 3000/25 =
+        120 chunks — capped at ``max_chunks`` (30min / 16ms ≈ 112_500)
+        which is well above 120. We expect ``slice_count >= 50`` and
+        each chunk size ~25 shares.
+        """
+        from src.data.adv_provider import AdvProvider  # noqa: F401  (sanity import)
+
+        broker = MagicMock()
+        broker.place_order.return_value = OrderStatus.FILLED
+
+        flow = OrderFlow(
+            broker=broker,
+            risk_gate=self._approved_gate(),
+            quote_provider=self._quote_provider(),
+            adv_provider=self._adv_provider(Decimal("500")),
+        )
+        result = flow.submit_market("ILLIQ", OrderSide.BUY, Decimal("3000"), self._portfolio(cash="10000000"))
+
+        # 5%-ADV = 25 shares; 3000 / 25 = 120 chunks.
+        assert result.slice_count >= 50, (
+            f"multi-slice regression: expected slice_count ≥ 50 for "
+            f"qty=3000 vs ADV=500 (5%-ADV=25 → ~120 chunks), got {result.slice_count}"
+        )
+        # Broker must have been called per slice (FILLED return for all).
+        assert broker.place_order.call_count == result.slice_count
+        assert result.final_status == OrderStatus.FILLED
+
+    def test_adv_provider_small_qty_uses_single_chunk(self) -> None:
+        """Sanity check: a tiny order that fits in 5%-ADV still yields 1 chunk.
+
+        With ``adv_provider=10000`` and ``qty=100``, 5%-ADV = 500 >
+        ``qty``, so the slicer's "single chunk" early-return fires.
+        This is the *legitimate* single-chunk path (parent fits in one
+        5%-ADV slice), NOT the broken ``max(qty*20, 100)`` placeholder.
+        """
+        broker = MagicMock()
+        broker.place_order.return_value = OrderStatus.FILLED
+
+        flow = OrderFlow(
+            broker=broker,
+            risk_gate=self._approved_gate(),
+            quote_provider=self._quote_provider(),
+            adv_provider=self._adv_provider(Decimal("10000")),
+        )
+        result = flow.submit_market("SBER", OrderSide.BUY, Decimal("100"), self._portfolio())
+        assert result.slice_count == 1
+        assert result.final_status == OrderStatus.FILLED
+
+    # --- fail-safe: provider raises ---
+
+    def test_adv_provider_raises_returns_adv_unavailable_rejected(self) -> None:
+        """Mirrors the ``quote_provider`` fail-safe contract from issue #166.
+
+        If the provider raises (network, store down, ticker missing
+        from ``ohlcv_daily``), the order must be rejected up-front
+        with ``ADV_UNAVAILABLE`` — never silently fall back to the
+        pre-#230 placeholder.
+        """
+        broker = MagicMock()
+
+        flow = OrderFlow(
+            broker=broker,
+            risk_gate=self._approved_gate(),
+            quote_provider=self._quote_provider(),
+            adv_provider=self._raising_adv_provider(),
+        )
+        result = flow.submit_market("SBER", OrderSide.BUY, Decimal("1000"), self._portfolio())
+
+        assert result.final_status == OrderStatus.REJECTED
+        assert "ADV_UNAVAILABLE" in result.decision_violations
+        assert result.slice_count == 0
+        # Broker must NOT have been called — ADV was never available.
+        assert broker.place_order.call_count == 0
+
+    def test_adv_provider_returns_zero_returns_adv_invalid_rejected(self) -> None:
+        """An ADV of 0 is meaningless (no tradable volume). Reject."""
+
+        broker = MagicMock()
+        flow = OrderFlow(
+            broker=broker,
+            risk_gate=self._approved_gate(),
+            quote_provider=self._quote_provider(),
+            adv_provider=self._adv_provider(Decimal("0")),
+        )
+        result = flow.submit_market("SBER", OrderSide.BUY, Decimal("1000"), self._portfolio())
+        assert result.final_status == OrderStatus.REJECTED
+        assert "ADV_INVALID" in result.decision_violations
+        assert broker.place_order.call_count == 0
+
+    # --- legacy fallback ---
+
+    def test_no_adv_provider_falls_back_to_placeholder_with_warning(self, caplog) -> None:
+        """Pre-#230 callers that don't pass ``adv_provider`` keep working
+        but emit a one-shot WARNING so operators see the gap.
+        """
+        import logging
+
+        broker = MagicMock()
+        broker.place_order.return_value = OrderStatus.FILLED
+
+        flow = OrderFlow(
+            broker=broker,
+            risk_gate=self._approved_gate(),
+            quote_provider=self._quote_provider(),
+            # adv_provider explicitly omitted
+        )
+        with caplog.at_level(logging.WARNING, logger="src.broker.integration"):
+            result = flow.submit_market("SBER", OrderSide.BUY, Decimal("10"), self._portfolio())
+
+        # Placeholder path: single chunk (parent_qty = 10; placeholder adv=200 → chunk=10).
+        assert result.slice_count == 1
+        assert result.final_status == OrderStatus.FILLED
+        # One-shot warning must mention issue #230.
+        assert any(
+            "issue #230" in rec.message for rec in caplog.records
+        ), f"expected a one-shot warning mentioning issue #230, got: {[r.message for r in caplog.records]}"
+
+        # Second call must NOT re-warn.
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="src.broker.integration"):
+            flow.submit_market("SBER", OrderSide.BUY, Decimal("10"), self._portfolio())
+        assert not any(
+            "issue #230" in rec.message for rec in caplog.records
+        ), "expected no warning on second call (one-shot flag should be set)"
+
+    # --- symbol upper-cased before provider call ---
+
+    def test_adv_provider_called_with_uppercase_symbol(self) -> None:
+        captured: dict[str, str] = {}
+
+        def _ap(symbol: str) -> Decimal:
+            captured["symbol"] = symbol
+            return Decimal("1000")
+
+        broker = MagicMock()
+        broker.place_order.return_value = OrderStatus.FILLED
+
+        flow = OrderFlow(
+            broker=broker,
+            risk_gate=self._approved_gate(),
+            quote_provider=self._quote_provider(),
+            adv_provider=_ap,
+        )
+        flow.submit_market("sber", OrderSide.BUY, Decimal("10"), self._portfolio())
+        assert captured["symbol"] == "SBER"
 
 
 # ────────────────────────────────────────────

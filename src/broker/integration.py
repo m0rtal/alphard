@@ -73,6 +73,7 @@ class OrderFlow:
         broker: BrokerAccount,
         risk_gate: Any,  # src.risk.gate.RiskGate (typed Any to satisfy --strict)
         quote_provider: QuoteProvider,
+        adv_provider: "Callable[[str], Decimal] | None" = None,
         universe_filter: Callable[[str], bool] | None = None,
         peak_equity_provider: Callable[[], Decimal] | None = None,
     ):
@@ -84,6 +85,25 @@ class OrderFlow:
                 a ticker. MUST raise on failure — ``OrderFlow`` will refuse
                 the order with a ``QUOTE_UNAVAILABLE`` violation rather than
                 substitute a placeholder (issue #166).
+            adv_provider: Optional callable returning the per-ticker
+                Average Daily Volume (ADV) in **shares** for a given symbol.
+                Issue #230: a previous version of ``submit_market`` built
+                the OrderSlicer's ``adv_shares`` as ``max(qty * 20, 100)``
+                — a hardcoded placeholder unrelated to real ADV — which
+                made the slicer's 5%-ADV-chunk policy collapse to
+                exactly one chunk for every realistic production
+                quantity. The whole TWAP / rate-limit enforcement
+                shipped as dead code on the OrderFlow path. Passing
+                ``adv_provider`` wires a real ADV source (Phase 2.6
+                ``ohlcv_daily`` reads, exposed via
+                ``src.data.adv_provider.AdvProvider``); a provider that
+                raises is mapped to ``ADV_UNAVAILABLE`` so the order is
+                rejected up-front rather than silently submitted as a
+                single slice. ``None`` keeps the pre-#230 behaviour
+                (1-chunk fallback) and logs a one-shot WARNING so
+                operators see the gap; callers are encouraged to
+                migrate. Production paths must pass an explicit
+                ``adv_provider``.
             universe_filter: Optional allow-list. Symbols for which the
                 filter returns False are short-circuited with
                 ``UNIVERSE_BLOCKED``.
@@ -114,8 +134,14 @@ class OrderFlow:
         self._broker = broker
         self._risk_gate = risk_gate
         self._quote_provider = quote_provider
+        self._adv_provider = adv_provider
         self._universe_filter = universe_filter
         self._peak_equity_provider = peak_equity_provider
+        # Issue #230: one-shot warning flag for the legacy
+        # ``adv_provider=None`` code path. Logged on the FIRST
+        # submit_market call only — operators should see the gap but
+        # not be flooded on every order.
+        self._warned_missing_adv: bool = False
         # Issue #195: one-shot warning flag. We log the missing-peak
         # WARNING on the FIRST submit_market call only, not on every
         # call, so a busy session doesn't flood the log.
@@ -230,7 +256,76 @@ class OrderFlow:
             )
 
         # 4. Slice
-        adv_shares = max(quantity * Decimal("20"), Decimal("100"))
+        # Issue #230: previously this line was
+        #     adv_shares = max(quantity * Decimal("20"), Decimal("100"))
+        # which is a hardcoded placeholder unrelated to real ADV.
+        # ``chunk_size = adv_shares * CHUNK_PCT(5%)`` therefore equalled
+        # ``quantity`` for every qty ≥ 5, the slicer's "single chunk"
+        # early-return (slicer.py:78-89) always fired, and the TWAP /
+        # rate-limit / 5%-ADV participation policy shipped as dead code
+        # on the OrderFlow path. Tests at test_broker_connector.py:2017
+        # and 2072 / 2108 already monkey-patched ``OrderSlicer.__init__``
+        # to lie about ADV precisely because of this gap.
+        #
+        # New contract:
+        #   * ``adv_provider`` set and returns > 0 → use that as
+        #     ``adv_shares``; the slicer's 5%-ADV policy actually
+        #     applies.
+        #   * ``adv_provider`` set but raises → refuse the order with
+        #     ``ADV_UNAVAILABLE`` violation (fail-safe; we DO NOT fall
+        #     back to a placeholder, mirroring the ``quote_provider``
+        #     contract from issue #166).
+        #   * ``adv_provider`` not set → keep the legacy 1-chunk
+        #     fallback (``max(qty * 20, 100)``) and emit a one-shot
+        #     WARNING on the first call. New deployments MUST wire an
+        #     ``adv_provider``; the placeholder is preserved for
+        #     backwards-compatibility with the test suite and any
+        #     caller that has not yet migrated.
+        if self._adv_provider is None:
+            if not self._warned_missing_adv:
+                logger.warning(
+                    "OrderFlow invoked without adv_provider (issue #230); "
+                    "falling back to max(qty*20, 100) placeholder and emitting "
+                    "a single-chunk MarketOrder. Wire an adv_provider from "
+                    "src.data.adv_provider before going to production."
+                )
+                self._warned_missing_adv = True
+            adv_shares = max(quantity * Decimal("20"), Decimal("100"))
+        else:
+            try:
+                adv_shares = Decimal(self._adv_provider(symbol.upper()))
+            except Exception as exc:  # noqa: BLE001 — diagnostic only
+                logger.error(
+                    "ADV_UNAVAILABLE for %s: %s — refusing order (issue #230, "
+                    "fail-safe: never substitute a placeholder ADV).",
+                    symbol,
+                    exc,
+                )
+                return OrderFlowResult(
+                    intent_symbol=symbol,
+                    side=side.value,
+                    quantity=quantity,
+                    decision_violations=("ADV_UNAVAILABLE",),
+                    slice_count=0,
+                    submitted=[],
+                    final_status=OrderStatus.REJECTED,
+                )
+            if adv_shares <= Decimal("0"):
+                logger.error(
+                    "ADV_INVALID for %s: adv_provider returned %r — refusing "
+                    "order (issue #230, fail-safe: never substitute a placeholder).",
+                    symbol,
+                    adv_shares,
+                )
+                return OrderFlowResult(
+                    intent_symbol=symbol,
+                    side=side.value,
+                    quantity=quantity,
+                    decision_violations=("ADV_INVALID",),
+                    slice_count=0,
+                    submitted=[],
+                    final_status=OrderStatus.REJECTED,
+                )
         try:
             slicer = OrderSlicer(adv_shares=adv_shares, parent_qty=quantity)
             slices = slicer.slice()
