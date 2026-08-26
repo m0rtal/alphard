@@ -65,6 +65,11 @@ build/
 .alphard/
 *.swp
 
+# Stray clones left behind inside the worktree (e.g. `git clone . alphard/`).
+# A nested repo of the same tree is never intentional and confuses `git status`.
+# If you really need one, use `git worktree` (see .worktrees/ above).
+/alphard/
+
 # Database backups (large TSV files)
 backups/
 *.tsv
