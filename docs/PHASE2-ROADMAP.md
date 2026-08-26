@@ -12,8 +12,8 @@ operator can correlate a Grafana panel with the code commit that emits it.
 
 | Sub-step | Deliverable | Status | PR |
 |---|---|---|---|
-| 2.8 step 1 | Prometheus metrics HTTP server (`alphard_uptime_seconds`, `alphard_heartbeat_last_tick_timestamp`, `alphard_heartbeats_total`) + heartbeat dashboard | ✅ MERGEABLE | PR #TBD |
-| 2.8 step 2 | Universe coverage gauges (`alphard_tickers_in_universe_total`, `alphard_tickers_with_full_history_total`) | ✅ MERGEABLE | PR #TBD |
+| 2.8 step 1 | Prometheus metrics HTTP server (`alphard_uptime_seconds`, `alphard_heartbeat_last_tick_timestamp`, `alphard_heartbeats_total`) + heartbeat dashboard | ✅ MERGEABLE | PR #34 |
+| 2.8 step 2 | Universe coverage gauges (`alphard_tickers_in_universe_total`, `alphard_tickers_with_full_history_total`) | ✅ MERGEABLE | PR #243 |
 | 2.7 step 1 | Weekly delisted_at cron (`_delisted_sync_loop`) | ✅ merged | (see history) |
 | 2.6 step 1 | Cross-source validation cron + schema | ✅ merged | (see history) |
 | 2.5 step 2b | `apply_corporate_actions` weekly orchestrator | ✅ merged | (see history) |
