@@ -274,7 +274,13 @@ services:
       - alphard-net
 
   pg-init:
-    image: alpine:3.20
+    # BUGFIX (2026-08-26): switched image from alpine:3.20 to
+    # postgres:16-alpine. The alpine image's `apk add` was failing on
+    # hosts with restricted egress (`.107` PVE LXC, sandboxed CI runners)
+    # because `dl-cdn.alpinelinux.org` was unreachable. `postgres:16-alpine`
+    # ships with the matching `psql` client pre-installed — no `apk add`
+    # step required. The cmd still uses `sh -c` (busybox), not bash.
+    image: postgres:16-alpine
     container_name: alphard-pg-init
     restart: "no"
     security_opt:
@@ -283,7 +289,6 @@ services:
     command:
       - |
         set -e
-        apk add --no-cache postgresql-client bash >/dev/null
         # Wait for postgres to accept connections.
         until PGPASSWORD="$$POSTGRES_PASSWORD" psql -h alphard-postgres \
               -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -c 'SELECT 1' >/dev/null 2>&1; do
@@ -311,7 +316,14 @@ services:
                  -d "$$POSTGRES_DB" -tAc "SHOW hba_file")
           if [ -z "$$HBA" ] || [ ! -e "$$HBA" ]; then
             echo "[pg-init] hba_file ($$HBA) not reachable from this container; trust rule MUST be set via SQL or via initdb init script"
-            echo "[pg-init] OK (no-op — pre-existing postgres volume)"
+            # BUGFIX (issue #243, first-shot-friendly): on pre-existing
+            # postgres volumes init.sql was never run, so the
+            # _auth_probe table the bot requires is missing. Apply
+            # the minimal subset inline via psql -c so the bot can
+            # start without manual intervention. Idempotent: every
+            # statement uses IF NOT EXISTS / ON CONFLICT.
+            PGPASSWORD="$$POSTGRES_PASSWORD" psql -h alphard-postgres -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -c "CREATE TABLE IF NOT EXISTS _auth_probe (id SMALLINT PRIMARY KEY, probed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), source VARCHAR(32) NOT NULL);" -c "INSERT INTO _auth_probe (id, probed_at, source) VALUES (1, NOW(), 'pg-init-fallback') ON CONFLICT (id) DO NOTHING;" -c "GRANT ALL PRIVILEGES ON TABLE _auth_probe TO CURRENT_USER;" >/dev/null
+            echo "[pg-init] OK (no-op hba; created _auth_probe via fallback)"
             exit 0
           fi
           echo "[pg-init] injecting trust rule for $${TRUST_CIDR} into $$HBA"
@@ -538,6 +550,8 @@ services:
     # 0.0.0.0:3000 listener = host's 0.0.0.0:3000. forgejo already lives on
     # host:3000, so Grafana binds to 3300 via GF_SERVER_HTTP_PORT instead.
     network_mode: host
+    security_opt:
+      - apparmor=unconfined
     # Override the upstream entrypoint (/run.sh) with our wrapper that
     # decodes the *_B64 env vars before exec'ing /run.sh. The upstream
     # entrypoint is still what configures GF_PATHS_* and starts
