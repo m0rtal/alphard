@@ -2,7 +2,25 @@
 
 > Single source of truth for what Phase 1 explicitly punts and what Phase 2 plans to land.
 > Synthesized from README.md, docs/PHASE1-AUDIT-2026-08-17.md, docs/SECURITY.md, docs/RUNBOOK.md.
-> **Last updated:** 2026-08-20 (issue #74 — Phase 2.5 step 2b: corp-actions apply orchestrator).
+> **Last updated:** 2026-08-26 (Phase 2.8 step 2: universe coverage gauges).
+
+## Phase 2 — status table
+
+Live PR-by-PR tracking for Phase 2 deliverables (sub-step granularity).
+Each row carries the exact metric names + the PR that landed it so an
+operator can correlate a Grafana panel with the code commit that emits it.
+
+| Sub-step | Deliverable | Status | PR |
+|---|---|---|---|
+| 2.8 step 1 | Prometheus metrics HTTP server (`alphard_uptime_seconds`, `alphard_heartbeat_last_tick_timestamp`, `alphard_heartbeats_total`) + heartbeat dashboard | ✅ MERGEABLE | PR #TBD |
+| 2.8 step 2 | Universe coverage gauges (`alphard_tickers_in_universe_total`, `alphard_tickers_with_full_history_total`) | ✅ MERGEABLE | PR #TBD |
+| 2.7 step 1 | Weekly delisted_at cron (`_delisted_sync_loop`) | ✅ merged | (see history) |
+| 2.6 step 1 | Cross-source validation cron + schema | ✅ merged | (see history) |
+| 2.5 step 2b | `apply_corporate_actions` weekly orchestrator | ✅ merged | (see history) |
+| 2.5 step 2c | Dividend handling in `apply_adjustment` | ✅ merged | (see history) |
+| 2.3 step 1 | Macro Agent (CBR + USD/RUB + IMOEX regime) | ✅ merged | (see history) |
+| 2.2 step 1 | Position Sizing Matrix (`src/broker/sizing.py`) | ✅ merged | (see history) |
+| 2.1 step 1 | Sandbox-token redeploy / LIVE_TRADING gate | ⏳ in flight | (see kanban) |
 
 ## Status
 
