@@ -102,13 +102,24 @@ def _quickstart_skel(
 
 
 def _qs_link(env_dir: Path) -> Path:
-    """Return a symlink path to quickstart.sh inside env_dir/scripts/."""
+    """Materialise a copy of quickstart.sh inside env_dir/scripts/.
+
+    We copy (NOT symlink) the real script because issues #248/#249
+    require that REPO_ROOT be derived from the real path of the
+    script, not the symlink. With a symlink, `readlink -f` (or our
+    python3 equivalent) resolves to the original location, and the
+    script would then operate on /root/projects/alphard instead of
+    the isolated test_dir. Copying keeps the test self-contained.
+
+    The name `_qs_link` is retained for backwards compat with
+    existing call-sites; the function actually copies now.
+    """
     tmp_scripts = env_dir / "scripts"
     tmp_scripts.mkdir(exist_ok=True)
     tmp_qs = tmp_scripts / "quickstart.sh"
     if tmp_qs.exists() or tmp_qs.is_symlink():
         tmp_qs.unlink()
-    tmp_qs.symlink_to(QS)
+    shutil.copy(QS, tmp_qs)
     os.chmod(tmp_qs, 0o755)
     return tmp_qs
 
@@ -118,6 +129,13 @@ def _qs_link(env_dir: Path) -> Path:
 # non-zero AFTER the bake stages (3/5 Grafana + 4/5 Prometheus) have
 # completed. This lets us test the bake + bootstrap logic without a
 # real Docker daemon.
+#
+# IMPORTANT: the real quickstart.sh invokes `docker compose --profile=X up -d`,
+# so the fake must match `up` regardless of positional args. The previous
+# version used `case "$2" in ... up)` which only matched when up was the
+# first arg after `compose` — the test suite silently passed because the
+# script's `set -e` would die on the pipeline before reaching the
+# PIPESTATUS check (issue #250).
 FAKE_DOCKER_SCRIPT = """#!/bin/sh
 case "$1" in
   version|--version)
@@ -129,20 +147,27 @@ case "$1" in
     exit 0
     ;;
   compose)
-    case "$2" in
-      version|--short)
-        echo "v2.40.3"
-        exit 0
-        ;;
-      up)
+    # Match 'compose up' regardless of preceding flags (e.g. --profile=X).
+    _has_up=0
+    for a in "$@"; do
+        if [ "$a" = "up" ]; then _has_up=1; break; fi
+    done
+    if [ "$_has_up" = "1" ]; then
         echo "fake compose up -d (always fails in test mode)" >&2
         exit 1
-        ;;
-      *)
-        echo "fake compose $*"
-        exit 0
-        ;;
-    esac
+    fi
+    # Other compose subcommands (version, ps, logs, inspect) succeed.
+    exit 0
+    ;;
+  inspect)
+    # Health-gate inspect call: report State.Status=running, State.Health.Status=healthy
+    # so the gate would loop forever if TIMEOUT_SEC > 0 (we use 0 in tests).
+    echo "running"
+    exit 0
+    ;;
+  ps)
+    # ALPHARD_SKIP_COMPOSE path prints `docker ps` — return empty.
+    exit 0
     ;;
   *)
     echo "fake docker $*"
@@ -183,6 +208,97 @@ def _run_with_fake_docker(env_dir: Path, tmp_path: Path) -> subprocess.Completed
     return subprocess.run(
         ["/bin/bash", str(_qs_link(env_dir))],
         cwd=str(env_dir),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+
+def _run_skip_compose(env_dir: Path, tmp_path: Path) -> subprocess.CompletedProcess[str]:
+    """Run quickstart.sh with ALPHARD_SKIP_COMPOSE=1. The script
+    bakes .env and exits 0 without ever invoking `docker compose up`.
+
+    Useful for testing the bake + bootstrap logic without the
+    pipeline-failure noise. The fake docker is still on PATH so the
+    sanity checks (and the post-skip `docker ps` summary) succeed.
+
+    NOTE: we do NOT set ALPHARD_QUIET=1 here — the SKIP_COMPOSE
+    path emits its key diagnostic ("compose not invoked") via the
+    info/ok helpers, and QUIET suppresses them. Callers that want
+    to assert on stdout content should use this helper without QUIET.
+    """
+    fake_docker_dir = tmp_path / "fakebin"
+    fake_docker_dir.mkdir(exist_ok=True)
+    fake_docker = fake_docker_dir / "docker"
+    fake_docker.write_text(FAKE_DOCKER_SCRIPT, encoding="utf-8")
+    fake_docker.chmod(0o755)
+
+    _qs_link(env_dir)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_docker_dir}:{env['PATH']}"
+    env["HOME"] = str(tmp_path)
+    env["ALPHARD_SKIP_COMPOSE"] = "1"
+    # Belt-and-suspenders: even if SKIP_COMPOSE early-exit is
+    # accidentally bypassed, ALPHARD_TIMEOUT_SEC=0 ensures the
+    # health gate never enters its polling loop.
+    env["ALPHARD_TIMEOUT_SEC"] = "0"
+
+    return subprocess.run(
+        ["/bin/bash", str(_qs_link(env_dir))],
+        cwd=str(env_dir),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+
+def _run_via_symlink(env_dir: Path, tmp_path: Path, with_skip_compose: bool = True) -> subprocess.CompletedProcess[str]:
+    """Invoke quickstart.sh through a SYMLINK (not the real path),
+    from a directory OUTSIDE the repo root. This is the regression
+    test for issues #248/#249: BASH_SOURCE[0] is the path as
+    invoked, so deriving REPO_ROOT from it directly used to point at
+    the symlink's parent directory. The fix is `readlink -f` (with
+    a python3 fallback). We assert the script correctly bakes .env
+    into the REAL repo dir.
+    """
+    fake_docker_dir = tmp_path / "fakebin"
+    fake_docker_dir.mkdir(exist_ok=True)
+    fake_docker = fake_docker_dir / "docker"
+    fake_docker.write_text(FAKE_DOCKER_SCRIPT, encoding="utf-8")
+    fake_docker.chmod(0o755)
+
+    # Materialise the real quickstart.sh inside env_dir/scripts/ first.
+    # (This is the test fixture's "real repo" — without it the
+    # symlink in /tmp/.../bin/qs has nothing to point at.)
+    _qs_link(env_dir)
+
+    # Symlink setup:
+    #   tmp_path/bin/qs                       → env_dir/scripts/quickstart.sh
+    #   cwd = tmp_path/elsewhere/             (NOT the repo root)
+    sym_dir = tmp_path / "bin"
+    sym_dir.mkdir(exist_ok=True)
+    qs_link = sym_dir / "qs"
+    if qs_link.exists() or qs_link.is_symlink():
+        qs_link.unlink()
+    qs_link.symlink_to(env_dir / "scripts" / "quickstart.sh")
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir(exist_ok=True)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_docker_dir}:{env['PATH']}"
+    env["ALPHARD_QUIET"] = "1"
+    env["HOME"] = str(tmp_path)
+    if with_skip_compose:
+        env["ALPHARD_SKIP_COMPOSE"] = "1"
+    env["ALPHARD_TIMEOUT_SEC"] = "0"
+
+    return subprocess.run(
+        ["/bin/bash", str(qs_link)],
+        cwd=str(elsewhere),
         env=env,
         capture_output=True,
         text=True,
@@ -292,15 +408,23 @@ def test_env_created_from_example(tmp_path: Path) -> None:
 
 
 def test_postgres_password_autogenerated(tmp_path: Path) -> None:
-    """POSTGRES_PASSWORD empty -> 24 random bytes injected."""
+    """POSTGRES_PASSWORD empty -> 24 random bytes injected.
+
+    This test asserts the post-bake SUCCESS path returns rc=0,
+    not rc in (1, 2). The previous permissive assertion masked
+    the regression fixed by ALPHARD_SKIP_COMPOSE=1 (issue #251):
+    with the old code, every bake-success run exited 1 with a
+    misleading "compose step failed" message, so the test suite
+    could never verify the bake path was actually clean.
+    """
     env_dir = _quickstart_skel(tmp_path, with_gpw=True, skip_env=False)
     (env_dir / ".env").write_text(
         "GRAFANA_ADMIN_PASSWORD=ci_test_password_DO_NOT_USE_IN_PRODUCTION\n" "POSTGRES_PASSWORD=\n" "REDIS_PASSWORD=\n",
         encoding="utf-8",
     )
 
-    r = _run_with_fake_docker(env_dir, tmp_path)
-    assert r.returncode in (1, 2), "expect compose to fail (rc=1) or validation (rc=2)"
+    r = _run_skip_compose(env_dir, tmp_path)
+    assert r.returncode == 0, f"expected exit 0 on bake-success path; got {r.returncode}; " f"stderr: {r.stderr[-500:]}"
 
     text = (env_dir / ".env").read_text()
     pgpw = re.search(r'^POSTGRES_PASSWORD="([^"]+)"', text, re.MULTILINE)
@@ -308,6 +432,147 @@ def test_postgres_password_autogenerated(tmp_path: Path) -> None:
     assert pgpw and pgpw.group(1).strip(), f"POSTGRES_PASSWORD should be set; env:\n{text}"
     assert rpw and rpw.group(1).strip(), f"REDIS_PASSWORD should be set; env:\n{text}"
     assert pgpw.group(1).strip() != "alphard"
+
+
+def test_skip_compose_exits_zero_and_skips_docker(tmp_path: Path) -> None:
+    """ALPHARD_SKIP_COMPOSE=1: bake stages only, exits 0 BEFORE
+    invoking docker compose up. Regression for issue #251.
+
+    We additionally assert that the fake docker's `compose up`
+    branch was NOT invoked — if it was, the script would have
+    failed and exited 0 only by accident. We detect this by
+    checking stdout: the SKIP_COMPOSE path prints 'compose not
+    invoked' (rc=0), while a real `compose up` failure would print
+    'docker compose up failed' (rc=2).
+    """
+    env_dir = _quickstart_skel(tmp_path, with_gpw=True)
+    r = _run_skip_compose(env_dir, tmp_path)
+    assert r.returncode == 0, f"ALPHARD_SKIP_COMPOSE=1 should exit 0; got {r.returncode}; " f"stderr: {r.stderr[-500:]}"
+    combined = r.stdout + r.stderr
+    assert (
+        "compose not invoked" in combined
+    ), f"expected 'compose not invoked' message; got stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
+    assert "docker compose up failed" not in combined, (
+        f"docker compose up should NOT have run under SKIP_COMPOSE; " f"got stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
+    )
+
+
+def test_compose_failure_exits_2_with_diagnostic(tmp_path: Path) -> None:
+    """When `docker compose up` actually returns non-zero, the
+    script must exit 2 AND print a useful diagnostic pointing at
+    `docker compose logs` and `docker ps`. Regression for issue
+    #250: under `set -euo pipefail`, the previous PIPESTATUS check
+    was unreachable because `set -e` killed the script on the
+    pipeline BEFORE the diagnostic branch could run. The test
+    suite's `rc in (1, 2)` assertion masked this — the script was
+    silently exiting 1 from the pipeline itself.
+    """
+    env_dir = _quickstart_skel(tmp_path, with_gpw=True)
+    r = _run_with_fake_docker(env_dir, tmp_path)
+    assert r.returncode == 2, (
+        f"compose-up failure should exit 2; got {r.returncode}; "
+        f"stdout: {r.stdout[-500:]}\nstderr: {r.stderr[-500:]}"
+    )
+    combined = r.stdout + r.stderr
+    assert "docker compose up failed" in combined, f"expected 'docker compose up failed' diagnostic; got:\n{combined}"
+    assert (
+        "docker compose logs" in combined or "docker ps" in combined
+    ), f"expected inspect-hint diagnostic; got:\n{combined}"
+
+
+def test_timeout_zero_exits_1_with_honest_message(tmp_path: Path) -> None:
+    """ALPHARD_TIMEOUT_SEC=0 (without SKIP_COMPOSE) means: bake +
+    compose ran, but no health-gate polling. Exit 1 with an honest
+    message. Regression for issue #251: the previous code conflated
+    'compose failed' with 'compose skipped', printing
+    'compose step failed; bakes ran' even when the bakes were the
+    only thing that ran.
+    """
+    env_dir = _quickstart_skel(tmp_path, with_gpw=True)
+    r = _run_with_fake_docker(env_dir, tmp_path)
+    # Note: with our fake docker that fails `compose up`, the script
+    # should exit 2 (compose-failure) BEFORE reaching the TIMEOUT_SEC=0
+    # branch. So we instead exercise the timeout-0 path with a fake
+    # docker that SUCCEEDS on compose up — see the next test.
+    # For now, just assert the compose-failure path does NOT hit the
+    # old "compose step failed; bakes ran; quickstart test mode active"
+    # dead-code branch.
+    combined = r.stdout + r.stderr
+    assert "quickstart test mode active" not in combined, f"dead-code branch should be removed; got:\n{combined}"
+
+
+def test_timeout_zero_with_successful_compose_exits_1(tmp_path: Path) -> None:
+    """ALPHARD_TIMEOUT_SEC=0 + docker compose up SUCCESS = exit 1.
+
+    This is the pure fast-fail-smoke path. With the fix, when
+    compose succeeds and the operator asked for no health polling,
+    the script should exit 1 with a message that's HONEST about
+    what happened: 'fast-fail smoke mode', NOT 'compose step
+    failed' (because compose didn't fail — the operator just asked
+    us to skip the health check).
+    """
+    env_dir = _quickstart_skel(tmp_path, with_gpw=True)
+    _fill_all_b64(env_dir)
+
+    # Custom fake docker: ALL commands succeed (including `compose up`).
+    fake_docker_dir = tmp_path / "fakebin_success"
+    fake_docker_dir.mkdir(exist_ok=True)
+    fake_docker = fake_docker_dir / "docker"
+    fake_docker.write_text(
+        "#!/bin/sh\n" 'echo "fake docker $*"\n' "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_docker.chmod(0o755)
+
+    _qs_link(env_dir)
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_docker_dir}:{env['PATH']}"
+    env["ALPHARD_QUIET"] = "1"
+    env["HOME"] = str(tmp_path)
+    env["ALPHARD_TIMEOUT_SEC"] = "0"
+
+    r = subprocess.run(
+        ["/bin/bash", str(_qs_link(env_dir))],
+        cwd=str(env_dir),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert r.returncode == 1, (
+        f"timeout-0 + compose-success should exit 1; got {r.returncode}; " f"stderr: {r.stderr[-500:]}"
+    )
+    combined = r.stdout + r.stderr
+    assert "fast-fail" in combined.lower(), f"expected honest fast-fail message; got:\n{combined}"
+    assert "ALPHARD_SKIP_COMPOSE" in combined, f"expected hint about ALPHARD_SKIP_COMPOSE alternative; got:\n{combined}"
+
+
+def test_symlink_invocation_finds_real_repo(tmp_path: Path) -> None:
+    """Invoking quickstart.sh through a SYMLINK from a directory
+    OUTSIDE the repo root must find the real .env / docker-compose.yaml.
+
+    Regression for issues #248 and #249. The script's REPO_ROOT
+    must come from `readlink -f $BASH_SOURCE[0]`, not
+    `${BASH_SOURCE[0]%/*}`. We verify by running the script via a
+    symlink at tmp_path/bin/qs → env_dir/scripts/quickstart.sh with
+    cwd=tmp_path/elsewhere/, then asserting .env was created in the
+    real env_dir, not in the symlink's parent directory.
+    """
+    env_dir = _quickstart_skel(tmp_path, with_gpw=True, skip_env=True)
+    assert not (env_dir / ".env").exists()
+
+    r = _run_via_symlink(env_dir, tmp_path, with_skip_compose=True)
+    assert r.returncode == 0, (
+        f"symlinked invocation should succeed (rc=0); got {r.returncode}; " f"stderr: {r.stderr[-500:]}"
+    )
+    assert (env_dir / ".env").exists(), (
+        f".env should be created in the REAL repo dir {env_dir}; " f"got stderr: {r.stderr[-500:]}"
+    )
+    # And NOT in the symlink's parent directory (tmp_path/bin/.. = tmp_path).
+    assert not (tmp_path / ".env").exists(), ".env must NOT be created in the symlink's parent directory"
+    # And the script must have found the real compose file.
+    text = (env_dir / ".env").read_text()
+    assert "GRAFANA_ADMIN_PASSWORD=ci_test_password_DO_NOT_USE_IN_PRODUCTION" in text
 
 
 def test_prom_b64_baked_when_missing(tmp_path: Path) -> None:
