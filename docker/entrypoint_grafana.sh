@@ -129,8 +129,8 @@ decode_b64 "DASHBOARD_PHASE28_JSON_B64" "/var/lib/grafana/dashboards/alphard-pha
 # Grafana's later writes (it doesn't write into dashboards/ after
 # startup, but it does chmod-on-write, which silently fails on a
 # foreign-owner file).
-chown -R 472:472 /var/lib/grafana/dashboards
-chown -R 472:472 /etc/grafana/provisioning
+chown -R 472:472 /var/lib/grafana/dashboards 2>/dev/null || log "chown dashboards failed (LXC bind-mount) — continuing"
+chown -R 472:472 /etc/grafana/provisioning 2>/dev/null || log "chown provisioning failed (LXC bind-mount) — continuing"
 
 log "decoded 4 files; exec /run.sh (upstream grafana entrypoint)"
 # `exec` so PID 1 is /run.sh — signals (SIGTERM from docker stop) reach
