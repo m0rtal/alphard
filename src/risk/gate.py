@@ -122,14 +122,35 @@ class Position(BaseModel):
     check in RiskGate would compute against falsified market_value, letting
     an oversized position slip through RISK_SECTOR. Same defence-in-depth
     reasoning as TradeIntent / RiskLimits.
+
+    Issue #240: normalise ``symbol`` to UPPERCASE on construction, mirroring
+    ``TradeIntent._strip_symbol`` (line 90-96). Without this, a
+    ``PortfolioState(positions=[Position(symbol="sber", ...)])`` built from
+    mixed-case broker output (e.g. Tinkoff) would silently miss the lookup
+    against ``TradeIntent(symbol="SBER")`` in
+    ``RiskGate._check_position_size`` (line 326) — the existing_qty would
+    be reported as 0, and the existing position would be invisible to the
+    RISK_POSITION check. Sister fix of the ticker-normalisation series
+    (issues #183, #185, #224, #234, #236, #238).
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    symbol: str
+    symbol: str = Field(..., min_length=1, description="Instrument ticker, e.g. 'SBER'")
     quantity: Decimal = Field(..., ge=Decimal("0"))
     avg_price: Decimal = Field(..., gt=Decimal("0"))
     sector: str | None = None
+
+    @field_validator("symbol")
+    @classmethod
+    def _strip_symbol(cls, v: str) -> str:
+        # Mirrors TradeIntent._strip_symbol (line 90-96) so that
+        # ``Position(symbol="sber")`` and ``Position(symbol="SBER")`` are
+        # canonicalised to the same key for the lookup at line 326.
+        v = v.strip().upper()
+        if not v:
+            raise ValueError("symbol must be non-empty after stripping")
+        return v
 
     @property
     def market_value(self) -> Decimal:

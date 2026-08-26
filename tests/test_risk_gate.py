@@ -1334,3 +1334,123 @@ class TestHelpers:
         """Symbol is stripped and uppercased."""
         i = TradeIntent(symbol="  sber  ", side="buy", quantity=Decimal("1"), price=Decimal("1"))
         assert i.symbol == "SBER"
+
+
+# ===========================================================================
+# Position.symbol normalisation — issue #240
+# ===========================================================================
+
+
+class TestPositionSymbolNormalisation:
+    """Issue #240: ``Position.symbol`` must normalise to UPPERCASE on
+    construction, mirroring ``TradeIntent._strip_symbol`` (gate.py:90-96).
+    Without this, a ``PortfolioState(positions=[Position(symbol="sber", ...)])``
+    silently misses the lookup against ``TradeIntent(symbol="SBER")`` in
+    ``RiskGate._check_position_size`` — existing_qty reads as 0, the
+    existing position is invisible to RISK_POSITION, and a double-buy can
+    slip through.
+
+    Sister coverage of test_intent_symbol_normalised above.
+    """
+
+    def test_position_symbol_uppercases_lowercase(self) -> None:
+        p = Position(symbol="sber", quantity=Decimal("10"), avg_price=Decimal("250"))
+        assert p.symbol == "SBER"
+
+    def test_position_symbol_strips_whitespace(self) -> None:
+        p = Position(symbol="  SBER  ", quantity=Decimal("10"), avg_price=Decimal("250"))
+        assert p.symbol == "SBER"
+
+    def test_position_symbol_strips_and_uppercases(self) -> None:
+        p = Position(symbol="  sber  ", quantity=Decimal("10"), avg_price=Decimal("250"))
+        assert p.symbol == "SBER"
+
+    def test_position_symbol_empty_raises(self) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            Position(symbol="", quantity=Decimal("10"), avg_price=Decimal("250"))
+        assert "symbol" in str(exc_info.value).lower()
+
+    def test_position_symbol_whitespace_only_raises(self) -> None:
+        """``"   "`` strips to empty → must raise (mirrors TradeIntent line 94-95)."""
+        with pytest.raises(ValidationError) as exc_info:
+            Position(symbol="   ", quantity=Decimal("10"), avg_price=Decimal("250"))
+        assert "symbol" in str(exc_info.value).lower()
+
+    def test_lowercase_position_visible_to_uppercase_intent(self) -> None:
+        """Regression test for issue #240: the original bug.
+
+        Build a portfolio state with a lowercase-symbol position and an
+        uppercase-symbol TradeIntent. Pre-fix, ``_check_position_size``
+        (gate.py:326) compared ``p.symbol == intent.symbol`` literally,
+        reported ``existing_qty=0``, and the existing 500-share position
+        was invisible — so a 100-share BUY at price 200 (= 20% of equity)
+        was treated as if no position existed yet, only tripping at the
+        10% max_position_pct if the single intent alone exceeded it.
+
+        With the validator, both sides are canonical to "SBER" and the
+        existing 500 shares are correctly accounted for in the lookup.
+        """
+        state = PortfolioState(
+            total_equity=Decimal("1000000"),
+            cash=Decimal("0"),
+            peak_equity=Decimal("1000000"),
+            positions=[
+                # Issue #240 path: lowercase symbol on Position.
+                Position(symbol="sber", quantity=Decimal("500"), avg_price=Decimal("1000")),
+            ],
+        )
+        intent = TradeIntent(
+            symbol="SBER",  # uppercase intent
+            side="buy",
+            quantity=Decimal("100"),
+            price=Decimal("200"),
+        )
+        gate = RiskGate(
+            limits=RiskLimits(
+                max_dd_pct=Decimal("15.0"),
+                max_position_pct=Decimal("10.0"),
+                max_sector_pct=Decimal("30.0"),
+                max_daily_loss_pct=Decimal("3.0"),
+            )
+        )
+        decision = gate.evaluate(intent, state)
+        # Pre-fix: existing_qty would be 0 → effective_notional = 20000 → 2%
+        # which passes the 10% position limit but is WRONG (the position
+        # was already there). Post-fix: existing_qty = 500 → effective_notional
+        # = 20000 → 2%, same outcome here, but at least the lookup is correct.
+        # The critical assertion is that existing_qty in meta is 500, not 0.
+        assert decision.meta.get("existing_qty") == 500.0, (
+            f"existing_qty must be 500 after Position.symbol is normalised; "
+            f"got {decision.meta.get('existing_qty')!r}. This is the exact "
+            f"silent-miss the issue #240 fix targets (gate.py:326)."
+        )
+
+    def test_uppercase_position_visible_to_lowercase_intent(self) -> None:
+        """Inverse: uppercase position + lowercase intent. Both sides
+        must normalise, so existing_qty must be visible."""
+        state = PortfolioState(
+            total_equity=Decimal("1000000"),
+            cash=Decimal("0"),
+            peak_equity=Decimal("1000000"),
+            positions=[
+                Position(symbol="SBER", quantity=Decimal("500"), avg_price=Decimal("1000")),
+            ],
+        )
+        intent = TradeIntent(
+            symbol="sber",  # TradeIntent validator handles lowercase
+            side="buy",
+            quantity=Decimal("100"),
+            price=Decimal("200"),
+        )
+        gate = RiskGate(
+            limits=RiskLimits(
+                max_dd_pct=Decimal("15.0"),
+                max_position_pct=Decimal("10.0"),
+                max_sector_pct=Decimal("30.0"),
+                max_daily_loss_pct=Decimal("3.0"),
+            )
+        )
+        decision = gate.evaluate(intent, state)
+        assert decision.meta.get("existing_qty") == 500.0, (
+            f"existing_qty must be 500 when intent side normalises; " f"got {decision.meta.get('existing_qty')!r}"
+        )
