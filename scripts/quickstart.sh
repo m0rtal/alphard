@@ -30,6 +30,16 @@
 #                           Prometheus + Grafana; bot + postgres + redis
 #                           only — for memory-constrained hosts).
 #   ALPHARD_TIMEOUT_SEC   = 180 (default; how long to wait for healthy).
+#                           Set to 0 to run bake stages + compose up,
+#                           skip the health-gate polling, and exit
+#                           regardless of container state. Useful for
+#                           CI fast-fail smoke tests.
+#   ALPHARD_SKIP_COMPOSE  = "1" runs only the bake stages (Grafana +
+#                           Prometheus B64 + password auto-gen) and
+#                           exits 0 once .env is fully populated, without
+#                           invoking docker compose at all. The
+#                           operator is then expected to run
+#                           `docker compose up` themselves.
 #   ALPHARD_QUIET         = "1" suppress progress dots.
 #
 # Why this script exists: a clean-host `git clone + docker compose up`
@@ -54,19 +64,44 @@
 
 set -euo pipefail
 
-# SCRIPT_DIR/REPO_ROOT resolution — no `dirname` (busybox-alpine
-# strips it from some PATHs; we use bash-native parameter expansion).
-# BASH_SOURCE[0] is the path as invoked; ${BASH_SOURCE[0]%/*} is its
-# directory (without trailing slash), and a `cd` + `pwd` round-trip
-# gives the canonical absolute path.
+# SCRIPT_DIR/REPO_ROOT resolution.
+#
+# BASH_SOURCE[0] is the path AS INVOKED (e.g. "/usr/local/bin/qs" when
+# the script is invoked via a symlink), not the real path. Deriving
+# REPO_ROOT from it directly makes the script read .env / docker-
+# compose.yaml / tools/bake_grafana_env.py from the symlink's parent
+# directory instead of the real repo, which silently breaks for
+#   cp scripts/quickstart.sh /usr/local/bin/alphard-quickstart
+# or any CI flow that copies the script into a shared /usr/local/bin.
+# (issues #248, #249).
+#
+# We resolve symlinks via `python3 -c 'os.path.realpath'`. python3 is
+# already a hard dependency of this script (tools/bake_grafana_env.py
+# requires it), so the cost is zero. We deliberately avoid `readlink -f`
+# and `dirname` because:
+#   - busybox-alpine (the base of alphard-pg-init) ships readlink
+#     without `-f` support on some images.
+#   - test fixtures that strip docker from PATH also strip
+#     /usr/bin (where readlink and dirname live), which would
+#     otherwise make the script fail before the real sanity checks.
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "FATAL: quickstart.sh requires python3 on PATH (used for symlink resolution and Grafana B64 bake)." >&2
+    echo "       Install python3 3.8+ first." >&2
+    exit 2
+fi
 SCRIPT_PATH="${BASH_SOURCE[0]}"
-SCRIPT_DIR="$(cd "${SCRIPT_PATH%/*}" && pwd)"
+SCRIPT_REAL="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$SCRIPT_PATH")"
+SCRIPT_DIR="${SCRIPT_REAL%/*}"
+# `cd && pwd` resolves any relative-path or final-segment components
+# (e.g. SCRIPT_REAL = "bin/./qs" -> absolute /abs/bin/qs).
+SCRIPT_DIR="$(cd "$SCRIPT_DIR" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
 # ---- Config knobs (env-driven with defaults) ----
 PROFILE="${ALPHARD_PROFILE:-observability}"
 TIMEOUT_SEC="${ALPHARD_TIMEOUT_SEC:-180}"
+SKIP_COMPOSE="${ALPHARD_SKIP_COMPOSE:-0}"
 QUIET="${ALPHARD_QUIET:-0}"
 
 # ---- Pretty output helpers ----
@@ -223,6 +258,23 @@ else
 fi
 
 # ---- 5. docker compose up ----
+# Two early-exit paths:
+#   - ALPHARD_SKIP_COMPOSE=1: bake-only mode. Operator wants a fully-
+#     populated .env and will run docker compose themselves (CI / k8s).
+#     We exit 0 BEFORE invoking docker compose at all.
+#   - compose actually returns non-zero: handled below with full
+#     diagnostics (exit 2).
+# The remaining TIMEOUT_SEC=0 fast-fail path is checked AFTER compose
+# runs but BEFORE the health-gate polling loop.
+if [[ "$SKIP_COMPOSE" == "1" ]]; then
+    info "5/5 docker compose up — skipped (ALPHARD_SKIP_COMPOSE=1)"
+    info "  Bakes written; docker compose not invoked. Run \`docker compose --profile $PROFILE up -d\` yourself."
+    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+        docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' --filter "name=alphard-" 2>/dev/null || true
+    fi
+    ok "bakes complete; compose not invoked"
+    exit 0
+fi
 info "5/5 docker compose up -d --profile $PROFILE"
 
 # We do NOT `set -a; source .env; set +a` because that would export every
@@ -230,22 +282,34 @@ info "5/5 docker compose up -d --profile $PROFILE"
 # process environment. `docker compose` automatically reads .env at the
 # project root for variable substitution. See:
 # https://docs.docker.com/compose/environment-variables/env-files/
-# We use PIPESTATUS to detect docker compose failures, because without
-# `set -o pipefail` the `||` after a pipeline only checks the LAST
-# command (sed, which always succeeds) and silently ignores compose
-# errors. The previous version hung the Health gate for 180s waiting
-# for containers that never started.
-docker compose "--profile=$PROFILE" up -d 2>&1 | sed 's/^/  /'
-_compose_rc="${PIPESTATUS[0]}"
+#
+# We capture compose output into a variable instead of piping directly,
+# because `set -o pipefail` + `set -e` together would kill the script on
+# any pipeline element's non-zero exit BEFORE we could inspect the
+# return code (PIPESTATUS would be unreachable, the diagnostic
+# message dead code). Command substitution with `if !` is the
+# idiomatic alternative: bash checks the exit status of the assignment
+# without killing the script, the output is preserved in full for
+# diagnostics, and the trailing `sed` re-indents for log readability.
+_compose_output="$(docker compose "--profile=$PROFILE" up -d 2>&1)" || _compose_rc=$?
+_compose_rc="${_compose_rc:-0}"
+printf '%s\n' "$_compose_output" | sed 's/^/  /'
 if [[ "$_compose_rc" -ne 0 ]]; then
     err "docker compose up failed (rc=$_compose_rc)"
+    err "Inspect: docker compose logs; docker ps --filter name=alphard-"
     exit 2
 fi
 
 # ---- Health gate ----
+# ALPHARD_TIMEOUT_SEC=0 means: compose just ran, but skip the
+# health-gate polling. We always exit 1 here so that CI fast-fail
+# smoke runs have a non-zero signal when the compose step did NOT
+# make containers healthy (without conflating that with bake failures,
+# which exit 2 earlier).
 if [[ "$TIMEOUT_SEC" -lt 1 ]]; then
-    info "Health gate skipped (TIMEOUT_SEC=0; for fast-fail test runs)"
-    err "compose step failed; bakes ran; quickstart test mode active"
+    err "Health gate skipped (ALPHARD_TIMEOUT_SEC=0)"
+    err "  This is a fast-fail smoke mode: bake + compose ran but no health polling."
+    err "  If you intended to bake only, set ALPHARD_SKIP_COMPOSE=1 instead."
     exit 1
 fi
 info "Health gate (up to ${TIMEOUT_SEC}s)"
