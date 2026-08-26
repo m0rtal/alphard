@@ -351,3 +351,48 @@ def test_generic_exception_also_caught(_setup):
     assert call_count["n"] >= 2
     # No gauge value set since every iteration failed.
     assert reg.get_gauge("alphard_tickers_in_universe_total") == 0.0
+
+
+def test_uses_connect_with_timeouts_helper(_setup):
+    """Issue #244 regression guard: the loop MUST go through connect_with_timeouts,
+    not raw ``psycopg.connect``. Mirrors the contract enforced for coordinator.py
+    (issue #232 / PR #233) — a Postgres network stall on an in-flight query
+    must not hang the universe_metrics daemon indefinitely.
+    """
+    main = _setup
+    reg = _install_registry(main)
+    _patch_psycopg((5,), (2,))
+
+    # Patch connect_with_timeouts on the pg_store module — the loop imports
+    # it lazily, so we have to patch where it is *looked up*, not where it
+    # is defined. Easiest: patch the symbol in src.data.pg_store.
+    from src.data import pg_store
+
+    with mock.patch.object(pg_store, "connect_with_timeouts", wraps=pg_store.connect_with_timeouts) as spy:
+        with mock.patch.object(main, "_sleep_interruptible", lambda s: main._shutdown_event.set()):
+            main._universe_metrics_loop()
+
+    # Must have been called at least once with the DSN we seeded.
+    assert spy.call_count >= 1, "connect_with_timeouts was not called"
+    assert spy.call_args_list[0].args[0] == "host=fake port=5432 dbname=alphard"
+    # And the fake psycopg.connect itself must be invoked exactly once per
+    # iteration — *transitively* through connect_with_timeouts, which is the
+    # single source of truth and wraps the real driver internally. If the
+    # loop regresses to calling psycopg.connect directly (issue #244), the
+    # call count would also be 1, but the ``connect_with_timeouts`` spy above
+    # would not have been called. The two assertions together pin down the
+    # contract: loop → connect_with_timeouts → psycopg.connect.
+    fake_psycopg = sys.modules["psycopg"]
+    assert fake_psycopg.connect.call_count == 1, (
+        f"psycopg.connect call_count={fake_psycopg.connect.call_count}; "
+        f"expected exactly 1 transitively through connect_with_timeouts"
+    )
+    assert fake_psycopg.connect.call_args.kwargs == {
+        "connect_timeout": 10,
+        "options": "-c statement_timeout=60000",
+    }, (
+        "H-NETWORK-DETECT two-guard kwargs regressed: " f"{fake_psycopg.connect.call_args.kwargs}"
+    )
+    # Smoke: gauges still published correctly via the helper.
+    assert reg.get_gauge("alphard_tickers_in_universe_total") == 5.0
+    assert reg.get_gauge("alphard_tickers_with_full_history_total") == 2.0

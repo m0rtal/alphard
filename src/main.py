@@ -558,11 +558,17 @@ def _universe_metrics_loop() -> None:
     # Lazy import: psycopg is a Phase 1.1 dep, not required for the Phase 0
     # heartbeat to start. Importing inside the loop body keeps the import
     # surface small and matches the pattern in connect_with_timeouts.
+    # Issue #244: use the shared connect_with_timeouts helper so the
+    # H-NETWORK-DETECT two-guard pattern (connect_timeout=10s + Postgres
+    # statement_timeout=60000ms) is enforced here too. The previous
+    # psycopg.connect(dsn, connect_timeout=10) only guarded the TCP
+    # handshake — a hung in-flight query would still wedge this daemon.
     import psycopg  # noqa: WPS433 — lazy import is intentional
+    from src.data.pg_store import connect_with_timeouts  # noqa: WPS433 — local import intentional
 
     while not _shutdown_event.is_set():
         try:
-            with psycopg.connect(dsn, connect_timeout=10) as conn:
+            with connect_with_timeouts(dsn) as conn:
                 with conn.cursor() as cur:
                     cur.execute("SELECT COUNT(*) FROM ticker_universe")
                     total_row = cur.fetchone()
