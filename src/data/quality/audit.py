@@ -161,7 +161,10 @@ class PostgresAuditLog:
             raise RuntimeError(
                 "PostgresAuditLog needs psycopg: install with `pip install psycopg[binary]`"
             ) from e  # noqa: E501
-        self._cursor.execute(  # pragma: no cover — live-Postgres only; tested in test_pg_store_integration.py
+        # Live-Postgres path; exercised by tests/test_audit_integration.py in CI
+        # (closes #258 — replaces earlier pragma that falsely cited
+        # test_pg_store_integration.py).
+        self._cursor.execute(
             sql.SQL("""
                 INSERT INTO {}
                     (ticker, gate, kind, severity, message, count, extra)
@@ -188,7 +191,10 @@ class PostgresAuditLog:
         if self._conn is not None:
             try:
                 self._conn.commit()
-            finally:  # pragma: no cover — covered by commit() success path tests
+            finally:
+                # Live-Postgres path; exercised by
+                # tests/test_audit_integration.py::test_close_commits_and_closes
+                # (closes #258).
                 self._conn.close()
             self._conn = None
             self._cursor = None
