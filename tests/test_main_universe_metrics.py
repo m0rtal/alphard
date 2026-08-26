@@ -63,14 +63,24 @@ def _fast_sleep(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _uncache_psycopg():
-    """Drop any cached psycopg before each test so the loop re-imports the fake.
+def _isolate_psycopg(monkeypatch):
+    """Install an isolated fake psycopg for this test only, restore on teardown.
 
-    Some tests in this suite run after other tests that may have imported
-    the real psycopg module (e.g. integration tests against the live
-    Postgres). The loop's ``import psycopg`` returns the cached module
-    when present, bypassing our ``sys.modules['psycopg'] = fake`` patch.
+    Critical: must restore the real ``psycopg`` module on teardown so
+    later tests (e.g. ``test_pg_store_integration.py`` against a live
+    Postgres service) see the genuine module. Otherwise ``sys.modules``
+    retains our fake, and the integration tests fail with
+    ``RuntimeError: not a psycopg error`` because the fake's
+    ``psycopg.connect`` raises a synthetic error that pg_store cannot
+    recover from.
     """
+    # Drop any cached psycopg before installing the fake — the loop's
+    # lazy ``import psycopg`` would otherwise return the real driver
+    # and bypass our fake.
+    sys.modules.pop("psycopg", None)
+    yield
+    # Restore: drop the fake so subsequent tests re-import the real
+    # module on next ``import psycopg``.
     sys.modules.pop("psycopg", None)
 
 
@@ -248,6 +258,12 @@ def test_thread_joins_on_shutdown(_setup):
 
     _install_registry(main)
 
+    # Stub _spawn_backfill so the backfill-supervisor thread (also spawned by
+    # main()) does not try to exec ``scripts/backfill_history_md.py`` — CI's
+    # cwd is the repo root, not /app, so an unstubbed Popen would raise
+    # FileNotFoundError inside the daemon thread, polluting test output.
+    fake_popen = mock.MagicMock()
+    fake_popen.pid = 99999
     with mock.patch.object(threading.Thread, "start", spy_start):
         with mock.patch.object(main, "_seconds_until_next_target_hour_msk", lambda *a: 0.0):
             with mock.patch.object(main, "_sleep_interruptible", lambda s: None):
@@ -256,22 +272,23 @@ def test_thread_joins_on_shutdown(_setup):
                     "run",
                     lambda *a, **kw: mock.Mock(returncode=0, stdout="", stderr=""),
                 ):
-                    ticks = {"n": 0}
+                    with mock.patch.object(main.subprocess, "Popen", mock.MagicMock(return_value=fake_popen)):
+                        ticks = {"n": 0}
 
-                    def fake_sleep(s):
-                        ticks["n"] += 1
-                        if ticks["n"] >= 1:
-                            raise KeyboardInterrupt("stop main")
-                        return None
+                        def fake_sleep(s):
+                            ticks["n"] += 1
+                            if ticks["n"] >= 1:
+                                raise KeyboardInterrupt("stop main")
+                            return None
 
-                    with mock.patch.object(main.time, "sleep", fake_sleep):
-                        with pytest.raises((KeyboardInterrupt, SystemExit)):
-                            main.main()
+                        with mock.patch.object(main.time, "sleep", fake_sleep):
+                            with pytest.raises((KeyboardInterrupt, SystemExit)):
+                                main.main()
 
     um_threads = [t for t in started_threads if t.name == "alphard-universe-metrics"]
     assert len(um_threads) == 1
     assert um_threads[0].daemon is True
-    # Thread must have exited (joined in finally).
+    # Thread must have exited (join succeeded in finally).
     assert not um_threads[0].is_alive(), "universe-metrics thread did not join on shutdown"
 
 
