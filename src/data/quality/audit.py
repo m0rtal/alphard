@@ -157,11 +157,11 @@ class PostgresAuditLog:
         # quotes it properly even if the validator is ever loosened.
         try:  # pragma: no cover — psycopg is a hard dep in CI
             from psycopg import sql  # local import keeps module usable without psycopg
-        except ImportError as e:  # pragma: no cover — environment-dependent
+        except ImportError as e:  # pragma: no cover — psycopg is a hard dep in CI
             raise RuntimeError(
                 "PostgresAuditLog needs psycopg: install with `pip install psycopg[binary]`"
             ) from e  # noqa: E501
-        self._cursor.execute(  # pragma: no cover — only fires against a live Postgres; covered by integration tests (test_pg_store_integration.py)
+        self._cursor.execute(  # pragma: no cover — live-Postgres only; tested in test_pg_store_integration.py
             sql.SQL("""
                 INSERT INTO {}
                     (ticker, gate, kind, severity, message, count, extra)
@@ -188,7 +188,7 @@ class PostgresAuditLog:
         if self._conn is not None:
             try:
                 self._conn.commit()
-            finally:  # pragma: no cover — covered by tests on commit() success path
+            finally:  # pragma: no cover — covered by commit() success path tests
                 self._conn.close()
             self._conn = None
             self._cursor = None
