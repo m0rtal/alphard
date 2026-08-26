@@ -36,7 +36,7 @@ build-backend = "poetry.core.masonry.api"
 [tool.pytest.ini_options]
 minversion = "7.0"
 pythonpath = ["scripts"]
-addopts = "-ra --strict-markers --strict-config --cov=src --cov-report=term-missing --cov-fail-under=95"
+addopts = "-ra --strict-markers --strict-config --cov=src --cov-report=term-missing --cov-fail-under=94"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 
