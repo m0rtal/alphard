@@ -15,7 +15,7 @@
       }
     ]
   },
-  "description": "Phase 2.8 step 1 — basic liveness + heartbeat. Add panels as new metrics become available.",
+  "description": "Phase 2.8 — heartbeat + universe coverage. Step 1: heartbeat / uptime / lag. Step 2: ticker-universe gauges.",
   "editable": true,
   "graphTooltip": 0,
   "id": null,
@@ -115,7 +115,7 @@
           "unit": "short"
         }
       },
-      "gridPos": {"h": 8, "w": 16, "x": 0, "y": 6},
+      "gridPos": {"h": 8, "w": 16, "x": 0, "y": 12},
       "id": 3,
       "options": {
         "legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true},
@@ -131,6 +131,80 @@
       ],
       "title": "Heartbeat rate (5m window)",
       "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{"color": "green", "value": null}]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 6},
+      "id": 4,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "showPercentLabels": false,
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+          "expr": "alphard_tickers_in_universe_total",
+          "legendFormat": "tickers in universe",
+          "refId": "A"
+        }
+      ],
+      "title": "Universe size (tickers in universe)",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{"color": "green", "value": null}]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 6, "w": 8, "x": 8, "y": 6},
+      "id": 5,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "showPercentLabels": false,
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+          "expr": "alphard_tickers_with_full_history_total",
+          "legendFormat": "tickers with full history",
+          "refId": "A"
+        }
+      ],
+      "title": "Tickers with full history (backfill_complete)",
+      "type": "stat"
     }
   ],
   "refresh": "30s",

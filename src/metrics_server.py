@@ -34,6 +34,16 @@ Gauges exposed
 - ``alphard_daily_sync_last_run_status{status}`` — 1 for the status
   last reported (only one of {ok, failed, timeout} is 1 at a time; others 0).
 - ``alphard_open_positions`` — current count of positions (broker stub).
+- ``alphard_tickers_in_universe_total`` (Phase 2.8 step 2) — ``COUNT(*)
+  FROM ticker_universe``, refreshed every ``ALPHARD_UNIVERSE_REFRESH_SECONDS``
+  (default 300s) by ``src/main.py::_universe_metrics_loop``. Used by Grafana
+  panel "Universe size" on the Phase 2.8 dashboard.
+- ``alphard_tickers_with_full_history_total`` (Phase 2.8 step 2) —
+  ``COUNT(*) FROM ticker_universe WHERE backfill_complete = TRUE``,
+  same refresh cadence. Index-backed (``idx_ticker_universe_backfill_complete``)
+  so the query is cheap. Used by Grafana panel "Tickers with full history".
+  Pair with the total gauge in Prometheus: ``alphard_tickers_with_full_history_total
+  / alphard_tickers_in_universe_total`` is the backfill coverage ratio.
 """
 
 from __future__ import annotations

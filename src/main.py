@@ -77,6 +77,16 @@ MACRO_SYNC_CADENCE_SECONDS = 3600  # 1 hour between runs.
 MACRO_SYNC_FIRST_RUN_DELAY_SECONDS = 5 * 60  # 5 min after launch.
 MACRO_SYNC_SUBPROCESS_TIMEOUT = 300  # 5 min hard cap; fetch + upsert is sub-second.
 
+# Phase 2.8 step 2: universe coverage gauges. Two Prometheus gauges expose
+# the size of the ticker universe + the subset that has a full backfill.
+# Refreshed in-process by a daemon thread (no subprocess) because each
+# iteration is two ``SELECT COUNT(*)`` queries — sub-second on local Postgres,
+# so the subprocess isolation overhead of daily_sync / macro_sync is not
+# warranted. Default 5 min is generous: backfill_complete is updated by the
+# orchestrator on each ticker pass (not in tight loop), so even 1-minute
+# cadence would not change the gauge often.
+UNIVERSE_METRICS_REFRESH_SECONDS = 300
+
 # Phase 1.6 audit: in-process watchdog for the daily_sync daemon thread.
 # A thread that crashes inside a live process leaves no signal — heartbeat
 # keeps ticking, container stays "Up", but the daily schedule is silently
@@ -513,6 +523,74 @@ def _macro_sync_loop() -> None:
         _sleep_interruptible(MACRO_SYNC_CADENCE_SECONDS)
 
 
+def _universe_metrics_loop() -> None:
+    """Refresh universe-coverage Prometheus gauges every UNIVERSE_METRICS_REFRESH_SECONDS.
+
+    Phase 2.8 step 2. Emits two gauges via the in-process ``_metrics_registry``:
+
+    - ``alphard_tickers_in_universe_total`` — ``SELECT COUNT(*) FROM ticker_universe``.
+    - ``alphard_tickers_with_full_history_total`` — ``SELECT COUNT(*) FROM
+      ticker_universe WHERE backfill_complete = TRUE`` (the indexed column,
+      so the query is cheap on a multi-thousand-row universe).
+
+    Why in-process (no subprocess) unlike daily_sync / macro_sync:
+    Each iteration is two ``COUNT(*)`` queries against a single Postgres
+    table — sub-second on local Postgres. The subprocess + 5-min timeout
+    pattern would be pure overhead. A connection failure must NOT kill the
+    heartbeat, so any exception inside the loop is caught and logged; the
+    gauges simply stop updating (Prometheus sees them go stale, which is
+    the correct degraded-mode signal).
+
+    Why exit early when ``$ALPHARD_PG_DSN`` is unset:
+    Phase 1.1 sets the DSN from entrypoint.sh, but Phase 0 dev mode
+    (``ALLOW_NO_BROKER=true``) does not require Postgres. The loop is
+    a no-op + log warning in that case, gauges stay at 0.
+    """
+    logger = logging.getLogger("alphard.universe_metrics")
+    dsn = os.environ.get("ALPHARD_PG_DSN")
+    if not dsn:
+        logger.warning(
+            "_universe_metrics_loop: ALPHARD_PG_DSN not set; loop disabled "
+            "(gauges will remain at 0 — set the DSN to enable coverage tracking)"
+        )
+        return
+
+    # Lazy import: psycopg is a Phase 1.1 dep, not required for the Phase 0
+    # heartbeat to start. Importing inside the loop body keeps the import
+    # surface small and matches the pattern in connect_with_timeouts.
+    import psycopg  # noqa: WPS433 — lazy import is intentional
+
+    while not _shutdown_event.is_set():
+        try:
+            with psycopg.connect(dsn, connect_timeout=10) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT COUNT(*) FROM ticker_universe")
+                    total_row = cur.fetchone()
+                    total_n = int(total_row[0]) if total_row is not None else 0
+                    cur.execute("SELECT COUNT(*) FROM ticker_universe WHERE backfill_complete = TRUE")
+                    complete_row = cur.fetchone()
+                    complete_n = int(complete_row[0]) if complete_row is not None else 0
+            registry = globals().get("_metrics_registry")
+            if registry is not None:
+                registry.set_gauge("alphard_tickers_in_universe_total", float(total_n))
+                registry.set_gauge("alphard_tickers_with_full_history_total", float(complete_n))
+            logger.info(f"_universe_metrics_loop: refreshed total={total_n} complete={complete_n}")
+        except psycopg.Error as exc:
+            # Connection-level error, syntax error, auth failure, etc. The
+            # gauges keep their last value (stale in Prometheus — that IS
+            # the correct alert signal). Loop survives.
+            logger.warning(
+                f"_universe_metrics_loop: psycopg error ({type(exc).__name__}: {exc}); "
+                f"leaving gauges at last known value"
+            )
+        except Exception as exc:  # noqa: BLE001 — never kill the heartbeat
+            logger.warning(
+                f"_universe_metrics_loop: unexpected error ({type(exc).__name__}: {exc}); "
+                f"leaving gauges at last known value"
+            )
+        _sleep_interruptible(UNIVERSE_METRICS_REFRESH_SECONDS)
+
+
 def _sleep_interruptible(seconds: float) -> None:
     """Sleep up to `seconds`, but wake up immediately on shutdown_event.
 
@@ -790,6 +868,17 @@ def main() -> None:
         f"subprocess_timeout={MACRO_SYNC_SUBPROCESS_TIMEOUT}s)"
     )
 
+    # Phase 2.8 step 2: universe coverage gauges. In-process daemon thread
+    # (no subprocess — two SELECT COUNT(*) per iteration is sub-second).
+    # Runs ONLY when ALPHARD_PG_DSN is set; otherwise the loop body logs
+    # a warning and returns immediately.
+    universe_metrics_thread = threading.Thread(
+        target=_universe_metrics_loop, daemon=True, name="alphard-universe-metrics"
+    )
+    universe_metrics_thread.start()
+    dsn_present = bool(os.environ.get("ALPHARD_PG_DSN"))
+    logger.info(f"universe-metrics daemon started (refresh={UNIVERSE_METRICS_REFRESH_SECONDS}s, dsn_set={dsn_present})")
+
     # Phase 2.8 step 1: Prometheus metrics HTTP server. Stdlib ThreadingHTTPServer
     # bound to ALPHARD_METRICS_PORT (default 8765) on 0.0.0.0. Exposes
     # /health (cheap liveness probe) and /metrics (Prometheus text exposition
@@ -870,6 +959,12 @@ def main() -> None:
         macro_sync_thread.join(timeout=10)
         if macro_sync_thread.is_alive():
             logger.warning("macro-sync daemon did not exit within 10s")
+        # Phase 2.8 step 2: universe-metrics is an in-process loop (no
+        # subprocess), so it exits within 1s of _shutdown_event because
+        # _sleep_interruptible polls every second. 5s timeout is generous.
+        universe_metrics_thread.join(timeout=5)
+        if universe_metrics_thread.is_alive():
+            logger.warning("universe-metrics daemon did not exit within 5s")
         _metrics_registry_obj = globals().get("_metrics_registry")
         if _metrics_registry_obj is not None and "_metrics_server" in globals():
             try:
