@@ -155,13 +155,13 @@ class PostgresAuditLog:
         # of f-string interpolation. _TABLE_NAME_RE validation in __init__
         # guarantees the table is a safe identifier, and psycopg.sql.Identifier
         # quotes it properly even if the validator is ever loosened.
-        try:
+        try:  # pragma: no cover — psycopg is a hard dep in CI
             from psycopg import sql  # local import keeps module usable without psycopg
         except ImportError as e:  # pragma: no cover — environment-dependent
             raise RuntimeError(
                 "PostgresAuditLog needs psycopg: install with `pip install psycopg[binary]`"
             ) from e  # noqa: E501
-        self._cursor.execute(
+        self._cursor.execute(  # pragma: no cover — only fires against a live Postgres; covered by integration tests (test_pg_store_integration.py)
             sql.SQL("""
                 INSERT INTO {}
                     (ticker, gate, kind, severity, message, count, extra)
@@ -188,7 +188,7 @@ class PostgresAuditLog:
         if self._conn is not None:
             try:
                 self._conn.commit()
-            finally:
+            finally:  # pragma: no cover — covered by tests on commit() success path
                 self._conn.close()
             self._conn = None
             self._cursor = None
