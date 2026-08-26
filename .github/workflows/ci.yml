@@ -172,11 +172,11 @@ jobs:
 
   ops-policy:
     # Issue #55: forbid hardcoded Grafana admin password and anonymous auth.
-    # This is a defense-in-depth check: the deploy_monitoring.sh script
-    # already sources the password from .env and refuses the literal
-    # "alphard", but a future refactor that re-introduces a literal must
-    # fail CI rather than silently ship. See docs/SECURITY.md §4 for the
-    # monitoring-profile LAN-exposure footprint and the rationale.
+    # This is a defense-in-depth check: scripts/quickstart.sh sources the
+    # password from .env and refuses the literal "alphard", but a future
+    # refactor that re-introduces a literal must fail CI rather than
+    # silently ship. See docs/SECURITY.md §4 for the monitoring-profile
+    # LAN-exposure footprint and the rationale.
     name: Ops policy (no literal Grafana password, no anonymous auth)
     runs-on: ubuntu-latest
     steps:
