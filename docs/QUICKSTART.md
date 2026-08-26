@@ -91,7 +91,8 @@ All are optional env vars.
 | Var | Default | Effect |
 |-----|---------|--------|
 | `ALPHARD_PROFILE` | `observability` | Set to `data` to skip Prometheus + Grafana; bot + postgres + redis only |
-| `ALPHARD_TIMEOUT_SEC` | `180` | Health-gate timeout. Set to `0` to skip the gate (useful for CI) |
+| `ALPHARD_TIMEOUT_SEC` | `180` | Health-gate timeout. Set to `0` to skip polling and exit 1 after `compose up` (CI fast-fail smoke) |
+| `ALPHARD_SKIP_COMPOSE` | `0` | Set to `1` to bake `.env` only — exit 0 without invoking `docker compose` (operator runs compose themselves) |
 | `ALPHARD_QUIET` | `0` | Set to `1` to suppress progress dots and info banners |
 | `APPDATA_DIR` | `/srv/alphard` | Host directory for persistent bind-mounts |
 
