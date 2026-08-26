@@ -171,8 +171,8 @@
   for the broken bridge-NAT on the .107 Docker daemon — see
   `docker-compose.yaml:190-194`).
 - Prometheus binds host port 9090 via standard bridge port-mapping.
-- Both containers are deployed by `scripts/deploy_monitoring.sh` and live
-  on the .107 host's LAN.
+- Both containers live on the .107 host's LAN via the Portainer Stack
+  defined in `docker-compose.yaml` (issue #228 / PR #228, 2026-08-25).
 
 **Threats:**
 1. **Anonymous Grafana access** — any LAN peer that reaches `:3300` would
@@ -183,11 +183,17 @@
    without auth.
 2. **Literal admin password in git** — the original `deploy_monitoring.sh`
    hardcoded `GF_SECURITY_ADMIN_PASSWORD=alphard` (committed 2026-08-19).
-   Status: **mitigated** in issue #55 — the script now sources
+   Status: **mitigated** in issue #55 — the script was rewritten to source
    `GRAFANA_ADMIN_PASSWORD` from `$ALPHARD_ENV_FILE` (default `./.env`)
-   and refuses to run if the variable is missing or set to the historical
-   literal. Note that the literal is **still in git history**; the
-   password must be rotated on the live Grafana instance (owner action,
+   and refused to run if the variable was missing or set to the historical
+   literal. The literal is **still in git history** but the script
+   itself is now deleted (B3 cleanup, 2026-08-26) because the .107-specific
+   deploy workaround it implemented is no longer needed: PR #228 moved
+   observability under the standard `docker compose` flow (which
+   configures port mapping correctly even on the .107 daemon) and
+   Portainer StackUpdate is the production deploy path. The literal in
+   git history is reachable by the same git-filter-repo procedure used
+   for other historical leaks.
    tracked in issue #55 acceptance criteria).
 3. **Cross-stack secret drift** — pre-fix `scripts/deploy_monitoring.sh`
    and `docker-compose.yaml` had different Grafana security postures
