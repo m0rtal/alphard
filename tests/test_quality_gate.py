@@ -775,6 +775,309 @@ class TestCrossSource:
             f"issues={[(i.kind, i.severity) for i in r.issues]}"
         )
 
+    # ------------------------------------------------------------------
+    # Issue #278 — leading-bad bar must emit a NaN gap, not silently
+    # drop a slot in the output series. Length contract:
+    #     len(_log_returns(closes)) == len(closes) - 1  for all len >= 2
+    # ------------------------------------------------------------------
+
+    def test_log_returns_emits_leading_nan_gap(self) -> None:
+        """Issue #278: leading NaN close produces a leading NaN return,
+        not a length-shortened series. Pre-fix the leading slot was
+        silently dropped, breaking the length contract for ``_pearson``."""
+        from src.data.quality.cross_source import _log_returns
+
+        rets = _log_returns([float("nan"), 100.0, 102.0])
+        # 3 closes -> 2 returns (NOT 1 — that was the bug).
+        assert len(rets) == 2, f"expected 2 returns, got {rets!r}"
+        # First return is NaN (the gap for the bad first bar).
+        assert math.isnan(rets[0]), f"expected NaN leading gap, got {rets!r}"
+        # Second return is the log-return of the first valid pair.
+        assert math.isfinite(rets[1]), f"expected finite second return, got {rets!r}"
+        assert rets[1] == pytest.approx(math.log(102.0 / 100.0))
+
+    def test_log_returns_emits_leading_zero_gap(self) -> None:
+        """Issue #278: leading zero close behaves the same as leading NaN."""
+        from src.data.quality.cross_source import _log_returns
+
+        rets = _log_returns([0.0, 100.0, 102.0])
+        assert len(rets) == 2, f"expected 2 returns, got {rets!r}"
+        assert math.isnan(rets[0]), f"expected NaN leading gap, got {rets!r}"
+        assert rets[1] == pytest.approx(math.log(102.0 / 100.0))
+
+    def test_log_returns_emits_leading_negative_gap(self) -> None:
+        """Issue #278: leading negative close also produces a leading
+        NaN gap. Negative closes are equally invalid for log-returns."""
+        from src.data.quality.cross_source import _log_returns
+
+        rets = _log_returns([-5.0, 100.0, 102.0])
+        assert len(rets) == 2, f"expected 2 returns, got {rets!r}"
+        assert math.isnan(rets[0])
+
+    def test_log_returns_length_equals_closes_minus_one_always(self) -> None:
+        """Issue #278 property test: ``_log_returns`` must return exactly
+        ``len(closes) - 1`` elements for ANY input of length >= 2, no
+        matter where the bad bars sit. This pins the length contract
+        callers (``_pearson``) depend on."""
+        from src.data.quality.cross_source import _log_returns
+
+        cases = [
+            [100.0, 102.0, 0.0, 0.0, 101.0, 103.0],  # middle (issue #271 pattern)
+            [float("nan"), 100.0, 102.0],  # leading NaN
+            [0.0, 100.0, 102.0],  # leading zero
+            [-1.0, 100.0, 102.0],  # leading negative
+            [float("inf"), 100.0, 102.0],  # leading inf
+            [float("nan"), float("nan"), 100.0, 102.0],  # double leading bad
+            [100.0, 102.0, float("nan")],  # trailing NaN
+            [100.0, 102.0, 0.0],  # trailing zero
+            [float("nan"), float("nan"), float("nan")],  # all bad
+            [100.0, 102.0],  # clean baseline
+        ]
+        for closes in cases:
+            rets = _log_returns(closes)
+            assert len(rets) == len(closes) - 1, (
+                f"_log_returns({closes!r}) returned {len(rets)} returns " f"(expected {len(closes) - 1}); rets={rets!r}"
+            )
+
+    def test_log_returns_leading_glitch_does_not_poison_subsequent(self) -> None:
+        """Issue #278 (orthogonal to #271): after a leading bad bar, the
+        remaining returns must NOT be NaN-poisoned. The post-#271 fix
+        already protects the middle/trailing cases; this test pins the
+        leading-edge symmetry."""
+        from src.data.quality.cross_source import _log_returns
+
+        rets = _log_returns([float("nan"), 100.0, 102.0, 104.0])
+        assert len(rets) == 3
+        # Leading gap is NaN.
+        assert math.isnan(rets[0])
+        # Next two returns are real numbers, not poisoned. The baseline
+        # was the first VALID close (100.0), so returns are paired
+        # against it: log(102/100) and log(104/102).
+        assert math.isfinite(rets[1])
+        assert math.isfinite(rets[2])
+        assert rets[1] == pytest.approx(math.log(102.0 / 100.0))
+        assert rets[2] == pytest.approx(math.log(104.0 / 102.0))
+
+    def test_cross_source_leading_glitch_emits_documented_kind(self) -> None:
+        """Issue #278 end-to-end: a leading bad bar in one source (with
+        the other source clean) must NOT silently produce a misleading
+        ``XSC_SOURCE_MISSING - zero variance`` message. The post-fix
+        state machine emits a NaN gap for the leading bad bar so
+        ``_pearson`` sees a properly-aligned return series; the NaN
+        inside that series then triggers the ``"nan_gap"`` reason,
+        which the gate surfaces with a message that names the bad
+        close (not "zero variance")."""
+        from src.data.quality.cross_source import check_cross_source
+
+        # Build 10 trading days with one perfectly-correlated source and
+        # another perfectly-correlated source with a leading bad bar.
+        start = date(2026, 1, 5)
+        dates: list[date] = []
+        d = start
+        while len(dates) < 10:
+            if d.weekday() < 5:
+                dates.append(d)
+            d += timedelta(days=1)
+
+        a_closes = [100.0 + i for i in range(10)]
+        b_closes = [100.0 + i for i in range(10)]
+        b_closes[0] = 0.0  # data glitch on the FIRST bar of B
+
+        sa = SourceSeries(source_name="a", bars=tuple(zip(dates, a_closes)))
+        sb = SourceSeries(source_name="b", bars=tuple(zip(dates, b_closes)))
+
+        r = check_cross_source("TEST", sa, sb)
+        assert not r.passed, "check_cross_source passed despite leading-bad bar"
+        # XSC_SOURCE_MISSING is the right IssueKind (one source has NaN
+        # in the return series due to the leading-bad bar). The bug was
+        # that the message lied about "zero variance in one source" when
+        # the real cause was the silent length-shortening of B's return
+        # series — pre-fix, the lengths of A and B differed (len 9 vs 10)
+        # so _pearson returned None on the n != len(ys) guard rather
+        # than the stdev==0 guard.
+        kinds = {i.kind for i in r.issues}
+        assert IssueKind.XSC_SOURCE_MISSING in kinds, f"expected XSC_SOURCE_MISSING, got {kinds}"
+        msgs = " ".join(i.message for i in r.issues)
+        # The bug: the message said "zero variance in one source" for a
+        # leading-bad bar (issue #278 acceptance #3).
+        assert "zero variance" not in msgs, f"misleading zero-variance message still emitted: {msgs!r}"
+        # The fix: the message now mentions the NaN-gap / bad close
+        # pattern so operators can act on it.
+        assert (
+            "NaN gap" in msgs or "bad close" in msgs.lower()
+        ), f"expected message to mention NaN gap or bad close, got: {msgs!r}"
+
+    # ------------------------------------------------------------------
+    # Issue #278 follow-up — discriminator tests for the three failure
+    # modes of ``_pearson_with_reason`` and the corresponding messages
+    # emitted by ``check_cross_source``. These pin the QA-accepted
+    # #278 acceptance #3 contract: operator-facing messages must
+    # distinguish "stuck/flat source" from "one bar arrived as NaN".
+    # ------------------------------------------------------------------
+
+    def test_pearson_with_reason_length_mismatch(self) -> None:
+        """Issue #278 (follow-up): ``_pearson_with_reason`` returns
+        ``('length_mismatch', ...)`` when ``len(xs) != len(ys)`` or
+        ``n < 2``. This was the exact guard that the #278 length-fix
+        was supposed to make unreachable in production (because
+        ``_log_returns`` now emits a leading NaN gap instead of
+        silently dropping a slot)."""
+        from src.data.quality.cross_source import _pearson_with_reason
+
+        # n < 2
+        corr, reason, detail = _pearson_with_reason([1.0], [2.0])
+        assert corr is None
+        assert reason == "length_mismatch", f"got {reason!r}"
+        assert "1" in detail and "1" in detail  # both lengths reported
+
+        # n != len(ys)
+        corr, reason, detail = _pearson_with_reason([1.0, 2.0], [1.0])
+        assert corr is None
+        assert reason == "length_mismatch"
+        assert "2" in detail and "1" in detail
+
+    def test_pearson_with_reason_nan_gap(self) -> None:
+        """Issue #278 (follow-up): ``_pearson_with_reason`` returns
+        ``('nan_gap', ...)`` when any paired entry is non-finite, and
+        the detail reports the count and the first few indices."""
+        from src.data.quality.cross_source import _pearson_with_reason
+
+        corr, reason, detail = _pearson_with_reason([0.01, 0.02, 0.03], [0.01, float("nan"), 0.03])
+        assert corr is None
+        assert reason == "nan_gap", f"got {reason!r}"
+        assert "1" in detail  # count of bad entries
+        assert "[1]" in detail or "1]" in detail  # first index
+        assert "bad close" in detail.lower()
+
+    def test_pearson_with_reason_zero_variance_names_flat_side(self) -> None:
+        """Issue #278 (follow-up): ``_pearson_with_reason`` returns
+        ``('zero_variance', ...)`` and names which side is flat
+        (xs / ys / xs,ys)."""
+        from src.data.quality.cross_source import _pearson_with_reason
+
+        # xs is flat.
+        corr, reason, detail = _pearson_with_reason([100.0, 100.0, 100.0], [1.0, 2.0, 3.0])
+        assert corr is None
+        assert reason == "zero_variance"
+        assert "xs" in detail
+
+        # ys is flat.
+        corr, reason, detail = _pearson_with_reason([1.0, 2.0, 3.0], [100.0, 100.0, 100.0])
+        assert corr is None
+        assert reason == "zero_variance"
+        assert "ys" in detail
+
+    def test_pearson_with_reason_ok(self) -> None:
+        """Issue #278 (follow-up): ``_pearson_with_reason`` returns
+        ``('ok', '')`` for a clean computation."""
+        from src.data.quality.cross_source import _pearson_with_reason
+
+        corr, reason, detail = _pearson_with_reason([0.01, 0.02, 0.03], [0.02, 0.04, 0.06])
+        assert reason == "ok"
+        assert detail == ""
+        assert corr is not None
+        assert abs(corr - 1.0) < 1e-9
+
+    def test_check_cross_source_zero_variance_message_names_flat_side(
+        self,
+    ) -> None:
+        """Issue #278 (follow-up): when ``check_cross_source`` fails
+        because one source is genuinely flat, the message names which
+        side is flat (not a generic misleading string)."""
+        from src.data.quality.cross_source import check_cross_source
+
+        start = date(2026, 1, 5)
+        dates: list[date] = []
+        d = start
+        while len(dates) < 10:
+            if d.weekday() < 5:
+                dates.append(d)
+            d += timedelta(days=1)
+
+        # A genuinely flat; B varies.
+        a_closes = [100.0] * 10
+        b_closes = [100.0 + i for i in range(10)]
+        sa = SourceSeries(source_name="flat_a", bars=tuple(zip(dates, a_closes)))
+        sb = SourceSeries(source_name="rising_b", bars=tuple(zip(dates, b_closes)))
+
+        r = check_cross_source("TEST", sa, sb)
+        assert not r.passed
+        kinds = {i.kind for i in r.issues}
+        assert IssueKind.XSC_SOURCE_MISSING in kinds
+        msgs = " ".join(i.message for i in r.issues)
+        # The flat-side discriminator must be present (issue #278 #3).
+        assert "zero variance" in msgs.lower()
+        # And must name the flat side so the operator knows which feed
+        # is stuck.
+        assert "flat_a" in msgs or "xs" in msgs, f"flat side not named in message: {msgs!r}"
+
+    def test_log_returns_empty_for_short_input(self) -> None:
+        """Issue #278 (follow-up, coverage): ``_log_returns`` of a list
+        shorter than 2 must return an empty list (no slot to pair).
+        Pre-#278 the function relied on the loop running zero times —
+        this test pins the explicit guard."""
+        from src.data.quality.cross_source import _log_returns
+
+        assert _log_returns([]) == []
+        assert _log_returns([100.0]) == []
+
+    def test_check_cross_source_fails_closed_with_nan_close(self) -> None:
+        """Issue #271 regression test: a NaN close in any source must
+        cause ``check_cross_source`` to fail (not silently pass). The
+        NaN surfaces as a NaN-return in ``_log_returns`` and triggers
+        the ``"nan_gap"`` reason in ``_pearson_with_reason``; the
+        gate then emits ``XSC_SOURCE_MISSING`` with a message that
+        names the bad-close pattern. Pinned here so a future refactor
+        that decouples correlation from rolling divergence does not
+        regress to the pre-#271 silent NaN-skip defect.
+        """
+        from src.data.quality.cross_source import check_cross_source
+
+        # Plant a NaN bar inside the FIRST 5-day window. B is otherwise
+        # identical to A so correlation would otherwise be 1.0.
+        start = date(2026, 1, 5)
+        dates: list[date] = []
+        d = start
+        while len(dates) < 10:
+            if d.weekday() < 5:
+                dates.append(d)
+            d += timedelta(days=1)
+        a_closes = [100.0 + i for i in range(10)]
+        b_closes = [100.0 + i for i in range(10)]
+        b_closes[2] = float("nan")  # inside window [0:5]
+        sa = SourceSeries(source_name="a", bars=tuple(zip(dates, a_closes)))
+        sb = SourceSeries(source_name="b", bars=tuple(zip(dates, b_closes)))
+
+        r = check_cross_source("TEST", sa, sb)
+        # Must not pass cleanly — NaN bar in B triggers XSC_SOURCE_MISSING
+        # via the correlation NaN-gap path (issue #271 fix).
+        assert not r.passed
+
+    def test_check_cross_source_emits_correlation_low(self) -> None:
+        """Issue #278 (follow-up, coverage): when two sources are
+        intentionally uncorrelated, the gate must emit
+        ``XSC_CORRELATION_LOW`` (not ``XSC_SOURCE_MISSING``). Pins the
+        ``corr < p.correlation_min`` branch."""
+        from src.data.quality.cross_source import check_cross_source
+
+        start = date(2026, 1, 5)
+        dates: list[date] = []
+        d = start
+        while len(dates) < 10:
+            if d.weekday() < 5:
+                dates.append(d)
+            d += timedelta(days=1)
+
+        # A monotonically rises; B oscillates — Pearson is negative.
+        a_closes = [100.0 + i for i in range(10)]
+        b_closes = [100.0 + (-1) ** i for i in range(10)]
+        sa = SourceSeries(source_name="rising_a", bars=tuple(zip(dates, a_closes)))
+        sb = SourceSeries(source_name="oscillating_b", bars=tuple(zip(dates, b_closes)))
+
+        r = check_cross_source("TEST", sa, sb)
+        kinds = {i.kind for i in r.issues}
+        assert IssueKind.XSC_CORRELATION_LOW in kinds, f"expected XSC_CORRELATION_LOW, got {kinds}"
+
 
 # ---------------------------------------------------------------------------
 # Audit log tests

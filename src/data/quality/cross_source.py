@@ -114,49 +114,115 @@ class SourceSeries(BaseModel):
 
 
 def _log_returns(closes: list[float]) -> list[float]:
-    """ln(close_t / close_{t-1}) for t=1..len-1.
+    """Return one log-return per adjacent close pair: ``len(closes) - 1``
+    elements total.
 
-    Bad bars (close <= 0 or NaN) are treated as gaps: the return on the
-    pair that includes the bad bar is NaN, but the next return uses the
-    last VALID previous close (not the bad close) so a single corrupted
-    bar does not poison the rest of the return series.
+    Pair semantics: ``out[i] = log(closes[i+1] / closes[i])`` if both
+    closes are finite and positive; ``out[i] = float('nan')`` otherwise
+    (a gap return). When the FIRST close is bad, the corresponding
+    leading return is a NaN gap — not a silent drop — so the output
+    length always matches ``len(closes) - 1`` (issue #278).
 
-    Issue #271 (regression): pre-fix this function did ``prev = cur``
-    unconditionally, so when ``cur`` was zero/negative, ``prev`` became
-    zero/negative too. Every subsequent return was NaN because
-    ``prev <= 0`` fired on every iteration, even when the actual
-    adjacent closes were perfectly fine. That NaN-poisoned series then
-    slipped through ``_pearson`` (which did not detect NaN as a missing
-    case) and through ``check_cross_source`` (which compared ``NaN <
-    threshold`` and got False), silently bypassing the Level-2 gate.
+    Last-valid-baseline (issue #271): when a close is bad, the
+    corresponding return is NaN and the baseline cursor is NOT
+    advanced — the next valid bar pairs against the same baseline
+    instead of against the corrupted value. This prevents a single
+    zero/negative bar from poisoning every subsequent return.
+
+    Issue #271 (regression): the previous implementation advanced the
+    ``prev`` cursor unconditionally, so when ``cur`` was zero/negative,
+    ``prev`` became zero/negative too. Every subsequent return was NaN
+    because ``prev <= 0`` fired on every iteration, even when the
+    actual adjacent closes were perfectly fine. That NaN-poisoned
+    series then slipped through ``_pearson`` (which did not detect NaN
+    as a missing case) and through ``check_cross_source`` (which
+    compared ``NaN < threshold`` and got False), silently bypassing
+    the Level-2 gate.
+
+    Issue #278 (regression-of-regression): the post-#271 fix tracked
+    ``last_valid`` instead of ``prev`` so a bad bar never advanced the
+    baseline — but for the LEADING edge it still silently skipped the
+    first slot, producing a length-shortened output (``len(closes) - 2``
+    instead of ``len(closes) - 1``). That length asymmetry tripped the
+    ``n != len(ys)`` guard in ``_pearson`` and caused
+    ``check_cross_source`` to emit a misleading ``XSC_SOURCE_MISSING -
+    zero variance`` message even when the real cause was a leading-bad
+    bar in one source.
     """
     out: list[float] = []
+    n = len(closes)
+    if n < 2:
+        return out
+    # ``last_valid`` is the most recent CLOSE that is finite and > 0,
+    # or None if we have not yet seen one. It is consumed as the
+    # denominator of the next return; it is updated to ``cur`` only
+    # when ``cur`` is valid. This two-state machine produces the
+    # desired gap semantics:
+    #   * pre-baseline (last_valid is None): the FIRST valid close
+    #     latches the baseline (no return emitted — there is no
+    #     previous close to compare against). Subsequent bars in this
+    #     state emit a NaN gap-return (the pair with the immediately
+    #     preceding bar is bad) AND, if valid, become the new
+    #     baseline.
+    #   * post-baseline (last_valid is set): every bar emits a return
+    #     (real if the bar is valid, NaN gap otherwise) and ``last_valid``
+    #     advances only on valid bars.
     last_valid: float | None = None
-    for cur in closes:
-        if last_valid is None:
-            # First valid close becomes the baseline; nothing to compare
-            # against yet.
-            if math.isfinite(cur) and cur > 0:
-                last_valid = cur
-            # Otherwise we still need to start somewhere — fall through;
-            # the gap return will be NaN once we see a valid pair.
+    for i, cur in enumerate(closes):
+        is_valid = math.isfinite(cur) and cur > 0
+        if not is_valid:
+            if last_valid is None:
+                # Pre-baseline bad bar: the current slot is the
+                # right-hand side of the pair (closes[i-1], closes[i]),
+                # and ``closes[i-1]`` was also bad (we never latched),
+                # so the gap-return is NaN. Emit a NaN-gap here to
+                # maintain ``len(out) == len(closes) - 1`` (issue
+                # #278). Stay in pre-baseline.
+                if i >= 1:
+                    out.append(float("nan"))
+            else:
+                # Post-baseline bad bar: emit NaN gap; do NOT advance
+                # ``last_valid`` so the next valid bar pairs against the
+                # same baseline (issue #271 fix).
+                out.append(float("nan"))
             continue
-        if math.isfinite(cur) and cur > 0:
-            out.append(math.log(cur / last_valid))
-            last_valid = cur
-        else:
-            # Bad bar — emit NaN for this return but DO NOT advance
-            # ``last_valid``; the next valid bar will pair against the
-            # same baseline instead of against the corrupted value.
-            out.append(float("nan"))
+        # ``cur`` is valid.
+        if last_valid is None:
+            if i == 0:
+                # First slot, valid. Latch baseline; no return emitted
+                # because there is no previous close to pair against.
+                last_valid = cur
+            else:
+                # Pre-baseline slot, valid: the pair (closes[i-1],
+                # closes[i]) has ``closes[i-1]`` bad → NaN gap. Emit
+                # the gap-return and latch ``cur`` as the new baseline
+                # for the NEXT iteration.
+                out.append(float("nan"))
+                last_valid = cur
+            continue
+        # Post-baseline: emit the real log-return for the pair
+        # (``last_valid``, ``cur``), then advance the baseline.
+        out.append(math.log(cur / last_valid))
+        last_valid = cur
     return out
 
 
-def _pearson(xs: list[float], ys: list[float]) -> float | None:
-    """Pearson correlation between two same-length series.
+def _pearson_with_reason(xs: list[float], ys: list[float]) -> tuple[float | None, str, str]:
+    """Pearson correlation between two same-length series, with a reason code.
 
-    Returns None if stdev is zero on either series, if any pair is NaN
-    (NaN-poisoned input — caller should treat as missing), or if len < 2.
+    Returns ``(correlation, reason_code, detail)`` where ``reason_code``
+    is one of:
+
+    * ``"ok"``              — finite correlation computed successfully.
+    * ``"length_mismatch"`` — ``len(xs) != len(ys)`` or ``n < 2``;
+                             detail reports the two lengths.
+    * ``"nan_gap"``         — one or more paired entries are non-finite
+                             (typically a NaN-poisoned return from a
+                             bad close in one source); detail reports
+                             the count and the first few indices.
+    * ``"zero_variance"``   — stdev of ``xs`` or ``ys`` is zero
+                             (genuinely flat series); detail names the
+                             side that is flat.
 
     Issue #271 (regression): pre-fix this function did not detect NaN
     in either series, so ``sum(xs)`` with one NaN element returned NaN,
@@ -164,20 +230,32 @@ def _pearson(xs: list[float], ys: list[float]) -> float | None:
     so the zero-variance guard did not trip) and produced a final
     correlation of NaN. Callers compared NaN with thresholds and
     always got False, silently bypassing the gate.
+
+    Issue #278 (regression-of-regression): the previous fix returned
+    ``None`` from three distinct guards (length-mismatch, NaN, and
+    zero-variance) with no way for the caller to tell them apart.
+    ``check_cross_source`` collapsed every ``None`` return into one
+    hardcoded "zero variance in one source" message, which was
+    factually wrong for both the length-mismatch case (a leading-bad
+    bar tripping ``n != len(ys)``) and the NaN-gap case (a single
+    bad close making one of the returns NaN). This function restores
+    the discriminator so the gate can emit an accurate message.
     """
     n = len(xs)
     if n < 2 or n != len(ys):
-        return None
-    # Reject NaN-poisoned input up front. We deliberately return None
-    # rather than trying to filter NaN pairs and compute a "partial"
-    # Pearson: (a) the cross-source gate already has its own
-    # length-based minimum aligned-points guard, so removing more pairs
-    # would obscure the operator-facing signal; (b) NaN here means one
-    # of the sources has a zero/NaN close somewhere — the gate should
-    # surface that as XSC_SOURCE_MISSING, not silently accommodate it.
-    for x, y in zip(xs, ys):
+        return None, "length_mismatch", f"series length mismatch ({n} vs {len(ys)})"
+    # Collect NaN-gap indices first so the detail field can report them.
+    bad_idx: list[int] = []
+    for i, (x, y) in enumerate(zip(xs, ys)):
         if not (math.isfinite(x) and math.isfinite(y)):
-            return None
+            bad_idx.append(i)
+    if bad_idx:
+        sample = bad_idx[:5]
+        return (
+            None,
+            "nan_gap",
+            f"{len(bad_idx)} NaN gap return(s) at index {sample} " f"(bad close in one source)",
+        )
     mx = sum(xs) / n
     my = sum(ys) / n
     cov = 0.0
@@ -190,8 +268,21 @@ def _pearson(xs: list[float], ys: list[float]) -> float | None:
         varx += dx * dx
         vary += dy * dy
     if varx == 0 or vary == 0:
-        return None
-    return cov / math.sqrt(varx * vary)
+        # Identify which side is flat so the operator can act on it.
+        flat = "xs" if varx == 0 else ("ys" if vary == 0 else "xs,ys")
+        return None, "zero_variance", f"zero variance in {flat} — cannot correlate"
+    return cov / math.sqrt(varx * vary), "ok", ""
+
+
+def _pearson(xs: list[float], ys: list[float]) -> float | None:
+    """Backward-compat wrapper around :func:`_pearson_with_reason`.
+
+    Returns just the correlation value (or ``None`` on any failure).
+    Prefer :func:`_pearson_with_reason` in new code — it surfaces the
+    failure mode so the gate can emit an accurate message (issue #278).
+    """
+    corr, _, _ = _pearson_with_reason(xs, ys)
+    return corr
 
 
 def _align(
@@ -285,14 +376,43 @@ def check_cross_source(
     # Correlation on log-returns (drops one index; matches series length).
     rets_a = _log_returns(closes_a)
     rets_b = _log_returns(closes_b)
-    corr = _pearson(rets_a, rets_b)
+    corr, reason, detail = _pearson_with_reason(rets_a, rets_b)
 
     if corr is None:
+        # Issue #278: the previous implementation collapsed every
+        # ``_pearson(...) is None`` return into one hardcoded "zero
+        # variance" message, which was factually wrong for both the
+        # length-mismatch case (leading-bad bar tripping ``n != len(ys)``)
+        # and the NaN-gap case (a single bad close making one of the
+        # returns NaN). The reason code distinguishes the three
+        # failure modes; the message uses the precise detail so an
+        # operator paging on ``XSC_SOURCE_MISSING`` can tell "MOEX
+        # feed is stuck/flat" apart from "one bar arrived as NaN".
+        if reason == "zero_variance":
+            message = detail  # already names the flat side
+        elif reason == "nan_gap":
+            message = f"{detail} (one source has a bad close — leading, middle, or trailing)"
+        else:  # length_mismatch
+            message = (  # pragma: no cover — defensive branch: _log_returns
+                # is now invariant-length (issue #278), so rets_a and
+                # rets_b are guaranteed equal length. The branch is kept
+                # so that any future refactor that introduces a length
+                # divergence surfaces an accurate operator-facing message
+                # instead of the pre-#278 misleading "zero variance"
+                # string.
+                f"return series length mismatch: A={len(rets_a)}, B={len(rets_b)} "
+                f"({detail}) — possible leading-bad bar in one source"
+            )
         issues.append(
             Issue.make(
                 gate="cross_source",
                 kind=IssueKind.XSC_SOURCE_MISSING,
-                message="zero variance in one source — cannot correlate",
+                message=message,
+                extra={
+                    "reason": reason,
+                    "len_a": len(rets_a),
+                    "len_b": len(rets_b),
+                },
             )
         )
         return QualityReport(ticker=ticker, gate="cross_source", issues=tuple(issues))
@@ -330,7 +450,14 @@ def check_cross_source(
             # never exceeded the threshold. The divergence issue was
             # silently skipped.
             if any(not (math.isfinite(c) and c > 0) for c in window_a + window_b):
-                continue
+                continue  # pragma: no cover — defensive: when any close
+                # is bad, _log_returns surfaces a NaN-return and
+                # _pearson_with_reason returns ("nan_gap", ...), so
+                # check_cross_source returns early before reaching the
+                # rolling divergence loop. The guard stays so that a
+                # future refactor that decouples rolling divergence
+                # from correlation does not regress to the pre-#271
+                # silent NaN-skip defect.
             mean_div = sum(abs(math.log(a) - math.log(b)) for a, b in zip(window_a, window_b)) / win
             if mean_div > max_mean_div:
                 max_mean_div = mean_div
