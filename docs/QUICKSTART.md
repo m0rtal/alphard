@@ -40,9 +40,9 @@ That is **all**. The script:
    `GRAFANA_ADMIN_PASSWORD=alphard` (issue #55).
 4. Auto-generates a 24-byte random `POSTGRES_PASSWORD` /
    `REDIS_PASSWORD` (if missing).
-5. Bakes the Grafana provisioning / dashboards B64 vars
-   (`PROVISIONING_*_B64`, `DASHBOARD_*_B64`) via
-   `tools/bake_grafana_env.py` if `.env` doesn't already have them.
+5. (No Grafana bake needed — provisioning + dashboards are
+   bind-mounted from `./docker/grafana/{provisioning,dashboards}`
+   in compose; nothing for the script to do here. See PR #297.)
 7. Verifies `docker/prometheus/prometheus.yml` exists and contains the
    `alphard-bot:8765` scrape target (issue #283 — bind-mounted into the
    prometheus container, no env-based config).
@@ -83,7 +83,7 @@ ok: stack is up
 | `GRAFANA_ADMIN_PASSWORD is set to the historical literal 'alphard'` | 2 | Replace with a new password |
 | `docker compose up failed` | 2 | Inspect `docker compose logs` for the failing service |
 | Stack didn't reach healthy state in 180 s | 1 | `docker ps --filter name=alphard-; docker logs <service>` |
-| `bake_grafana_env.py failed: source file missing` | 2 | Re-clone or restore `docker/grafana/` (was deleted from working tree) |
+| `grafana` has no datasource / "No data" on every panel | 1 | Verify `./docker/grafana/provisioning/datasources/prometheus.yml` exists. (issue #297: bind-mount from repo, no env-based config.) |
 
 ## Run-time knobs
 
@@ -119,9 +119,9 @@ All are optional env vars.
 - Verifies `docker/prometheus/prometheus.yml` exists with the
   `alphard-bot:8765` scrape target (issue #283 — bind-mounted, no env
   config).
-- Bakes the 4 Grafana B64 vars via `tools/bake_grafana_env.py`.
-  Without these, Grafana entrypoint bails at
-  `FATAL: ... is unset or empty`.
+- (No Grafana bake step — provisioning + dashboards are bind-mounted
+  directly from `./docker/grafana/{provisioning,dashboards}`. Same
+  pattern as PR #284 for prometheus.yml.)
 - Refuses to run with empty GPW (issue #55). The first version of
   the deploy script allowed an empty password and silently deployed
   with the historical literal `alphard` — that path is closed.
@@ -157,6 +157,6 @@ host fails in 4 places (PR #228 / this PR's notes):
 | 1 | `pg-init` hangs on `apk add postgresql-client` | `dl-cdn.alpinelinux.org` unreachable on hosts with restricted egress. **Fix**: `pg-init` uses `postgres:16-alpine` image (psql already in there). |
 | 2 | `grafana` fails to start with `apparmor_parser: Access denied` | Grafana service was missing `security_opt: apparmor=unconfined`. **Fix**: added in compose. |
 | 3 | Prometheus starts with empty config, zero targets | `docker/prometheus/prometheus.yml` missing or wrong content. **Fix**: check the bind-mount target exists and contains the `alphard-bot:8765` scrape target. |
-| 4 | Grafana entrypoint bails `FATAL: ... is unset or empty` | `PROVISIONING_*_B64` and `DASHBOARD_*_B64` were empty in `.env.example`. **Fix**: this script bakes them via `tools/bake_grafana_env.py` on first run. |
+| 4 | Grafana "No data" on every panel | `./docker/grafana/provisioning/datasources/prometheus.yml` missing. **Fix**: bind-mount from repo (issue #297). |
 
 Issue: closes #243 (`Make alphard first-shot-friendly`).

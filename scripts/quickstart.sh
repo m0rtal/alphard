@@ -216,29 +216,15 @@ else
     ok "REDIS_PASSWORD set"
 fi
 
-# ---- 3. Grafana B64 bake ----
-info "3/5 Grafana provisioning + dashboards bake"
-
-# Quick check: are all 4 B64 vars present and non-empty?
-_b64_ok=1
-for k in PROVISIONING_DATASOURCES_YML_B64 PROVISIONING_DASHBOARDS_PROVIDER_YML_B64 DASHBOARD_PHASE0_JSON_B64 DASHBOARD_PHASE28_JSON_B64; do
-    _v="$(env_value "$k")"
-    if [[ -z "$_v" ]]; then _b64_ok=0; break; fi
-done
-if [[ "$_b64_ok" == "1" ]]; then
-    ok "all 4 B64 vars present"
-else
-    if [[ ! -f "$REPO_ROOT/tools/bake_grafana_env.py" ]]; then
-        err "tools/bake_grafana_env.py not found"
-        exit 2
-    fi
-    log "running tools/bake_grafana_env.py"
-    if ! python3 "$REPO_ROOT/tools/bake_grafana_env.py" >> "$REPO_ROOT/.env"; then
-        err "bake_grafana_env.py failed"
-        exit 2
-    fi
-    ok "4 B64 vars baked into .env"
-fi
+# ---- 3. (No Grafana bake needed — provisioning + dashboards bind-mounted from repo) ----
+# Issue #297: the *_B64 env-var approach was retired because Portainer
+# StackUpdate silently truncates env values >60 chars (Go JSON unmarshal
+# fails on long strings), and the baked base64 blobs were routinely cut
+# off mid-keyword. Bind-mount from the repo is the same fix PR #284 used
+# for prometheus.yml. ./docker/grafana/provisioning and
+# ./docker/grafana/dashboards are mounted directly into the container
+# (see docker-compose.yaml grafana.volumes). Nothing to bake here.
+info "3/5 Grafana provisioning + dashboards (bind-mounted from repo)"
 
 # ---- 4. Prometheus config bind-mount sanity check ----
 # Issue #283: PROM_YML_B64 used to be the source of truth, but Portainer
@@ -272,7 +258,7 @@ ok "docker/prometheus/prometheus.yml present and contains alphard-bot:8765 targe
 # The remaining TIMEOUT_SEC=0 fast-fail path is checked AFTER compose
 # runs but BEFORE the health-gate polling loop.
 if [[ "$SKIP_COMPOSE" == "1" ]]; then
-    info "5/5 docker compose up — skipped (ALPHARD_SKIP_COMPOSE=1)"
+    info "4/4 docker compose up — skipped (ALPHARD_SKIP_COMPOSE=1)"
     info "  Bakes written; docker compose not invoked. Run \`docker compose --profile $PROFILE up -d\` yourself."
     if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
         docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' --filter "name=alphard-" 2>/dev/null || true
@@ -280,7 +266,7 @@ if [[ "$SKIP_COMPOSE" == "1" ]]; then
     ok "bakes complete; compose not invoked"
     exit 0
 fi
-info "5/5 docker compose up -d --profile $PROFILE"
+info "4/4 docker compose up -d --profile $PROFILE"
 
 # We do NOT `set -a; source .env; set +a` because that would export every
 # variable in .env (HTTP_PROXY, MATTERMOST_*, etc.) into the compose

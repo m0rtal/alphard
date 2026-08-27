@@ -975,27 +975,23 @@ class TestGrafanaPortability:
 
 
 class TestGrafanaProvisioning:
-    """Compose refactor 2.0 (kanban t_884fec4a): Grafana provisioning +
-    dashboards are baked into *_B64 env vars and decoded at container
-    start by docker/entrypoint_grafana.sh. There are NO bind-mounts
-    to ./docker/grafana/provisioning or ./docker/grafana/dashboards
-    on the grafana service — those existed in PR #217 (issue #216
-    sister-bug) as a workaround, but they depend on a host path
-    matching exactly the bind source AND the chown actually taking
-    effect at the bind-mount boundary. Both are fragile on .107 PVE
-    LXC (the userns-mapping bug — see issue #108 / #122 / #147 /
-    #209 / #216).
+    """Issue #297: bind-mount Grafana provisioning + dashboards from
+    the repo directly, instead of decoding *_B64 env vars.
 
-    This refactor is the FINAL fix: provisioning + dashboard files
-    live as base64 env vars decoded into upstream-default paths
-    inside the container. No host bind-mount, no userns-mapping
-    boundary, no host-path dependency.
+    Same Portainer 60-char env truncation bug as PROM_YML_B64
+    (issue #283 / PR #284) hit the Grafana service: after
+    PortainerStackUpdate on .107 the PROVISIONING_DATASOURCES_YML_B64
+    value was truncated, base64 -d produced garbage or empty bytes,
+    and Grafana started with no datasource and no dashboards ("No data"
+    on every panel even though prometheus was scraping alphard-bot
+    correctly). Fix: bind-mount the provisioning and dashboard
+    directories from the repo.
 
-    The legacy tests in this class were rewritten to assert the
-    absence of the bind-mounts (which is the architectural contract
-    for refactor 2.0) instead of their APPDATA_DIR parameterisation.
-    See TestGrafanaEnvProvisioning + TestNoRelativeBindMounts for
-    the new positive-contract tests.
+    The previous PR #246 / kanban t_884fec4a approach used
+    ``PROVISIONING_*_B64`` env vars decoded by an in-container wrapper
+    (docker/entrypoint_grafana.sh). That wrapper is now deleted —
+    see ``test_no_entrypoint_grafana_sh_wrapper_exists`` for the
+    regression marker.
     """
 
     def _grafana_volumes(self) -> list:
@@ -1006,158 +1002,136 @@ class TestGrafanaProvisioning:
     @staticmethod
     def _split_mount(v: str) -> tuple[str, str] | None:
         """Split a short-form compose volume string ``src:dst[:ro|rw]``
-        into ``(src, dst)``.
+        into ``(src, dst)``."""
+        parts = v.split(":")
+        if len(parts) >= 2:
+            return parts[0], parts[1]
+        return None
 
-        Important: the host path can itself contain ``:`` (the
-        ``${APPDATA_DIR:-/srv/alphard}`` default has one). So
-        ``partition(":")`` is wrong — it splits on the FIRST colon.
-        Strategy: strip a trailing mode flag (``:ro`` or ``:rw``) if
-        present, then rsplit with maxsplit=1 on the remaining string.
-        """
-        if not isinstance(v, str) or ":" not in v:
-            return None
-        # Strip optional mode flag at the tail — only ":ro" or ":rw".
-        stripped = v
-        if v.endswith(":ro") or v.endswith(":rw"):
-            stripped = v[:-3]
-        # Now the last colon separates src from dst.
-        src, _, dst = stripped.rpartition(":")
-        if not src or not dst:
-            return None
-        return src, dst
+    def test_provisioning_bind_mounted_from_repo(self) -> None:
+        """The grafana service must bind-mount provisioning YAMLs from
+        the repo directly: ``./docker/grafana/provisioning`` →
+        ``/etc/grafana/provisioning:ro``.
 
-    def test_provisioning_bind_uses_appdata_dir(self) -> None:
-        """Compose refactor 2.0: there must be NO bind-mount to
-        ``/etc/grafana/provisioning`` on the grafana service.
-
-        The legacy PR #217 implementation bind-mounted
-        ``${APPDATA_DIR:-/srv/alphard}/grafana/provisioning``
-        to ``/etc/grafana/provisioning:ro``. That worked in compose
-        CLI deployments but was fragile on .107 PVE LXC (the
-        userns-mapping bug). Refactor 2.0 bakes provisioning into
-        PROVISIONING_*_YML_B64 env vars instead.
-
-        This test asserts the bind-mount is GONE — the grafana
-        container has no /etc/grafana/provisioning mount, so the
-        entrypoint_grafana.sh wrapper writes to /etc/grafana/provisioning
-        via the container's writable root filesystem (no boundary).
+        Why: PR #246 baked provisioning into PROVISIONING_*_B64 env
+        vars and decoded them via entrypoint_grafana.sh wrapper. But
+        Portainer StackUpdate silently truncates >60-char env values
+        (Go JSON unmarshal limit), so the decoded files were empty /
+        partial and Grafana had no datasource registered. Bind-mount
+        from the repo is the same fix as PR #284 for prometheus.yml.
         """
         volumes = self._grafana_volumes()
-        provisioning_mounts = []
-        for v in volumes:
-            if isinstance(v, str):
-                parts = self._split_mount(v)
-                if parts and parts[1] == "/etc/grafana/provisioning":
-                    provisioning_mounts.append(v)
-            elif isinstance(v, dict) and v.get("target") == "/etc/grafana/provisioning":
-                provisioning_mounts.append(v)
-        assert not provisioning_mounts, (
-            "grafana must NOT bind-mount to /etc/grafana/provisioning "
-            "(compose refactor 2.0 bakes provisioning into "
-            "PROVISIONING_*_YML_B64 env vars; the entrypoint decodes "
-            "them into /etc/grafana/provisioning via the container's "
-            "writable rootfs). Found legacy mounts: "
-            f"{provisioning_mounts}"
+        vol_strs = [str(v) for v in volumes]
+        prov_mount = next(
+            (v for v in vol_strs if "/etc/grafana/provisioning" in v),
+            None,
+        )
+        assert prov_mount is not None, (
+            f"grafana.volumes must bind-mount provisioning YAMLs from "
+            f"the repo (issue #297, same Portainer 60-char env truncation "
+            f"bug as PR #284 / PROM_YML_B64); got: {vol_strs}"
+        )
+        # Must be read-only (Grafana writes to /var/lib/grafana for
+        # sqlite db + plugins, but provisioning is read-only).
+        assert ":ro" in prov_mount, (
+            f"provisioning bind-mount must be read-only (:ro) so Grafana "
+            f"can't tamper with the source-of-truth yaml files; got: "
+            f"{prov_mount}"
+        )
+        # Source must be the repo path
+        src, _ = self._split_mount(prov_mount)
+        assert src == "./docker/grafana/provisioning", (
+            f"provisioning bind-mount source must be " f"'./docker/grafana/provisioning' (the repo path); got: {src}"
         )
 
-    def test_dashboards_bind_uses_appdata_dir(self) -> None:
-        """Compose refactor 2.0: there must be NO bind-mount to
-        ``/var/lib/grafana/dashboards`` on the grafana service.
-
-        Same rationale as test_provisioning_bind_uses_appdata_dir.
-        Dashboards are baked into DASHBOARD_*_JSON_B64 env vars
-        and decoded at container start. The grafana container has
-        no /var/lib/grafana/dashboards mount from the host.
+    def test_dashboards_bind_mounted_from_repo(self) -> None:
+        """The grafana service must bind-mount dashboard JSONs from
+        the repo: ``./docker/grafana/dashboards`` →
+        ``/var/lib/grafana/dashboards:ro``. Provider at
+        ``/etc/grafana/provisioning/dashboards/provider.yml`` declares
+        the directory as the dashboard source.
         """
         volumes = self._grafana_volumes()
-        dashboards_mounts = []
-        for v in volumes:
-            if isinstance(v, str):
-                parts = self._split_mount(v)
-                if parts and parts[1] == "/var/lib/grafana/dashboards":
-                    dashboards_mounts.append(v)
-            elif isinstance(v, dict) and v.get("target") == "/var/lib/grafana/dashboards":
-                dashboards_mounts.append(v)
-        assert not dashboards_mounts, (
-            "grafana must NOT bind-mount to /var/lib/grafana/dashboards "
-            "(compose refactor 2.0 bakes dashboards into "
-            "DASHBOARD_*_JSON_B64 env vars; the entrypoint decodes "
-            "them into /var/lib/grafana/dashboards via the container's "
-            "writable rootfs). Found legacy mounts: "
-            f"{dashboards_mounts}"
+        vol_strs = [str(v) for v in volumes]
+        dash_mount = next(
+            (v for v in vol_strs if "/var/lib/grafana/dashboards" in v),
+            None,
+        )
+        assert dash_mount is not None, (
+            f"grafana.volumes must bind-mount dashboard JSONs from the " f"repo (issue #297); got: {vol_strs}"
+        )
+        assert ":ro" in dash_mount, (
+            f"dashboards bind-mount must be read-only (:ro) — dashboards "
+            f"are git-versioned, not UI-edited; got: {dash_mount}"
+        )
+        src, _ = self._split_mount(dash_mount)
+        assert src == "./docker/grafana/dashboards", (
+            f"dashboards bind-mount source must be " f"'./docker/grafana/dashboards'; got: {src}"
         )
 
-    def test_no_relative_docker_grafana_volumes(self) -> None:
-        """Wider regression guard: NO service in the compose may
-        bind-mount from ``./docker/grafana/...`` (issue #216).
+    def test_grafana_no_longer_uses_provisioning_b64_env(self) -> None:
+        """Regression marker for issue #297.
 
-        Any such bind that lands inside the grafana container is a
-        silent footgun: relative paths resolve against the cwd at the
-        moment of compose render, which Portainer standalone does NOT
-        preserve across StackUpdate. The fix is to funnel every
-        grafana-side bind through ``${APPDATA_DIR}`` so an operator
-        can override via a single stack Env.
+        All *_B64 env vars previously used to bake provisioning +
+        dashboards must be gone from grafana.service.environment.
+        If a future refactor reintroduces PROVISIONING_DATASOURCES_YML_B64
+        etc, this test fires.
         """
-        data = _load_compose()
-        offenders = []
-        for svc_name, svc in data["services"].items():
-            for v in svc.get("volumes", []):
-                src = None
-                if isinstance(v, str):
-                    parts = self._split_mount(v)
-                    if parts:
-                        src = parts[0]
-                elif isinstance(v, dict):
-                    src = v.get("source")
-                if isinstance(src, str) and ("./docker/grafana" in src or src.startswith("./docker/grafana")):
-                    offenders.append((svc_name, src))
-        assert not offenders, (
-            "No service may bind-mount from ./docker/grafana/... — "
-            "relative paths break Portainer standalone StackUpdate "
-            "(issue #216: /api/search?type=dash-db returned []). "
-            "Use ${APPDATA_DIR:-/srv/alphard}/grafana/... instead. "
-            f"Found offenders: {offenders}"
-        )
+        svc = _load_compose()["services"]["grafana"]
+        env = svc.get("environment", {})
+        if isinstance(env, list):
+            keys = {item.split("=", 1)[0] for item in env if isinstance(item, str) and "=" in item}
+            keys |= {item for item in env if isinstance(item, str) and "=" not in item}
+        else:
+            keys = set(env.keys())
+        for forbidden in (
+            "PROVISIONING_DATASOURCES_YML_B64",
+            "PROVISIONING_DASHBOARDS_PROVIDER_YML_B64",
+            "DASHBOARD_PHASE0_JSON_B64",
+            "DASHBOARD_PHASE28_JSON_B64",
+        ):
+            assert forbidden not in keys, (
+                f"grafana.environment must NOT declare {forbidden} "
+                f"(replaced by bind-mount per issue #297); got: "
+                f"{sorted(keys)}"
+            )
 
-    def test_chownfix_chowns_grafana_leaf(self) -> None:
-        """Compose refactor 2.0: chownfix must chown 472:472 the
-        ``${APPDATA_DIR}/grafana`` host-data leaf so grafana (running
-        as in-image uid 472) can write its sqlite db + plugin
-        cache on first start.
+    def test_grafana_entrypoint_is_upstream_run_sh(self) -> None:
+        """With bind-mount provisioning in place, the grafana service
+        must use the UPSTREAM entrypoint (no custom wrapper). Issue
+        #297 explicitly removes the entrypoint_grafana.sh wrapper.
 
-        Sister-check to test_chownfix_replaces_grafana_init_v2
-        (which verifies the chownfix service exists with the right
-        env/restart). Issue #216 proves we need the leaf-prep
-        contract for grafana — otherwise the bind-mount target is
-        created by Docker daemon as root:root, and grafana can't
-        write /var/lib/grafana/grafana.db on first start.
-
-        Note: refactor 2.0 NO LONGER bind-mounts
-        ``${APPDATA_DIR}/grafana/provisioning`` and
-        ``${APPDATA_DIR}/grafana/dashboards`` — those leaves are
-        baked into *_B64 env vars. So we only need to chown the
-        top-level grafana leaf (the sqlite db mount target).
+        Without explicit entrypoint: directive, the upstream image's
+        /run.sh runs by default — that's what we want now.
         """
-        data = _load_compose()
-        init_svc = data["services"].get("chownfix")
-        assert init_svc is not None, "chownfix service must exist"
-        # Compose inline entrypoint is loaded as a list whose last
-        # element is the shell script body. Walk every entrypoint arg
-        # and grep the script body for the required chown call.
-        entrypoint = init_svc.get("entrypoint", [])
-        script = ""
-        if isinstance(entrypoint, list) and entrypoint:
-            script = str(entrypoint[-1])
-        elif isinstance(entrypoint, str):
-            script = entrypoint
-        assert script, f"chownfix.entrypoint must include a shell script; got: {entrypoint!r}"
-        # Required chown: the top-level grafana leaf must be 472:472.
-        # The script uses "$$APPDATA_DIR" (compose escapes $), so we
-        # check for "grafana" with the right chown target.
-        assert "472:472" in script, (
-            f"chownfix script must chown 472:472 the grafana leaf " f"(grafana user is uid 472). Script:\n{script}"
+        svc = _load_compose()["services"]["grafana"]
+        ep = svc.get("entrypoint")
+        # Either absent (defaults to upstream /run.sh) or pointing at /run.sh.
+        if ep is None:
+            return  # OK — upstream default
+        if isinstance(ep, list):
+            ep_str = " ".join(str(x) for x in ep)
+        else:
+            ep_str = str(ep)
+        assert "/entrypoint_grafana.sh" not in ep_str, (
+            f"grafana entrypoint must NOT point at /entrypoint_grafana.sh "
+            f"(deleted in issue #297; provisioning is now bind-mounted "
+            f"from the repo). Got: {ep_str!r}"
         )
-        assert "grafana" in script, f"chownfix script must mention the grafana leaf. " f"Script:\n{script}"
+
+    def test_no_entrypoint_grafana_sh_wrapper_exists(self) -> None:
+        """The docker/entrypoint_grafana.sh wrapper script (which used
+        to decode *_B64 env vars) MUST be deleted from the repo after
+        PR #297. Keeping it would re-introduce the very path that
+        Portainer's 60-char truncation bug killed.
+        """
+        repo = Path(__file__).resolve().parent.parent
+        wrapper = repo / "docker" / "entrypoint_grafana.sh"
+        assert not wrapper.exists(), (
+            f"docker/entrypoint_grafana.sh must be deleted (issue #297): "
+            f"the B64-decode wrapper is dead code now that provisioning "
+            f"is bind-mounted. Found at: {wrapper}"
+        )
 
 
 class TestPortainerStandaloneEnv:
@@ -1319,229 +1293,6 @@ class TestPortainerStandaloneEnv:
         )
 
 
-class TestGrafanaEnvProvisioning:
-    """Compose refactor 2.0 (kanban t_884fec4a): Grafana provisioning + dashboards
-    are baked into base64 env vars instead of bind-mounted from
-    ``./docker/grafana/{provisioning,dashboards}``.
-
-    Why this class exists
-    ---------------------
-    The legacy bind-mounts to ``./docker/grafana/...`` worked in
-    compose-CLI deployments but failed in Portainer standalone
-    StackUpdate (PR #217 documented the sister-bug; this refactor is
-    the final fix). The fix is to ship the provisioning YAMLs and
-    dashboard JSONs as base64 env vars and decode them inside the
-    container on startup.
-
-    The architectural test contract:
-
-    1. All 4 *_B64 env vars must appear in grafana.service.environment
-       (Portainer standalone contract, issue #149).
-    2. The grafana service must NOT bind-mount to
-       ``./docker/grafana/provisioning`` or ``./docker/grafana/dashboards``
-       (the relative path that broke Portainer standalone).
-    3. The grafana service's entrypoint must point at our wrapper
-       (./docker/entrypoint_grafana.sh), not the upstream /run.sh.
-    4. Required env vars must default to empty (so a misconfigured
-       stack fails LOUDLY in the entrypoint, not silently with empty
-       provisioning).
-    """
-
-    REQUIRED_B64_VARS = (
-        "PROVISIONING_DATASOURCES_YML_B64",
-        "PROVISIONING_DASHBOARDS_PROVIDER_YML_B64",
-        "DASHBOARD_PHASE0_JSON_B64",
-        "DASHBOARD_PHASE28_JSON_B64",
-    )
-
-    def _grafana_service(self) -> dict:
-        data = _load_compose()
-        svc = data["services"].get("grafana")
-        assert svc is not None, "grafana service must exist in docker-compose.yaml"
-        return svc
-
-    def test_grafana_declares_all_b64_env_vars(self) -> None:
-        """All 4 base64 env vars MUST be declared in grafana.service.environment.
-
-        Why: Portainer standalone strips undeclared stack-level env vars
-        from the rendered container (issue #149). The entrypoint
-        (docker/entrypoint_grafana.sh) bails on empty *_B64 with a clear
-        FATAL log line, but only if the vars are reachable inside the
-        container at all — without an explicit service.environment
-        declaration, the var is empty even before our fail-fast runs.
-        """
-        svc = self._grafana_service()
-        env = svc.get("environment", {})
-        if isinstance(env, list):
-            env_map = {}
-            for item in env:
-                if isinstance(item, str) and "=" in item:
-                    k, _, v = item.partition("=")
-                    env_map[k] = v
-                elif isinstance(item, str):
-                    env_map[item] = None
-            env = env_map
-        for required in self.REQUIRED_B64_VARS:
-            assert required in env, (
-                f"grafana service.environment must declare {required} "
-                f"explicitly (Portainer standalone contract, issue #149). "
-                f"Otherwise the stack-level value is stripped during render "
-                f"and entrypoint_grafana.sh fails with FATAL: var unset."
-            )
-
-    def test_grafana_b64_env_vars_default_to_empty(self) -> None:
-        """All 4 *_B64 vars must default to empty string (fail-fast contract).
-
-        Why empty default (and not a baked-in dummy value): a baked-in
-        dummy would let a misconfigured stack pass compose config check
-        and start a half-loaded Grafana with stale provisioning. Empty
-        default makes the entrypoint FATAL-out with a clear log line
-        ("FATAL: ${VAR} is unset or empty — re-run tools/bake_grafana_env.py").
-        """
-        svc = self._grafana_service()
-        env = svc.get("environment", {})
-        if isinstance(env, list):
-            env_map = {}
-            for item in env:
-                if isinstance(item, str) and "=" in item:
-                    k, _, v = item.partition("=")
-                    env_map[k] = v
-                elif isinstance(item, str):
-                    env_map[item] = None
-            env = env_map
-        for var in self.REQUIRED_B64_VARS:
-            assert env.get(var) in (None, "", "${" + var + ":-}"), (
-                f"{var} must default to empty string (fail-fast contract). "
-                f"A baked-in default would mask misconfigured stacks. "
-                f"Got: {env.get(var)!r}"
-            )
-
-    def test_grafana_entrypoint_is_wrapper(self) -> None:
-        """The grafana service's entrypoint must be our wrapper
-        ``/entrypoint_grafana.sh``, NOT the upstream ``/run.sh``.
-
-        Why: /run.sh starts grafana-server directly with no opportunity
-        to decode the *_B64 env vars. Our wrapper decodes them into
-        /etc/grafana/provisioning and /var/lib/grafana/dashboards, then
-        exec's /run.sh. Without the wrapper override, grafana-server
-        starts with empty provisioning and /api/search?type=dash-db
-        returns [].
-        """
-        svc = self._grafana_service()
-        entrypoint = svc.get("entrypoint")
-        # Compose accepts entrypoint as a string OR a list.
-        if isinstance(entrypoint, list):
-            entrypoint_str = " ".join(str(x) for x in entrypoint)
-        else:
-            entrypoint_str = str(entrypoint or "")
-        assert "/entrypoint_grafana.sh" in entrypoint_str, (
-            f"grafana entrypoint must point at /entrypoint_grafana.sh "
-            f"(our wrapper that decodes *_B64 env vars). Without this "
-            f"override, grafana-server starts with empty provisioning "
-            f"and /api/search returns []. Got: {entrypoint_str!r}"
-        )
-        # The wrapper MUST exec /run.sh at the end (so the upstream
-        # entrypoint's logic for GF_PATHS_* and gosu drop-to-grafana
-        # still runs). We verify this by reading the script content.
-        script = Path(__file__).resolve().parent.parent / "docker" / "entrypoint_grafana.sh"
-        assert script.is_file(), (
-            f"docker/entrypoint_grafana.sh must exist at the repo root "
-            f"(compose bind-mounts it into the container). Got path: {script}"
-        )
-        text = script.read_text()
-        assert "exec /run.sh" in text, (
-            f"docker/entrypoint_grafana.sh must exec /run.sh at the end "
-            f"so the upstream entrypoint's GF_PATHS_* config + gosu drop "
-            f"to uid 472 still runs. Script content: {text[:500]!r}"
-        )
-
-    def test_grafana_no_bind_mount_on_provisioning_or_dashboards(self) -> None:
-        """The grafana service must NOT bind-mount
-        ``./docker/grafana/provisioning`` to ``/etc/grafana/provisioning``
-        or ``./docker/grafana/dashboards`` to ``/var/lib/grafana/dashboards``.
-
-        Why: relative-path bind-mounts break in Portainer standalone
-        StackUpdate (compose-CLI's cwd is dropped during render, so
-        the bind source resolves against the wrong host dir →
-        provisioning reads empty directory inside the container →
-        /api/search returns []). The refactor replaces these with
-        env-baked base64; the wrapper decodes them into upstream
-        default paths. Any future PR that re-introduces these bind
-        mounts re-introduces the bug.
-
-        Note: the grafana service DOES still bind-mount
-        ``./docker/entrypoint_grafana.sh:/entrypoint_grafana.sh:ro``
-        (a single file, not a dir). That bind is OK and explicitly
-        approved by the refactor — it doesn't go through the dir-
-        vs-file leaf quirk that broke provisioning/dashboards
-        (single-file binds survive even on .107 Docker 29.1.x).
-        """
-        svc = self._grafana_service()
-        forbidden_substrings = (
-            ("/docker/grafana/provisioning", "/etc/grafana/provisioning"),
-            ("/docker/grafana/dashboards", "/var/lib/grafana/dashboards"),
-        )
-        for v in svc.get("volumes", []):
-            v_str = str(v)
-            for bad_src, bad_dst in forbidden_substrings:
-                assert bad_src not in v_str or bad_dst not in v_str, (
-                    f"grafana must NOT bind-mount {bad_src} (or any "
-                    f"relative-path docker/grafana/{{provisioning,dashboards}}) "
-                    f"to {bad_dst}. The compose refactor 2.0 baked these "
-                    f"into *_B64 env vars; restore would re-introduce "
-                    f"the Portainer standalone cwd-drop bug. Found: {v!r}"
-                )
-
-    def test_grafana_b64_decode_smoke(self) -> None:
-        """End-to-end smoke: re-run the bake script, decode each value,
-        and verify the bytes match the source file. This is the same
-        logic the entrypoint runs inside the container — if it passes
-        here, it passes at container startup (modulo the entrypoint
-        script, which is tested by `test_grafana_entrypoint_is_wrapper`).
-
-        This test runs the bake + decode loop in-process so a future
-        PR that breaks either side (bake output format, decode
-        target paths, etc.) surfaces immediately in CI rather than at
-        the next Portainer StackUpdate on .107.
-        """
-        import base64
-        import re
-        import subprocess
-
-        repo = Path(__file__).resolve().parent.parent
-        out = subprocess.check_output(
-            ["python3", str(repo / "tools" / "bake_grafana_env.py")],
-            cwd=repo,
-        ).decode()
-        pairs = re.findall(
-            r'^(PROVISIONING_[A-Z_]+_B64|DASHBOARD_[A-Z0-9_]+_B64)="([^"]+)"',
-            out,
-            re.M,
-        )
-        keys = {k for k, _ in pairs}
-        assert keys == set(self.REQUIRED_B64_VARS), (
-            f"bake script output must declare exactly the 4 *_B64 vars; "
-            f"got: {sorted(keys)}, expected: {sorted(self.REQUIRED_B64_VARS)}"
-        )
-        # Decode each value and verify it round-trips to the source file
-        expected_sources = {
-            "PROVISIONING_DATASOURCES_YML_B64": repo / "docker/grafana/provisioning/datasources/prometheus.yml",
-            "PROVISIONING_DASHBOARDS_PROVIDER_YML_B64": repo / "docker/grafana/provisioning/dashboards/provider.yml",
-            "DASHBOARD_PHASE0_JSON_B64": repo / "docker/grafana/dashboards/alphard-phase0.json",
-            "DASHBOARD_PHASE28_JSON_B64": repo / "docker/grafana/dashboards/alphard-phase28.json",
-        }
-        for k, v in pairs:
-            decoded = base64.b64decode(v)
-            src = expected_sources[k].read_bytes()
-            assert decoded == src, (
-                f"{k} round-trip mismatch: decoded bytes != source file. "
-                f"This means bake_grafana_env.py and entrypoint_grafana.sh "
-                f"disagree on the encoding — Grafana would see wrong "
-                f"content. Got {len(decoded)} decoded bytes vs "
-                f"{len(src)} source bytes."
-            )
-
-
 class TestChownfixService:
     """Compose refactor 2.0 (kanban t_884fec4a): a single ``chownfix``
     one-shot service replaces per-service init containers
@@ -1660,141 +1411,110 @@ class TestChownfixService:
 
 
 class TestNoRelativeBindMounts:
-    """Compose refactor 2.0 (kanban t_884fec4a): no service may bind-mount
-    any file or directory under ``./docker/grafana/{provisioning,dashboards}``.
+    """Issue #297 — bind-mounts from ./docker/ are now the canonical
+    mechanism for provisioning + dashboards (replacing the env-baked
+    B64 approach that PR #284 retired for prometheus).
 
-    The original provision/dashboards bind-mounts used relative paths
-    like ``./docker/grafana/provisioning:/etc/grafana/provisioning:ro``.
-    Portainer standalone StackUpdate drops the compose cwd during
-    render, so the bind source resolves against the wrong host
-    directory → provisioning reads empty inside the container →
-    /api/search returns [].
+    Why bind-mounts are safe now (vs. the broken PR #217 era):
+    The dir-vs-file leaf quirk on .107 PVE LXC + Docker 29.1.x only
+    affects HOST DIRECTORY bind-mounts whose source path doesn't
+    exist at bind time — the daemon creates the leaf as a directory
+    and the in-container user can't write through. Single-file binds
+    (e.g. PR #284 prometheus.yml) and pre-existing directory binds
+    (provisioning, dashboards) are unaffected because their leaf
+    already exists in the repo.
 
-    The refactor bakes these into *_B64 env vars and decodes them at
-    container start. The ONLY remaining relative-path bind under
-    docker/ is the grafana entrypoint wrapper
-    (``./docker/entrypoint_grafana.sh:/entrypoint_grafana.sh:ro``),
-    which is a single-file bind and therefore does NOT trigger the
-    dir-vs-file leaf quirk on .107.
+    Allowed pattern:
+      - ./docker/grafana/provisioning → /etc/grafana/provisioning:ro
+      - ./docker/grafana/dashboards → /var/lib/grafana/dashboards:ro
+      - ./docker/prometheus/prometheus.yml → /etc/prometheus/prometheus.yml:ro
+
+    NOT allowed:
+      - Any bind-mount whose source path doesn't exist (covered by
+        docker-compose CLI validation, not in this test)
+      - B64 env vars that depend on Portainer-side env propagation
+        (issue #297 root cause; we removed all *_B64 vars from grafana
+        service.environment)
     """
 
-    RELATIVE_FORBIDDEN_SUBSTRINGS = (
-        "./docker/grafana/provisioning",
-        "./docker/grafana/dashboards",
-        "docker/grafana/provisioning",
-        "docker/grafana/dashboards",
-    )
-
-    def test_no_relative_bind_mount_on_provisioning(self) -> None:
-        data = _load_compose()
-        offenders = []
-        for svc_name, svc in data["services"].items():
-            for v in svc.get("volumes", []):
-                v_str = str(v)
-                for forbidden in self.RELATIVE_FORBIDDEN_SUBSTRINGS:
-                    if forbidden in v_str:
-                        offenders.append((svc_name, v))
-        assert not offenders, (
-            f"No service may bind-mount from "
-            f"./docker/grafana/{{provisioning,dashboards}} — these "
-            f"broke in Portainer standalone StackUpdate (cwd dropped "
-            f"during render). Compose refactor 2.0 bakes these into "
-            f"*_B64 env vars; restore would re-introduce the bug. "
-            f"Found offenders: {offenders!r}"
-        )
-
-    def test_no_hardcoded_mnt_appdata_volumes_for_config(self) -> None:
-        """Wider guard: no service may bind-mount ANY host config file
-        (yaml, json, yml) from the repo into a container. The only
-        host-bind-mount for grafana is the entrypoint script (a single
-        .sh file), which is acceptable.
-
-        This is broader than the previous test — it catches a future
-        PR that adds, say, an alertmanager provision file and bind-
-        mounts ``./docker/alertmanager/...`` from the repo.
-        """
-        data = _load_compose()
-        offenders = []
-        for svc_name, svc in data["services"].items():
-            for v in svc.get("volumes", []):
-                v_str = str(v)
-                # Match any source path under ./docker/ that ENDS in a
-                # config-file extension. We use a permissive regex to
-                # catch yaml/yml/json/conf/ini/toml — the contract is
-                # "no bind-mounted config file under ./docker/".
-                import re
-
-                m = re.search(r"\.?/docker/[^\s:]+\.(yaml|yml|json|conf|ini|toml)", v_str)
-                if m:
-                    # Issue #283 carve-out: prometheus.yml is the ONE config
-                    # file we intentionally bind-mount. PROM_YML_B64 was the
-                    # original mechanism but Portainer StackUpdate silently
-                    # truncates env values >60 chars (Go JSON unmarshal
-                    # fails on long strings), so the base64 blob was routinely
-                    # cut off mid-keyword and dropped the alphard-bot scrape
-                    # target. Bind-mount from ./docker/prometheus/prometheus.yml
-                    # is read-only (:ro) so the .107 LXC userns-mapping trap
-                    # doesn't apply (nobody user never writes to it).
-                    if "prometheus/prometheus.yml" in v_str and ":ro" in v_str:
-                        continue
-                    offenders.append((svc_name, v, m.group(0)))
-        assert not offenders, (
-            f"No service may bind-mount config files from ./docker/. "
-            f"All provisioning/dashboards/etc. should be env-baked "
-            f"(compose refactor 2.0 pattern) or baked into the image. "
-            f"Exceptions: grafana entrypoint script (.sh, single-file bind) "
-            f"and prometheus.yml bind-mount (:ro, issue #283 carve-out). "
-            f"Found offenders: {offenders!r}"
-        )
-
-    def test_grafana_entrypoint_bind_is_single_file(self) -> None:
-        """The grafana entrypoint wrapper bind
-        ``./docker/entrypoint_grafana.sh:/entrypoint_grafana.sh:ro``
-        is the ONE allowed relative-path bind under ./docker/. It must
-        be a single-file bind (host path ends in a file, not a dir).
-
-        Why this is OK on .107 PVE LXC: the dir-vs-file leaf quirk
-        (Docker 29.1.x) only affects HOST DIRECTORY bind-mounts whose
-        source path doesn't exist — the daemon creates the leaf as a
-        directory and the in-container user can't write through.
-        Single-file binds survive because the file already exists
-        (committed in the repo).
+    def test_grafana_provisioning_bind_mount_present(self) -> None:
+        """Regression for issue #297: grafana MUST bind-mount provisioning
+        from ./docker/grafana/provisioning. This is the new source of
+        truth after the *_B64 env approach was retired.
         """
         data = _load_compose()
         grafana = data["services"]["grafana"]
-        allowed_binds = []
+        prov_mount = None
         for v in grafana.get("volumes", []):
             v_str = str(v)
-            if "./docker/" in v_str:
-                # Must be a single-file bind, not a dir bind.
-                # short-form: "src:dst[:ro]" — src must NOT have trailing /
-                if isinstance(v, str):
-                    src = v.split(":")[0]
-                    assert not src.endswith("/"), (
-                        f"grafana bind-mount source must NOT end in / "
-                        f"(dir-bind would re-trigger the .107 quirk). "
-                        f"Found: {v!r}"
-                    )
-                    # Source must be a .sh file (the entrypoint wrapper).
-                    assert src.endswith(".sh"), (
-                        f"grafana bind-mount under ./docker/ must be "
-                        f"the entrypoint wrapper .sh file, not a "
-                        f"config file. Found: {v!r}"
-                    )
-                    allowed_binds.append(v)
-                else:
-                    # Long-form dict: type=bind, source=./..., target=...
-                    assert v.get("type") == "bind", f"grafana bind under ./docker/ must be type=bind. " f"Found: {v!r}"
-                    src = v.get("source", "")
-                    assert src.endswith(".sh"), (
-                        f"grafana bind source under ./docker/ must end "
-                        f"in .sh (the entrypoint wrapper). Found: {src!r}"
-                    )
-                    allowed_binds.append(v)
-        # At least one bind (the entrypoint) MUST be present.
-        assert allowed_binds, (
-            "grafana must bind-mount the entrypoint wrapper "
-            "./docker/entrypoint_grafana.sh:/entrypoint_grafana.sh:ro "
-            "so the wrapper is reachable inside the container. "
-            "Found no ./docker/ binds on grafana."
+            if "/etc/grafana/provisioning" in v_str:
+                prov_mount = v_str
+                break
+        assert prov_mount is not None, (
+            "grafana.volumes must bind-mount provisioning YAMLs from "
+            "./docker/grafana/provisioning (issue #297, fixes "
+            "Portainer 60-char env truncation bug for PROVISIONING_*_B64)"
+        )
+        assert ":ro" in prov_mount, f"provisioning bind-mount must be read-only (:ro); got: {prov_mount}"
+
+    def test_grafana_dashboards_bind_mount_present(self) -> None:
+        """Regression for issue #297: grafana MUST bind-mount dashboards
+        from ./docker/grafana/dashboards (matches the dashboard provider
+        YAML at docker/grafana/provisioning/dashboards/provider.yml).
+        """
+        data = _load_compose()
+        grafana = data["services"]["grafana"]
+        dash_mount = None
+        for v in grafana.get("volumes", []):
+            v_str = str(v)
+            if "/var/lib/grafana/dashboards" in v_str:
+                dash_mount = v_str
+                break
+        assert dash_mount is not None, (
+            "grafana.volumes must bind-mount dashboard JSONs from " "./docker/grafana/dashboards (issue #297)"
+        )
+        assert ":ro" in dash_mount, f"dashboards bind-mount must be read-only (:ro); got: {dash_mount}"
+
+    def test_grafana_no_b64_env_vars(self) -> None:
+        """Issue #297 — *_B64 env vars are gone. Any reintroduction
+        re-triggers the Portainer 60-char truncation bug.
+        """
+        svc = _load_compose()["services"]["grafana"]
+        env = svc.get("environment", {})
+        if isinstance(env, list):
+            keys = {item.split("=", 1)[0] for item in env if isinstance(item, str) and "=" in item}
+            keys |= {item for item in env if isinstance(item, str) and "=" not in item}
+        else:
+            keys = set(env.keys())
+        for forbidden in (
+            "PROVISIONING_DATASOURCES_YML_B64",
+            "PROVISIONING_DASHBOARDS_PROVIDER_YML_B64",
+            "DASHBOARD_PHASE0_JSON_B64",
+            "DASHBOARD_PHASE28_JSON_B64",
+        ):
+            assert forbidden not in keys, (
+                f"grafana.environment must NOT declare {forbidden} "
+                f"(replaced by bind-mount per issue #297); got: {sorted(keys)}"
+            )
+
+    def test_no_hardcoded_mnt_appdata_volumes_for_config(self) -> None:
+        """Wider guard: no service may bind-mount ANY host config file
+        (yaml, json, yml) under an APPDATA_DIR-style absolute path.
+        The bind sources must be repo-relative paths.
+        """
+        data = _load_compose()
+        offenders = []
+        for svc_name, svc in data["services"].items():
+            for v in svc.get("volumes", []):
+                v_str = str(v)
+                # Skip the canonical APPDATA_DIR-based DATA leaves
+                if "/var/lib/" in v_str or "/prometheus" in v_str or "/var/log/" in v_str:
+                    continue
+                import re
+
+                m = re.search(r"^/[^:]+\.(yaml|yml|json|conf|ini|toml):", v_str)
+                if m and "/etc/" in v_str:
+                    offenders.append((svc_name, v, m.group(0)))
+        assert not offenders, (
+            f"No service may bind-mount host config files into /etc/. " f"Found offenders: {offenders!r}"
         )

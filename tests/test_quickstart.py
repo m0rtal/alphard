@@ -46,10 +46,6 @@ def _quickstart_skel(
         "REDIS_PASSWORD=\n"
         "GRAFANA_ADMIN_PASSWORD=ci_test_password_DO_NOT_USE_IN_PRODUCTION\n"
         "PROMETHEUS_RETENTION_DAYS=30\n"
-        "PROVISIONING_DATASOURCES_YML_B64=\n"
-        "PROVISIONING_DASHBOARDS_PROVIDER_YML_B64=\n"
-        "DASHBOARD_PHASE0_JSON_B64=\n"
-        "DASHBOARD_PHASE28_JSON_B64=\n"
     )
     (env_dir / ".env.example").write_text(example, encoding="utf-8")
 
@@ -59,21 +55,9 @@ def _quickstart_skel(
                 "GRAFANA_ADMIN_PASSWORD=ci_test_password_DO_NOT_USE_IN_PRODUCTION\n"
                 "POSTGRES_PASSWORD=\n"
                 "REDIS_PASSWORD=\n"
-                "PROVISIONING_DATASOURCES_YML_B64=\n"
-                "PROVISIONING_DASHBOARDS_PROVIDER_YML_B64=\n"
-                "DASHBOARD_PHASE0_JSON_B64=\n"
-                "DASHBOARD_PHASE28_JSON_B64=\n"
             )
         else:
-            env = (
-                "GRAFANA_ADMIN_PASSWORD=\n"
-                "POSTGRES_PASSWORD=\n"
-                "REDIS_PASSWORD=\n"
-                "PROVISIONING_DATASOURCES_YML_B64=\n"
-                "PROVISIONING_DASHBOARDS_PROVIDER_YML_B64=\n"
-                "DASHBOARD_PHASE0_JSON_B64=\n"
-                "DASHBOARD_PHASE28_JSON_B64=\n"
-            )
+            env = "GRAFANA_ADMIN_PASSWORD=\n" "POSTGRES_PASSWORD=\n" "REDIS_PASSWORD=\n"
         (env_dir / ".env").write_text(env, encoding="utf-8")
 
     (env_dir / "docker-compose.yaml").write_text("# stub\n", encoding="utf-8")
@@ -581,41 +565,3 @@ def test_symlink_invocation_finds_real_repo(tmp_path: Path) -> None:
     # And the script must have found the real compose file.
     text = (env_dir / ".env").read_text()
     assert "GRAFANA_ADMIN_PASSWORD=ci_test_password_DO_NOT_USE_IN_PRODUCTION" in text
-
-
-def test_grafana_b64_baked_when_missing(tmp_path: Path) -> None:
-    """PROVISIONING_*_B64 missing -> baked via tools/bake_grafana_env.py."""
-    env_dir = _quickstart_skel(tmp_path, with_gpw=True)
-    text = (env_dir / ".env").read_text()
-    for k in (
-        "PROVISIONING_DATASOURCES_YML_B64",
-        "PROVISIONING_DASHBOARDS_PROVIDER_YML_B64",
-        "DASHBOARD_PHASE0_JSON_B64",
-        "DASHBOARD_PHASE28_JSON_B64",
-    ):
-        text = re.sub(rf"^{k}=.*$", "", text, flags=re.MULTILINE)
-    (env_dir / ".env").write_text(text)
-
-    _run_with_fake_docker(env_dir, tmp_path)  # noqa: F841 (side effects only)
-    text = (env_dir / ".env").read_text()
-    for k in (
-        "PROVISIONING_DATASOURCES_YML_B64",
-        "PROVISIONING_DASHBOARDS_PROVIDER_YML_B64",
-        "DASHBOARD_PHASE0_JSON_B64",
-        "DASHBOARD_PHASE28_JSON_B64",
-    ):
-        m = re.search(rf'^{k}="([A-Za-z0-9+/=]+)"', text, re.MULTILINE)
-        assert m, f"{k} should be baked after quickstart; env:\n{text}"
-
-
-def test_idempotent_no_rewrite_when_already_set(tmp_path: Path) -> None:
-    """If PROVISIONING_*_B64 already populated, quickstart must NOT call bake_grafana_env.py."""
-    env_dir = _quickstart_skel(tmp_path, with_gpw=True)
-    _fill_all_b64(env_dir)
-    _run_with_fake_docker(env_dir, tmp_path)  # noqa: F841 (side effects only)
-    text = (env_dir / ".env").read_text()
-    m = re.search(r'^PROVISIONING_DATASOURCES_YML_B64="([^"]+)"', text, re.MULTILINE)
-    assert m, "PROVISIONING_DATASOURCES_YML_B64 should still be set"
-    assert (
-        m.group(1) == "ZmFrZS1kYXRhc291cmNlLXltbA=="
-    ), "PROVISIONING_DATASOURCES_YML_B64 should NOT have been rewritten (idempotency)"
