@@ -100,7 +100,10 @@ def main() -> int:
         "--min-bars",
         type=int,
         default=1300,
-        help="If MD-backfill loader is selected, skip tickers with >= N bars already.",  # noqa: E501
+        help=(
+            "Skip tickers already having >= N bars in DB (default 1300). "
+            "Used by the legacy _is_complete() threshold — does not select a data source."
+        ),
     )
     parser.add_argument(
         "--prefer-md-backfill",
