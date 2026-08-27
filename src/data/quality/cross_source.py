@@ -114,41 +114,96 @@ class SourceSeries(BaseModel):
 
 
 def _log_returns(closes: list[float]) -> list[float]:
-    """ln(close_t / close_{t-1}) for t=1..len-1.
+    """Return one log-return per adjacent close pair: ``len(closes) - 1``
+    elements total.
 
-    Bad bars (close <= 0 or NaN) are treated as gaps: the return on the
-    pair that includes the bad bar is NaN, but the next return uses the
-    last VALID previous close (not the bad close) so a single corrupted
-    bar does not poison the rest of the return series.
+    Pair semantics: ``out[i] = log(closes[i+1] / closes[i])`` if both
+    closes are finite and positive; ``out[i] = float('nan')`` otherwise
+    (a gap return). When the FIRST close is bad, the corresponding
+    leading return is a NaN gap — not a silent drop — so the output
+    length always matches ``len(closes) - 1`` (issue #278).
 
-    Issue #271 (regression): pre-fix this function did ``prev = cur``
-    unconditionally, so when ``cur`` was zero/negative, ``prev`` became
-    zero/negative too. Every subsequent return was NaN because
-    ``prev <= 0`` fired on every iteration, even when the actual
-    adjacent closes were perfectly fine. That NaN-poisoned series then
-    slipped through ``_pearson`` (which did not detect NaN as a missing
-    case) and through ``check_cross_source`` (which compared ``NaN <
-    threshold`` and got False), silently bypassing the Level-2 gate.
+    Last-valid-baseline (issue #271): when a close is bad, the
+    corresponding return is NaN and the baseline cursor is NOT
+    advanced — the next valid bar pairs against the same baseline
+    instead of against the corrupted value. This prevents a single
+    zero/negative bar from poisoning every subsequent return.
+
+    Issue #271 (regression): the previous implementation advanced the
+    ``prev`` cursor unconditionally, so when ``cur`` was zero/negative,
+    ``prev`` became zero/negative too. Every subsequent return was NaN
+    because ``prev <= 0`` fired on every iteration, even when the
+    actual adjacent closes were perfectly fine. That NaN-poisoned
+    series then slipped through ``_pearson`` (which did not detect NaN
+    as a missing case) and through ``check_cross_source`` (which
+    compared ``NaN < threshold`` and got False), silently bypassing
+    the Level-2 gate.
+
+    Issue #278 (regression-of-regression): the post-#271 fix tracked
+    ``last_valid`` instead of ``prev`` so a bad bar never advanced the
+    baseline — but for the LEADING edge it still silently skipped the
+    first slot, producing a length-shortened output (``len(closes) - 2``
+    instead of ``len(closes) - 1``). That length asymmetry tripped the
+    ``n != len(ys)`` guard in ``_pearson`` and caused
+    ``check_cross_source`` to emit a misleading ``XSC_SOURCE_MISSING -
+    zero variance`` message even when the real cause was a leading-bad
+    bar in one source.
     """
     out: list[float] = []
+    n = len(closes)
+    if n < 2:
+        return out
+    # ``last_valid`` is the most recent CLOSE that is finite and > 0,
+    # or None if we have not yet seen one. It is consumed as the
+    # denominator of the next return; it is updated to ``cur`` only
+    # when ``cur`` is valid. This two-state machine produces the
+    # desired gap semantics:
+    #   * pre-baseline (last_valid is None): the FIRST valid close
+    #     latches the baseline (no return emitted — there is no
+    #     previous close to compare against). Subsequent bars in this
+    #     state emit a NaN gap-return (the pair with the immediately
+    #     preceding bar is bad) AND, if valid, become the new
+    #     baseline.
+    #   * post-baseline (last_valid is set): every bar emits a return
+    #     (real if the bar is valid, NaN gap otherwise) and ``last_valid``
+    #     advances only on valid bars.
     last_valid: float | None = None
-    for cur in closes:
-        if last_valid is None:
-            # First valid close becomes the baseline; nothing to compare
-            # against yet.
-            if math.isfinite(cur) and cur > 0:
-                last_valid = cur
-            # Otherwise we still need to start somewhere — fall through;
-            # the gap return will be NaN once we see a valid pair.
+    for i, cur in enumerate(closes):
+        is_valid = math.isfinite(cur) and cur > 0
+        if not is_valid:
+            if last_valid is None:
+                # Pre-baseline bad bar: the current slot is the
+                # right-hand side of the pair (closes[i-1], closes[i]),
+                # and ``closes[i-1]`` was also bad (we never latched),
+                # so the gap-return is NaN. Emit a NaN-gap here to
+                # maintain ``len(out) == len(closes) - 1`` (issue
+                # #278). Stay in pre-baseline.
+                if i >= 1:
+                    out.append(float("nan"))
+            else:
+                # Post-baseline bad bar: emit NaN gap; do NOT advance
+                # ``last_valid`` so the next valid bar pairs against the
+                # same baseline (issue #271 fix).
+                out.append(float("nan"))
             continue
-        if math.isfinite(cur) and cur > 0:
-            out.append(math.log(cur / last_valid))
-            last_valid = cur
-        else:
-            # Bad bar — emit NaN for this return but DO NOT advance
-            # ``last_valid``; the next valid bar will pair against the
-            # same baseline instead of against the corrupted value.
-            out.append(float("nan"))
+        # ``cur`` is valid.
+        if last_valid is None:
+            if i == 0:
+                # First slot, valid. Latch baseline; no return emitted
+                # because there is no previous close to pair against.
+                last_valid = cur
+            else:
+                # Pre-baseline slot, valid: the pair (closes[i-1],
+                # closes[i]) has ``closes[i-1]`` bad → NaN gap. Emit
+                # the gap-return and latch ``cur`` as the new baseline
+                # for the NEXT iteration.
+                out.append(float("nan"))
+                last_valid = cur
+            continue
+        # Post-baseline: emit the real log-return for the pair
+        # (``last_valid``, ``cur``), then advance the baseline.
+        out.append(math.log(cur / last_valid))
+        last_valid = cur
     return out
 
 

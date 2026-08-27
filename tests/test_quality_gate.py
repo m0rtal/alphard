@@ -775,6 +775,129 @@ class TestCrossSource:
             f"issues={[(i.kind, i.severity) for i in r.issues]}"
         )
 
+    # ------------------------------------------------------------------
+    # Issue #278 — leading-bad bar must emit a NaN gap, not silently
+    # drop a slot in the output series. Length contract:
+    #     len(_log_returns(closes)) == len(closes) - 1  for all len >= 2
+    # ------------------------------------------------------------------
+
+    def test_log_returns_emits_leading_nan_gap(self) -> None:
+        """Issue #278: leading NaN close produces a leading NaN return,
+        not a length-shortened series. Pre-fix the leading slot was
+        silently dropped, breaking the length contract for ``_pearson``."""
+        from src.data.quality.cross_source import _log_returns
+
+        rets = _log_returns([float("nan"), 100.0, 102.0])
+        # 3 closes -> 2 returns (NOT 1 — that was the bug).
+        assert len(rets) == 2, f"expected 2 returns, got {rets!r}"
+        # First return is NaN (the gap for the bad first bar).
+        assert math.isnan(rets[0]), f"expected NaN leading gap, got {rets!r}"
+        # Second return is the log-return of the first valid pair.
+        assert math.isfinite(rets[1]), f"expected finite second return, got {rets!r}"
+        assert rets[1] == pytest.approx(math.log(102.0 / 100.0))
+
+    def test_log_returns_emits_leading_zero_gap(self) -> None:
+        """Issue #278: leading zero close behaves the same as leading NaN."""
+        from src.data.quality.cross_source import _log_returns
+
+        rets = _log_returns([0.0, 100.0, 102.0])
+        assert len(rets) == 2, f"expected 2 returns, got {rets!r}"
+        assert math.isnan(rets[0]), f"expected NaN leading gap, got {rets!r}"
+        assert rets[1] == pytest.approx(math.log(102.0 / 100.0))
+
+    def test_log_returns_emits_leading_negative_gap(self) -> None:
+        """Issue #278: leading negative close also produces a leading
+        NaN gap. Negative closes are equally invalid for log-returns."""
+        from src.data.quality.cross_source import _log_returns
+
+        rets = _log_returns([-5.0, 100.0, 102.0])
+        assert len(rets) == 2, f"expected 2 returns, got {rets!r}"
+        assert math.isnan(rets[0])
+
+    def test_log_returns_length_equals_closes_minus_one_always(self) -> None:
+        """Issue #278 property test: ``_log_returns`` must return exactly
+        ``len(closes) - 1`` elements for ANY input of length >= 2, no
+        matter where the bad bars sit. This pins the length contract
+        callers (``_pearson``) depend on."""
+        from src.data.quality.cross_source import _log_returns
+
+        cases = [
+            [100.0, 102.0, 0.0, 0.0, 101.0, 103.0],  # middle (issue #271 pattern)
+            [float("nan"), 100.0, 102.0],  # leading NaN
+            [0.0, 100.0, 102.0],  # leading zero
+            [-1.0, 100.0, 102.0],  # leading negative
+            [float("inf"), 100.0, 102.0],  # leading inf
+            [float("nan"), float("nan"), 100.0, 102.0],  # double leading bad
+            [100.0, 102.0, float("nan")],  # trailing NaN
+            [100.0, 102.0, 0.0],  # trailing zero
+            [float("nan"), float("nan"), float("nan")],  # all bad
+            [100.0, 102.0],  # clean baseline
+        ]
+        for closes in cases:
+            rets = _log_returns(closes)
+            assert len(rets) == len(closes) - 1, (
+                f"_log_returns({closes!r}) returned {len(rets)} returns " f"(expected {len(closes) - 1}); rets={rets!r}"
+            )
+
+    def test_log_returns_leading_glitch_does_not_poison_subsequent(self) -> None:
+        """Issue #278 (orthogonal to #271): after a leading bad bar, the
+        remaining returns must NOT be NaN-poisoned. The post-#271 fix
+        already protects the middle/trailing cases; this test pins the
+        leading-edge symmetry."""
+        from src.data.quality.cross_source import _log_returns
+
+        rets = _log_returns([float("nan"), 100.0, 102.0, 104.0])
+        assert len(rets) == 3
+        # Leading gap is NaN.
+        assert math.isnan(rets[0])
+        # Next two returns are real numbers, not poisoned. The baseline
+        # was the first VALID close (100.0), so returns are paired
+        # against it: log(102/100) and log(104/102).
+        assert math.isfinite(rets[1])
+        assert math.isfinite(rets[2])
+        assert rets[1] == pytest.approx(math.log(102.0 / 100.0))
+        assert rets[2] == pytest.approx(math.log(104.0 / 102.0))
+
+    def test_cross_source_leading_glitch_emits_documented_kind(self) -> None:
+        """Issue #278 end-to-end: a leading bad bar in one source (with
+        the other source clean) must NOT silently produce a misleading
+        ``XSC_SOURCE_MISSING - zero variance`` message. With the post-fix
+        length contract, ``_pearson`` still returns None (because both
+        series contain NaN — that's by design for cross-source), but the
+        semantic signal is now consistent with the underlying defect:
+        the gate emits XSC_SOURCE_MISSING for a leading-NaN mismatch
+        the same way it would for a middle-NaN mismatch."""
+        from src.data.quality.cross_source import check_cross_source
+
+        # Build 10 trading days with one perfectly-correlated source and
+        # another perfectly-correlated source with a leading bad bar.
+        start = date(2026, 1, 5)
+        dates: list[date] = []
+        d = start
+        while len(dates) < 10:
+            if d.weekday() < 5:
+                dates.append(d)
+            d += timedelta(days=1)
+
+        a_closes = [100.0 + i for i in range(10)]
+        b_closes = [100.0 + i for i in range(10)]
+        b_closes[0] = 0.0  # data glitch on the FIRST bar of B
+
+        sa = SourceSeries(source_name="a", bars=tuple(zip(dates, a_closes)))
+        sb = SourceSeries(source_name="b", bars=tuple(zip(dates, b_closes)))
+
+        r = check_cross_source("TEST", sa, sb)
+        assert not r.passed, "check_cross_source passed despite leading-bad bar"
+        # XSC_SOURCE_MISSING is the right IssueKind (one source has NaN
+        # in the return series due to the leading-bad bar). The bug was
+        # that the message lied about "zero variance in one source" when
+        # the real cause was the silent length-shortening of B's return
+        # series — pre-fix, the lengths of A and B differed (len 9 vs 10)
+        # so _pearson returned None on the n != len(ys) guard rather
+        # than the stdev==0 guard.
+        kinds = {i.kind for i in r.issues}
+        assert IssueKind.XSC_SOURCE_MISSING in kinds, f"expected XSC_SOURCE_MISSING, got {kinds}"
+
 
 # ---------------------------------------------------------------------------
 # Audit log tests
