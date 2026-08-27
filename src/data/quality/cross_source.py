@@ -114,26 +114,70 @@ class SourceSeries(BaseModel):
 
 
 def _log_returns(closes: list[float]) -> list[float]:
-    """ln(close_t / close_{t-1}) for t=1..len-1."""
+    """ln(close_t / close_{t-1}) for t=1..len-1.
+
+    Bad bars (close <= 0 or NaN) are treated as gaps: the return on the
+    pair that includes the bad bar is NaN, but the next return uses the
+    last VALID previous close (not the bad close) so a single corrupted
+    bar does not poison the rest of the return series.
+
+    Issue #271 (regression): pre-fix this function did ``prev = cur``
+    unconditionally, so when ``cur`` was zero/negative, ``prev`` became
+    zero/negative too. Every subsequent return was NaN because
+    ``prev <= 0`` fired on every iteration, even when the actual
+    adjacent closes were perfectly fine. That NaN-poisoned series then
+    slipped through ``_pearson`` (which did not detect NaN as a missing
+    case) and through ``check_cross_source`` (which compared ``NaN <
+    threshold`` and got False), silently bypassing the Level-2 gate.
+    """
     out: list[float] = []
-    prev = closes[0]
-    for cur in closes[1:]:
-        if prev <= 0 or cur <= 0:
-            out.append(float("nan"))
+    last_valid: float | None = None
+    for cur in closes:
+        if last_valid is None:
+            # First valid close becomes the baseline; nothing to compare
+            # against yet.
+            if math.isfinite(cur) and cur > 0:
+                last_valid = cur
+            # Otherwise we still need to start somewhere — fall through;
+            # the gap return will be NaN once we see a valid pair.
+            continue
+        if math.isfinite(cur) and cur > 0:
+            out.append(math.log(cur / last_valid))
+            last_valid = cur
         else:
-            out.append(math.log(cur / prev))
-        prev = cur
+            # Bad bar — emit NaN for this return but DO NOT advance
+            # ``last_valid``; the next valid bar will pair against the
+            # same baseline instead of against the corrupted value.
+            out.append(float("nan"))
     return out
 
 
 def _pearson(xs: list[float], ys: list[float]) -> float | None:
     """Pearson correlation between two same-length series.
 
-    Returns None if stdev is zero on either series or len < 2.
+    Returns None if stdev is zero on either series, if any pair is NaN
+    (NaN-poisoned input — caller should treat as missing), or if len < 2.
+
+    Issue #271 (regression): pre-fix this function did not detect NaN
+    in either series, so ``sum(xs)`` with one NaN element returned NaN,
+    which silently propagated through ``varx/vary`` (NaN == 0 is False,
+    so the zero-variance guard did not trip) and produced a final
+    correlation of NaN. Callers compared NaN with thresholds and
+    always got False, silently bypassing the gate.
     """
     n = len(xs)
     if n < 2 or n != len(ys):
         return None
+    # Reject NaN-poisoned input up front. We deliberately return None
+    # rather than trying to filter NaN pairs and compute a "partial"
+    # Pearson: (a) the cross-source gate already has its own
+    # length-based minimum aligned-points guard, so removing more pairs
+    # would obscure the operator-facing signal; (b) NaN here means one
+    # of the sources has a zero/NaN close somewhere — the gate should
+    # surface that as XSC_SOURCE_MISSING, not silently accommodate it.
+    for x, y in zip(xs, ys):
+        if not (math.isfinite(x) and math.isfinite(y)):
+            return None
     mx = sum(xs) / n
     my = sum(ys) / n
     cov = 0.0
@@ -279,7 +323,13 @@ def check_cross_source(
         for i in range(len(closes_a) - win + 1):
             window_a = closes_a[i : i + win]  # noqa: E203
             window_b = closes_b[i : i + win]  # noqa: E203
-            if any(c <= 0 for c in window_a + window_b):
+            # Issue #271: guard against BOTH non-positive AND NaN closes.
+            # Pre-fix the `c <= 0` test did not catch NaN (NaN <= 0 is
+            # False), so a NaN bar leaked into ``math.log`` (producing
+            # NaN) and the resulting ``abs(NaN - x)`` was NaN, which
+            # never exceeded the threshold. The divergence issue was
+            # silently skipped.
+            if any(not (math.isfinite(c) and c > 0) for c in window_a + window_b):
                 continue
             mean_div = sum(abs(math.log(a) - math.log(b)) for a, b in zip(window_a, window_b)) / win
             if mean_div > max_mean_div:
