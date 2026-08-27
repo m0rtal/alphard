@@ -747,9 +747,10 @@ class TestAudit:
 
         sink.close()
 
-        assert call_order == ["commit", "close"], (
-            f"close() must call conn.commit() before conn.close(); got {call_order}"
-        )
+        assert call_order == [
+            "commit",
+            "close",
+        ], f"close() must call conn.commit() before conn.close(); got {call_order}"
         assert sink._conn is None
         assert sink._cursor is None
 
@@ -789,8 +790,7 @@ class TestAudit:
         # Primary exception is the commit() error, not the close() error.
         assert "commit failed" in str(exc_info.value)
         assert "connection already closed" not in str(exc_info.value), (
-            "caller must see commit()'s error, not the chained close() "
-            "InterfaceError (issue #266)"
+            "caller must see commit()'s error, not the chained close() " "InterfaceError (issue #266)"
         )
         # Handles cleared even on error path.
         assert sink._conn is None
