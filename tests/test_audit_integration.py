@@ -66,10 +66,18 @@ def pg_audit():
     # this fixture missed the schema-creation step and failed on fresh Postgres
     # with ``InvalidSchemaName: schema "alphard_test" does not exist``
     # (closes issue #265; CI's postgres:16 service has no pre-existing schema).
+    #
+    # Note on cursor lifetime: ``log._cursor`` is closed by psycopg when the
+    # ``with log._cursor as cur:`` block exits, so each subsequent block
+    # opens a fresh cursor from ``log._conn`` rather than reusing the
+    # closed handle. (Reopening on the same connection is fine — same
+    # transaction state.) This was a latent bug in the original fixture
+    # that only surfaced once CI began actually running (issue #265 follow-up).
     log._ensure_conn()
-    with log._cursor as cur:
-        cur.execute("CREATE SCHEMA IF NOT EXISTS alphard_test")
-        cur.execute(f"""
+    setup_cur = log._conn.cursor()
+    try:
+        setup_cur.execute("CREATE SCHEMA IF NOT EXISTS alphard_test")
+        setup_cur.execute(f"""
             CREATE TABLE IF NOT EXISTS alphard_test.{TEST_TABLE} (
                 id          BIGSERIAL PRIMARY KEY,
                 ts          TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -82,12 +90,11 @@ def pg_audit():
                 extra       JSONB
             )
             """)
-    log._conn.commit()
-    try:
-        # Wipe any rows left over from a previous failed run.
-        with log._cursor as cur:
-            cur.execute(f"DELETE FROM alphard_test.{TEST_TABLE}")
+        setup_cur.execute(f"DELETE FROM alphard_test.{TEST_TABLE}")
         log._conn.commit()
+    finally:
+        setup_cur.close()
+    try:
         yield log
     finally:
         log.close()
@@ -131,12 +138,11 @@ class TestPostgresAuditLogWrite:
         )
         pg_audit.write_event(issue, ticker="PG_AUDIT_TEST", gate="ingestion")
 
-        # The cursor context manager commits on exit; this is a read-side
-        # convenience that does NOT exercise the production close()-commits
-        # path (see test_close_commits_and_closes for that). We use it here
-        # only because pg_audit is the live writer and we're inspecting
-        # uncommitted-then-committed state within the same connection.
-        with pg_audit._cursor as cur:
+        # The cursor context manager commits on exit and CLOSES the cursor;
+        # we therefore open a fresh one from the underlying connection instead
+        # of reusing ``pg_audit._cursor`` (which would be closed on first use
+        # and break subsequent tests in the same module-scoped fixture).
+        with pg_audit._conn.cursor() as cur:
             cur.execute(
                 f"SELECT ticker, gate, kind, severity, message, count, extra "
                 f"FROM alphard_test.{TEST_TABLE} WHERE ticker = %s",
@@ -165,7 +171,8 @@ class TestPostgresAuditLogWrite:
             )
             pg_audit.write_event(issue, ticker="PG_AUDIT_MULTI", gate="history")
 
-        with pg_audit._cursor as cur:
+        # Fresh cursor (see test_write_event_roundtrip for rationale).
+        with pg_audit._conn.cursor() as cur:
             cur.execute(
                 f"SELECT COUNT(*) FROM alphard_test.{TEST_TABLE} " f"WHERE ticker = %s",
                 ("PG_AUDIT_MULTI",),
