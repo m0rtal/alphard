@@ -1,5 +1,18 @@
 # Docs & UX Audit — Alphard Phase 0
 
+> ⚠️ **LEGACY DOCUMENT** — Snapshot from 2026-08-14 (Phase 0 audit).
+> Pre-Phase-1.0 state. The security posture, tooling recommendations, and
+> repo-structure observations in this file have been superseded by:
+>
+> - [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) — current architecture (Phase 2.x)
+> - [`docs/SECURITY.md`](SECURITY.md) — current security posture
+> - [`DOCS-INDEX.md`](../DOCS-INDEX.md) — top-level navigation, including the legacy table
+>
+> Do **not** make decisions based on this file. Preserved for audit trail only.
+> See issue #292.
+
+---
+
 **Audit date:** 2026-08-14
 **Auditor lens:** new OSS contributor opening the repo for the first time
 **Repo state verified:** 6 commits, branch `main`, last push 2026-08-14 11:53 UTC

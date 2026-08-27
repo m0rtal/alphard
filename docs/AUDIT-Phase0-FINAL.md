@@ -1,5 +1,18 @@
 # Phase 0 QA — Final Synthesis
 
+> ⚠️ **LEGACY DOCUMENT** — Snapshot from 2026-08-14 (Phase 0 wrap-up).
+> Pre-Phase-1.0 state. Test counts, coverage figures, and tooling
+> recommendations in this file have been superseded by:
+>
+> - [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) — current architecture (Phase 2.x)
+> - [`docs/TESTING.md`](TESTING.md) — current test strategy + coverage gate
+> - [`DOCS-INDEX.md`](../DOCS-INDEX.md) — top-level navigation, including the legacy table
+>
+> Do **not** make decisions based on this file. Preserved for audit trail only.
+> See issue #292.
+
+---
+
 **Audit date:** 2026-08-14
 **Synthesizer task:** `t_25bc20af` (developer profile, kanban swarm v1)
 **Repo:** https://github.com/m0rtal/alphard

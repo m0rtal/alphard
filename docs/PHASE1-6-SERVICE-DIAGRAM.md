@@ -1,5 +1,21 @@
 # Alphard service — current state (Phase 1.6)
 
+> ⚠️ **LEGACY DOCUMENT** — Snapshot from Phase 1.6 (before Macro Agent,
+> before observability metrics, before Postgres audit). The diagrams in
+> this file reflect Phase 1.6 topology only.
+>
+> Current architecture (Phase 2.x with Macro Agent, RiskGate, observability
+> stack):
+>
+> - [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) — canonical current architecture
+> - [`docs/PHASE2-8-METRICS.md`](PHASE2-8-METRICS.md) — current runtime diagrams
+> - [`DOCS-INDEX.md`](../DOCS-INDEX.md) — top-level navigation, including the legacy table
+>
+> Do **not** make decisions based on this file. Preserved for audit trail only.
+> See issue #292.
+
+---
+
 Three diagrams: stack, runtime, fallback chain. Render in any mermaid viewer (GitHub, VSCode, mermaid.live).
 
 ## 1. Service stack

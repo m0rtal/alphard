@@ -1,5 +1,21 @@
 # Phase 1 — Honest Audit (snapshot 2026-08-17, refreshed)
 
+> ⚠️ **LEGACY DOCUMENT** — One-time audit snapshot from 2026-08-17
+> (Phase 1.0 state). Coverage figures, test counts, and CI status
+> described in the tables below are stale; subsequent phases (1.5,
+> 1.6, 2.x) have shipped changes that supersede them.
+>
+> For current state:
+>
+> - [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) — current architecture
+> - [`docs/TESTING.md`](TESTING.md) — current test strategy + coverage gate
+> - [`DOCS-INDEX.md`](../DOCS-INDEX.md) — top-level navigation, including the legacy table
+>
+> Do **not** make decisions based on this file. Preserved for audit trail only.
+> See issue #292.
+
+---
+
 This is a status report, not a plan. Each row carries a single source
 of truth that anyone can verify.
 
