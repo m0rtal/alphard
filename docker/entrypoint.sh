@@ -6,12 +6,25 @@ set -e
 # S-H5: support long-token env injection via bind-mounted file.
 # Portainer StackUpdate Env-parameter has a 60-char Go-unmarshal limit,
 # so we cannot pass Tinkoff tokens (64+ chars) inline. The /root/.env file
-# is bind-mounted at /run/secrets/alphard.env (see docker-compose stack).
-# S-H5: source long-token env from file. Order: ENV_FILE override,
-# /run/secrets/alphard.env (compose secrets), /tmp/alphard.env
-# (manual cp fallback for Docker 29.x bind-mount bug that creates
-# a directory at the leaf when /run/secrets/ doesn't pre-exist).
-for ENV_FILE_CANDIDATE in     "${ENV_FILE:-}"     "/run/secrets/alphard.env"     "/run/secrets/alphard_env"     "/tmp/alphard.env"; do
+# is bind-mounted at /root/.env (see docker-compose stack BUGFIX #122).
+# S-H5: source long-token env from file. Order (first existing wins):
+#   1. ${ENV_FILE:-}                   — explicit override (highest priority)
+#   2. /root/.env                      — bind-mounted compose local-dev path
+#   3. /run/secrets/alphard.env        — compose secrets (.107 production)
+#   4. /run/secrets/alphard_env        — alternative compose secrets path
+#   5. /tmp/alphard.env                — manual fallback for Docker 29.x
+#                                        bind-mount bug that creates a
+#                                        directory at the leaf when
+#                                        /run/secrets/ doesn't pre-exist.
+#
+# Why /root/.env: the compose file mounts it at /root/.env:ro with the
+# "BUGFIX (#122)" comment that says entrypoint.sh should source it.
+# Production (.107) hits path #3 first (compose secrets) so adding #2
+# is purely additive — local dev bring-ups without an explicit ENV_FILE
+# now pick up the bind-mounted file instead of silently running with
+# ALPHARD_PG_DSN=None and all universe-coverage gauges stuck at 0.
+# Issue #295.
+for ENV_FILE_CANDIDATE in     "${ENV_FILE:-}"     "/root/.env"     "/run/secrets/alphard.env"     "/run/secrets/alphard_env"     "/tmp/alphard.env"; do
     if [ -n "${ENV_FILE_CANDIDATE}" ] && [ -f "${ENV_FILE_CANDIDATE}" ]; then
         set -a
         . "${ENV_FILE_CANDIDATE}"
