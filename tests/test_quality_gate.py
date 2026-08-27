@@ -1275,3 +1275,152 @@ class TestIngestionGateDefensiveBranches:
 
 
 # flake8: noqa: W391
+
+
+# ---------------------------------------------------------------------------
+# C6 coverage: defensive branches in src/data/quality/historical.py
+# ---------------------------------------------------------------------------
+
+
+class TestHistoricalDefensiveBranches:
+    """Coverage for defensive branches in historical.py (line 146, 155, 162,
+    204, 210, 213, 222, 301).
+
+    Targets the early-return/continue paths in:
+      - detect_splits() loops (line 146, 155, 162)
+      - _nearest_integer() early returns (line 204, 210, 213, 222)
+      - check_historical() now=None path (line 301)
+    """
+
+    def test_nearest_integer_returns_none_for_non_positive(self) -> None:
+        """Line 204: ratio <= 0 (zero/negative) → return None."""
+        from src.data.quality.historical import _nearest_integer
+
+        assert _nearest_integer(0.0) is None
+        assert _nearest_integer(-0.5) is None
+        assert _nearest_integer(-100.0) is None
+
+    def test_nearest_integer_returns_none_for_nan_or_inf(self) -> None:
+        """Line 204: math.isnan/isinf → return None."""
+        from src.data.quality.historical import _nearest_integer
+
+        assert _nearest_integer(float("nan")) is None
+        assert _nearest_integer(float("inf")) is None
+        assert _nearest_integer(float("-inf")) is None
+
+    def test_nearest_integer_returns_none_for_small_inverse(self) -> None:
+        """Line 210: 1.0/ratio gives N<2 → return None (small forward split)."""
+        from src.data.quality.historical import _nearest_integer
+
+        # ratio=0.99 → inv=1.0101 → n=round(1.01)=1 → n<2 → None
+        assert _nearest_integer(0.99) is None
+        # ratio=0.6 → inv=1.667 → n=2 but deviation = 0.167/2 = 8.3% > 2% → None
+        assert _nearest_integer(0.6) is None
+
+    def test_nearest_integer_returns_none_for_small_ratio(self) -> None:
+        """Line 213: round(ratio) < 2 → return None (ordinary price move, not split)."""
+        from src.data.quality.historical import _nearest_integer
+
+        # ratio=1.01 → n=round(1.01)=1 → n<2 → None
+        assert _nearest_integer(1.01) is None
+        # ratio=1.5 → n=round(1.5)=2 but deviation = 0.5/2 = 25% > 2% → None
+        assert _nearest_integer(1.5) is None
+
+    def test_check_historical_uses_now_when_none(self) -> None:
+        """Line 301: now=None → use datetime.now(timezone.utc)."""
+        from src.data.quality.historical import check_historical, HistoricalParams
+
+        # Build a 10-bar series ending today (UTC); should pass without future rows.
+        from datetime import date, timedelta
+
+        today = date.today()
+        bars = _bars(10, base=today - timedelta(days=20))
+        r = check_historical("X", bars)  # now=None
+        # No issues expected (no future rows, no splits, no delisting).
+        kinds = {i.kind for i in r.issues}
+        assert IssueKind.HST_FUTURE_ROW not in kinds
+
+    def test_detect_splits_skips_zero_or_negative_close(self) -> None:
+        """Line 146: prev.close <= 0 or cur.close <= 0 → continue."""
+        from src.data.quality.historical import detect_splits
+        from src.data.quality.ingestion_gate import Bar as _Bar
+
+        # Build bars via model_construct to bypass Field(gt=0) on close.
+        base = date(2025, 1, 1)
+        bars = [
+            _Bar.model_construct(
+                primary_key=base + timedelta(days=i),
+                open=100.0,
+                high=101.0,
+                low=99.0,
+                close=0.0 if i == 1 else 100.0,  # bar[1] has close=0
+                volume=1000,
+            )
+            for i in range(5)
+        ]
+        # detect_splits should skip the bad pair (line 146), not raise.
+        result = detect_splits(bars)
+        # No splits expected because the bad row breaks the chain.
+        assert isinstance(result, list)
+
+    def test_detect_splits_skips_field_with_zero_value(self) -> None:
+        """Line 162: field cross-check loop continues if prev_v <= 0 or cur_v <= 0.
+
+        Build bars where the close ratio is a clean 2:1 split but one of
+        open/high/low has a zero value, triggering the inner field loop's
+        continue branch.
+        """
+        from src.data.quality.historical import detect_splits
+        from src.data.quality.ingestion_gate import Bar as _Bar
+
+        # Two bars: prev.close=100, cur.close=200 (2:1 split). All other
+        # fields also follow the 2x ratio except open=0 on cur.
+        base = date(2025, 1, 1)
+        prev = _Bar.model_construct(
+            primary_key=base,
+            open=100.0,
+            high=100.0,
+            low=100.0,
+            close=100.0,
+            volume=1000,
+        )
+        cur = _Bar.model_construct(
+            primary_key=base + timedelta(days=1),
+            open=0.0,  # ← open=0 (non-positive) triggers line 162
+            high=200.0,
+            low=200.0,
+            close=200.0,
+            volume=2000,
+        )
+        # detect_splits: close ratio 2.0 → clean split. But open=0 means
+        # field check skips the 'open' field; only high+low agree.
+        # With split_min_agreeing_fields=2 (default), we still emit the split.
+        # The stored ratio is the multiplicative adjustment for PRE-event
+        # bars, so a 2:1 forward split is stored as ratio=0.5.
+        result = detect_splits([prev, cur])
+        # Should detect the split based on high+low agreement.
+        assert len(result) == 1
+        assert result[0].ratio == 0.5
+
+    def test_detect_splits_skips_non_integer_ratio(self) -> None:
+        """Line 155: n_signed is None (not a clean integer ratio) → continue."""
+        from src.data.quality.historical import detect_splits
+
+        # Construct bars with a 1.07x move: not a clean integer ratio.
+        bars = _bars(5, close_fn=lambda i: 100.0 * (1.07**i))
+        result = detect_splits(bars)
+        # 1.07x is an ordinary price move, not a split.
+        assert result == []
+
+    def test_detect_splits_skips_out_of_range_ratio(self) -> None:
+        """Line 162: split outside [split_min_ratio, split_max_ratio] → continue."""
+        from src.data.quality.historical import detect_splits
+
+        # 20x move: too large to be a split (default max=10).
+        bars = _bars(5, close_fn=lambda i: 100.0 * (20.0 if i == 1 else 1.0))
+        result = detect_splits(bars)
+        # 20x exceeds default split_max_ratio=10.
+        assert result == []
+
+
+# flake8: noqa: W391
