@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
 import csv
+import math
 import os
 
 import pytest
@@ -629,6 +630,150 @@ class TestCrossSource:
         assert any(
             i.kind == IssueKind.XSC_SOURCE_MISSING and i.extra.get("dropped_b") == 5 for i in r.issues  # noqa: E501
         )  # noqa: E501
+
+    # ------------------------------------------------------------------
+    # Issue #271 — _log_returns NaN-poison + _pearson NaN silent-pass.
+    # ------------------------------------------------------------------
+
+    def test_log_returns_does_not_poison_after_zero(self) -> None:
+        """Issue #271: consecutive zero/NaN closes must NOT poison subsequent returns.
+
+        Pre-fix: _log_returns([100, 102, 0, 0, 101, 103]) propagated the
+        zero forward as ``prev`` (unconditional ``prev = cur``), so once
+        a zero appeared, prev stayed zero and every subsequent return
+        was NaN — even when the actual adjacent closes were perfectly
+        fine. That NaN-poisoned series then slipped through ``_pearson``
+        (no NaN handling) and through ``check_cross_source`` (``NaN <
+        threshold`` is False), silently bypassing the Level-2 gate.
+
+        Post-fix: each invalid bar is treated as a gap — the return
+        that includes it is NaN, but ``last_valid`` does not advance to
+        the bad bar. The next valid bar pairs against the LAST VALID
+        close (not against the corrupted one), so the return series
+        resumes a clean shape immediately after the gap rather than
+        staying poisoned.
+        """
+        from src.data.quality.cross_source import _log_returns
+
+        rets = _log_returns([100.0, 102.0, 0.0, 0.0, 101.0, 103.0])
+        # Six input closes -> five returns.
+        assert len(rets) == 5
+        # Index 0: ln(102/100) — valid.
+        assert rets[0] == pytest.approx(math.log(102.0 / 100.0))
+        # Index 1: cur=0 (bad) -> NaN gap; last_valid stays at 102.
+        assert math.isnan(rets[1])
+        # Index 2: cur=0 (bad) -> NaN gap; last_valid stays at 102.
+        assert math.isnan(rets[2])
+        # Index 3: cur=101 (valid) -> ln(101/102). Pre-fix this was NaN
+        # because prev=0 carried forward and `prev <= 0` fired again.
+        # Post-fix it is a real log return, just over a slightly wider
+        # gap than a normal pair.
+        assert rets[3] == pytest.approx(math.log(101.0 / 102.0))
+        # Index 4: ln(103/101).
+        assert rets[4] == pytest.approx(math.log(103.0 / 101.0))
+
+    def test_log_returns_handles_nan_close(self) -> None:
+        """NaN close must NOT poison the return series."""
+        from src.data.quality.cross_source import _log_returns
+
+        rets = _log_returns([100.0, float("nan"), 105.0])
+        assert len(rets) == 2
+        assert math.isnan(rets[0])
+        # Pre-fix this was NaN because prev=nan; post-fix the gap is bridged.
+        assert rets[1] == pytest.approx(math.log(105.0 / 100.0))
+
+    def test_pearson_returns_none_when_any_nan(self) -> None:
+        """Issue #271: _pearson must NOT return NaN — return None instead.
+
+        Pre-fix: sum() of a list containing NaN yields NaN, which then
+        silently flows through varx/vary comparison (NaN == 0 is False)
+        and produces NaN as the final correlation. Post-fix: any NaN pair
+        short-circuits to None.
+        """
+        from src.data.quality.cross_source import _pearson
+
+        result = _pearson([0.01, 0.02, 0.03], [0.01, float("nan"), 0.03])
+        assert result is None
+
+    def test_zero_close_in_source_emits_quality_issue_not_silent_pass(
+        self,
+    ) -> None:
+        """Issue #271 regression test.
+
+        Pre-fix: source B with a single zero close in a 10-point window
+        causes Pearson to return NaN, the NaN-comparison guards in
+        check_cross_source silently let it pass, and operators get NO
+        XSC_CORRELATION_LOW / XSC_SOURCE_MISSING warning.
+
+        Post-fix: a quality issue MUST be raised (XSC_SOURCE_MISSING is the
+        natural fit — the source has at least one zero/NaN close that
+        corrupts the log-return series).
+        """
+        # 10 trading days starting Mon 2026-01-05.
+        start = date(2026, 1, 5)
+        dates: list[date] = []
+        d = start
+        while len(dates) < 10:
+            if d.weekday() < 5:
+                dates.append(d)
+            d += timedelta(days=1)
+        a_closes = [100.0 + i for i in range(10)]
+        # B mirrors A except index 2 is zero (data glitch).
+        b_closes = [100.0 + i for i in range(10)]
+        b_closes[2] = 0.0
+
+        sa = SourceSeries(source_name="a", bars=tuple(zip(dates, a_closes)))
+        sb = SourceSeries(source_name="b", bars=tuple(zip(dates, b_closes)))
+
+        r = check_cross_source("X", sa, sb)
+        # The gate MUST raise at least one issue — silent pass is the bug.
+        assert not r.passed, (
+            f"check_cross_source silently passed despite zero close in B; "
+            f"issues={[(i.kind, i.severity) for i in r.issues]}"
+        )
+        # The natural issue kind is XSC_SOURCE_MISSING (NaN correlation
+        # because at least one source has zero/NaN closes).
+        kinds = {i.kind for i in r.issues}
+        assert IssueKind.XSC_SOURCE_MISSING in kinds, f"expected XSC_SOURCE_MISSING in issues, got {kinds}"
+
+    def test_rolling_divergence_emits_when_one_source_has_nan_close(self) -> None:
+        """Issue #271: rolling divergence must also surface NaN closes.
+
+        Pre-fix: the rolling loop guards `c <= 0` but NaN compares False
+        to 0, so a NaN close is treated as a normal price; the resulting
+        log-divergence is NaN, never exceeds the threshold, and the
+        divergence issue is silently skipped. Post-fix: the loop must
+        skip windows with NaN closes, AND emit XSC_SOURCE_MISSING if ALL
+        windows are NaN-poisoned (so we don't lose the signal entirely).
+        """
+        from src.data.quality.cross_source import CrossSourceParams
+
+        # 10 trading days, A clean & rising, B clean & rising but with one
+        # NaN and a large divergence on the LAST bar (window ends at last bar).
+        start = date(2026, 1, 5)
+        dates: list[date] = []
+        d = start
+        while len(dates) < 10:
+            if d.weekday() < 5:
+                dates.append(d)
+            d += timedelta(days=1)
+        a_closes = [100.0 + i for i in range(10)]
+        b_closes = [100.0 + i for i in range(10)]
+        # Plant NaN + divergence on the same final bar so the rolling
+        # window that includes the divergence contains the NaN.
+        b_closes[9] = float("nan")  # data glitch
+
+        sa = SourceSeries(source_name="a", bars=tuple(zip(dates, a_closes)))
+        sb = SourceSeries(source_name="b", bars=tuple(zip(dates, b_closes)))
+
+        # Lower the threshold so any surviving divergence would trip.
+        params = CrossSourceParams(rolling_max_mean_divergence=0.001)
+        r = check_cross_source("X", sa, sb, params=params)
+        # Must NOT silently pass.
+        assert not r.passed, (
+            f"check_cross_source silently passed despite NaN close in B; "
+            f"issues={[(i.kind, i.severity) for i in r.issues]}"
+        )
 
 
 # ---------------------------------------------------------------------------
