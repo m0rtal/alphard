@@ -43,8 +43,9 @@ That is **all**. The script:
 5. Bakes the Grafana provisioning / dashboards B64 vars
    (`PROVISIONING_*_B64`, `DASHBOARD_*_B64`) via
    `tools/bake_grafana_env.py` if `.env` doesn't already have them.
-7. Bakes `PROM_YML_B64` (the base64 of
-   `docker/prometheus/prometheus.yml`) into `.env` if missing.
+7. Verifies `observability/prometheus.yml` exists and contains the
+   `alphard-bot:8765` scrape target (issue #283 — bind-mounted into the
+   prometheus container, no env-based config).
 8. Runs `docker compose --profile observability up -d`.
 9. Waits up to 180 s for every long-running service to report
    `healthy` (one-shot services — `alphard-chownfix`,
@@ -115,8 +116,9 @@ All are optional env vars.
 
 ## What it does that you probably forgot
 
-- Generates `PROM_YML_B64` if missing. Without this, Prometheus
-  starts with an empty config and zero scrape targets.
+- Verifies `observability/prometheus.yml` exists with the
+  `alphard-bot:8765` scrape target (issue #283 — bind-mounted, no env
+  config).
 - Bakes the 4 Grafana B64 vars via `tools/bake_grafana_env.py`.
   Without these, Grafana entrypoint bails at
   `FATAL: ... is unset or empty`.
@@ -154,7 +156,7 @@ host fails in 4 places (PR #228 / this PR's notes):
 |---|---------|-----------|
 | 1 | `pg-init` hangs on `apk add postgresql-client` | `dl-cdn.alpinelinux.org` unreachable on hosts with restricted egress. **Fix**: `pg-init` uses `postgres:16-alpine` image (psql already in there). |
 | 2 | `grafana` fails to start with `apparmor_parser: Access denied` | Grafana service was missing `security_opt: apparmor=unconfined`. **Fix**: added in compose. |
-| 3 | Prometheus starts with empty config, zero targets | `PROM_YML_B64` was not in `.env.example`. **Fix**: this script bakes it on first run. |
+| 3 | Prometheus starts with empty config, zero targets | `observability/prometheus.yml` missing or wrong content. **Fix**: check the bind-mount target exists and contains the `alphard-bot:8765` scrape target. |
 | 4 | Grafana entrypoint bails `FATAL: ... is unset or empty` | `PROVISIONING_*_B64` and `DASHBOARD_*_B64` were empty in `.env.example`. **Fix**: this script bakes them via `tools/bake_grafana_env.py` on first run. |
 
 Issue: closes #243 (`Make alphard first-shot-friendly`).

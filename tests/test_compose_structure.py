@@ -712,39 +712,72 @@ class TestPrometheusLXC:
         """
         return None
 
-    def test_prometheus_config_inlined_via_b64_env(self) -> None:
-        """The /etc/prometheus/prometheus.yml bind-mount is also broken
-        on .107 (src=file becomes a leaf directory, Docker 29.1.x quirk).
-        Solution: ship the config inline as a base64 env var and have
-        the container's entrypoint decode it into the tmpfs on startup.
-        This avoids the bind-mount file-vs-directory leaf quirk.
+    def test_prometheus_config_bind_mounted_from_repo(self) -> None:
+        """Issue #283: PROM_YML_B64 was the source of truth for the
+        scrape config. Portainer StackUpdate silently truncates env
+        values >60 chars (Go JSON unmarshal fails on long strings) and
+        292-byte base64 blobs were routinely cut off mid-keyword. That
+        dropped the alphard-bot scrape target and broke every Grafana
+        panel.
 
-        The env var name MUST be PROM_YML_B64 (used by the inline
-        entrypoint shell) and MUST default to empty so a stack
-        restart without a fresh env falls back to an empty config
-        (loud failure, not silent scrape of a half-loaded rule set).
+        Fix: bind-mount the config file from the repo
+        (``./docker/prometheus/prometheus.yml`` -> ``/etc/prometheus/prometheus.yml:ro``)
+        instead of supplying it via env. Read-only mount is safe from the
+        .107 LXC userns-mapping leaf trap because the in-image nobody user
+        never writes to it.
         """
-        svc = self._prometheus_service()
+        svc = _load_compose()["services"]["prometheus"]
+        volumes = svc.get("volumes", [])
+        # Normalise to string list (docker compose accepts both long and
+        # short syntax; we always emit long-form strings in this repo).
+        vol_strs = [str(v) for v in volumes]
+        config_mount = next(
+            (v for v in vol_strs if "/etc/prometheus/prometheus.yml" in v),
+            None,
+        )
+        assert config_mount is not None, (
+            f"prometheus.volumes must bind-mount the scrape config from "
+            f"the repo; got: {vol_strs}. See issue #283 — PROM_YML_B64 "
+            f"is unreliable because Portainer truncates >60-char env "
+            f"values to ~80 chars mid-word."
+        )
+        # Must be read-only (the in-image nobody user can't write to
+        # bind-mounted leaves on .107 LXC; ro avoids the write-path trap).
+        assert ":ro" in config_mount, (
+            f"prometheus.yml bind-mount must be read-only (:ro) to avoid "
+            f"the .107 userns-mapping leaf trap; got: {config_mount}"
+        )
+
+    def test_prometheus_no_longer_uses_prom_yml_b64_env(self) -> None:
+        """Regression marker for issue #283. PROM_YML_B64 is gone — the
+        bind-mount above replaces it. If a future refactor reintroduces
+        the inline entrypoint + PROM_YML_B64 env, this test fires before
+        the bind-mount one so the failure message points at the right
+        cause.
+        """
+        svc = _load_compose()["services"]["prometheus"]
+        # No PROM_YML_B64 in environment (env was the broken path).
         env = svc.get("environment", {})
         if isinstance(env, list):
-            env_map = {}
-            for item in env:
-                if isinstance(item, str) and "=" in item:
-                    k, _, v = item.partition("=")
-                    env_map[k] = v
-                elif isinstance(item, str):
-                    env_map[item] = None
-            env = env_map
-        assert "PROM_YML_B64" in env, (
-            "prometheus.environment must declare PROM_YML_B64 so the "
-            "inline entrypoint can decode the config at startup (avoids "
-            "the .107 bind-mount file-vs-directory leaf quirk)"
+            keys = {item.split("=", 1)[0] for item in env if isinstance(item, str) and "=" in item}
+            keys |= {item for item in env if isinstance(item, str) and "=" not in item}
+        else:
+            keys = set(env.keys())
+        assert "PROM_YML_B64" not in keys, (
+            f"prometheus.environment must NOT declare PROM_YML_B64 "
+            f"(replaced by bind-mount per issue #283); got: {sorted(keys)}"
         )
-        # Must default to empty (no fallback baked into the image) so
-        # partial envs fail loudly with a 'No such file or directory'
-        # from base64 -d, not silently load a stale config.
-        assert env.get("PROM_YML_B64") in (None, "", "${PROM_YML_B64:-}"), (
-            f"PROM_YML_B64 must default to empty string for fail-fast " f"behaviour; got: {env.get('PROM_YML_B64')!r}"
+        # Entryptoint MAY exist (for chown of the writable named volume —
+        # issue #209) but it MUST NOT base64-decode PROM_YML_B64. The config
+        # is bind-mounted now, no inline base64 -d needed.
+        ep = svc.get("entrypoint", [])
+        if isinstance(ep, list):
+            ep_str = "\n".join(str(p) for p in ep)
+        else:
+            ep_str = str(ep)
+        assert "base64 -d" not in ep_str, (
+            f"prometheus.entrypoint must NOT base64-decode PROM_YML_B64 "
+            f"(config is bind-mounted per issue #283); got: {ep_str!r}"
         )
 
     def test_prometheus_exposes_port_9090(self) -> None:
@@ -1151,23 +1184,72 @@ class TestPortainerStandaloneEnv:
             f"(fail-fast contract), got: {env.get('REDIS_PASSWORD')!r}"
         )
 
-    def test_prometheus_declares_prom_yml_b64_explicit(self) -> None:
-        """prometheus service's inline entrypoint decodes PROM_YML_B64
-        from env. Without explicit declaration Portainer strips it ->
-        prometheus starts with empty config -> fails to bind.
+    def test_prometheus_config_bind_mounted_from_repo(self) -> None:
+        """Issue #283: PROM_YML_B64 was the source of truth for the
+        scrape config. Portainer StackUpdate silently truncates env
+        values >60 chars (Go JSON unmarshal fails on long strings) and
+        292-byte base64 blobs were routinely cut off mid-keyword. That
+        dropped the alphard-bot scrape target and broke every Grafana
+        panel.
+
+        Fix: bind-mount the config file from the repo
+        (``./docker/prometheus/prometheus.yml`` -> ``/etc/prometheus/prometheus.yml:ro``)
+        instead of supplying it via env. Read-only mount is safe from the
+        .107 LXC userns-mapping leaf trap because the in-image nobody user
+        never writes to it.
         """
-        data = _load_compose()
-        prom = data["services"]["prometheus"]
-        env = self._env_map(prom)
-        assert "PROM_YML_B64" in env, (
-            "prometheus service.environment must declare PROM_YML_B64 "
-            "explicitly so Portainer standalone propagates the stack-level "
-            "Env value into the container (otherwise the inline entrypoint "
-            "decodes an empty string and prometheus refuses to bind on 9090)."
+        svc = _load_compose()["services"]["prometheus"]
+        volumes = svc.get("volumes", [])
+        # Normalise to string list (docker compose accepts both long and
+        # short syntax; we always emit long-form strings in this repo).
+        vol_strs = [str(v) for v in volumes]
+        config_mount = next(
+            (v for v in vol_strs if "/etc/prometheus/prometheus.yml" in v),
+            None,
         )
-        assert env.get("PROM_YML_B64") in (None, "", "${PROM_YML_B64:-}"), (
-            f"PROM_YML_B64 default in compose must be empty string "
-            f"(loud failure on missing config), got: {env.get('PROM_YML_B64')!r}"
+        assert config_mount is not None, (
+            f"prometheus.volumes must bind-mount the scrape config from "
+            f"the repo; got: {vol_strs}. See issue #283 — PROM_YML_B64 "
+            f"is unreliable because Portainer truncates >60-char env "
+            f"values to ~80 chars mid-word."
+        )
+        # Must be read-only (the in-image nobody user can't write to
+        # bind-mounted leaves on .107 LXC; ro avoids the write-path trap).
+        assert ":ro" in config_mount, (
+            f"prometheus.yml bind-mount must be read-only (:ro) to avoid "
+            f"the .107 userns-mapping leaf trap; got: {config_mount}"
+        )
+
+    def test_prometheus_no_longer_uses_prom_yml_b64_env(self) -> None:
+        """Regression marker for issue #283. PROM_YML_B64 is gone — the
+        bind-mount above replaces it. If a future refactor reintroduces
+        the inline entrypoint + PROM_YML_B64 env, this test fires before
+        the bind-mount one so the failure message points at the right
+        cause.
+        """
+        svc = _load_compose()["services"]["prometheus"]
+        # No PROM_YML_B64 in environment (env was the broken path).
+        env = svc.get("environment", {})
+        if isinstance(env, list):
+            keys = {item.split("=", 1)[0] for item in env if isinstance(item, str) and "=" in item}
+            keys |= {item for item in env if isinstance(item, str) and "=" not in item}
+        else:
+            keys = set(env.keys())
+        assert "PROM_YML_B64" not in keys, (
+            f"prometheus.environment must NOT declare PROM_YML_B64 "
+            f"(replaced by bind-mount per issue #283); got: {sorted(keys)}"
+        )
+        # Entryptoint MAY exist (for chown of the writable named volume —
+        # issue #209) but it MUST NOT base64-decode PROM_YML_B64. The config
+        # is bind-mounted now, no inline base64 -d needed.
+        ep = svc.get("entrypoint", [])
+        if isinstance(ep, list):
+            ep_str = "\n".join(str(p) for p in ep)
+        else:
+            ep_str = str(ep)
+        assert "base64 -d" not in ep_str, (
+            f"prometheus.entrypoint must NOT base64-decode PROM_YML_B64 "
+            f"(config is bind-mounted per issue #283); got: {ep_str!r}"
         )
 
     def test_postgres_declares_secrets_explicit(self) -> None:
@@ -1606,14 +1688,25 @@ class TestNoRelativeBindMounts:
 
                 m = re.search(r"\.?/docker/[^\s:]+\.(yaml|yml|json|conf|ini|toml)", v_str)
                 if m:
+                    # Issue #283 carve-out: prometheus.yml is the ONE config
+                    # file we intentionally bind-mount. PROM_YML_B64 was the
+                    # original mechanism but Portainer StackUpdate silently
+                    # truncates env values >60 chars (Go JSON unmarshal
+                    # fails on long strings), so the base64 blob was routinely
+                    # cut off mid-keyword and dropped the alphard-bot scrape
+                    # target. Bind-mount from ./docker/prometheus/prometheus.yml
+                    # is read-only (:ro) so the .107 LXC userns-mapping trap
+                    # doesn't apply (nobody user never writes to it).
+                    if "prometheus/prometheus.yml" in v_str and ":ro" in v_str:
+                        continue
                     offenders.append((svc_name, v, m.group(0)))
         assert not offenders, (
             f"No service may bind-mount config files from ./docker/. "
             f"All provisioning/dashboards/etc. should be env-baked "
             f"(compose refactor 2.0 pattern) or baked into the image. "
-            f"The only exception is the grafana entrypoint script "
-            f"(single-file bind, not a config). Found offenders: "
-            f"{offenders!r}"
+            f"Exceptions: grafana entrypoint script (.sh, single-file bind) "
+            f"and prometheus.yml bind-mount (:ro, issue #283 carve-out). "
+            f"Found offenders: {offenders!r}"
         )
 
     def test_grafana_entrypoint_bind_is_single_file(self) -> None:
