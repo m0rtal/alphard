@@ -421,7 +421,8 @@ services:
     # --web.enable-lifecycle stays so prometheus.yml can be hot-reloaded via
     # POST /-/reload after the config file is updated on the host.
     entrypoint:
-      - sh -c
+      - sh
+      - -c
       - |
         chown -R nobody:nobody /prometheus
         exec /bin/prometheus \
