@@ -206,19 +206,40 @@ class TestEntrypointSourceLoop:
         picks it. ALPHARD_PG_DSN must come from /root/.env's real
         contents (which contain a postgres://alphard:***@alphard-postgres
         string).
+
+        Test isolation: remove any stale /tmp/alphard.env from a previous
+        CI run. test_tmp_alphard_env_picked_when_only_tmp_exists deletes
+        its file in finally, but if a previous CI run crashed mid-test
+        the file may persist into the next run; in CI /root/.env does
+        NOT exist (no compose bind-mount on the GitHub Actions runner),
+        so the loop would pick /tmp/alphard.env as the LAST candidate
+        and this assertion would fail. Cleanup is idempotent.
         """
-        result = _run_sh(extracted_loop, env={})
-        assert result.returncode == 0, f"script failed: {result.stderr}"
-        sourced, dsn = _parse_sourced(result)
-        # /root/.env exists on this dev host, so the loop picks it.
-        assert sourced == "/root/.env", (
-            f"Expected /root/.env to be picked as fallback, got {sourced}. "
-            f"This is exactly issue #295 — fix reverted?"
-        )
-        # The actual DSN string from /root/.env starts with postgresql://
-        assert dsn is not None and dsn.startswith("postgresql://"), (
-            f"Expected ALPHARD_PG_DSN from /root/.env to look like a " f"postgres DSN, got {dsn!r}"
-        )
+        tmp_alpha_env = Path("/tmp/alphard.env")
+        tmp_alpha_env.unlink(missing_ok=True)
+        try:
+            result = _run_sh(extracted_loop, env={})
+            assert result.returncode == 0, f"script failed: {result.stderr}"
+            sourced, dsn = _parse_sourced(result)
+            # /root/.env exists on this dev host, so the loop picks it.
+            # On CI (no /root/.env) we skip — see test_no_source_when_loop_exhausts_candidates.
+            if sourced is None:
+                pytest.skip(
+                    "Neither /root/.env nor any candidate file exists on "
+                    "this host — cannot exercise the /root/.env path. "
+                    "Run inside a container with the compose bind-mount."
+                )
+            assert sourced == "/root/.env", (
+                f"Expected /root/.env to be picked as fallback, got {sourced}. "
+                f"This is exactly issue #295 — fix reverted?"
+            )
+            # The actual DSN string from /root/.env starts with postgresql://
+            assert dsn is not None and dsn.startswith("postgresql://"), (
+                f"Expected ALPHARD_PG_DSN from /root/.env to look like a "
+                f"postgres DSN, got {dsn!r}"
+            )
+        finally:
+            tmp_alpha_env.unlink(missing_ok=True)
 
     def test_tmp_alphard_env_picked_when_only_tmp_exists(self, extracted_loop: str) -> None:
         """``/tmp/alphard.env`` is the documented last-resort manual
@@ -279,25 +300,31 @@ class TestEntrypointSourceLoop:
     def test_set_a_export_does_not_leak_into_parent_shell(self, extracted_loop: str) -> None:
         """``set -a`` inside the loop must NOT leak back to the caller.
 
-        The outer pytest process must see ALPHARD_PG_DSN unset after the
-        loop exits. Guards against accidental scope leakage that would
-        cause cross-test pollution.
+        The outer pytest process must NOT see ALPHARD_PG_DSN **changed**
+        by the loop's `set -a` invocation. Guards against accidental
+        scope leakage that would cause cross-test pollution.
+
+        Note: ALPHARD_PG_DSN may already be in the CI pytest env (the
+        Tests + Coverage job sets it for Postgres integration). We only
+        verify it wasn't CLOBBERED, not that it's absent. The pre-existing
+        value is restored in the finally block.
         """
-        # Snapshot pre-existing ALPHARD_PG_DSN in our env (defensive —
-        # we should never have it but check anyway)
+        # Snapshot pre-existing ALPHARD_PG_DSN (defensive — CI may have
+        # it for integration tests, but we must not assume it doesn't).
         pre_existing = os.environ.get("ALPHARD_PG_DSN")
         try:
             result = _run_sh(extracted_loop, env={})
             assert result.returncode == 0
-            # OUTER pytest process must not see ALPHARD_PG_DSN.
-            assert "ALPHARD_PG_DSN" not in os.environ, (
+            # OUTER pytest process must not see ALPHARD_PG_DSN *changed*.
+            # set -a inside the loop runs in a child sh -c, so its exports
+            # die with the child. Verify by checking the value is exactly
+            # what it was before the run.
+            assert os.environ.get("ALPHARD_PG_DSN") == pre_existing, (
                 "set -a inside the loop leaked into the parent shell — "
                 "this would cause cross-test pollution. The loop should "
                 "use a subshell or the entrypoint process boundary, not "
                 "the test runner's env."
             )
-            # Verify pre-existing value (if any) was not clobbered.
-            assert os.environ.get("ALPHARD_PG_DSN") == pre_existing
         finally:
             if pre_existing is not None:
                 os.environ["ALPHARD_PG_DSN"] = pre_existing
