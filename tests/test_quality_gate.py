@@ -1077,4 +1077,201 @@ class TestExtraAudit:
         assert sink.events[0]["extra"] == {"first_index": 7, "threshold": 6.0}
 
 
+# ---------------------------------------------------------------------------
+# C4 coverage: focused tests for defensive branches in
+# _zscore_threshold_filter, log_returns, expected_trading_days,
+# and check_ingestion early-return paths.
+# ---------------------------------------------------------------------------
+
+
+class TestIngestionGateDefensiveBranches:
+    """Coverage for defensive branches that real-world data rarely hits.
+
+    Each test below targets a single missing branch in coverage report.
+    Branches include:
+      - log_returns NaN propagation (zero/negative prev or cur)
+      - _zscore_threshold_filter with stdev==0 (constant prices)
+      - _zscore_threshold_filter with StatisticsError (1 non-NaN value)
+      - _zscore_threshold_filter with all-NaN returns
+      - _zscore_threshold_filter + check_ingestion outlier firing
+      - expected_trading_days where end < start returns 0
+      - check_ingestion: null primary_key path (lines 280-288)
+      - check_ingestion: NaN-in-OHLC path (lines 300-309)
+    """
+
+    def test_log_returns_nan_when_prev_zero(self) -> None:
+        """Line 153-155: prev <= 0 → first return entry is NaN.
+
+        With ``[0.0, 100.0, 110.0]``, the first return (NaN for prev=0→cur=100)
+        is NaN; subsequent returns proceed normally.
+        """
+        rets = log_returns([0.0, 100.0, 110.0])
+        assert len(rets) == 2
+        # First return: NaN (because prev=0.0 emitted the early-return branch).
+        assert rets[0] != rets[0]  # NaN != NaN
+        # Second return: log(110/100) ≈ 0.0953 — finite.
+        assert rets[1] == pytest.approx(0.09531017980432493, abs=1e-9)
+
+    def test_log_returns_nan_when_cur_zero(self) -> None:
+        """Line 153-155: cur <= 0 → NaN return."""
+        rets = log_returns([100.0, 0.0])
+        assert len(rets) == 1
+        assert rets[0] != rets[0]  # NaN
+
+    def test_log_returns_nan_when_both_zero(self) -> None:
+        """Line 153-155: both prev and cur zero/negative → both NaN."""
+        rets = log_returns([0.0, 0.0, 100.0])
+        assert len(rets) == 2
+        assert rets[0] != rets[0]
+        assert rets[1] != rets[1]
+
+    def test_zscore_filter_all_nan_returns_empty(self) -> None:
+        """Line 178: len(clean) < 2 → return [].
+
+        With all-NaN returns, ``clean`` is empty → no statistics computed.
+        """
+        from src.data.quality.ingestion_gate import _zscore_threshold_filter
+
+        # Two NaNs → no clean values → return [].
+        result = _zscore_threshold_filter([float("nan"), float("nan")], 3.0)
+        assert result == []
+
+    def test_zscore_filter_single_clean_returns_empty(self) -> None:
+        """Line 178: only one non-NaN return → len(clean) < 2 → []."""
+        from src.data.quality.ingestion_gate import _zscore_threshold_filter
+
+        # Only one finite value, rest NaN.
+        result = _zscore_threshold_filter([0.01, float("nan"), float("nan")], 3.0)
+        assert result == []
+
+    def test_zscore_filter_constant_prices_returns_empty(self) -> None:
+        """Line 186: stdev == 0 (no deviation) → no outliers."""
+        from src.data.quality.ingestion_gate import _zscore_threshold_filter
+
+        # Identical returns → zero variance → stdev==0 → no outliers.
+        result = _zscore_threshold_filter([0.05, 0.05, 0.05, 0.05], 3.0)
+        assert result == []
+
+    def test_zscore_filter_outlier_append_path(self) -> None:
+        """Lines 191-192: |z| > threshold → append (i+1, r)."""
+        from src.data.quality.ingestion_gate import _zscore_threshold_filter
+
+        # Construct returns with one extreme outlier.
+        # Mean=0, stdev ~0.033; one return of 0.10 has |z| ≈ 3.0+.
+        rets = [0.01, 0.02, 0.005, 0.015, 0.10, 0.02, 0.03]
+        result = _zscore_threshold_filter(rets, 2.0)
+        assert len(result) == 1
+        # Index is i+1 (one-based for bar positions).
+        assert result[0][0] == 5
+        assert abs(result[0][1] - 0.10) < 1e-9
+
+    def test_expected_trading_days_inverted_range(self) -> None:
+        """Line 130: end < start → return 0."""
+        assert expected_trading_days(date(2025, 6, 1), date(2025, 5, 1)) == 0
+
+    def test_check_ingestion_null_primary_key(self) -> None:
+        """Lines 280-288: rows with NULL primary_key → ING_NULL_PRIMARY_KEY."""
+        # We need to bypass pydantic validation. Build a Bar then manually
+        # set primary_key to None.
+        bar = _bars(5)[0]
+        # model_copy with update sets primary_key=None, but pydantic forbids
+        # None at construction. Use object.__setattr__ to bypass.
+        object.__setattr__(bar, "primary_key", None)
+        r = check_ingestion("X", [bar], now=FROZEN_NOW)
+        assert r.rejected
+        assert IssueKind.ING_NULL_PRIMARY_KEY in {i.kind for i in r.issues}
+
+    def test_check_ingestion_nan_via_positive_bypass(self) -> None:
+        """Lines 300-309: NaN-in-OHLC → ING_NAN_PRICE.
+
+        Pydantic Field(gt=0) blocks NaN at construction. We monkeypatch
+        ``gt`` to None on a fresh Bar model class to allow NaN construction,
+        simulating 'NaN that slipped through json.loads' as the docstring
+        describes.
+        """
+        # Build via model_construct which skips validation entirely.
+        bar = Bar.model_construct(
+            primary_key=date(2026, 1, 5),
+            open=1.0,
+            high=2.0,
+            low=0.5,
+            close=float("nan"),
+            volume=0,
+        )
+        r = check_ingestion("X", [bar], now=FROZEN_NOW)
+        assert r.rejected
+        assert IssueKind.ING_NAN_PRICE in {i.kind for i in r.issues}
+
+    def test_max_calendar_gap_returns_zero_for_single_bar(self) -> None:
+        """Line 203: fewer than 2 bars → return 0."""
+        from src.data.quality.ingestion_gate import _max_calendar_gap
+
+        bars = _bars(1)
+        assert _max_calendar_gap(bars) == 0
+
+    def test_max_calendar_gap_returns_zero_for_empty(self) -> None:
+        """Line 203: empty bars list → return 0."""
+        from src.data.quality.ingestion_gate import _max_calendar_gap
+
+        assert _max_calendar_gap([]) == 0
+
+    def test_zscore_filter_single_value_raises_statistics_error(self) -> None:
+        """Lines 182-183: ``stdev()`` raises StatisticsError on 1 value.
+
+        Note: ``statistics.stdev`` requires at least 2 data points. With
+        exactly 1 non-NaN return and rest NaN, ``clean`` has 1 value, so
+        ``len(clean) < 2`` triggers first (line 178 → return []).
+        To exercise the StatisticsError branch (line 182), we need a
+        contrived input that reaches ``stdev()`` but raises. We test
+        this by patching stdev with a side_effect to raise the error.
+        """
+        import unittest.mock as mock
+        import src.data.quality.ingestion_gate as gate
+
+        with mock.patch.object(
+            gate.statistics,
+            "stdev",
+            side_effect=gate.statistics.StatisticsError,
+        ):
+            # 3 finite values → clean=[0.01, 0.02, 0.03] → stdev would be called
+            # and raises. Expected: return [] (StatisticsError caught).
+            result = gate._zscore_threshold_filter([0.01, 0.02, 0.03], 3.0)
+        assert result == []
+
+    def test_check_ingestion_outlier_via_synthetic_spike(self) -> None:
+        """Lines 346-347: outlier detected → Issue.append with first_idx/extra.
+
+        Construct prices so one log-return has |z| > default threshold (6.0).
+        Mean returns ~0, stdev small relative to the spike.
+        """
+        # 260 normal bars (≥252 to pass min_history) ending just before FROZEN_NOW,
+        # then one spike bar at close=200 (vs ~100 baseline) → ln(2) ≈ 0.693 ≈ 6σ+ return.
+        bars = _bars(260, base=date(2025, 8, 1))
+        last = bars[-1].primary_key
+        spike_date = last + timedelta(days=2)  # one weekday after the cluster
+        spike = Bar(
+            primary_key=spike_date,
+            # open/high/low must satisfy range check (b.high >= max(open,close) - eps,
+            # b.low <= min(open,close) + eps). Use safe margins above/below.
+            open=199.0,
+            high=201.0,  # > max(199, 200)=200 with eps
+            low=197.0,  # < min(199, 200)=199 with eps
+            close=200.0,
+            volume=1000,
+        )
+        # Adjust ``now`` to satisfy staleness (≤3 calendar days from last bar).
+        # Spike is at +2 days, so 'now' = spike + 0 days is 2 days after last 'real' bar.
+        now = datetime(spike_date.year, spike_date.month, spike_date.day, tzinfo=timezone.utc)
+        all_bars = sorted(bars + [spike], key=lambda b: b.primary_key)
+        r = check_ingestion("X", all_bars, now=now)
+        kinds = {i.kind for i in r.issues}
+        assert IssueKind.ING_OUTLIER in kinds, f"expected ING_OUTLIER; got: {kinds}"
+        # Verify the issue carries first_outlier_index + threshold.
+        for i in r.issues:
+            if i.kind == IssueKind.ING_OUTLIER:
+                assert i.extra is not None
+                assert "first_outlier_index" in i.extra
+                assert i.extra["threshold"] == pytest.approx(6.0)
+
+
 # flake8: noqa: W391
