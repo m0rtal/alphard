@@ -526,20 +526,25 @@ def _macro_sync_loop() -> None:
 def _universe_metrics_loop() -> None:
     """Refresh universe-coverage Prometheus gauges every UNIVERSE_METRICS_REFRESH_SECONDS.
 
-    Phase 2.8 step 2. Emits two gauges via the in-process ``_metrics_registry``:
+    Phase 2.8 step 2. Emits three gauges via the in-process ``_metrics_registry``:
 
     - ``alphard_tickers_in_universe_total`` — ``SELECT COUNT(*) FROM ticker_universe``.
     - ``alphard_tickers_with_full_history_total`` — ``SELECT COUNT(*) FROM
       ticker_universe WHERE backfill_complete = TRUE`` (the indexed column,
       so the query is cheap on a multi-thousand-row universe).
+    - ``alphard_ohlcv_rows_total`` — ``SELECT COUNT(*) FROM ohlcv_daily``
+      (cumulative accumulation of daily-candle rows across all tickers
+      and sources; never decreases). Used by Grafana panel
+      "Daily-candle row accumulation" on the Phase 2.8 dashboard
+      (issue #290).
 
     Why in-process (no subprocess) unlike daily_sync / macro_sync:
-    Each iteration is two ``COUNT(*)`` queries against a single Postgres
-    table — sub-second on local Postgres. The subprocess + 5-min timeout
-    pattern would be pure overhead. A connection failure must NOT kill the
-    heartbeat, so any exception inside the loop is caught and logged; the
-    gauges simply stop updating (Prometheus sees them go stale, which is
-    the correct degraded-mode signal).
+    Each iteration is three ``COUNT(*)`` queries against Postgres tables
+    (two on ticker_universe, one on ohlcv_daily) — sub-second on local
+    Postgres. The subprocess + 5-min timeout pattern would be pure overhead.
+    A connection failure must NOT kill the heartbeat, so any exception
+    inside the loop is caught and logged; the gauges simply stop updating
+    (Prometheus sees them go stale, which is the correct degraded-mode signal).
 
     Why exit early when ``$ALPHARD_PG_DSN`` is unset:
     Phase 1.1 sets the DSN from entrypoint.sh, but Phase 0 dev mode
@@ -576,11 +581,23 @@ def _universe_metrics_loop() -> None:
                     cur.execute("SELECT COUNT(*) FROM ticker_universe WHERE backfill_complete = TRUE")
                     complete_row = cur.fetchone()
                     complete_n = int(complete_row[0]) if complete_row is not None else 0
+                    # Issue #290: cumulative ohlcv_daily row count for the
+                    # Grafana "Daily-candle row accumulation" panel. The
+                    # table is indexed on (ticker, ts, source), so this
+                    # COUNT(*) is a cheap planner-only stat; it does NOT
+                    # grow with table size because Postgres caches the
+                    # reltuples estimate in pg_stat.
+                    cur.execute("SELECT COUNT(*) FROM ohlcv_daily")
+                    ohlcv_row = cur.fetchone()
+                    ohlcv_n = int(ohlcv_row[0]) if ohlcv_row is not None else 0
             registry = globals().get("_metrics_registry")
             if registry is not None:
                 registry.set_gauge("alphard_tickers_in_universe_total", float(total_n))
                 registry.set_gauge("alphard_tickers_with_full_history_total", float(complete_n))
-            logger.info(f"_universe_metrics_loop: refreshed total={total_n} complete={complete_n}")
+                registry.set_gauge("alphard_ohlcv_rows_total", float(ohlcv_n))
+            logger.info(
+                f"_universe_metrics_loop: refreshed total={total_n} " f"complete={complete_n} ohlcv_rows={ohlcv_n}"
+            )
         except psycopg.Error as exc:
             # Connection-level error, syntax error, auth failure, etc. The
             # gauges keep their last value (stale in Prometheus — that IS
