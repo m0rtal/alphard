@@ -235,8 +235,7 @@ class TestEntrypointSourceLoop:
             )
             # The actual DSN string from /root/.env starts with postgresql://
             assert dsn is not None and dsn.startswith("postgresql://"), (
-                f"Expected ALPHARD_PG_DSN from /root/.env to look like a "
-                f"postgres DSN, got {dsn!r}"
+                f"Expected ALPHARD_PG_DSN from /root/.env to look like a " f"postgres DSN, got {dsn!r}"
             )
         finally:
             tmp_alpha_env.unlink(missing_ok=True)
