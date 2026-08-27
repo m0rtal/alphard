@@ -718,6 +718,35 @@ class TestAudit:
         sink = PostgresAuditLog(dsn="postgresql://x", table="custom_table_42")
         assert sink._table == "custom_table_42"
 
+    def test_postgres_schema_name_accepts_valid_identifier(self) -> None:
+        """Issue #265 follow-up: schema qualifier must round-trip safely."""
+        from src.data.quality.audit import PostgresAuditLog
+
+        sink = PostgresAuditLog(dsn="postgresql://x", table="t", schema="my_schema")
+        assert sink._schema == "my_schema"
+
+    def test_postgres_schema_default_is_none(self) -> None:
+        """When schema is not configured the table stays unqualified
+        (the connection's search_path resolves it — public in production)."""
+        from src.data.quality.audit import PostgresAuditLog
+
+        sink = PostgresAuditLog(dsn="postgresql://x", table="t")
+        assert sink._schema is None
+
+    def test_postgres_schema_name_rejects_sql_injection(self) -> None:
+        """Same defensive validation as table names — single safe identifier."""
+        from src.data.quality.audit import PostgresAuditLog
+
+        for bad in (
+            "sch; DROP TABLE users--",
+            "schema'with'quotes",
+            "Schema.With.Dots",
+            "1leading_digit",
+            "",
+        ):
+            with pytest.raises(ValueError, match="invalid schema name"):
+                PostgresAuditLog(dsn="postgresql://x", table="t", schema=bad)
+
     def test_close_is_noop_when_never_connected(self) -> None:
         """Closing an unconnected PostgresAuditLog is a silent no-op."""
         from src.data.quality.audit import PostgresAuditLog

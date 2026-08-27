@@ -112,7 +112,12 @@ class PostgresAuditLog:
         Target table name (default ``data_quality_events``).
     """
 
-    def __init__(self, dsn: str | None = None, table: str = "data_quality_events") -> None:
+    def __init__(
+        self,
+        dsn: str | None = None,
+        table: str = "data_quality_events",
+        schema: str | None = None,
+    ) -> None:
         self._dsn = dsn or os.environ.get("ALPHARD_PG_DSN")
         # BUGFIX (C-2): table name is later interpolated into a SQL string
         # via psycopg.sql.Identifier — but validate here too so a bad name
@@ -120,6 +125,21 @@ class PostgresAuditLog:
         if not _TABLE_NAME_RE.match(table):
             raise ValueError(f"invalid table name {table!r}: must match {_TABLE_NAME_RE.pattern}")
         self._table = table
+        # Issue #265 follow-up: support placing the audit log in a non-default
+        # schema (used by tests/test_audit_integration.py to isolate into
+        # alphard_test). When ``schema`` is None the table is unqualified and
+        # inherits the connection's default search_path (``public``). When
+        # set, the INSERT statement explicitly qualifies ``schema.table``.
+        # Schema name is validated with the same defensive regex as table
+        # names — single identifier, no commas, no quoting. Mirrors the
+        # ``search_path`` handling in src/data/pg_store.py.
+        self._schema: str | None
+        if schema is not None:
+            if not _TABLE_NAME_RE.match(schema):
+                raise ValueError(f"invalid schema name {schema!r}: must match {_TABLE_NAME_RE.pattern}")
+            self._schema = schema
+        else:
+            self._schema = None
         self._conn: Any = None
         self._cursor: Any = None
 
@@ -164,13 +184,25 @@ class PostgresAuditLog:
         # Live-Postgres path; exercised by tests/test_audit_integration.py in CI
         # (closes #258 — replaces earlier pragma that falsely cited
         # test_pg_store_integration.py).
+        # Issue #265 follow-up: when a schema was configured at construction
+        # time, qualify the table reference as ``schema.table`` so the INSERT
+        # lands in the correct namespace regardless of the connection's
+        # search_path. When schema is None, we emit just ``table`` (the
+        # search_path resolves it — public in production).
+        if self._schema is not None:
+            table_ident: Any = sql.SQL("{}.{}").format(
+                sql.Identifier(self._schema),
+                sql.Identifier(self._table),
+            )
+        else:
+            table_ident = sql.Identifier(self._table)
         self._cursor.execute(
             sql.SQL("""
                 INSERT INTO {}
                     (ticker, gate, kind, severity, message, count, extra)
                 VALUES
                     (%s, %s, %s, %s, %s, %s, %s::jsonb)
-                """).format(sql.Identifier(self._table)),
+                """).format(table_ident),
             (
                 ticker,
                 gate,

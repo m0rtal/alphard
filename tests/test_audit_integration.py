@@ -59,7 +59,7 @@ def pg_audit():
     """Skip if no DSN. Otherwise return an audit log pointed at an isolated table."""
     if not DSN:
         pytest.skip(SKIP_REASON)
-    log = PostgresAuditLog(dsn=DSN, table=TEST_TABLE)
+    log = PostgresAuditLog(dsn=DSN, table=TEST_TABLE, schema="alphard_test")
     # Pre-create the schema AND table so we don't depend on a separate migration
     # step. The schema mirrors tests/test_pg_store_integration.py:43 (also
     # ``CREATE SCHEMA IF NOT EXISTS alphard_test``) — the original draft of
@@ -204,7 +204,7 @@ class TestPostgresAuditLogWrite:
         """
         # Use a fresh writer so we have an isolated connection to close.
         # The fixture's pg_audit remains open for sibling tests.
-        second = PostgresAuditLog(dsn=DSN, table=TEST_TABLE)
+        second = PostgresAuditLog(dsn=DSN, table=TEST_TABLE, schema="alphard_test")
         issue = Issue.make(
             gate="ingestion",
             kind=IssueKind.ING_OUTLIER,
