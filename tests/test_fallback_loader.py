@@ -257,3 +257,76 @@ def test_iter_corporate_actions_skips_sources_without_method() -> None:
     grpc.iter_corporate_actions.assert_called_once()
     # moex was called (has method), but no rows from grpc -> moex
     moex.iter_corporate_actions.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# C5 coverage: defensive paths in FallbackDataLoader
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_returns_none_for_unknown_source_name() -> None:
+    """Line 150: ``_resolve`` returns ``None`` for unknown name.
+
+    Exercising this path requires passing a custom ``order`` that contains
+    a name not in {``tinkoff_md``, ``tinkoff_grpc``, ``moex_iss``}. The
+    fallback contract should treat unknown sources as 'not configured'
+    rather than raise.
+    """
+    md = _loader_with_rows(["row1"])
+    fl = FallbackDataLoader(
+        tinkoff_md=md,
+        tinkoff_grpc=None,
+        moex_iss=None,
+        order=("nonexistent_source",),
+    )
+    out = list(fl.iter_ohlcv("X", date(2026, 1, 1), date(2026, 1, 31)))
+    assert out == []
+    # The unknown source never reaches the underlying loader.
+    md.iter_ohlcv.assert_not_called()
+
+
+def test_resolve_skips_missing_ohlcv_source_at_iter_time() -> None:
+    """Line 124: ``_resolve`` returns ``None`` for a configured-but-unset source.
+
+    If you instantiate FallbackDataLoader with only tinkoff_md and leave
+    tinkoff_grpc/moex_iss at their defaults (``None``), ``_resolve("tinkoff_grpc")``
+    returns ``None`` and the loop skips to the next source.
+    """
+    md = _loader_with_rows(["bar"])
+    fl = FallbackDataLoader(
+        tinkoff_md=md,
+        tinkoff_grpc=None,  # type: ignore[arg-type]
+        moex_iss=None,  # type: ignore[arg-type]
+    )
+    out = list(fl.iter_ohlcv("X", date(2026, 1, 1), date(2026, 1, 31)))
+    assert out == ["bar"]
+
+
+def test_iter_corporate_actions_skips_when_method_missing() -> None:
+    """Lines 167-169: skip sources without ``iter_corporate_actions``.
+
+    The ``hasattr(source, 'iter_corporate_actions')`` check should skip
+    sources that don't implement the method.
+    """
+    md = MagicMock(spec=["iter_ohlcv"])  # no iter_corporate_actions
+    grpc = MagicMock()
+    grpc.iter_corporate_actions.return_value = iter(["div2"])
+    # md is configured as first in the order but lacks iter_corporate_actions.
+    fl = FallbackDataLoader(tinkoff_md=md, tinkoff_grpc=grpc, moex_iss=None)
+    out = list(fl.iter_corporate_actions("X", date(2026, 1, 1), date(2026, 1, 31)))
+    assert out == ["div2"]
+
+
+def test_iter_corporate_actions_exception_falls_back() -> None:
+    """Lines 170-172: source raises during corp-actions → fall back.
+
+    Tinkoff gRPC raises; MOEX ISS returns rows. The exception branch
+    logs + continues; MOEX supplies the answer.
+    """
+    grpc = MagicMock()
+    grpc.iter_corporate_actions.side_effect = RuntimeError("grpc down")
+    moex = MagicMock()
+    moex.iter_corporate_actions.return_value = iter(["corp_event"])
+    fl = FallbackDataLoader(tinkoff_md=None, tinkoff_grpc=grpc, moex_iss=moex)
+    out = list(fl.iter_corporate_actions("X", date(2026, 1, 1), date(2026, 1, 31)))
+    assert out == ["corp_event"]
