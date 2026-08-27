@@ -55,6 +55,13 @@ def extracted_loop() -> str:
     Why extract rather than copy/paste: the test must reflect what
     entrypoint.sh actually does. If someone changes the loop, this test
     notices.
+
+    Issue #298: the loop now exports ``SOURCED_ENV_FILE`` (set only
+    inside the `if [ -f ... ]` branch). POSIX ``for`` loops leave the
+    iteration variable set to its LAST iterated value even when the
+    loop exits without ``break`` — so reading ``$ENV_FILE_CANDIDATE``
+    after the loop is meaningless. We use ``$SOURCED_ENV_FILE`` (only
+    set on a real hit) for the test's debug echo instead.
     """
     src = _ENTRYPOINT.read_text()
     lines = src.splitlines()
@@ -80,7 +87,10 @@ def extracted_loop() -> str:
         # --- END extracted loop ---
 
         # Debug instrumentation (test-only, NOT in entrypoint.sh):
-        echo SOURCED="${{ENV_FILE_CANDIDATE:-NONE}}"
+        # Use SOURCED_ENV_FILE (set only on a real hit) instead of
+        # ENV_FILE_CANDIDATE (which POSIX for-loops leave set to the
+        # last-iterated value even on no-match).
+        echo SOURCED="${{SOURCED_ENV_FILE:-NONE}}"
         echo ALPHARD_PG_DSN="${{ALPHARD_PG_DSN:-NONE}}"
         echo TINKOFF_SANDBOX_TOKEN="${{TINKOFF_SANDBOX_TOKEN:-NONE}}"
         """)
@@ -207,28 +217,41 @@ class TestEntrypointSourceLoop:
         contents (which contain a postgres://alphard:***@alphard-postgres
         string).
 
-        Test isolation: remove any stale /tmp/alphard.env from a previous
-        CI run. test_tmp_alphard_env_picked_when_only_tmp_exists deletes
-        its file in finally, but if a previous CI run crashed mid-test
-        the file may persist into the next run; in CI /root/.env does
-        NOT exist (no compose bind-mount on the GitHub Actions runner),
-        so the loop would pick /tmp/alphard.env as the LAST candidate
-        and this assertion would fail. Cleanup is idempotent.
+        Skip precondition: this test only exercises the bind-mount leaf
+        path (``/root/.env``). On bare CI runners — where the
+        compose-style bind-mount is intentionally absent — earlier
+        candidates (e.g. an empty ``/run/secrets/alphard.env`` left by
+        a prior crashed run) can win the loop, and ``/root/.env`` is
+        never tried. The assertion below would be meaningless. Check
+        the host state up-front and skip if the bind-mount leaf is
+        absent.
+
+        Issue #298: a previous fix attempt (commit ``355420a``) added
+        pre-test cleanup of ``/tmp/alphard.env`` and tried to use the
+        POSITIVE ``if sourced is None`` skip predicate — but a POSIX
+        ``for`` loop leaves the iteration variable set to its LAST
+        iterated value even when the loop exits without ``break``, so
+        ``sourced`` was never ``None`` on a CI-shaped host (it was
+        ``"/tmp/alphard.env"`` — the last candidate tried). That made
+        the predicate useless. The root-cause fix is in entrypoint.sh:
+        the loop now sets ``SOURCED_ENV_FILE`` only on a real hit. This
+        test complements that by gating on the host state — the only
+        signal that's actually meaningful here.
         """
+        root_env = Path("/root/.env")
+        if not root_env.exists():
+            pytest.skip(
+                "/root/.env does not exist on this host (no compose "
+                "bind-mount). Cannot exercise the /root/.env path — "
+                "run inside a container with the bind-mount to validate "
+                "issue #295's regression contract."
+            )
         tmp_alpha_env = Path("/tmp/alphard.env")
         tmp_alpha_env.unlink(missing_ok=True)
         try:
             result = _run_sh(extracted_loop, env={})
             assert result.returncode == 0, f"script failed: {result.stderr}"
             sourced, dsn = _parse_sourced(result)
-            # /root/.env exists on this dev host, so the loop picks it.
-            # On CI (no /root/.env) we skip — see test_no_source_when_loop_exhausts_candidates.
-            if sourced is None:
-                pytest.skip(
-                    "Neither /root/.env nor any candidate file exists on "
-                    "this host — cannot exercise the /root/.env path. "
-                    "Run inside a container with the compose bind-mount."
-                )
             assert sourced == "/root/.env", (
                 f"Expected /root/.env to be picked as fallback, got {sourced}. "
                 f"This is exactly issue #295 — fix reverted?"

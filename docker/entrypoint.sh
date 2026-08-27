@@ -29,9 +29,23 @@ for ENV_FILE_CANDIDATE in     "${ENV_FILE:-}"     "/root/.env"     "/run/secrets
         set -a
         . "${ENV_FILE_CANDIDATE}"
         set +a
+        # Issue #298: POSIX `for` loops leave the iteration variable
+        # set to its LAST iterated value even when the loop exits
+        # without `break`. Downstream code (and tests) cannot tell
+        # whether the loop actually sourced a candidate or just iterated
+        # past every missing file. Record the chosen path in a separate
+        # variable that's only set on a real hit. This also makes
+        # `docker logs` show which env file the bot actually sourced,
+        # which is useful ops telemetry.
+        SOURCED_ENV_FILE="${ENV_FILE_CANDIDATE}"
+        export SOURCED_ENV_FILE
         break
     fi
 done
+# Defensive: clear the iteration variable so accidental later reads
+# (or test snippets that echo it) cannot leak the last-tried value
+# as if it had been sourced.
+unset ENV_FILE_CANDIDATE
 
 echo "Starting Alphard..."
 # S-H5: do NOT echo $ENV value into docker logs (it may carry secrets in
