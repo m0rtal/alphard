@@ -2,7 +2,8 @@
 
 The loop:
 - Refreshes two Prometheus gauges via the in-process ``_metrics_registry``.
-- Runs two ``SELECT COUNT(*)`` queries against ``ticker_universe``
+- Runs three ``SELECT COUNT(*)`` queries (two on ``ticker_universe``,
+  one on ``ohlcv_daily``; issue #290 added the ohlcv_daily one)
   (one for the total universe size, one for the backfill_complete subset).
 - Skips work entirely when ``$ALPHARD_PG_DSN`` is unset.
 - Survives ``psycopg.Error`` and generic ``Exception`` without dying.
@@ -93,7 +94,7 @@ def _install_registry(main):
     return reg
 
 
-def _patch_psycopg(total_row, complete_row):
+def _patch_psycopg(*fetch_rows):
     """Inject a fake psycopg module whose ``connect()`` returns a stub connection.
 
     psycopg's API uses two nested ``with`` blocks:
@@ -108,12 +109,18 @@ def _patch_psycopg(total_row, complete_row):
     ``__enter__`` yields the cursor itself (psycopg's Cursor supports both
     ``with conn.cursor() as cur`` and bare ``cur = conn.cursor()``).
 
+    One fetchone() per SELECT COUNT(*) the loop runs. As of issue #290,
+    the loop runs three queries (two on ticker_universe, one on
+    ohlcv_daily), so callers pass three tuples. Earlier callers passed
+    two (and the iteration's third fetchone() would have returned a
+    StopIteration, which is exactly the issue this update fixes).
+
     Returns (fake_module, cursor_mock) so callers can inspect calls.
     """
     cursor = mock.MagicMock()
     cursor.execute = mock.MagicMock()
-    # Two fetchone() calls per iteration: one per COUNT(*) query.
-    cursor.fetchone = mock.MagicMock(side_effect=[total_row, complete_row])
+    # One fetchone() per SELECT COUNT(*) the loop issues.
+    cursor.fetchone = mock.MagicMock(side_effect=list(fetch_rows))
 
     # Make ``with conn.cursor() as cur`` yield `cursor` itself (not a new mock).
     cursor.__enter__ = mock.MagicMock(return_value=cursor)
@@ -155,10 +162,16 @@ def test_constants_match_spec(_setup):
 
 
 def test_gauges_updated_after_successful_select(_setup):
-    """Loop publishes both gauges from the SELECT COUNT(*) results."""
+    """Loop publishes all three gauges from the SELECT COUNT(*) results.
+
+    Issue #290 added a third gauge ``alphard_ohlcv_rows_total`` that
+    reports cumulative ohlcv_daily row count, alongside the two
+    universe-coverage gauges.
+    """
     main = _setup
     reg = _install_registry(main)
-    fake, cursor = _patch_psycopg((42,), (7,))
+    # Three SELECT COUNT(*) → three result tuples.
+    fake, cursor = _patch_psycopg((42,), (7,), (1234567,))
     sleep_calls = {"n": 0}
 
     def fake_sleep(seconds):
@@ -169,10 +182,12 @@ def test_gauges_updated_after_successful_select(_setup):
     with mock.patch.object(main, "_sleep_interruptible", side_effect=fake_sleep):
         main._universe_metrics_loop()
 
-    # Both gauges reflect the cursor values.
+    # All three gauges reflect the cursor values.
     assert reg.get_gauge("alphard_tickers_in_universe_total") == 42.0
     assert reg.get_gauge("alphard_tickers_with_full_history_total") == 7.0
-    # SQL check: one COUNT(*) on bare ticker_universe, one filtered by backfill_complete.
+    assert reg.get_gauge("alphard_ohlcv_rows_total") == 1234567.0
+    # SQL check: one COUNT(*) on bare ticker_universe, one filtered by backfill_complete,
+    # and one COUNT(*) on ohlcv_daily (issue #290).
     executed_sqls = [c.args[0] for c in cursor.execute.call_args_list]
     assert any(
         "FROM ticker_universe" in sql and "backfill_complete" not in sql for sql in executed_sqls
@@ -180,6 +195,7 @@ def test_gauges_updated_after_successful_select(_setup):
     assert any(
         "backfill_complete = TRUE" in sql for sql in executed_sqls
     ), f"missing filtered COUNT(*) in {executed_sqls}"
+    assert any("FROM ohlcv_daily" in sql for sql in executed_sqls), f"missing ohlcv_daily COUNT(*) in {executed_sqls}"
     # One iteration → one sleep before shutdown.
     assert sleep_calls["n"] >= 1
 
@@ -304,7 +320,7 @@ def test_loop_iterates_multiple_times(_setup):
             main._shutdown_event.set()
         cursor = mock.MagicMock()
         cursor.execute = mock.MagicMock()
-        cursor.fetchone = mock.MagicMock(side_effect=[(10,), (2,)])
+        cursor.fetchone = mock.MagicMock(side_effect=[(10,), (2,), (100,)])
         cursor.__enter__ = mock.MagicMock(return_value=cursor)
         cursor.__exit__ = mock.MagicMock(return_value=None)
         conn = mock.MagicMock()
@@ -361,7 +377,7 @@ def test_uses_connect_with_timeouts_helper(_setup):
     """
     main = _setup
     reg = _install_registry(main)
-    _patch_psycopg((5,), (2,))
+    _patch_psycopg((5,), (2,), (0,))  # issue #290: third SELECT on ohlcv_daily
 
     # Patch connect_with_timeouts on the pg_store module — the loop imports
     # it lazily, so we have to patch where it is *looked up*, not where it

@@ -44,6 +44,13 @@ Gauges exposed
   so the query is cheap. Used by Grafana panel "Tickers with full history".
   Pair with the total gauge in Prometheus: ``alphard_tickers_with_full_history_total
   / alphard_tickers_in_universe_total`` is the backfill coverage ratio.
+- ``alphard_ohlcv_rows_total`` (issue #290) — ``COUNT(*) FROM ohlcv_daily``,
+  same refresh cadence as the universe gauges. Cumulative daily-candle row
+  count across all tickers and sources; never decreases. Used by Grafana
+  panel "Daily-candle row accumulation" on the Phase 2.8 dashboard.
+  Query is a planner-only stat (Postgres uses reltuples from pg_stat
+  when the table has not been ANALYZE'd since the last batch INSERT,
+  so the gauge is cheap to update at the 5-minute cadence).
 """
 
 from __future__ import annotations
