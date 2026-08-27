@@ -144,8 +144,19 @@ def expected_trading_days(start: date, end: date) -> int:
 def log_returns(closes: Sequence[float]) -> list[float]:
     """Return log-returns r_t = ln(close_t / close_{t-1}).
 
-    Empty input or single-element input -> empty list. NaN/inf in closes
-    propagate as math domain errors; callers should sanitize first.
+    Empty input or single-element input -> empty list.
+
+    Behaviour on bad input:
+        * Zero or negative closes yield NaN in the output (we emit
+          ``float('nan')`` for the affected return rather than raising).
+        * NaN/inf closes propagate as NaN in the output for the affected
+          return (the ``math.log`` branch is skipped, not raised).
+
+    Callers that need strict validation should sanitize the input
+    themselves; this function does not raise on non-finite values.
+    Downstream gates (e.g. ``_zscore_threshold_filter``) handle NaN
+    in the return series by silently filtering it out of the
+    statistics; NaN returns do not produce a separate surfacing.
     """
     if len(closes) < 2:
         return []
@@ -153,9 +164,13 @@ def log_returns(closes: Sequence[float]) -> list[float]:
     prev = closes[0]
     for cur in closes[1:]:
         if prev <= 0 or cur <= 0:
-            # Caller is supposed to filter zero/negatives out before
-            # computing returns. If they don't, we emit +inf / -inf so
-            # the outlier check catches it rather than silently dropping.
+            # Emit NaN so the affected return is clearly invalid. We do
+            # NOT raise, and we do NOT emit +inf/-inf (that would falsely
+            # look like a large-magnitude return to downstream gates).
+            # The downstream ``_zscore_threshold_filter`` filters NaN out
+            # of its statistics computation and silently drops NaN
+            # returns from its outlier check — see that function's
+            # docstring for the full silent-drop contract.
             out.append(float("nan"))
             prev = cur
             continue
@@ -169,10 +184,25 @@ def _zscore_threshold_filter(returns: Sequence[float], threshold: float) -> list
 
     Uses sample standard deviation. If stdev is 0 (constant prices),
     NO outlier is reported — there is no deviation to measure.
+
+    NaN handling (silent-drop contract):
+        * NaN returns are filtered out of the statistics computation
+          (line below: ``clean = [r for r in returns if not math.isnan(r)]``).
+        * NaN returns are also skipped in the per-return outlier loop
+          (``if math.isnan(r): continue``).
+        * As a result, a NaN return is NEVER surfaced — there is no
+          audit row, no IssueKind emitted, no log line. A caller that
+          receives an empty list from this function cannot distinguish
+          "no outliers" from "all returns were NaN and got silently
+          dropped". If that ambiguity matters to your gate, count the
+          NaNs separately upstream and emit a dedicated
+          ``IssueKind.ING_NAN_RETURN`` yourself.
     """
     if len(returns) < 2:
         return []
-    # Filter NaN out for statistics; we will still surface them separately.
+    # Drop NaN from statistics — without this, mean/stdev would be NaN
+    # and the comparison ``abs(z) > threshold`` would always be False,
+    # silently masking any real outliers in the same series.
     clean = [r for r in returns if not math.isnan(r)]
     if len(clean) < 2:
         return []
@@ -185,6 +215,8 @@ def _zscore_threshold_filter(returns: Sequence[float], threshold: float) -> list
         return []
     out: list[tuple[int, float]] = []
     for i, r in enumerate(returns):
+        # NaN returns are silently dropped here — they do not produce
+        # a separate surfacing (no issue, no audit row). See docstring.
         if math.isnan(r):
             continue
         z = (r - mean) / stdev
