@@ -43,7 +43,7 @@ That is **all**. The script:
 5. Bakes the Grafana provisioning / dashboards B64 vars
    (`PROVISIONING_*_B64`, `DASHBOARD_*_B64`) via
    `tools/bake_grafana_env.py` if `.env` doesn't already have them.
-7. Verifies `observability/prometheus.yml` exists and contains the
+7. Verifies `docker/prometheus/prometheus.yml` exists and contains the
    `alphard-bot:8765` scrape target (issue #283 — bind-mounted into the
    prometheus container, no env-based config).
 8. Runs `docker compose --profile observability up -d`.
@@ -116,7 +116,7 @@ All are optional env vars.
 
 ## What it does that you probably forgot
 
-- Verifies `observability/prometheus.yml` exists with the
+- Verifies `docker/prometheus/prometheus.yml` exists with the
   `alphard-bot:8765` scrape target (issue #283 — bind-mounted, no env
   config).
 - Bakes the 4 Grafana B64 vars via `tools/bake_grafana_env.py`.
@@ -156,7 +156,7 @@ host fails in 4 places (PR #228 / this PR's notes):
 |---|---------|-----------|
 | 1 | `pg-init` hangs on `apk add postgresql-client` | `dl-cdn.alpinelinux.org` unreachable on hosts with restricted egress. **Fix**: `pg-init` uses `postgres:16-alpine` image (psql already in there). |
 | 2 | `grafana` fails to start with `apparmor_parser: Access denied` | Grafana service was missing `security_opt: apparmor=unconfined`. **Fix**: added in compose. |
-| 3 | Prometheus starts with empty config, zero targets | `observability/prometheus.yml` missing or wrong content. **Fix**: check the bind-mount target exists and contains the `alphard-bot:8765` scrape target. |
+| 3 | Prometheus starts with empty config, zero targets | `docker/prometheus/prometheus.yml` missing or wrong content. **Fix**: check the bind-mount target exists and contains the `alphard-bot:8765` scrape target. |
 | 4 | Grafana entrypoint bails `FATAL: ... is unset or empty` | `PROVISIONING_*_B64` and `DASHBOARD_*_B64` were empty in `.env.example`. **Fix**: this script bakes them via `tools/bake_grafana_env.py` on first run. |
 
 Issue: closes #243 (`Make alphard first-shot-friendly`).

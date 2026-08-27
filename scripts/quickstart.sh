@@ -245,7 +245,7 @@ fi
 # StackUpdate silently truncates env values >60 chars (Go JSON unmarshal
 # fails on long strings), and the 292-byte base64 blob was routinely cut
 # off mid-keyword. The fix is to bind-mount the config file from the
-# repo at ./observability/prometheus.yml — Portainer's env-length limit
+# repo at ./docker/prometheus/prometheus.yml — Portainer's env-length limit
 # is no longer relevant.
 #
 # We just verify the file exists; compose.yaml bind-mounts it as :ro

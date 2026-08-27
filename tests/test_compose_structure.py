@@ -780,6 +780,44 @@ class TestPrometheusLXC:
             f"(config is bind-mounted per issue #283); got: {ep_str!r}"
         )
 
+    def test_prometheus_doc_path_matches_real_repo_path(self) -> None:
+        """Belt-and-braces test (suggested by QA on PR #284): no doc or
+        script should ever reference the non-existent
+        ``observability/prometheus.yml`` path. The real bind-mount source
+        is ``docker/prometheus/prometheus.yml`` (see
+        ``docker-compose.yaml:439``). Catches a future rename that
+        forgets to update one of the doc/comment references.
+
+        Scanned paths: ``docs/``, ``scripts/`` (relative to repo root).
+        Excludes the ``compose.yaml`` itself (which is the source of
+        truth and intentionally names the bind-mount source) and
+        ``tests/`` (covered by ``TestNoRelativeBindMounts``).
+        """
+        repo_root = Path(__file__).resolve().parent.parent
+        offenders: list[tuple[str, int, str]] = []
+        for subdir in ("docs", "scripts"):
+            root = repo_root / subdir
+            if not root.is_dir():
+                continue
+            for p in root.rglob("*"):
+                if not p.is_file():
+                    continue
+                if p.suffix not in {".md", ".sh", ".py", ".yaml", ".yml"}:
+                    continue
+                try:
+                    text = p.read_text(encoding="utf-8")
+                except (UnicodeDecodeError, OSError):
+                    continue
+                for i, line in enumerate(text.splitlines(), start=1):
+                    if "observability/prometheus" in line:
+                        offenders.append((str(p.relative_to(repo_root)), i, line.strip()))
+        assert not offenders, (
+            "Doc/scripts reference the wrong path "
+            "`observability/prometheus.yml` (must be "
+            "`docker/prometheus/prometheus.yml`). Offenders:\n  "
+            + "\n  ".join(f"{p}:{i}: {line}" for p, i, line in offenders)
+        )
+
     def test_prometheus_exposes_port_9090(self) -> None:
         """Grafana (network_mode: host, see compose) reaches Prometheus
         via ``http://localhost:9090``. For this to work Prometheus must
