@@ -54,7 +54,10 @@ jobs:
           # Tests use ``Path(__file__).resolve().parent.parent`` to locate
           # compose/init scripts, so they don't depend on the runner user
           # being able to traverse /root — works in any checkout layout.
-          pytest --cov=src --cov-fail-under=95 --cov-report=term-missing
+          # Coverage gate comes from pyproject.toml (single source of truth).
+          # See ADR history: --cov-fail-under was 94 on main after PR #255 and
+          # was restored to 95 (closes #257). Do not re-add the flag here.
+          pytest --cov=src --cov-report=term-missing
 
       - name: Upload coverage to Codecov
         if: github.event_name == 'push'
