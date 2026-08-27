@@ -10,6 +10,8 @@
 alphard/
 ├── README.md            # публичный обзор + Quickstart
 ├── CONTRIBUTING.md      # этот файл
+├── ARCHITECTURE.md      # canonical architecture (Phase 2.x)
+├── API.md               # public Python contract (Coordinator, RiskGate, env vars)
 ├── LICENSE              # Apache-2.0
 ├── docs/
 │   ├── SECURITY.md      # Threat model + Defense layers + Runbook triggers
@@ -26,8 +28,20 @@ alphard/
 Перед любым изменением прочитайте:
 
 - [README.md](README.md) — что проект делает и в какой фазе находится.
+- [ARCHITECTURE.md](ARCHITECTURE.md) — канонический архитектурный документ (Phase 2.x).
+- [API.md](API.md) — публичный Python-контракт (Coordinator, RiskGate, env vars). Обязательно к прочтению перед добавлением нового агента.
 - [docs/SECURITY.md](docs/SECURITY.md) — threat model и defense layers. Любой PR, затрагивающий сетевую поверхность, секреты или Risk Agent, должен ссылаться на соответствующий раздел SECURITY.md.
 - [docs/RUNBOOK.md](docs/RUNBOOK.md) — если ваше изменение вводит новый kill-switch или меняет процедуру rollback.
+
+### 2.1 Adding an agent
+
+См. [`API.md` §7 — Hello World Agent](API.md) для рабочего примера
+Coordinator-интеграции. Ключевые ограничения:
+
+- Агент НЕ ДОЛЖЕН вызывать `Coordinator._execute()` напрямую.
+- Агент НЕ ДОЛЖЕН обходить `RiskGate.evaluate()`.
+- Агент НЕ ДОЛЖЕН писать в `audit_log` напрямую — только через `Coordinator._audit()`.
+- Агент ДОЛЖЕН эмитить Prometheus counters через `_metrics_registry` (см. `src/main.py`).
 
 ## 2. Workflow
 
