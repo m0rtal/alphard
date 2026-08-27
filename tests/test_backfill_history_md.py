@@ -345,92 +345,73 @@ def test_progress_heartbeat_format_includes_counters() -> None:
 
 
 # ---------------------------------------------------------------------------
-# --on-empty-only flag (service-flow guard: literal contract
-# "запускается бэкфил если данных по тикеру нет" — see issue #276)
+# Per-ticker guard is _is_complete (service-flow contract: skip a ticker
+# iff its Tinkoff MD archive backfill has already completed). This is
+# unambiguous because only the MD archive can cover the full 9-year
+# history — broker gRPC and MOEX ISS both cap at 1825d.
+#
+# Tests below pin this semantic so a future refactor cannot regress to a
+# "count == 0" check (which would falsely skip a ticker whose broker
+# gRPC has supplied the last 5 trading days but whose MD archive pull
+# was never finished). See issue #276 for the rejection of
+# ``--on-empty-only``.
 # ---------------------------------------------------------------------------
 
 
-def test_argparser_accepts_on_empty_only() -> None:
-    """--on-empty-only is wired into argparse and parses to args.on_empty_only."""
-    import argparse  # noqa: PLC0415 — local to keep imports tight
+def test_is_complete_is_md_archive_backfill_guard() -> None:
+    """The per-ticker guard ``_is_complete`` MUST use the expected-bars
+    formula (full ``listed_at..today`` range with 15% HALTS_PCT slack),
+    NOT a ``count == 0`` short-circuit. A ``count == 0`` guard would
+    confuse "broker gRPC supplied 5 days" with "MD archive done".
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--on-empty-only",
-        action="store_true",
-    )
-    args = parser.parse_args(["--on-empty-only"])
-    assert args.on_empty_only is True
-    args_default = parser.parse_args([])
-    assert args_default.on_empty_only is False
-
-
-def test_on_empty_only_skips_ticker_with_any_rows() -> None:
-    """When --on-empty-only is set, the per-ticker guard short-circuits
-    as soon as ``store.count_ohlcv(ticker) > 0``. The guard is more
-    aggressive than the legacy ``_is_complete()`` (HALTS_PCT formula)
-    and implements the literal contract "no row = pull, any row = leave
-    alone"."""
-    import argparse  # noqa: PLC0415
-
-    args = argparse.Namespace(on_empty_only=True)
-
-    # Ticker has 1 row in DB → skip.
-    store_one_row = MagicMock()
-    store_one_row.count_ohlcv.return_value = 1
-    skipped = False
-    if args.on_empty_only and store_one_row.count_ohlcv(ticker="SBER") > 0:
-        skipped = True
-    assert skipped
-
-    # Ticker has 1300 rows in DB → still skip.
-    store_full = MagicMock()
-    store_full.count_ohlcv.return_value = 1300
-    skipped_full = False
-    if args.on_empty_only and store_full.count_ohlcv(ticker="GAZP") > 0:
-        skipped_full = True
-    assert skipped_full
-
-
-def test_on_empty_only_proceeds_when_count_is_zero() -> None:
-    """When --on-empty-only is set and count == 0, the guard does NOT
-    short-circuit — the backfill continues for this ticker."""
-    import argparse  # noqa: PLC0415
-
-    args = argparse.Namespace(on_empty_only=True)
-
-    store_empty = MagicMock()
-    store_empty.count_ohlcv.return_value = 0
-    proceed = True
-    if args.on_empty_only and store_empty.count_ohlcv(ticker="NEW") > 0:
-        proceed = False
-    assert proceed
-
-
-def test_on_empty_only_off_falls_back_to_is_complete() -> None:
-    """Default (no flag) behaviour must remain the legacy ``_is_complete()``
-    gate so re-runs that top up partial tickers are not affected."""
-    import argparse  # noqa: PLC0415
-
-    args = argparse.Namespace(on_empty_only=False, force=False)
-    # Mirror the production predicate: ``args.on_empty_only`` short-circuits
-    # on count > 0; otherwise we delegate to ``_is_complete``.
-    store = MagicMock()
-    store.count_ohlcv.return_value = 0  # would be skipped if --on-empty-only
-    store.ticker_meta.return_value = None
-    # With on_empty_only OFF the per-ticker guard is _is_complete().
-    # count=0, no metadata → _is_complete() returns False → not skipped.
-    skip_via_flag = bool(args.on_empty_only and store.count_ohlcv(ticker="SBER") > 0)
-    skip_via_complete = False if skip_via_flag else bh._is_complete(store, "SBER", min_bars=1300)
-    assert not skip_via_flag
-    assert not skip_via_complete
-
-
-def test_progress_log_string_on_empty_only_present() -> None:
-    """The skip log line for --on-empty-only is wired into the main loop
-    (defensive — guards against a future refactor silently dropping the
-    per-ticker visibility into why a ticker was skipped)."""
-    import inspect
+    This test inspects the source to pin the formula structure.
+    """
+    import inspect  # noqa: PLC0415
 
     source = inspect.getsource(bh)
-    assert "skip (count > 0, --on-empty-only)" in source
+    # The expected-bars formula must be present in _is_complete.
+    assert "_HALTS_PCT" in source, "expected-bars formula not found in backfill_history_md"
+    assert "trading_days" in source, "trading_days() helper not found"
+    # The misleading --on-empty-only flag must be gone (it was rejected
+    # because it conflated "row count" with "MD archive completion").
+    assert "--on-empty-only" not in source, (
+        "--on-empty-only flag was reintroduced; "
+        "the user explicitly rejected it as conflating row count with MD completion"
+    )
+    assert "skip (count > 0, --on-empty-only)" not in source, (
+        "count > 0 short-circuit log line was reintroduced; " "this contradicts the MD-completion contract"
+    )
+
+
+def test_is_complete_partial_recent_bars_not_complete() -> None:
+    """A ticker with only the last 5 trading days (from broker gRPC) is
+    NOT complete — the MD archive pull was never run. _is_complete
+    must return False."""
+    # listed 2010, today=2026, count = 5 (only last week from broker gRPC).
+    # expected_bars = 16y * 252 * 0.85 ≈ 3427; count=5 << 3427 → incomplete.
+    store = MagicMock()
+    store.count_ohlcv.return_value = 5
+    store.ticker_meta.return_value = (date(2010, 1, 1), None)
+    store.earliest_ts.return_value = date(2026, 8, 20)  # only 5 days
+
+    # _is_complete falls through to: count < expected → False
+    assert bh._is_complete(store, "PARTIAL", min_bars=1300) is False
+
+
+def test_is_complete_full_history_from_md_archive_is_complete() -> None:
+    """A ticker with the full 9-year history (the MD archive is the only
+    source that can produce this) is complete. _is_complete returns True.
+
+    The test pins a count that is unambiguously above the expected-bars
+    formula's threshold so the test does not depend on the exact
+    trading-day arithmetic. We pick count=3000 for a ticker listed
+    2018 — comfortably above expected_bars for any reasonable
+    trading-day formula and HALTS_PCT slack."""
+    # Listed 2018 (MIN_YEAR). With ~8 years × ~252 trading days × 0.85
+    # HALTS_PCT slack, expected_bars ≈ 1700-1800. count=3000 is well
+    # above that floor and unambiguously complete.
+    store = MagicMock()
+    store.count_ohlcv.return_value = 3000
+    store.ticker_meta.return_value = (date(2018, 1, 1), None)
+
+    assert bh._is_complete(store, "DONE", min_bars=1300) is True
