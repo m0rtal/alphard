@@ -59,12 +59,25 @@ def pg_audit():
     """Skip if no DSN. Otherwise return an audit log pointed at an isolated table."""
     if not DSN:
         pytest.skip(SKIP_REASON)
-    log = PostgresAuditLog(dsn=DSN, table=TEST_TABLE)
-    # Pre-create the table so we don't depend on a separate migration step.
-    # The schema mirrors src/data/quality/audit.py docstring (data_quality_events).
+    log = PostgresAuditLog(dsn=DSN, table=TEST_TABLE, schema="alphard_test")
+    # Pre-create the schema AND table so we don't depend on a separate migration
+    # step. The schema mirrors tests/test_pg_store_integration.py:43 (also
+    # ``CREATE SCHEMA IF NOT EXISTS alphard_test``) — the original draft of
+    # this fixture missed the schema-creation step and failed on fresh Postgres
+    # with ``InvalidSchemaName: schema "alphard_test" does not exist``
+    # (closes issue #265; CI's postgres:16 service has no pre-existing schema).
+    #
+    # Note on cursor lifetime: ``log._cursor`` is closed by psycopg when the
+    # ``with log._cursor as cur:`` block exits, so each subsequent block
+    # opens a fresh cursor from ``log._conn`` rather than reusing the
+    # closed handle. (Reopening on the same connection is fine — same
+    # transaction state.) This was a latent bug in the original fixture
+    # that only surfaced once CI began actually running (issue #265 follow-up).
     log._ensure_conn()
-    with log._cursor as cur:
-        cur.execute(f"""
+    setup_cur = log._conn.cursor()
+    try:
+        setup_cur.execute("CREATE SCHEMA IF NOT EXISTS alphard_test")
+        setup_cur.execute(f"""
             CREATE TABLE IF NOT EXISTS alphard_test.{TEST_TABLE} (
                 id          BIGSERIAL PRIMARY KEY,
                 ts          TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -77,23 +90,24 @@ def pg_audit():
                 extra       JSONB
             )
             """)
-    log._conn.commit()
-    try:
-        # Wipe any rows left over from a previous failed run.
-        with log._cursor as cur:
-            cur.execute(f"DELETE FROM alphard_test.{TEST_TABLE}")
+        setup_cur.execute(f"DELETE FROM alphard_test.{TEST_TABLE}")
         log._conn.commit()
+    finally:
+        setup_cur.close()
+    try:
         yield log
     finally:
         log.close()
         # Best-effort cleanup; ignore errors so a flaky teardown never masks
-        # the test outcome.
+        # the test outcome. Drop the whole schema (CASCADE) so we don't leave
+        # other tables around if the fixture was ever extended; this mirrors
+        # tests/test_pg_store_integration.py teardown.
         try:
             import psycopg
 
             with psycopg.connect(DSN) as conn:
                 with conn.cursor() as cur:
-                    cur.execute(f"DROP TABLE IF EXISTS alphard_test.{TEST_TABLE}")
+                    cur.execute("DROP SCHEMA IF EXISTS alphard_test CASCADE")
                 conn.commit()
         except Exception:
             pass
@@ -101,7 +115,20 @@ def pg_audit():
 
 class TestPostgresAuditLogWrite:
     def test_write_event_roundtrip(self, pg_audit):
-        """Exercises audit.py:164 ``self._cursor.execute(...)``."""
+        """Exercises audit.py ``self._cursor.execute(...)``.
+
+        Note: the ``with pg_audit._cursor as cur:`` block below is a
+        read-side artifact that bypasses the production ``close()``
+        commit path — the cursor context manager's ``__exit__`` commits
+        on our behalf. The actual commit-on-close semantics are exercised
+        by ``test_close_commits_and_closes`` below, which uses a fresh
+        writer and a fresh connection for the read-back.
+
+        Closes #267: prior version claimed "We don't commit per-write;
+        close() commits at the end" but the read used the cursor context
+        manager which commits independently — the test passed even if
+        ``close()`` were a no-op.
+        """
         issue = Issue.make(
             gate="ingestion",
             kind=IssueKind.ING_NULL_PRIMARY_KEY,
@@ -111,9 +138,11 @@ class TestPostgresAuditLogWrite:
         )
         pg_audit.write_event(issue, ticker="PG_AUDIT_TEST", gate="ingestion")
 
-        # We don't commit per-write; close() commits at the end. Read via
-        # a fresh cursor to confirm the row landed in the table.
-        with pg_audit._cursor as cur:
+        # The cursor context manager commits on exit and CLOSES the cursor;
+        # we therefore open a fresh one from the underlying connection instead
+        # of reusing ``pg_audit._cursor`` (which would be closed on first use
+        # and break subsequent tests in the same module-scoped fixture).
+        with pg_audit._conn.cursor() as cur:
             cur.execute(
                 f"SELECT ticker, gate, kind, severity, message, count, extra "
                 f"FROM alphard_test.{TEST_TABLE} WHERE ticker = %s",
@@ -142,7 +171,8 @@ class TestPostgresAuditLogWrite:
             )
             pg_audit.write_event(issue, ticker="PG_AUDIT_MULTI", gate="history")
 
-        with pg_audit._cursor as cur:
+        # Fresh cursor (see test_write_event_roundtrip for rationale).
+        with pg_audit._conn.cursor() as cur:
             cur.execute(
                 f"SELECT COUNT(*) FROM alphard_test.{TEST_TABLE} " f"WHERE ticker = %s",
                 ("PG_AUDIT_MULTI",),
@@ -151,16 +181,30 @@ class TestPostgresAuditLogWrite:
         assert n == 2
 
     def test_close_commits_and_closes(self, pg_audit):
-        """Exercises audit.py:191 ``finally: self._conn.close()``.
+        """Exercises ``close()`` actually commits pending writes.
 
-        The fixture already calls close() on teardown; here we just confirm
-        post-close state is clean (cursor is None, conn is None, and a
-        subsequent write re-establishes a connection).
+        Closes #267: prior version only checked ``_conn is None`` and
+        ``_cursor is None`` after ``close()``. A regression that replaced
+        ``self._conn.commit()`` with ``pass`` would still leave ``_conn``
+        and ``_cursor`` set after close() (the old code set them to None
+        only after the finally block) — but more importantly, the test
+        never verified the row was actually durable on disk. It was a
+        false-confidence test.
+
+        New shape: write through a *fresh* PostgresAuditLog instance so
+        we can't accidentally inherit the fixture's connection state,
+        call ``close()`` (the only commit path for that instance), then
+        read back from a *fresh* connection / cursor — the read-back
+        only succeeds if ``close()`` actually committed the transaction.
+
+        Acceptance (closes #267): if ``audit.py:close()`` is patched to
+        ``pass`` (commit removed), this test fails because no row is
+        visible from the fresh connection. Today it passed even when
+        close() did nothing.
         """
-        # Sanity: the fixture's teardown will close pg_audit. To test close()
-        # itself on a *fresh* writer, build a second one in this test and
-        # verify close() clears the connection handles.
-        second = PostgresAuditLog(dsn=DSN, table=TEST_TABLE)
+        # Use a fresh writer so we have an isolated connection to close.
+        # The fixture's pg_audit remains open for sibling tests.
+        second = PostgresAuditLog(dsn=DSN, table=TEST_TABLE, schema="alphard_test")
         issue = Issue.make(
             gate="ingestion",
             kind=IssueKind.ING_OUTLIER,
@@ -168,13 +212,43 @@ class TestPostgresAuditLogWrite:
             count=1,
         )
         second.write_event(issue, ticker="PG_AUDIT_CLOSE", gate="ingestion")
-        # Pre-close: handles live.
+
+        # Pre-close: the live writer has both handles.
         assert second._conn is not None
         assert second._cursor is not None
+
+        # Close is the ONLY commit path for this instance.
         second.close()
-        # Post-close: both cleared (the finally block ran).
+
+        # Post-close: handles cleared.
         assert second._conn is None
         assert second._cursor is None
+
+        # Read-back from a *fresh* connection (and therefore a fresh
+        # transaction). This is what proves close() actually committed —
+        # a reader on a different connection cannot see uncommitted data.
+        import psycopg
+
+        with psycopg.connect(DSN) as verify_conn:
+            with verify_conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT ticker, gate, kind, severity, message, count "
+                    f"FROM alphard_test.{TEST_TABLE} WHERE ticker = %s",
+                    ("PG_AUDIT_CLOSE",),
+                )
+                row = cur.fetchone()
+
+        assert row is not None, (
+            "row must be durable after close() commits; if this fails, "
+            "close() did not actually commit the transaction (issue #267)"
+        )
+        ticker, gate, kind, severity, message, count = row
+        assert ticker == "PG_AUDIT_CLOSE"
+        assert gate == "ingestion"
+        assert kind == IssueKind.ING_OUTLIER.value
+        assert severity == Severity.MEDIUM.value
+        assert message == "price outlier"
+        assert count == 1
 
     def test_make_default_audit_log_uses_pg(self):
         """When ``$ALPHARD_PG_DSN`` is set, make_default_audit_log returns PostgresAuditLog.

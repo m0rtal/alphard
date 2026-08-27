@@ -112,7 +112,12 @@ class PostgresAuditLog:
         Target table name (default ``data_quality_events``).
     """
 
-    def __init__(self, dsn: str | None = None, table: str = "data_quality_events") -> None:
+    def __init__(
+        self,
+        dsn: str | None = None,
+        table: str = "data_quality_events",
+        schema: str | None = None,
+    ) -> None:
         self._dsn = dsn or os.environ.get("ALPHARD_PG_DSN")
         # BUGFIX (C-2): table name is later interpolated into a SQL string
         # via psycopg.sql.Identifier — but validate here too so a bad name
@@ -120,6 +125,21 @@ class PostgresAuditLog:
         if not _TABLE_NAME_RE.match(table):
             raise ValueError(f"invalid table name {table!r}: must match {_TABLE_NAME_RE.pattern}")
         self._table = table
+        # Issue #265 follow-up: support placing the audit log in a non-default
+        # schema (used by tests/test_audit_integration.py to isolate into
+        # alphard_test). When ``schema`` is None the table is unqualified and
+        # inherits the connection's default search_path (``public``). When
+        # set, the INSERT statement explicitly qualifies ``schema.table``.
+        # Schema name is validated with the same defensive regex as table
+        # names — single identifier, no commas, no quoting. Mirrors the
+        # ``search_path`` handling in src/data/pg_store.py.
+        self._schema: str | None
+        if schema is not None:
+            if not _TABLE_NAME_RE.match(schema):
+                raise ValueError(f"invalid schema name {schema!r}: must match {_TABLE_NAME_RE.pattern}")
+            self._schema = schema
+        else:
+            self._schema = None
         self._conn: Any = None
         self._cursor: Any = None
 
@@ -164,13 +184,25 @@ class PostgresAuditLog:
         # Live-Postgres path; exercised by tests/test_audit_integration.py in CI
         # (closes #258 — replaces earlier pragma that falsely cited
         # test_pg_store_integration.py).
+        # Issue #265 follow-up: when a schema was configured at construction
+        # time, qualify the table reference as ``schema.table`` so the INSERT
+        # lands in the correct namespace regardless of the connection's
+        # search_path. When schema is None, we emit just ``table`` (the
+        # search_path resolves it — public in production).
+        if self._schema is not None:
+            table_ident: Any = sql.SQL("{}.{}").format(
+                sql.Identifier(self._schema),
+                sql.Identifier(self._table),
+            )
+        else:
+            table_ident = sql.Identifier(self._table)
         self._cursor.execute(
             sql.SQL("""
                 INSERT INTO {}
                     (ticker, gate, kind, severity, message, count, extra)
                 VALUES
                     (%s, %s, %s, %s, %s, %s, %s::jsonb)
-                """).format(sql.Identifier(self._table)),
+                """).format(table_ident),
             (
                 ticker,
                 gate,
@@ -188,16 +220,55 @@ class PostgresAuditLog:
         # autocommit on the DSN (e.g. ?autocommit=true).
 
     def close(self) -> None:
-        if self._conn is not None:
+        # Issue #266: the previous implementation nested ``self._conn.close()``
+        # inside the ``finally`` of ``try: self._conn.commit()``. When commit()
+        # raised (e.g. network blip on shutdown), the finally ran close() on a
+        # broken connection which raised ``psycopg.errors.InterfaceError``. The
+        # caller saw ``InterfaceError`` (with a misleading "connection already
+        # closed" message) and the actual ``OperationalError`` was buried one
+        # frame deep as ``__context__``. Production data loss was being
+        # misdiagnosed in incident postmortems.
+        #
+        # New shape (Option A from the issue): try the close in its own
+        # try/except inside the outer finally, capture the commit error
+        # explicitly, and re-raise it after the handles are cleared. A close()
+        # failure *after* a successful commit() is "the connection was already
+        # broken" and not actionable — only re-raise close()'s exception when
+        # commit() actually succeeded.
+        if self._conn is None:
+            return
+        commit_err: BaseException | None = None
+        try:
             try:
-                self._conn.commit()
-            finally:
                 # Live-Postgres path; exercised by
                 # tests/test_audit_integration.py::test_close_commits_and_closes
-                # (closes #258).
-                self._conn.close()
-            self._conn = None
-            self._cursor = None
+                # (closes #258) and the unit-test close() mock in
+                # tests/test_quality_gate.py.
+                self._conn.commit()
+            except BaseException as e:  # noqa: BLE001 — must capture everything
+                commit_err = e
+        finally:
+            try:
+                if self._conn is not None:
+                    self._conn.close()
+            except BaseException:  # noqa: BLE001 — see note above
+                if commit_err is None:
+                    # close() failed on a connection whose commit succeeded —
+                    # nothing actionable for the caller; swallow.
+                    pass
+                else:
+                    # commit() failed AND close() failed: the commit error is
+                    # the actionable one (data was not durably written);
+                    # close()'s "connection already closed" is expected noise
+                    # on a broken connection. Drop the close() exception.
+                    pass
+        self._conn = None
+        self._cursor = None
+        if commit_err is not None:
+            # Re-raise the *original* commit error, with a clear cause so
+            # postmortem tools (Sentry, etc.) attribute the failure to the
+            # commit path and not the teardown.
+            raise commit_err
 
 
 def make_default_audit_log() -> AuditLog:

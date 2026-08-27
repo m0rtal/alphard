@@ -718,6 +718,150 @@ class TestAudit:
         sink = PostgresAuditLog(dsn="postgresql://x", table="custom_table_42")
         assert sink._table == "custom_table_42"
 
+    def test_postgres_schema_name_accepts_valid_identifier(self) -> None:
+        """Issue #265 follow-up: schema qualifier must round-trip safely."""
+        from src.data.quality.audit import PostgresAuditLog
+
+        sink = PostgresAuditLog(dsn="postgresql://x", table="t", schema="my_schema")
+        assert sink._schema == "my_schema"
+
+    def test_postgres_schema_default_is_none(self) -> None:
+        """When schema is not configured the table stays unqualified
+        (the connection's search_path resolves it — public in production)."""
+        from src.data.quality.audit import PostgresAuditLog
+
+        sink = PostgresAuditLog(dsn="postgresql://x", table="t")
+        assert sink._schema is None
+
+    def test_postgres_schema_name_rejects_sql_injection(self) -> None:
+        """Same defensive validation as table names — single safe identifier."""
+        from src.data.quality.audit import PostgresAuditLog
+
+        for bad in (
+            "sch; DROP TABLE users--",
+            "schema'with'quotes",
+            "Schema.With.Dots",
+            "1leading_digit",
+            "",
+        ):
+            with pytest.raises(ValueError, match="invalid schema name"):
+                PostgresAuditLog(dsn="postgresql://x", table="t", schema=bad)
+
+    def test_close_is_noop_when_never_connected(self) -> None:
+        """Closing an unconnected PostgresAuditLog is a silent no-op."""
+        from src.data.quality.audit import PostgresAuditLog
+
+        sink = PostgresAuditLog(dsn="postgresql://x", table="custom_table_42")
+        assert sink._conn is None
+        sink.close()  # must not raise
+        assert sink._conn is None
+        assert sink._cursor is None
+
+    def test_close_calls_commit_then_close_in_order(self) -> None:
+        """Happy path: commit() runs, then close() runs, then handles clear."""
+        from src.data.quality.audit import PostgresAuditLog
+
+        sink = PostgresAuditLog(dsn="postgresql://x", table="custom_table_42")
+        call_order: list[str] = []
+
+        class _FakeConn:
+            def commit(self) -> None:
+                call_order.append("commit")
+
+            def close(self) -> None:
+                call_order.append("close")
+
+        sink._conn = _FakeConn()
+        sink._cursor = object()  # any sentinel
+
+        sink.close()
+
+        assert call_order == [
+            "commit",
+            "close",
+        ], f"close() must call conn.commit() before conn.close(); got {call_order}"
+        assert sink._conn is None
+        assert sink._cursor is None
+
+    def test_close_surfaces_commit_error_not_close_error(self) -> None:
+        """Issue #266: if commit() raises, the caller sees the commit error,
+        NOT the chained InterfaceError from close().
+
+        Old shape nested close() inside commit()'s finally block, so the
+        caller's primary exception was the close() error (with the real
+        commit failure buried one frame deep as __context__). New shape
+        explicitly captures commit errors and re-raises them, swallowing
+        close() errors when commit() failed first.
+        """
+        from src.data.quality.audit import PostgresAuditLog
+
+        class _CommitFails(RuntimeError):
+            """Stand-in for psycopg.OperationalError on a network blip."""
+
+        class _CloseAlsoFails(RuntimeError):
+            """Stand-in for psycopg.InterfaceError('connection already closed')."""
+
+        sink = PostgresAuditLog(dsn="postgresql://x", table="custom_table_42")
+
+        class _FakeConn:
+            def commit(self) -> None:
+                raise _CommitFails("commit failed: network blip")
+
+            def close(self) -> None:
+                raise _CloseAlsoFails("connection already closed")
+
+        sink._conn = _FakeConn()
+        sink._cursor = object()
+
+        with pytest.raises(_CommitFails) as exc_info:
+            sink.close()
+
+        # Primary exception is the commit() error, not the close() error.
+        assert "commit failed" in str(exc_info.value)
+        assert "connection already closed" not in str(exc_info.value), (
+            "caller must see commit()'s error, not the chained close() " "InterfaceError (issue #266)"
+        )
+        # Handles cleared even on error path.
+        assert sink._conn is None
+        assert sink._cursor is None
+
+    def test_close_swallows_close_error_when_commit_succeeded(self) -> None:
+        """If commit() succeeds but close() raises, the close() error is
+        not actionable for the caller (the connection was already broken
+        *after* the data was durably written). Swallow it silently."""
+        from src.data.quality.audit import PostgresAuditLog
+
+        sink = PostgresAuditLog(dsn="postgresql://x", table="custom_table_42")
+
+        class _FakeConn:
+            def commit(self) -> None:
+                pass  # success
+
+            def close(self) -> None:
+                raise RuntimeError("connection already closed")
+
+        sink._conn = _FakeConn()
+        sink._cursor = object()
+
+        # Must not raise.
+        sink.close()
+
+        assert sink._conn is None
+        assert sink._cursor is None
+
+    def test_close_is_idempotent(self) -> None:
+        """Calling close() twice on the same writer is a safe no-op the
+        second time (the handles are already None)."""
+        from src.data.quality.audit import PostgresAuditLog
+
+        sink = PostgresAuditLog(dsn="postgresql://x", table="custom_table_42")
+        sink._conn = None  # explicit: simulate post-close state
+        sink._cursor = None
+
+        sink.close()  # must not raise even though conn is None
+        assert sink._conn is None
+        assert sink._cursor is None
+
 
 class TestCLI:
     def _write_csv(self, path: str, rows: list[Bar]) -> None:
