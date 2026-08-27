@@ -11,8 +11,32 @@ Workflow
 3. Aggregate minute bars to daily OHLCV inside the loader.
 4. ``upsert_ohlcv`` into Postgres. Idempotent on ``(ticker, ts)`` PK.
 
+Service flow (per user contract)
+--------------------------------
+- **At startup, if a ticker has no rows in DB → run backfill for it.**
+- **Backfill has a fallback chain: zip (MD archive) → broker gRPC → MOEX ISS.**
+  The MD archive is FIRST because it has no 1825d lookback cap and is
+  the only source that covers the full 2018→today range in one pass.
+- **After backfill is complete, daily_sync.py takes over and uses broker
+  gRPC as the PRIMARY source for incremental updates.** The MD archive
+  is intentionally NOT used on the hot path. See ``scripts/daily_sync.py``
+  for the contract.
+
+Two per-ticker guards decide whether to actually pull:
+
+1. ``--on-empty-only`` (strict first-boot mode). Skip a ticker as soon
+   as ``count_ohlcv(ticker) > 0``. Used by the supervisor loop when the
+   operator wants "no row = pull, any row = leave alone". This is the
+   literal implementation of "запускается бэкфил если данных по тикеру
+   нет". Default OFF — use ``_is_complete`` instead for re-runs.
+
+2. ``_is_complete(store, ticker, args.min_bars)`` (legacy gate, default
+   behaviour). Skip a ticker when its stored bar count meets the
+   expected-bars formula (see below). Used for re-runs that want to
+   top up partial tickers but skip already-saturated ones.
+
 When backfill is "complete"
---------------------------
+---------------------------
 Complete for a ticker when **stored bar count >= expected bar count**
 for the date range we can possibly cover for it::
 
@@ -528,6 +552,15 @@ def main() -> int:
     parser.add_argument("--batch-sleep", type=float, default=0.0, help="Sleep between tickers (rate-limit cushion).")
     parser.add_argument("--force", action="store_true", help="Re-fetch even if ticker already has min-bars.")
     parser.add_argument(
+        "--on-empty-only",
+        action="store_true",
+        help="Only backfill tickers whose DB has 0 rows. Implies skip-if-any-data per "
+        "ticker (more aggressive than --min-bars). Use on first-boot or when a "
+        "table has been wiped — the script will not re-pull tickers that already "
+        "have any rows, even partial ones. Default OFF so the legacy "
+        "_is_complete() gate is used (covers expected-bars formula).",
+    )
+    parser.add_argument(
         "--skip-known-bad",
         action="store_true",
         help="Skip tickers whose ticker_universe.delisted_at is set (heuristic: no-data "
@@ -706,7 +739,20 @@ def main() -> int:
                 logger.info(f"{i}/{len(tickers)} {ticker}: skip " f"(effective_start {effective_start} > end {end})")
                 skipped_complete += 1
                 continue
-            if not args.force and _is_complete(store, ticker, args.min_bars):
+            if args.on_empty_only:
+                # Strict first-boot guard: skip a ticker as soon as the DB
+                # has any rows for it. The legacy _is_complete() check
+                # uses an expected-bars formula (HALTS_PCT slack), which
+                # is too permissive for a "fresh" run where the operator
+                # wants to know exactly which tickers still need pulling.
+                # --on-empty-only implements the literal contract
+                # "запускается бэкфил если данных по тикеру нет".
+                if store.count_ohlcv(ticker=ticker) > 0:
+                    logger.info(f"{i}/{len(tickers)} {ticker}: skip (count > 0, --on-empty-only)")
+                    skipped_complete += 1
+                    circuit_breaker_streak = 0
+                    continue
+            elif not args.force and _is_complete(store, ticker, args.min_bars):
                 logger.info(f"{i}/{len(tickers)} {ticker}: skip (complete)")
                 skipped_complete += 1
                 # Make sure the flag reflects reality. If a previous run

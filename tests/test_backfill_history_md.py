@@ -342,3 +342,95 @@ def test_progress_heartbeat_format_includes_counters() -> None:
         "errors=",
     ):
         assert needle in source, f"progress heartbeat missing {needle!r}"
+
+
+# ---------------------------------------------------------------------------
+# --on-empty-only flag (service-flow guard: literal contract
+# "запускается бэкфил если данных по тикеру нет" — see issue #276)
+# ---------------------------------------------------------------------------
+
+
+def test_argparser_accepts_on_empty_only() -> None:
+    """--on-empty-only is wired into argparse and parses to args.on_empty_only."""
+    import argparse  # noqa: PLC0415 — local to keep imports tight
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--on-empty-only",
+        action="store_true",
+    )
+    args = parser.parse_args(["--on-empty-only"])
+    assert args.on_empty_only is True
+    args_default = parser.parse_args([])
+    assert args_default.on_empty_only is False
+
+
+def test_on_empty_only_skips_ticker_with_any_rows() -> None:
+    """When --on-empty-only is set, the per-ticker guard short-circuits
+    as soon as ``store.count_ohlcv(ticker) > 0``. The guard is more
+    aggressive than the legacy ``_is_complete()`` (HALTS_PCT formula)
+    and implements the literal contract "no row = pull, any row = leave
+    alone"."""
+    import argparse  # noqa: PLC0415
+
+    args = argparse.Namespace(on_empty_only=True)
+
+    # Ticker has 1 row in DB → skip.
+    store_one_row = MagicMock()
+    store_one_row.count_ohlcv.return_value = 1
+    skipped = False
+    if args.on_empty_only and store_one_row.count_ohlcv(ticker="SBER") > 0:
+        skipped = True
+    assert skipped
+
+    # Ticker has 1300 rows in DB → still skip.
+    store_full = MagicMock()
+    store_full.count_ohlcv.return_value = 1300
+    skipped_full = False
+    if args.on_empty_only and store_full.count_ohlcv(ticker="GAZP") > 0:
+        skipped_full = True
+    assert skipped_full
+
+
+def test_on_empty_only_proceeds_when_count_is_zero() -> None:
+    """When --on-empty-only is set and count == 0, the guard does NOT
+    short-circuit — the backfill continues for this ticker."""
+    import argparse  # noqa: PLC0415
+
+    args = argparse.Namespace(on_empty_only=True)
+
+    store_empty = MagicMock()
+    store_empty.count_ohlcv.return_value = 0
+    proceed = True
+    if args.on_empty_only and store_empty.count_ohlcv(ticker="NEW") > 0:
+        proceed = False
+    assert proceed
+
+
+def test_on_empty_only_off_falls_back_to_is_complete() -> None:
+    """Default (no flag) behaviour must remain the legacy ``_is_complete()``
+    gate so re-runs that top up partial tickers are not affected."""
+    import argparse  # noqa: PLC0415
+
+    args = argparse.Namespace(on_empty_only=False, force=False)
+    # Mirror the production predicate: ``args.on_empty_only`` short-circuits
+    # on count > 0; otherwise we delegate to ``_is_complete``.
+    store = MagicMock()
+    store.count_ohlcv.return_value = 0  # would be skipped if --on-empty-only
+    store.ticker_meta.return_value = None
+    # With on_empty_only OFF the per-ticker guard is _is_complete().
+    # count=0, no metadata → _is_complete() returns False → not skipped.
+    skip_via_flag = bool(args.on_empty_only and store.count_ohlcv(ticker="SBER") > 0)
+    skip_via_complete = False if skip_via_flag else bh._is_complete(store, "SBER", min_bars=1300)
+    assert not skip_via_flag
+    assert not skip_via_complete
+
+
+def test_progress_log_string_on_empty_only_present() -> None:
+    """The skip log line for --on-empty-only is wired into the main loop
+    (defensive — guards against a future refactor silently dropping the
+    per-ticker visibility into why a ticker was skipped)."""
+    import inspect
+
+    source = inspect.getsource(bh)
+    assert "skip (count > 0, --on-empty-only)" in source

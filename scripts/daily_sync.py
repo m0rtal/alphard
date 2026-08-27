@@ -105,10 +105,7 @@ def main() -> int:
     parser.add_argument(
         "--prefer-md-backfill",
         action="store_true",
-        help="Use TinkoffInvestMDDataLoader (history-data ZIPs aggregated to daily) "
-        "for tickers short on history, then gRPC for the rest. "
-        "This is the production path; the default 'tkf' source remains "
-        "the gRPC-only path for incremental updates.",
+        help=argparse.SUPPRESS,  # deprecated; daily_sync is broker-only after initial backfill
     )
 
     args = parser.parse_args()
@@ -170,18 +167,6 @@ def main() -> int:
 
     store = PostgresDataStore()
 
-    # Lazy MD loader: only created if --prefer-md-backfill is on.
-    md_loader: Any = None
-    if args.prefer_md_backfill:
-        try:
-            from src.data.tinkoff_md_loader import TinkoffInvestMDDataLoader
-
-            md_loader = TinkoffInvestMDDataLoader()
-            logger.info("MD backfill loader enabled (TinkoffInvestMDDataLoader)")
-        except Exception as e:
-            logger.error(f"MD loader init failed (falling back to gRPC): {e}")
-            md_loader = None
-
     # Resolve TickerMeta once
     try:
         meta_cache = {t.ticker: t for t in loader.list_tickers()}
@@ -192,7 +177,6 @@ def main() -> int:
 
     total_bars = 0
     errors = []
-    md_used_count = 0  # BUGFIX (H-6): track how many tickers went through MD archive
 
     try:
         from src.data.models import TickerMeta as _TickerMeta
@@ -208,26 +192,12 @@ def main() -> int:
                 )
 
             try:
-                # MD-backfill path: if the ticker has < min_bars daily
-                # rows in DB AND the MD loader is enabled, fill the gap
-                # with the archive BEFORE incremental gRPC.
-                used_md = False
-                if md_loader is not None and store.count_ohlcv(symbol) < args.min_bars:
-                    md_start = date(2018, 1, 1)
-                    md_end = end
-                    md_bars = list(md_loader.iter_ohlcv(symbol, md_start, md_end))
-                    if md_bars:
-                        store.upsert_ohlcv(md_bars)
-                        logger.info(
-                            f"{i}/{len(symbols)} {symbol}: "
-                            f"MD backfill +{len(md_bars)} bars (archive 2018→{md_end.year})"
-                        )
-                        used_md = True
-                # BUGFIX (H-6): log when MD was used so the summary shows
-                # how many tickers actually went through the archive path.
-                if used_md:
-                    md_used_count += 1
-
+                # Service-flow contract: after backfill is complete,
+                # daily_sync is broker-only. The legacy --prefer-md-backfill
+                # path was removed (2026-08-27) because it re-enabled the
+                # MD archive on the hot path, contradicting the rule
+                # "после бэкфила переходим на broker". The flag is now
+                # argparse.SUPPRESS'd for backward-compat (silently ignored).
                 if args.source == "tkf":
                     bars = loader.fetch_ohlcv(symbol, start, end)
                 else:
@@ -306,7 +276,7 @@ def main() -> int:
         store.close()
 
     logger.info(
-        f"=== DONE: {total_bars} bars written, {len(errors)} errors, " f"md_archive_used={md_used_count} tickers ==="
+        f"=== DONE: {total_bars} bars written, {len(errors)} errors, broker-only (MD archive disabled) ==="  # noqa: E501
     )
 
     # Phase 1.6 audit: stamp the watchdog sentinel so src.main's
