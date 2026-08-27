@@ -403,27 +403,43 @@ services:
     # Inline config write: write prometheus.yml on container startup from an
     # env-baked base64 blob, then exec prometheus. Avoids the bind-mount leaf
     # file-vs-directory quirk that .107 has for src=file mounts.
+    # BUGFIX (issue #283): PROM_YML_B64 used to be the source of truth
+    # for the scrape config. Portainer StackUpdate silently truncates env
+    # values >60 chars (Go JSON unmarshal fails on long strings) and
+    # 292-byte base64 blobs were routinely cut off mid-keyword. Now we
+    # bind-mount the config file from the repo (./docker/prometheus/prometheus.yml)
+    # instead — the 60-char limit no longer applies and a config change
+    # is a normal git diff.
+    #
+    # BUGFIX (issue #209): prom/prometheus runs as in-image nobody (uid 65534)
+    # but /prometheus is a Docker-managed named volume owned by root:root.
+    # Without chown, queries.active write fails with EPERM and the container
+    # restart-loops. We chown here in the entrypoint BEFORE exec. The
+    # config file itself (bind-mounted :ro) is not affected — userns-mapping
+    # trap only applies to writable leaves.
+    #
+    # --web.enable-lifecycle stays so prometheus.yml can be hot-reloaded via
+    # POST /-/reload after the config file is updated on the host.
     entrypoint:
       - sh
       - -c
       - |
-        set -e
-        mkdir -p /etc/prometheus /prometheus
-        echo "$$PROM_YML_B64" | base64 -d > /etc/prometheus/prometheus.yml
-        # BUGFIX (issue #209): /prometheus is a named volume — Docker creates
-        # it root-owned, but prom/prometheus runs as in-image `nobody` (uid 65534).
-        # Without chown, queries.active write fails with EPERM and container
-        # restart-loops. Same userns-mapping trap as bind-mounts, different fix.
-        chown -R nobody:nobody /prometheus  # alpine uses nobody:nobody, not nogroup
+        chown -R nobody:nobody /prometheus
         exec /bin/prometheus \
           --config.file=/etc/prometheus/prometheus.yml \
           --storage.tsdb.path=/prometheus \
           --storage.tsdb.retention.time=30d \
           --web.listen-address=0.0.0.0:9090 \
           --web.enable-lifecycle
-    environment:
-      PROM_YML_B64: ${PROM_YML_B64:-}
     volumes:
+      # Read-only config mount from the bind-mounted repo leaf. The leaf
+      # file (docker/prometheus/prometheus.yml) has been the source of
+      # truth for the scrape config since Phase 2.8 step 1 — quickstart.sh
+      # used to base64-bake it into PROM_YML_B64 before issue #283 made
+      # that path unreliable due to Portainer's 60-char env limit.
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # TSDB lives in a named volume so /prometheus is root-owned by Docker
+      # itself, not bind-mounted (avoiding the #108 / #122 leaf trap).
       - alphard-prometheus-data:/prometheus
     ports:
       - "9090:9090"

@@ -240,22 +240,27 @@ else
     ok "4 B64 vars baked into .env"
 fi
 
-# ---- 4. Prometheus B64 bake ----
-info "4/5 Prometheus config bake"
+# ---- 4. Prometheus config bind-mount sanity check ----
+# Issue #283: PROM_YML_B64 used to be the source of truth, but Portainer
+# StackUpdate silently truncates env values >60 chars (Go JSON unmarshal
+# fails on long strings), and the 292-byte base64 blob was routinely cut
+# off mid-keyword. The fix is to bind-mount the config file from the
+# repo at ./docker/prometheus/prometheus.yml — Portainer's env-length limit
+# is no longer relevant.
+#
+# We just verify the file exists; compose.yaml bind-mounts it as :ro
+# into /etc/prometheus/prometheus.yml inside the prometheus container.
+info "4/5 Prometheus config bind-mount sanity check"
 
-_prom_b64="$(env_value PROM_YML_B64)"
-if [[ -n "$_prom_b64" ]]; then
-    ok "PROM_YML_B64 present"
-else
-    if [[ ! -f "$REPO_ROOT/docker/prometheus/prometheus.yml" ]]; then
-        err "docker/prometheus/prometheus.yml not found"
-        exit 2
-    fi
-    log "baking docker/prometheus/prometheus.yml into PROM_YML_B64"
-    _b64="$(base64 -w0 < "$REPO_ROOT/docker/prometheus/prometheus.yml")"
-    printf '\nPROM_YML_B64="%s"\n' "$_b64" >> "$REPO_ROOT/.env"
-    ok "PROM_YML_B64 baked into .env"
+if [[ ! -f "$REPO_ROOT/docker/prometheus/prometheus.yml" ]]; then
+    err "docker/prometheus/prometheus.yml not found (issue #283 — bind-mount target is missing from the repo)"
+    exit 2
 fi
+if ! grep -q "alphard-bot:8765" "$REPO_ROOT/docker/prometheus/prometheus.yml"; then
+    err "docker/prometheus/prometheus.yml does not declare the alphard-bot:8765 scrape target (Grafana will show 'No data')"
+    exit 2
+fi
+ok "docker/prometheus/prometheus.yml present and contains alphard-bot:8765 target"
 
 # ---- 5. docker compose up ----
 # Two early-exit paths:

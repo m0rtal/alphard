@@ -63,7 +63,6 @@ def _quickstart_skel(
                 "PROVISIONING_DASHBOARDS_PROVIDER_YML_B64=\n"
                 "DASHBOARD_PHASE0_JSON_B64=\n"
                 "DASHBOARD_PHASE28_JSON_B64=\n"
-                "PROM_YML_B64=\n"
             )
         else:
             env = (
@@ -74,7 +73,6 @@ def _quickstart_skel(
                 "PROVISIONING_DASHBOARDS_PROVIDER_YML_B64=\n"
                 "DASHBOARD_PHASE0_JSON_B64=\n"
                 "DASHBOARD_PHASE28_JSON_B64=\n"
-                "PROM_YML_B64=\n"
             )
         (env_dir / ".env").write_text(env, encoding="utf-8")
 
@@ -82,7 +80,16 @@ def _quickstart_skel(
 
     prom_dir = env_dir / "docker" / "prometheus"
     prom_dir.mkdir(parents=True, exist_ok=True)
-    (prom_dir / "prometheus.yml").write_text("# prom stub\n", encoding="utf-8")
+    # The stub must satisfy quickstart.sh's issue #283 sanity check:
+    # "docker/prometheus/prometheus.yml must contain alphard-bot:8765".
+    (prom_dir / "prometheus.yml").write_text(
+        "# prom stub for fixture\n"
+        "scrape_configs:\n"
+        "  - job_name: alphard-bot\n"
+        "    static_configs:\n"
+        "      - targets: ['alphard-bot:8765']\n",
+        encoding="utf-8",
+    )
 
     tools_dir = env_dir / "tools"
     tools_dir.mkdir(exist_ok=True)
@@ -325,14 +332,15 @@ def _run_no_docker(env_dir: Path, tmp_path: Path) -> subprocess.CompletedProcess
 
 
 def _fill_all_b64(env_dir: Path) -> None:
-    """Pre-populate all 4 Grafana B64 vars + PROM_YML_B64 in .env."""
+    """Pre-populate all 4 Grafana B64 vars in .env. PROM_YML_B64 is no
+    longer needed — the prometheus config is bind-mounted from the repo
+    (issue #283)."""
     text = (env_dir / ".env").read_text() if (env_dir / ".env").exists() else ""
     pairs = [
         ("PROVISIONING_DATASOURCES_YML_B64", "ZmFrZS1kYXRhc291cmNlLXltbA=="),
         ("PROVISIONING_DASHBOARDS_PROVIDER_YML_B64", "ZmFrZS1wcm92aWRlcg=="),
         ("DASHBOARD_PHASE0_JSON_B64", "e30="),
         ("DASHBOARD_PHASE28_JSON_B64", "e30="),
-        ("PROM_YML_B64", "Z2xvYmFsOgogIHNjcmF"),
     ]
     for k, v in pairs:
         pattern = f"^{k}=.*$"
@@ -573,20 +581,6 @@ def test_symlink_invocation_finds_real_repo(tmp_path: Path) -> None:
     # And the script must have found the real compose file.
     text = (env_dir / ".env").read_text()
     assert "GRAFANA_ADMIN_PASSWORD=ci_test_password_DO_NOT_USE_IN_PRODUCTION" in text
-
-
-def test_prom_b64_baked_when_missing(tmp_path: Path) -> None:
-    """PROM_YML_B64 missing -> baked from docker/prometheus/prometheus.yml."""
-    env_dir = _quickstart_skel(tmp_path, with_gpw=True)
-    _fill_all_b64(env_dir)
-    text = (env_dir / ".env").read_text()
-    text = re.sub(r"^PROM_YML_B64=.*$", "", text, flags=re.MULTILINE)
-    (env_dir / ".env").write_text(text)
-
-    _run_with_fake_docker(env_dir, tmp_path)  # noqa: F841 (side effects only)
-    text = (env_dir / ".env").read_text()
-    m = re.search(r'^PROM_YML_B64="([A-Za-z0-9+/=]+)"', text, re.MULTILINE)
-    assert m, f"PROM_YML_B64 should be baked; env:\n{text}"
 
 
 def test_grafana_b64_baked_when_missing(tmp_path: Path) -> None:
