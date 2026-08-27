@@ -239,11 +239,23 @@ class TestEntrypointSourceLoop:
         signal that's actually meaningful here.
         """
         root_env = Path("/root/.env")
-        if not root_env.exists():
+        try:
+            root_env_exists = root_env.exists()
+        except PermissionError:
+            # GitHub Actions runs the test job as a non-root user, but
+            # the runner image has /root/.env owned by root with mode 0600
+            # — so exists() raises PermissionError instead of returning
+            # True/False. Treat that as "exists but not readable to us",
+            # which from this test's perspective is the same as "absent":
+            # we cannot source it through the entrypoint loop on this
+            # host. Skip without failing.
+            root_env_exists = False
+        if not root_env_exists:
             pytest.skip(
                 "/root/.env does not exist on this host (no compose "
-                "bind-mount). Cannot exercise the /root/.env path — "
-                "run inside a container with the bind-mount to validate "
+                "bind-mount, or it is not readable by the test runner). "
+                "Cannot exercise the /root/.env path — run inside a "
+                "container with the bind-mount as root to validate "
                 "issue #295's regression contract."
             )
         tmp_alpha_env = Path("/tmp/alphard.env")
