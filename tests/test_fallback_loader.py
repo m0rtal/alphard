@@ -287,7 +287,9 @@ def test_list_tickers_falls_back_to_moex_when_md_and_grpc_fail() -> None:
 
 def test_list_tickers_returns_empty_when_all_sources_fail() -> None:
     """When ALL THREE sources fail, return [] — supervisor treats this as
-    rc=3 NO_UNIVERSE and applies exponential backoff (see test_main_backfill_supervisor.py).
+    a clean exit (rc=0) and respawns after the fixed 30s
+    _BACKFILL_RESPAWN_BACKOFF_SECONDS (src/main.py:150). See
+    test_main_backfill_supervisor.py for the supervisor-loop coverage.
     """
     moex = MagicMock()
     moex.list_tickers.side_effect = RuntimeError("network error")
@@ -309,9 +311,10 @@ def test_list_tickers_returns_empty_when_all_sources_fail() -> None:
 def test_list_tickers_full_chain_md_empty_then_grpc_empty_then_moex_empty() -> None:
     """All three sources return [] (not raise, just empty). Returns [].
 
-    This is the path that triggers rc=3 NO_UNIVERSE without any error
-    counters being incremented — every source reports ``fallback`` (zero
-    results) rather than ``error`` (exception). Order is MD → gRPC → MOEX.
+    This is the path that triggers a clean supervisor respawn (rc=0,
+    fixed 30s backoff) without any error counters being incremented —
+    every source reports ``fallback`` (zero results) rather than
+    ``error`` (exception). Order is MD → gRPC → MOEX.
     """
     moex = MagicMock()
     moex.list_tickers.return_value = []
