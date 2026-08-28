@@ -163,10 +163,13 @@ class FallbackDataLoader:
             self._stats["moex_iss"]["error"] += 1
             logger.warning(f"FallbackDataLoader.list_tickers: moex_iss failed ({type(e).__name__}: {e})")
 
-        # All three sources failed. Return empty list — supervisor will
-        # treat this as rc=3 NO_UNIVERSE and apply exponential backoff
-        # (see src/main.py:_backfill_supervisor_loop). The operator will
-        # see the per-source error stats in logs / Prometheus.
+        # All three sources failed. Return empty list — supervisor treats
+        # this as a clean exit (rc=0) and respawns after 30s; if the
+        # all-sources-fail state persists, the operator should check
+        # per-source stats and Tinkoff token health. PR #312 (closed
+        # without merge) introduced an rc=3 NO_UNIVERSE sentinel; the
+        # data-layer fix in this PR was preferred. The operator will see
+        # the per-source error stats in logs / Prometheus.
         logger.error("FallbackDataLoader.list_tickers: ALL THREE SOURCES returned 0 tickers or failed")
         return []
 

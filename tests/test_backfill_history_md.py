@@ -434,11 +434,12 @@ def test_md_loader_uses_grpc_token_not_args_token() -> None:
     SANDBOX bug the test fails immediately.
     """
     from pathlib import Path
+
     src = Path("scripts/backfill_history_md.py").read_text(encoding="utf-8")
     # gRPC loader constructed first (with no args — defaults to REAL).
-    assert "tinkoff_grpc_loader = TinkoffInvestDataLoader()" in src, (
-        "main() must construct tinkoff_grpc_loader first (no args → REAL)"
-    )
+    assert (
+        "tinkoff_grpc_loader = TinkoffInvestDataLoader()" in src
+    ), "main() must construct tinkoff_grpc_loader first (no args → REAL)"
     # MD loader constructed with gRPC loader's token.
     assert "TinkoffInvestMDDataLoader(token=tinkoff_grpc_loader._token)" in src, (
         "TinkoffInvestMDDataLoader() must receive tinkoff_grpc_loader._token "
