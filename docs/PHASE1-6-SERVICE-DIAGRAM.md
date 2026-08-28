@@ -4,6 +4,26 @@
 > Current architecture: see [`../ARCHITECTURE.md`](../ARCHITECTURE.md) at repo root.
 > This document is preserved for migration history only.
 
+> ⚠️ **LEGACY DOCUMENT** — Snapshot from Phase 1.6 (before Macro Agent,
+> before observability metrics, before Postgres audit). The diagrams in
+> this file reflect Phase 1.6 topology only.
+>
+> Current architecture (Phase 2.x with Macro Agent, RiskGate, observability
+> stack):
+>
+> - [`docs/PHASE2-8-METRICS.md`](PHASE2-8-METRICS.md) — current runtime diagrams
+> - [`docs/PHASE2-ROADMAP.md`](PHASE2-ROADMAP.md) — Phase 2 status + sub-step table
+> - [`docs/POSITION-SIZING.md`](POSITION-SIZING.md) — current sizing matrix
+>
+> Do **not** make decisions based on this file. Preserved for audit trail only.
+> See issue #292.
+>
+> **Note:** Once PRs #301 (`ARCHITECTURE.md`) and #305 (`DOCS-INDEX.md`) land,
+> this banner's "current docs" pointers will be updated in a follow-up to
+> reference them.
+
+---
+
 Three diagrams: stack, runtime, fallback chain. Render in any mermaid viewer (GitHub, VSCode, mermaid.live).
 
 ## 1. Service stack

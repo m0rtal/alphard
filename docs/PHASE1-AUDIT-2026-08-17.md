@@ -1,5 +1,25 @@
 # Phase 1 — Honest Audit (snapshot 2026-08-17, refreshed)
 
+> ⚠️ **LEGACY DOCUMENT** — One-time audit snapshot from 2026-08-17
+> (Phase 1.0 state). Coverage figures, test counts, and CI status
+> described in the tables below are stale; subsequent phases (1.5,
+> 1.6, 2.x) have shipped changes that supersede them.
+>
+> For current state:
+>
+> - [`docs/AUDIT-CodeQuality.md`](AUDIT-CodeQuality.md) — Phase 1 quality audit (current)
+> - [`docs/PHASE2-ROADMAP.md`](PHASE2-ROADMAP.md) — Phase 2 status + sub-step table
+> - [`README.md`](../README.md) — project root
+>
+> Do **not** make decisions based on this file. Preserved for audit trail only.
+> See issue #292.
+>
+> **Note:** Once PRs #301 (`ARCHITECTURE.md`), #303 (`TESTING.md`), and #305
+> (`DOCS-INDEX.md`) land, this banner's "current docs" pointers will be
+> updated in a follow-up to reference them.
+
+---
+
 This is a status report, not a plan. Each row carries a single source
 of truth that anyone can verify.
 

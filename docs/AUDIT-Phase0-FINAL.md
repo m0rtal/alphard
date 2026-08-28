@@ -1,5 +1,22 @@
 # Phase 0 QA — Final Synthesis
 
+> ⚠️ **LEGACY DOCUMENT** — Snapshot from 2026-08-14 (Phase 0 wrap-up).
+> Pre-Phase-1.0 state. Test counts, coverage figures, and tooling
+> recommendations in this file have been superseded by current docs:
+>
+> - [`docs/PHASE2-ROADMAP.md`](PHASE2-ROADMAP.md) — Phase 2 status table (current state)
+> - [`docs/AUDIT-CodeQuality.md`](AUDIT-CodeQuality.md) — Phase 1 quality audit
+> - [`docs/SECURITY.md`](SECURITY.md) — current security posture
+>
+> Do **not** make decisions based on this file. Preserved for audit trail only.
+> See issue #292.
+>
+> **Note:** Once PRs #301 (`ARCHITECTURE.md`), #303 (`TESTING.md`), and #305
+> (`DOCS-INDEX.md`) land, this banner's "current docs" pointers will be
+> updated in a follow-up to reference them.
+
+---
+
 **Audit date:** 2026-08-14
 **Synthesizer task:** `t_25bc20af` (developer profile, kanban swarm v1)
 **Repo:** https://github.com/m0rtal/alphard
