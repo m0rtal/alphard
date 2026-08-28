@@ -7,12 +7,16 @@
 > Current architecture (Phase 2.x with Macro Agent, RiskGate, observability
 > stack):
 >
-> - [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) — canonical current architecture
 > - [`docs/PHASE2-8-METRICS.md`](PHASE2-8-METRICS.md) — current runtime diagrams
-> - [`DOCS-INDEX.md`](../DOCS-INDEX.md) — top-level navigation, including the legacy table
+> - [`docs/PHASE2-ROADMAP.md`](PHASE2-ROADMAP.md) — Phase 2 status + sub-step table
+> - [`docs/POSITION-SIZING.md`](POSITION-SIZING.md) — current sizing matrix
 >
 > Do **not** make decisions based on this file. Preserved for audit trail only.
 > See issue #292.
+>
+> **Note:** Once PRs #301 (`ARCHITECTURE.md`) and #305 (`DOCS-INDEX.md`) land,
+> this banner's "current docs" pointers will be updated in a follow-up to
+> reference them.
 
 ---
 

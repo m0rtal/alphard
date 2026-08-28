@@ -2,14 +2,18 @@
 
 > ⚠️ **LEGACY DOCUMENT** — Snapshot from 2026-08-14 (Phase 0 audit).
 > Pre-Phase-1.0 state. The security posture, tooling recommendations, and
-> repo-structure observations in this file have been superseded by:
+> repo-structure observations in this file have been superseded by current docs:
 >
-> - [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) — current architecture (Phase 2.x)
 > - [`docs/SECURITY.md`](SECURITY.md) — current security posture
-> - [`DOCS-INDEX.md`](../DOCS-INDEX.md) — top-level navigation, including the legacy table
+> - [`docs/PHASE2-ROADMAP.md`](PHASE2-ROADMAP.md) — current Phase 2 status
+> - [`docs/AUDIT-CodeQuality.md`](AUDIT-CodeQuality.md) — Phase 1 quality audit
 >
 > Do **not** make decisions based on this file. Preserved for audit trail only.
 > See issue #292.
+>
+> **Note:** Once PRs #301 (`ARCHITECTURE.md`) and #305 (`DOCS-INDEX.md`) land,
+> this banner's "current docs" pointers will be updated in a follow-up to
+> reference them.
 
 ---
 
