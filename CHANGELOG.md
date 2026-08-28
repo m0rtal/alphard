@@ -51,6 +51,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - **`peak-equity` — atomic write + `.bak` fallback**. (Closes #199, #203.)
 - **`_risk_check` — pre-validate `limit_price > 0`** before passing to broker. (Closes #211, #212.)
 - **Sector exposure marked at `intent.price`**; sector-aware `trim_qty`; old non-economic clamp dropped. (Closes #204, #205.)
+- **`tinkoff_md._fill_universe_cache` raises `LoaderError` on total broker gRPC auth outage** instead of silently returning `[]`. `FallbackDataLoader.list_tickers` now records `stats["tinkoff_md"]["error"] = 1` (truthful: source raised) instead of `["fallback"] = 1` (misleading: source legitimately has no data), so operator-facing dashboards surface broker gRPC outages as actionable signals rather than silently degrading to MOEX ISS (TQBR-only). Partial-failure resilience preserved — only ALL sub-calls failing triggers the guard. (Closes #319, #321.)
 
 ### Changed
 - **Compose refactor 2.0** — Grafana env provisioning, `chown -R nobody:nobody` (Alpine uses `nobody`, not `nogroup`), bind-mount elimination for appdata. (`51a3c2c`, kanban `t_884fec4a`.)
@@ -59,6 +60,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Tests
 - **Defensive-branch coverage c1–c6** — `sqlite_store` (85→100%, #260), `tinkoff_md_loader` (91→99%, #261), `ingestion_gate` (91→100%, #268), `fallback_loader` (92→100%, #269), `historical` (93→100%, #270). 5 PRs, ~30 new test cases.
+- **`test_check_md_links`** — CI gate that walks every tracked `*.md` under the repo and asserts each markdown link whose target ends in `.md` resolves on disk. Closes the same defect class as the hand-fixed #307: a markdown link to a file supplied only by a sibling PR is invisible to CI until the sibling merges, leaving `main` briefly carrying broken links. Sanity test catches vacuous-pass parametrization bugs. (Closes #320, #322.)
 
 ### Maintenance
 - **Dead code dropped**: `deploy_monitoring.sh` + its tests (ADR-0008), dead `argparse` state in `bake_grafana_env` + dead doc link. (Closes #229.)

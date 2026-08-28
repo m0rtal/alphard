@@ -35,6 +35,7 @@ htmlcov/
 # Docker
 .docker/
 docker-compose.override.yml
+docker-compose.local-override.yaml
 
 # Secrets (CRITICAL: never commit)
 *.pem
