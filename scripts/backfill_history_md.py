@@ -164,6 +164,7 @@ from src.data.tinkoff_md_loader import TinkoffInvestMDDataLoader  # noqa: E402
 from src.data.tinkoff_loader import TinkoffInvestDataLoader  # noqa: E402
 from src.data.moex_loader import MOEXDataLoader  # noqa: E402
 from src.data.fallback_loader import FallbackDataLoader  # noqa: E402
+from src.data.loader import LoaderError  # noqa: E402
 from src.data.models import TickerMeta  # noqa: E402
 from typing import Any  # noqa: E402
 
@@ -259,8 +260,41 @@ def _resolve_universe(
       into ticker_universe BEFORE fetching bars (BUGFIX 2026-08-18:
       the FK on ohlcv_daily.ticker requires the row in ticker_universe
       to exist before INSERT).
+
+    Issue #319 / PR #326 followup: the historical chain in
+    ``loader.list_tickers()`` (step 1: ``tinkoff_md.list_tickers()``) was
+    class-code-filtered to TQBR-only in its internal implementation,
+    yielding a 252-ticker universe that masked the broker's full tradable
+    set. ``tinkoff_md.list_tickers_with_figi()`` is the SAME broker gRPC
+    endpoint as the chain — both go through
+    ``TinkoffInvestDataLoader(token=...)`` (see
+    ``src/data/tinkoff_md_loader.py:_fill_universe_cache`` line 306-313)
+    — but ``_fill_universe_cache`` walks every tradable ``class_code``
+    (``_TRADABLE_CLASS_CODES - bonds - ETF``) plus bonds via
+    ``list_bonds()`` and ETFs via ``list_etfs()``, yielding the full
+    ~3267-ticker broker-published universe. PR #321 guarantees that a
+    total broker-gRPC outage raises ``LoaderError`` out of
+    ``_fill_universe_cache`` (not silently returns ``[]``), and the
+    ``try/except`` below now falls back to the chain on BOTH raise AND
+    empty-return, raising a clear ``LoaderError`` if both are empty
+    (cycle101 review).
     """
-    metas = loader.list_tickers()
+    metas: list[Any] = []
+    try:
+        metas = loader.tinkoff_md.list_tickers_with_figi()
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            f"_resolve_universe: tinkoff_md.list_tickers_with_figi() failed: "
+            f"{type(exc).__name__}: {exc}; falling back to broker-chain loader.list_tickers()"
+        )
+    if not metas:
+        logger.warning(
+            "_resolve_universe: direct tinkoff_md yielded 0 tickers; "
+            "falling back to broker-chain loader.list_tickers()"
+        )
+        metas = loader.list_tickers()
+    if not metas:
+        raise LoaderError("_resolve_universe: universe empty from both direct tinkoff_md " "and the fallback chain")
     if classes:
         classes_upper = {c.upper() for c in classes}
         metas = [m for m in metas if (m.class_code or "").upper() in classes_upper]
