@@ -207,15 +207,17 @@ def test_stats_zero_rows_counts_as_fallback() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_list_tickers_uses_tinkoff_grpc_first() -> None:
-    """Issue #311 (2026-08-28): gRPC is the PRIMARY universe source.
+def test_list_tickers_uses_tinkoff_md_first() -> None:
+    """Issue #316 (2026-08-28): tinkoff_md is the PRIMARY universe source.
 
-    Reason: tinkoff_grpc uses the SAME token as daily_sync / broker
-    (real-app token, auth always works for live data). tinkoff_md uses
-    a SEPARATE history-data token (often rotated independently, often
-    UNAUTHENTICATED). Pre-fix the chain was md-only → empty universe
-    on auth-broken → 30s tight respawn loop. Post-fix gRPC is tried
-    first → 1927+ tickers available even when MD auth is broken.
+    Reason: tinkoff_md (history-data archive) covers ALL 4 MOEX classes
+    (TQBR + SPBXM + TQCB + TQOB = ~3259 tickers including delisted). It
+    uses the same REAL token shared from gRPC loader (post PR #313). Why
+    not gRPC first? tinkoff_grpc.list_tickers() returns ONLY the TQBR
+    class (~252 tickers) — losing ~3000 from the universe. Pre-fix
+    (gRPC-first in PR #313) the universe had only 252 tickers when it
+    should have had 3259. Post-fix: MD wins → 3259 → gRPC fallback
+    (252) → MOEX ISS last-resort (~1927 TQBR).
     """
     md = MagicMock()
     md.list_tickers_with_figi.return_value = ["MD_T1", "MD_T2"]
@@ -225,48 +227,48 @@ def test_list_tickers_uses_tinkoff_grpc_first() -> None:
 
     out = fl.list_tickers()
 
-    # gRPC wins (first non-empty).
-    assert out == ["GRPC_T1", "GRPC_T2", "GRPC_T3"]
-    grpc.list_tickers.assert_called_once()
-    # md must NOT have been called when gRPC succeeded.
-    md.list_tickers_with_figi.assert_not_called()
-
-
-def test_list_tickers_falls_back_to_md_when_grpc_empty() -> None:
-    """When gRPC returns 0 tickers (degenerate case), fall back to MD."""
-    md = MagicMock()
-    md.list_tickers_with_figi.return_value = ["MD_T1", "MD_T2"]
-    grpc = MagicMock()
-    grpc.list_tickers.return_value = []  # gRPC says 0
-    fl = FallbackDataLoader(tinkoff_md=md, tinkoff_grpc=grpc, moex_iss=_loader_empty())
-
-    out = fl.list_tickers()
-
+    # MD wins (first non-empty in MD → gRPC → MOEX chain).
     assert out == ["MD_T1", "MD_T2"]
-    grpc.list_tickers.assert_called_once()
     md.list_tickers_with_figi.assert_called_once()
-    assert fl.stats["tinkoff_grpc"]["fallback"] == 1
-    assert fl.stats["tinkoff_md"]["ok"] == 1
+    # gRPC must NOT have been called when MD succeeded.
+    grpc.list_tickers.assert_not_called()
 
 
-def test_list_tickers_falls_back_to_md_when_grpc_raises() -> None:
-    """When gRPC raises (UNAUTHENTICATED, network, etc.), fall back to MD."""
+def test_list_tickers_falls_back_to_grpc_when_md_empty() -> None:
+    """When MD returns 0 tickers (degenerate case), fall back to gRPC."""
     md = MagicMock()
-    md.list_tickers_with_figi.return_value = ["MD_T1"]
+    md.list_tickers_with_figi.return_value = []
     grpc = MagicMock()
-    grpc.list_tickers.side_effect = RuntimeError("UNAUTHENTICATED")
+    grpc.list_tickers.return_value = ["GRPC_T1", "GRPC_T2"]
     fl = FallbackDataLoader(tinkoff_md=md, tinkoff_grpc=grpc, moex_iss=_loader_empty())
 
     out = fl.list_tickers()
 
-    assert out == ["MD_T1"]
+    assert out == ["GRPC_T1", "GRPC_T2"]
     md.list_tickers_with_figi.assert_called_once()
-    assert fl.stats["tinkoff_grpc"]["error"] == 1
-    assert fl.stats["tinkoff_md"]["ok"] == 1
+    grpc.list_tickers.assert_called_once()
+    assert fl.stats["tinkoff_md"]["fallback"] == 1
+    assert fl.stats["tinkoff_grpc"]["ok"] == 1
 
 
-def test_list_tickers_falls_back_to_moex_when_md_raises() -> None:
-    """When both gRPC and MD fail, try MOEX ISS (no auth, last resort)."""
+def test_list_tickers_falls_back_to_grpc_when_md_raises() -> None:
+    """When MD raises (UNAUTHENTICATED, network, etc.), fall back to gRPC."""
+    md = MagicMock()
+    md.list_tickers_with_figi.side_effect = RuntimeError("UNAUTHENTICATED")
+    grpc = MagicMock()
+    grpc.list_tickers.return_value = ["GRPC_T1"]
+    fl = FallbackDataLoader(tinkoff_md=md, tinkoff_grpc=grpc, moex_iss=_loader_empty())
+
+    out = fl.list_tickers()
+
+    assert out == ["GRPC_T1"]
+    grpc.list_tickers.assert_called_once()
+    assert fl.stats["tinkoff_md"]["error"] == 1
+    assert fl.stats["tinkoff_grpc"]["ok"] == 1
+
+
+def test_list_tickers_falls_back_to_moex_when_md_and_grpc_fail() -> None:
+    """When both MD and gRPC fail, try MOEX ISS (no auth, last resort)."""
     moex = MagicMock()
     moex.list_tickers.return_value = ["MOEX_T1", "MOEX_T2"]
     md = MagicMock()
@@ -278,8 +280,8 @@ def test_list_tickers_falls_back_to_moex_when_md_raises() -> None:
     out = fl.list_tickers()
 
     assert out == ["MOEX_T1", "MOEX_T2"]
-    assert fl.stats["tinkoff_grpc"]["error"] == 1
     assert fl.stats["tinkoff_md"]["error"] == 1
+    assert fl.stats["tinkoff_grpc"]["error"] == 1
     assert fl.stats["moex_iss"]["ok"] == 1
 
 
@@ -299,17 +301,17 @@ def test_list_tickers_returns_empty_when_all_sources_fail() -> None:
 
     assert out == []
     # Every source must be marked as errored.
-    assert fl.stats["tinkoff_grpc"]["error"] == 1
     assert fl.stats["tinkoff_md"]["error"] == 1
+    assert fl.stats["tinkoff_grpc"]["error"] == 1
     assert fl.stats["moex_iss"]["error"] == 1
 
 
-def test_list_tickers_full_chain_grpc_returns_empty_then_md_empty_then_moex_empty() -> None:
+def test_list_tickers_full_chain_md_empty_then_grpc_empty_then_moex_empty() -> None:
     """All three sources return [] (not raise, just empty). Returns [].
 
     This is the path that triggers rc=3 NO_UNIVERSE without any error
     counters being incremented — every source reports ``fallback`` (zero
-    results) rather than ``error`` (exception).
+    results) rather than ``error`` (exception). Order is MD → gRPC → MOEX.
     """
     moex = MagicMock()
     moex.list_tickers.return_value = []
@@ -323,8 +325,8 @@ def test_list_tickers_full_chain_grpc_returns_empty_then_md_empty_then_moex_empt
 
     assert out == []
     # Each source reports fallback (zero results), NOT error (exception).
-    assert fl.stats["tinkoff_grpc"]["fallback"] == 1
     assert fl.stats["tinkoff_md"]["fallback"] == 1
+    assert fl.stats["tinkoff_grpc"]["fallback"] == 1
     assert fl.stats["moex_iss"]["fallback"] == 1
 
 
