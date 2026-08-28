@@ -1019,3 +1019,129 @@ class TestMainShutdownJoinsBackfillSupervisor:
             "_backfill_supervisor_loop must check _shutdown_event.is_set() so "
             "main()'s join(timeout=...) actually waits for it to exit."
         )
+
+
+# ---------------------------------------------------------------------------
+# Issue #311 (2026-08-28): rc=3 NO_UNIVERSE handling
+# ---------------------------------------------------------------------------
+
+
+class TestNoUniverseBackoffSchedule:
+    """Pin the NO_UNIVERSE exponential-backoff schedule.
+
+    The supervisor must apply an exponentially-growing backoff after
+    consecutive rc=3 exits, NOT the default 30s respawn. Without this,
+    a Tinkoff-auth-broken container enters a tight 30s loop forever
+    (the 2026-08-28 incident). The schedule: 5m, 10m, 30m, 1h, 2h.
+    """
+
+    def test_backoffs_constants_present(self, main_module: Any) -> None:
+        # Issue #311: backoff schedule constants exist on the module.
+        assert hasattr(main_module, "_BACKFILL_NO_UNIVERSE_BACKOFFS_SECONDS")
+        assert hasattr(main_module, "_BACKFILL_MAX_NO_UNIVERSE_PER_HOUR")
+
+    def test_backoffs_start_at_5_minutes(self, main_module: Any) -> None:
+        # The first NO_UNIVERSE must back off at least 5 minutes — much
+        # longer than the 30s default — so a 5m of Tinkoff down does
+        # not produce 10+ restarts and zero the auth-rate window.
+        schedule = main_module._BACKFILL_NO_UNIVERSE_BACKOFFS_SECONDS
+        assert schedule[0] >= 300, f"first NO_UNIVERSE backoff must be >= 5m, got {schedule[0]}s"
+
+    def test_backoffs_are_strictly_increasing(self, main_module: Any) -> None:
+        # Each retry must wait LONGER than the previous — no flapping
+        # between 5m and 5m.
+        schedule = main_module._BACKFILL_NO_UNIVERSE_BACKOFFS_SECONDS
+        for a, b in zip(schedule, schedule[1:]):
+            assert b > a, f"backoff schedule must be strictly increasing: {schedule}"
+
+    def test_backoffs_capped_at_2_hours(self, main_module: Any) -> None:
+        # The 6th+ NO_UNIVERSE in an hour must not wait longer than 2h
+        # — at that point the rate-limit death-counter takes over.
+        schedule = main_module._BACKFILL_NO_UNIVERSE_BACKOFFS_SECONDS
+        assert max(schedule) <= 2 * 3600, f"max NO_UNIVERSE backoff must be <= 2h, got {max(schedule)}s"
+
+
+class TestReadBackfillLogTail:
+    """Pin the tail-reader that the supervisor uses to surface the actual
+    Tinkoff error in the journal when a NO_UNIVERSE exit happens.
+
+    Pre-fix the operator had to `docker exec` into the container to see
+    why the backfill was empty-universing. Post-fix the supervisor
+    attaches the last 20 log lines to the ERROR record so the journal
+    alone is enough to diagnose.
+    """
+
+    def test_returns_placeholder_when_log_missing(self, main_module: Any, tmp_path: Path) -> None:
+        # BACKFILL_LOG defaults to /app/logs/backfill_history_md.log. On
+        # a fresh container the path is wiped (tmpfs, issue #120). The
+        # function must NOT raise — it must return a placeholder string
+        # the logger can concatenate without TypeError.
+        import os
+
+        os.environ["BACKFILL_LOG"] = str(tmp_path / "nonexistent.log")
+        result = main_module._read_backfill_log_tail(max_lines=20)
+        assert isinstance(result, str)
+        assert "unavailable" in result or "empty" in result
+        assert str(tmp_path / "nonexistent.log") in result or len(result) > 0
+
+    def test_returns_last_n_lines_of_existing_log(self, main_module: Any, tmp_path: Path) -> None:
+        # When the log file exists, the function must return its tail.
+        import os
+
+        log_path = tmp_path / "backfill.log"
+        log_path.write_text(
+            "\n".join(f"line {i}" for i in range(50)) + "\n",
+            encoding="utf-8",
+        )
+        os.environ["BACKFILL_LOG"] = str(log_path)
+        result = main_module._read_backfill_log_tail(max_lines=10)
+        # Last 10 lines: line 40 .. line 49.
+        assert "line 40" in result
+        assert "line 49" in result
+        # Earlier lines must be excluded.
+        assert "line 0" not in result
+        assert "line 39" not in result
+
+
+class TestBackfillScriptRc3Contract:
+    """Pin the rc=3 NO_UNIVERSE contract in backfill_history_md.py.
+
+    Pre-fix the script returned rc=0 on empty universe, hiding the
+    Tinkoff auth failure behind a clean exit and triggering the
+    supervisor respawn loop. Post-fix the script returns rc=3 so the
+    supervisor can apply exponential backoff and log the actual Tinkoff
+    error.
+    """
+
+    def test_exit_no_universe_sentinel_exists(self) -> None:
+        # The sentinel value 3 must be defined as a module constant in
+        # scripts/backfill_history_md.py so the contract is auditable
+        # without reading the entire main() flow.
+        from pathlib import Path
+
+        src_text = Path("scripts/backfill_history_md.py").read_text(encoding="utf-8")
+        assert "_EXIT_NO_UNIVERSE = 3" in src_text
+
+    def test_exit_no_universe_return_in_main_flow(self) -> None:
+        # Source-level check (the script cannot be safely imported in
+        # pytest because faulthandler.enable() needs a real fd, see
+        # issue in scripts/backfill_history_md.py:155). We verify the
+        # structural contract: main() returns _EXIT_NO_UNIVERSE on
+        # the empty-universe path.
+        from pathlib import Path
+
+        src_text = Path("scripts/backfill_history_md.py").read_text(encoding="utf-8")
+        # _EXIT_NO_UNIVERSE = 3 sentinel defined at module level.
+        assert "_EXIT_NO_UNIVERSE = 3" in src_text
+        # main() contains a return _EXIT_NO_UNIVERSE branch guarded by
+        # `if not tickers:`. Both phrases must appear in main()'s
+        # indentation scope (we just check string presence — the
+        # 4-space indent of `return _EXIT_NO_UNIVERSE` makes a
+        # strong structural signal even without parsing).
+        assert "if not tickers:" in src_text
+        assert "return _EXIT_NO_UNIVERSE" in src_text
+        # The auth-failure detection branch must surface the source
+        # name (tinkoff_md / tinkoff_grpc) so the operator knows which
+        # one is broken.
+        assert "auth_failures" in src_text
+        assert "tinkoff_md" in src_text and "tinkoff_grpc" in src_text

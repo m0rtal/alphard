@@ -205,6 +205,17 @@ def _alarm_handler(signum: int, frame: object) -> None:
 # on a doomed loop) but the threshold was wrong.
 _CIRCUIT_BREAKER_THRESHOLD = 50  # 2026-08-19: raised from 5 (user feedback)
 
+# Exit-code contract for the backfill supervisor (see src/main.py
+# _backfill_supervisor_loop for the response). The default of 0 was a
+# false positive on "no tickers to process" (operator forgetting to
+# rotate Tinkoff token, or Tinkoff returning UNAUTHENTICATED on every
+# Shares.list_shares_* call): the supervisor saw rc=0 and respawned in a
+# tight 30s loop forever, hiding the actual Tinkoff auth failure behind
+# /app/logs/backfill_history_md.log (tmpfs, wiped on container restart).
+# Now rc=3 = "no usable universe" so the supervisor can back off
+# exponentially and surface the failure to journal.
+_EXIT_NO_UNIVERSE = 3  # 2026-08-28, issue #311: empty universe ≠ success
+
 # Hard per-ticker deadline. If _backfill_one() doesn't return within this
 # many seconds, the heartbeating watchdog inside it raises _LoaderTimeout
 # and the run moves on to the next ticker. SBER + 9 years of minute bars
@@ -669,6 +680,40 @@ def main() -> int:
     try:
         tickers, universe_metas_map = _resolve_universe(loader, args.classes, args.limit)
         logger.info(f"=== Backfill (fallback chain md → grpc → moex): {len(tickers)} tickers, {start} → {end} ===")
+
+        # 2026-08-28 / issue #311: distinguish "no tickers discovered" from
+        # "all tickers processed". The previous behaviour returned rc=0
+        # in both cases; the supervisor then respawned in a 30s loop
+        # because rc=0 is treated as a clean exit, never crashing. The
+        # user-visible symptom was "backfill never progresses" with zero
+        # diagnostics. We now exit rc=3 so the supervisor can apply
+        # exponential backoff and surface the auth failure.
+        if not tickers:
+            loader_stats = loader.stats if isinstance(loader, FallbackDataLoader) else None
+            # Detect persistent auth failure: every source UNAUTHENTICATED
+            # means Tinkoff token is dead. Surface that explicitly so the
+            # operator knows to rotate it.
+            auth_failures = []
+            if loader_stats:
+                for src_name in ("tinkoff_md", "tinkoff_grpc"):
+                    if loader_stats[src_name]["error"] > 0 and loader_stats[src_name]["ok"] == 0:
+                        auth_failures.append(src_name)
+            if auth_failures:
+                logger.error(
+                    f"NO_UNIVERSE: every Tinkoff source failed with auth/network "
+                    f"errors ({', '.join(auth_failures)}). Tinkoff token in env "
+                    f"is likely dead or rate-limit-banned. Rotate TINKOFF_SANDBOX_TOKEN "
+                    f"or TINKOFF_REAL_TOKEN in /root/.env and restart the alphard-bot "
+                    f"container. Exiting rc=3 to signal supervisor for backoff."
+                )
+            else:
+                logger.error(
+                    "NO_UNIVERSE: ticker discovery returned 0 tickers. This is "
+                    "usually a Tinkoff API transient failure (rate-limit, network). "
+                    "Exiting rc=3 for supervisor backoff."
+                )
+            store.close()
+            return _EXIT_NO_UNIVERSE
 
         # BUGFIX (2026-08-18 / Phase 1.6 audit): upsert ticker_universe rows
         # BEFORE we try to write any ohlcv_daily bars. The FK

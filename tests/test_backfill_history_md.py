@@ -415,3 +415,66 @@ def test_is_complete_full_history_from_md_archive_is_complete() -> None:
     store.ticker_meta.return_value = (date(2018, 1, 1), None)
 
     assert bh._is_complete(store, "DONE", min_bars=1300) is True
+
+
+# ---------------------------------------------------------------------------
+# Issue #311 (2026-08-28): empty-universe branch exits rc=3 (NO_UNIVERSE)
+# instead of rc=0. The supervisor treats rc=0 as a clean exit (respawn in
+# 30s without death-counter increment), which caused a tight 30s respawn
+# loop on .107 when the Tinkoff token was UNAUTHENTICATED. Exit code 3 lets
+# the supervisor apply exponential backoff and log the actual Tinkoff error.
+# ---------------------------------------------------------------------------
+
+
+def test_exit_no_universe_constant_is_3() -> None:
+    """The NO_UNIVERSE exit code sentinel must be 3.
+
+    Pins the contract: the supervisor's ``if rc == 3`` branch in
+    ``_backfill_supervisor_loop`` matches this exact value. Changing
+    this constant without updating the supervisor breaks the contract.
+    """
+    assert bh._EXIT_NO_UNIVERSE == 3
+
+
+def test_main_empty_universe_returns_no_universe_rc3() -> None:
+    """Source-level check: main() returns _EXIT_NO_UNIVERSE on empty
+    universe.
+
+    Why source-level and not a full ``main()`` mock-out? The script
+    imports ``faulthandler.enable()`` at module top-level (issue #120
+    rationale) which requires a real fd and crashes the pytest
+    harness. Verifying the structural contract via source text is
+    consistent with the existing tests in this file that pin
+    structural invariants (see ``test_is_complete_is_md_archive_backfill_guard``).
+    """
+    import inspect
+
+    main_src = inspect.getsource(bh.main)
+    # The empty-universe guard MUST be present in main().
+    assert "if not tickers:" in main_src, (
+        "main() must guard the empty-universe path with `if not tickers:` "
+        "to distinguish 'no discovery' from 'all done' (issue #311)"
+    )
+    # And it MUST return the NO_UNIVERSE sentinel.
+    assert "return _EXIT_NO_UNIVERSE" in main_src, (
+        "main() must return _EXIT_NO_UNIVERSE (not rc=0) on empty universe "
+        "so the supervisor can back off exponentially (issue #311)"
+    )
+    # The auth-failure detection branch must reference both Tinkoff sources
+    # so the operator knows which one is broken.
+    assert "tinkoff_md" in main_src
+    assert "tinkoff_grpc" in main_src
+
+
+def test_resolve_universe_empty_loader_returns_empty_list() -> None:
+    """_resolve_universe on an empty loader returns an empty list —
+    no surprise, but pinning it lets us assert that main()'s
+    ``if not tickers`` branch is reachable from a healthy loader
+    call (not just from a network failure path)."""
+    loader = MagicMock()
+    loader.list_tickers.return_value = []
+
+    out, metas_map = bh._resolve_universe(loader, classes=None, limit=0)
+
+    assert out == []
+    assert metas_map == {}

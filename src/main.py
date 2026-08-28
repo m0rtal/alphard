@@ -150,6 +150,19 @@ _BACKFILL_SCRIPT_ARGS: tuple[str, ...] = (
 _BACKFILL_RESPAWN_BACKOFF_SECONDS = 30
 _BACKFILL_MAX_RESPAWNS_PER_HOUR = 10  # >10 deaths/hour = fatal: stop the loop
 
+# Issue #311 (2026-08-28): rc=3 means "no usable universe" (Tinkoff auth
+# dead, transient API failure, etc.). The supervisor used to treat rc=3
+# the same as rc=0 (clean exit → 30s respawn) because the carve-out in
+# PR #57 explicitly excluded rc=0-style "nothing to do" from the death
+# counter. But that carve-out was for "universe pass finished with no
+# writes" on a HEALTHY universe (all tickers already complete), NOT for
+# "Tinkoff auth is broken and we discovered 0 tickers". Distinguish:
+#  - rc=0 + ticker_universe had >= 1 ticker that was already complete: clean
+#  - rc=3: NO_UNIVERSE = persistent auth/network issue → exponential backoff
+# The exponential backoff goes 5m, 10m, 30m, 1h, 2h, capped at 2h.
+_BACKFILL_NO_UNIVERSE_BACKOFFS_SECONDS = (300, 600, 1800, 3600, 7200)
+_BACKFILL_MAX_NO_UNIVERSE_PER_HOUR = 3  # 3 NO_UNIVERSE in 1h = stop the loop, Docker restart
+
 # Module-level logger so _spawn_backfill can log without depending on
 # main() having called logging.basicConfig() yet.
 _supervisor_logger = logging.getLogger("alphard.backfill_supervisor")
@@ -188,6 +201,29 @@ def _spawn_backfill() -> int:
     return proc.pid
 
 
+def _read_backfill_log_tail(max_lines: int = 20) -> str:
+    """Return the last ``max_lines`` of /app/logs/backfill_history_md.log.
+
+    The backfill subprocess writes to this log via RotatingFileHandler
+    (issue #120). On rc=3 NO_UNIVERSE the supervisor attaches the tail
+    to the journal entry so the operator can see the actual Tinkoff
+    error without needing shell access. Returns a placeholder string
+    if the file is missing (tmpfs wiped on container restart) or
+    unreadable — never raises, never returns None, so the supervisor
+    logger can concatenate the result unconditionally.
+    """
+    log_path = os.environ.get("BACKFILL_LOG", "/app/logs/backfill_history_md.log")
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        return f"<BACKFILL_LOG={log_path} unavailable: file missing or unreadable>"
+    if not lines:
+        return f"<BACKFILL_LOG={log_path} is empty>"
+    tail = lines[-max_lines:]
+    return "".join(tail).rstrip()
+
+
 def _backfill_supervisor_loop() -> None:
     """Supervise the backfill daemon: waitpid, respawn on death, back off.
 
@@ -203,10 +239,24 @@ def _backfill_supervisor_loop() -> None:
     the invariant hardening (``rc`` is always bound before use, even
     under ``python -O``).
 
+    Special case for ``rc == 3`` (NO_UNIVERSE, introduced in PR fixing
+    issue #311, 2026-08-28): the backfill script exited cleanly but with
+    no tickers discovered — almost always because the Tinkoff token is
+    UNAUTHENTICATED or rate-limit-banned. We treat it like a crash (rate
+    limit counts) and apply **exponential backoff** so we do not hammer
+    the Tinkoff API with a 30s tight loop while the operator rotates
+    the token. The first NO_UNIVERSE waits 5m, second 10m, third 30m,
+    fourth 1h, fifth+ 2h.
+
     On excessive CRASHES (>10/hour) it logs CRITICAL and exits non-zero
     so Docker restart kicks in with fresh state.
     """
     death_timestamps: list[float] = []
+    # Issue #311: index into _BACKFILL_NO_UNIVERSE_BACKOFFS_SECONDS for
+    # exponential backoff after consecutive rc=3 (NO_UNIVERSE) exits.
+    # Reset to 0 on any clean rc=0 exit (i.e. the universe became
+    # available again and backfill completed normally).
+    no_universe_backoff_index: int = 0
     while not _shutdown_event.is_set():
         pid = _spawn_backfill()
         # Default to rc=0 so every exit path leaves `rc` bound. This
@@ -234,10 +284,47 @@ def _backfill_supervisor_loop() -> None:
                 break
             if waited_pid == pid:
                 rc = os.waitstatus_to_exitcode(status) if hasattr(os, "waitstatus_to_exitcode") else (status >> 8)
-                _supervisor_logger.warning(
-                    f"_backfill_supervisor_loop: child pid={pid} exited rc={rc}; "
-                    f"respawning in {_BACKFILL_RESPAWN_BACKOFF_SECONDS}s"
-                )
+                # Issue #311: rc=3 (NO_UNIVERSE) means backfill discovered
+                # 0 tickers — almost always a Tinkoff auth failure. Apply
+                # exponential backoff AND log the last lines of the
+                # child's log so the operator sees the actual Tinkoff
+                # API error without needing shell access. Also reset the
+                # backoff index on any clean exit (universe became
+                # available again).
+                if rc == 3:
+                    # Issue #311: exponential backoff for NO_UNIVERSE.
+                    # 5m, 10m, 30m, 1h, 2h, capped at 2h.
+                    backoff_secs = _BACKFILL_NO_UNIVERSE_BACKOFFS_SECONDS[
+                        min(no_universe_backoff_index, len(_BACKFILL_NO_UNIVERSE_BACKOFFS_SECONDS) - 1)
+                    ]
+                    no_universe_backoff_index = min(
+                        no_universe_backoff_index + 1,
+                        len(_BACKFILL_NO_UNIVERSE_BACKOFFS_SECONDS) - 1,
+                    )
+                    _log_tail = _read_backfill_log_tail(max_lines=20)
+                    _supervisor_logger.error(
+                        f"_backfill_supervisor_loop: child pid={pid} exited rc=3 "
+                        f"(NO_UNIVERSE) — Tinkoff auth/network likely broken. "
+                        f"Backing off {backoff_secs}s (next attempt #{no_universe_backoff_index + 1}). "
+                        f"Backfill log tail:\n{_log_tail}"
+                    )
+                    # rc=3 IS a death for rate-limit purposes: we want
+                    # persistent Tinkoff auth failures to eventually trip
+                    # the >10/hour cap and restart the container with
+                    # fresh state. So we count it like a regular crash.
+                    now = time.monotonic()
+                    death_timestamps.append(now)
+                elif rc == 0:
+                    no_universe_backoff_index = 0
+                    _supervisor_logger.warning(
+                        f"_backfill_supervisor_loop: child pid={pid} exited rc=0; "
+                        f"respawning in {_BACKFILL_RESPAWN_BACKOFF_SECONDS}s"
+                    )
+                else:
+                    _supervisor_logger.warning(
+                        f"_backfill_supervisor_loop: child pid={pid} exited rc={rc}; "
+                        f"respawning in {_BACKFILL_RESPAWN_BACKOFF_SECONDS}s"
+                    )
                 break
             # Sleep interruptibly so shutdown is responsive.
             _sleep_interruptible(5)
@@ -248,8 +335,14 @@ def _backfill_supervisor_loop() -> None:
             except ProcessLookupError:
                 pass
             break
-        # Backoff before respawn.
-        _sleep_interruptible(_BACKFILL_RESPAWN_BACKOFF_SECONDS)
+        # Backoff before respawn. Default 30s for clean exits and ordinary
+        # crashes. Extended to backoff_secs for rc=3 NO_UNIVERSE (set
+        # right before the break) so we don't hammer Tinkoff with a
+        # 30s tight loop when the auth token is dead.
+        if rc == 3:
+            _sleep_interruptible(backoff_secs)
+        else:
+            _sleep_interruptible(_BACKFILL_RESPAWN_BACKOFF_SECONDS)
         # Prune `death_timestamps` on EVERY iteration (cheap when empty,
         # bounded when not) so the list cannot grow unbounded on long
         # stretches of clean exits. Only APPEND on crashes — clean exits
@@ -259,6 +352,13 @@ def _backfill_supervisor_loop() -> None:
         # 30s respawn cadence (≈1M/year, ≈28 MB/year).
         now = time.monotonic()
         death_timestamps = [t for t in death_timestamps if now - t < 3600]
+        # Issue #311: reset no_universe_backoff_index after an hour of
+        # silence (i.e. when death_timestamps is empty AND no rc=3 has
+        # been seen in the last hour). This lets the backoff schedule
+        # reset automatically if the operator fixes the Tinkoff token
+        # mid-cycle without a container restart.
+        if not death_timestamps:
+            no_universe_backoff_index = 0
         # Rate-limit: count ONLY CRASHES (rc != 0) in the last hour. The
         # code-path producing rc=0 is: (a) the ChildProcessError branch
         # above (default), (b) a clean backfill finish — empty sandbox
