@@ -164,6 +164,7 @@ from src.data.tinkoff_md_loader import TinkoffInvestMDDataLoader  # noqa: E402
 from src.data.tinkoff_loader import TinkoffInvestDataLoader  # noqa: E402
 from src.data.moex_loader import MOEXDataLoader  # noqa: E402
 from src.data.fallback_loader import FallbackDataLoader  # noqa: E402
+from src.data.loader import LoaderError  # noqa: E402
 from src.data.models import TickerMeta  # noqa: E402
 from typing import Any  # noqa: E402
 
@@ -272,6 +273,7 @@ def _resolve_universe(
     out of ``tinkoff_md`` per PR #321 and aborts the backfill via the
     caller (see :func:`_resolve_universe` and supervisor log).
     """
+    metas: list[Any] = []
     try:
         metas = loader.tinkoff_md.list_tickers_with_figi()
     except Exception as exc:  # noqa: BLE001
@@ -279,9 +281,14 @@ def _resolve_universe(
             f"_resolve_universe: tinkoff_md.list_tickers_with_figi() failed: "
             f"{type(exc).__name__}: {exc}; falling back to broker-chain loader.list_tickers()"
         )
+    if not metas:
+        logger.warning(
+            "_resolve_universe: direct tinkoff_md yielded 0 tickers; "
+            "falling back to broker-chain loader.list_tickers()"
+        )
         metas = loader.list_tickers()
-        if not metas:
-            raise
+    if not metas:
+        raise LoaderError("_resolve_universe: universe empty from both direct tinkoff_md " "and the fallback chain")
     if classes:
         classes_upper = {c.upper() for c in classes}
         metas = [m for m in metas if (m.class_code or "").upper() in classes_upper]
@@ -289,9 +296,7 @@ def _resolve_universe(
         metas = metas[:limit]
     tickers = [m.ticker for m in metas]
     metas_map = {m.ticker: m for m in metas}
-    logger.info(
-        f"Universe: {len(tickers)} tickers (classes={classes or 'ALL'}, limit={limit})"
-    )
+    logger.info(f"Universe: {len(tickers)} tickers (classes={classes or 'ALL'}, limit={limit})")
     return tickers, metas_map
 
 

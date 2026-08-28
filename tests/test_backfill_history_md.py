@@ -103,18 +103,61 @@ def test_resolve_universe_md_failure_falls_back_to_loader_chain() -> None:
 
 def test_resolve_universe_md_failure_and_empty_chain_raises() -> None:
     """When both tinkoff_md AND the chain return empty, the resolver must
-    propagate so the supervisor exits with rc != 0 and the operator sees
-    a real signal rather than a 0-ticker backfill.
+    raise a clear LoaderError so the supervisor exits with rc != 0 and the
+    operator sees a real signal rather than a 0-ticker backfill. (Pre-#326
+    the bare ``raise`` re-raised the transport error — review cycle101
+    noted that hides the actual "universe empty" failure mode.)
     """
     import pytest
+
+    from src.data.loader import LoaderError
 
     loader = MagicMock()
     loader.tinkoff_md.list_tickers_with_figi.side_effect = RuntimeError("broker down")
     loader.list_tickers.return_value = []
 
-    # Both raised AND empty chain → raises RuntimeError (re-raised by branch)
-    with pytest.raises(RuntimeError, match="broker down"):
+    # MD raised AND chain empty → LoaderError, NOT the transport error.
+    with pytest.raises(LoaderError, match="universe empty"):
         bh._resolve_universe(loader, classes=None, limit=0)
+
+
+def test_resolve_universe_empty_md_falls_through_to_chain() -> None:
+    """Regression (cycle101): when tinkoff_md.list_tickers_with_figi()
+    returns successfully but with an EMPTY list (e.g. partial/degraded
+    response, see issue #319 title), the resolver must fall through to
+    ``loader.list_tickers()`` instead of silently producing a 0-ticker
+    universe. Pre-#326 the chain was only consulted on raise, not on
+    empty-return — exactly the failure mode issue #319 was filed for.
+    """
+    chain_metas = [MagicMock(ticker="SBER", class_code="TQBR")]
+    loader = MagicMock()
+    loader.tinkoff_md.list_tickers_with_figi.return_value = []  # success, empty
+    loader.list_tickers.return_value = chain_metas
+
+    out, _metas = bh._resolve_universe(loader, classes=None, limit=0)
+
+    assert out == ["SBER"]
+    loader.tinkoff_md.list_tickers_with_figi.assert_called_once()
+    loader.list_tickers.assert_called_once()
+
+
+def test_resolve_universe_empty_md_and_empty_chain_raises() -> None:
+    """Regression (cycle101): both the direct MD call AND the chain
+    return empty → raise LoaderError with a clear message. The supervisor
+    sees rc != 0 and the operator gets a real "universe empty" signal.
+    """
+    import pytest
+
+    from src.data.loader import LoaderError
+
+    loader = MagicMock()
+    loader.tinkoff_md.list_tickers_with_figi.return_value = []  # success, empty
+    loader.list_tickers.return_value = []
+
+    with pytest.raises(LoaderError, match="universe empty"):
+        bh._resolve_universe(loader, classes=None, limit=0)
+    loader.tinkoff_md.list_tickers_with_figi.assert_called_once()
+    loader.list_tickers.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
