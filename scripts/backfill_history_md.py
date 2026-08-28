@@ -261,17 +261,23 @@ def _resolve_universe(
       the FK on ohlcv_daily.ticker requires the row in ticker_universe
       to exist before INSERT).
 
-    Issue #319 / PR followup: the fallback chain in ``loader.list_tickers()``
-    is unreliable for universe discovery — local-stack observation (2026-08-28,
-    token ``<REDACTED-token-prefix-t.55p>`` against the public broker gRPC) showed that the
-    chain produces only the gRPC 252-TQBR subset even though ``tinkoff_md``
-    itself returns 1765 shares + 1502 bonds = 3267 when called directly.
-    Direct call to ``tinkoff_md.list_tickers_with_figi()`` bypasses the
-    chain entirely and returns the full broker-published universe (~3267
-    tickers across TQBR/SPBXM/TQCB/TQOB/TQTE). Fallback on
-    ``LoaderError`` is preserved — a total broker-gRPC outage still raises
-    out of ``tinkoff_md`` per PR #321 and aborts the backfill via the
-    caller (see :func:`_resolve_universe` and supervisor log).
+    Issue #319 / PR #326 followup: the historical chain in
+    ``loader.list_tickers()`` (step 1: ``tinkoff_md.list_tickers()``) was
+    class-code-filtered to TQBR-only in its internal implementation,
+    yielding a 252-ticker universe that masked the broker's full tradable
+    set. ``tinkoff_md.list_tickers_with_figi()`` is the SAME broker gRPC
+    endpoint as the chain — both go through
+    ``TinkoffInvestDataLoader(token=...)`` (see
+    ``src/data/tinkoff_md_loader.py:_fill_universe_cache`` line 306-313)
+    — but ``_fill_universe_cache`` walks every tradable ``class_code``
+    (``_TRADABLE_CLASS_CODES - bonds - ETF``) plus bonds via
+    ``list_bonds()`` and ETFs via ``list_etfs()``, yielding the full
+    ~3267-ticker broker-published universe. PR #321 guarantees that a
+    total broker-gRPC outage raises ``LoaderError`` out of
+    ``_fill_universe_cache`` (not silently returns ``[]``), and the
+    ``try/except`` below now falls back to the chain on BOTH raise AND
+    empty-return, raising a clear ``LoaderError`` if both are empty
+    (cycle101 review).
     """
     metas: list[Any] = []
     try:
