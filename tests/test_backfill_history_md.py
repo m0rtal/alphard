@@ -32,11 +32,16 @@ def test_resolve_universe_no_class_filter_returns_everything() -> None:
     fake_etfs = [MagicMock(ticker="FXUS", class_code="TQTE")]
 
     loader = MagicMock()
-    loader.list_tickers.return_value = fake_tqbr + fake_spbxm + fake_bonds + fake_etfs
+    loader.tinkoff_md.list_tickers_with_figi.return_value = (
+        fake_tqbr + fake_spbxm + fake_bonds + fake_etfs
+    )
 
     out, _metas = bh._resolve_universe(loader, classes=None, limit=0)
 
     assert out == ["SBER", "GAZP", "AAPL", "RU000A0JX0J3", "FXUS"]
+    # Guard against regression: chain path is NOT used. Direct tinkoff_md call only.
+    loader.list_tickers.assert_not_called()
+    loader.tinkoff_md.list_tickers_with_figi.assert_called_once()
 
 
 def test_resolve_universe_class_filter_case_insensitive() -> None:
@@ -46,7 +51,7 @@ def test_resolve_universe_class_filter_case_insensitive() -> None:
         MagicMock(ticker="AAPL", class_code="SPBXM"),
     ]
     loader = MagicMock()
-    loader.list_tickers.return_value = fake
+    loader.tinkoff_md.list_tickers_with_figi.return_value = fake
 
     upper, _ = bh._resolve_universe(loader, classes=["TQBR"], limit=0)
     lower, _ = bh._resolve_universe(loader, classes=["tqbr"], limit=0)
@@ -63,7 +68,7 @@ def test_resolve_universe_class_all_string_does_not_match() -> None:
     """
     fake = [MagicMock(ticker="SBER", class_code="TQBR")]
     loader = MagicMock()
-    loader.list_tickers.return_value = fake
+    loader.tinkoff_md.list_tickers_with_figi.return_value = fake
 
     out, _ = bh._resolve_universe(loader, classes=["ALL"], limit=0)
 
@@ -73,11 +78,45 @@ def test_resolve_universe_class_all_string_does_not_match() -> None:
 def test_resolve_universe_limit_caps_universe_size() -> None:
     fake = [MagicMock(ticker=f"T{i}", class_code="TQBR") for i in range(10)]
     loader = MagicMock()
-    loader.list_tickers.return_value = fake
+    loader.tinkoff_md.list_tickers_with_figi.return_value = fake
 
     out, _ = bh._resolve_universe(loader, classes=None, limit=3)
 
     assert len(out) == 3
+
+
+def test_resolve_universe_md_failure_falls_back_to_loader_chain() -> None:
+    """Regression: if tinkoff_md.list_tickers_with_figi() raises LoaderError,
+    the resolver must fall back to loader.list_tickers() (chain) so the
+    supervisor doesn't loop on a transient broker outage. The contract is:
+    direct MD first, chain only as last resort — match the chain contract
+    on the iter_ohlcv path (PR #321 / issues #319, #152).
+    """
+    loader = MagicMock()
+    chain_metas = [MagicMock(ticker="SBER", class_code="TQBR")]
+    loader.tinkoff_md.list_tickers_with_figi.side_effect = RuntimeError("broker down")
+    loader.list_tickers.return_value = chain_metas
+
+    out, _ = bh._resolve_universe(loader, classes=None, limit=0)
+
+    assert out == ["SBER"]
+    loader.list_tickers.assert_called_once()
+
+
+def test_resolve_universe_md_failure_and_empty_chain_raises() -> None:
+    """When both tinkoff_md AND the chain return empty, the resolver must
+    propagate so the supervisor exits with rc != 0 and the operator sees
+    a real signal rather than a 0-ticker backfill.
+    """
+    import pytest
+
+    loader = MagicMock()
+    loader.tinkoff_md.list_tickers_with_figi.side_effect = RuntimeError("broker down")
+    loader.list_tickers.return_value = []
+
+    # Both raised AND empty chain → raises RuntimeError (re-raised by branch)
+    with pytest.raises(RuntimeError, match="broker down"):
+        bh._resolve_universe(loader, classes=None, limit=0)
 
 
 # ---------------------------------------------------------------------------

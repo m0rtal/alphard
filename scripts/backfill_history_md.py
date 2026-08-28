@@ -259,8 +259,29 @@ def _resolve_universe(
       into ticker_universe BEFORE fetching bars (BUGFIX 2026-08-18:
       the FK on ohlcv_daily.ticker requires the row in ticker_universe
       to exist before INSERT).
+
+    Issue #319 / PR followup: the fallback chain in ``loader.list_tickers()``
+    is unreliable for universe discovery — local-stack observation (2026-08-28,
+    token ``t.55p…AU7uKA`` against the public broker gRPC) showed that the
+    chain produces only the gRPC 252-TQBR subset even though ``tinkoff_md``
+    itself returns 1765 shares + 1502 bonds = 3267 when called directly.
+    Direct call to ``tinkoff_md.list_tickers_with_figi()`` bypasses the
+    chain entirely and returns the full broker-published universe (~3267
+    tickers across TQBR/SPBXM/TQCB/TQOB/TQTE). Fallback on
+    ``LoaderError`` is preserved — a total broker-gRPC outage still raises
+    out of ``tinkoff_md`` per PR #321 and aborts the backfill via the
+    caller (see :func:`_resolve_universe` and supervisor log).
     """
-    metas = loader.list_tickers()
+    try:
+        metas = loader.tinkoff_md.list_tickers_with_figi()
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            f"_resolve_universe: tinkoff_md.list_tickers_with_figi() failed: "
+            f"{type(exc).__name__}: {exc}; falling back to broker-chain loader.list_tickers()"
+        )
+        metas = loader.list_tickers()
+        if not metas:
+            raise
     if classes:
         classes_upper = {c.upper() for c in classes}
         metas = [m for m in metas if (m.class_code or "").upper() in classes_upper]
@@ -268,7 +289,9 @@ def _resolve_universe(
         metas = metas[:limit]
     tickers = [m.ticker for m in metas]
     metas_map = {m.ticker: m for m in metas}
-    logger.info(f"Universe: {len(tickers)} tickers (classes={classes or 'ALL'}, limit={limit})")
+    logger.info(
+        f"Universe: {len(tickers)} tickers (classes={classes or 'ALL'}, limit={limit})"
+    )
     return tickers, metas_map
 
 
