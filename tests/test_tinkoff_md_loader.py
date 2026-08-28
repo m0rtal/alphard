@@ -660,6 +660,166 @@ class TestUniverse:
             assert r is first, "each thread got a distinct list — fill ran more than once"
         assert call_count == 1, f"_fill_universe_cache called {call_count} times, expected 1"
 
+    # -----------------------------------------------------------------------
+    # Issue #319 — auth outage must raise, not return []
+    # -----------------------------------------------------------------------
+
+    def test_universe_raises_when_every_broker_call_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Issue #319: a total broker gRPC auth outage (all of
+        ``list_shares_all`` / ``list_bonds`` / ``list_etfs`` raise) must
+        surface as ``LoaderError`` rather than a silent ``[]``.
+
+        Before the fix, every per-call exception was caught and the
+        function returned an empty list. ``FallbackDataLoader.list_tickers``
+        then took its ``if metas:`` else branch and recorded
+        ``stats["tinkoff_md"]["fallback"] = 1`` — the same stat it
+        records when the source is healthy but legitimately has zero
+        tickers (e.g. a fully-pruned universe). The operator couldn't
+        distinguish an auth outage from a real empty universe, and the
+        chain silently degraded to ``moex_iss`` (TQBR-only) without an
+        actionable signal.
+        """
+        from src.data.loader import LoaderError
+        from src.data.token_bucket import TokenBucket
+
+        monkeypatch.setenv("TINKOFF_SANDBOX_TOKEN", "fake-token-1234567890")
+        loader = TinkoffInvestMDDataLoader(bucket=TokenBucket(rate=1000.0, window_seconds=1.0))
+
+        with patch("src.data.tinkoff_loader.TinkoffInvestDataLoader") as GrpcCls:
+            inst = GrpcCls.return_value
+            err = Exception("UNAUTHENTICATED: broker gRPC token invalid")
+            inst.list_shares_all.side_effect = err
+            inst.list_bonds.side_effect = Exception("UNAUTHENTICATED")
+            inst.list_etfs.side_effect = Exception("UNAUTHENTICATED")
+            # All 7 share class_codes + bonds + etfs raise. We expect a
+            # LoaderError to bubble up — NOT a silent [].
+            with pytest.raises(LoaderError, match="all .* broker calls failed"):
+                loader.list_tickers_with_figi()
+
+    def test_universe_partial_failure_returns_subset_not_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Issue #319 (AC #3): partial failure must NOT regress.
+
+        If only some sub-calls raise (e.g. one class_code rate-limited),
+        the successful subset must still come through and the function
+        must return that subset — not raise. The fix's all-fail guard
+        must trigger ONLY when *every* sub-call failed.
+        """
+        from src.data.token_bucket import TokenBucket
+
+        monkeypatch.setenv("TINKOFF_SANDBOX_TOKEN", "fake-token-1234567890")
+        loader = TinkoffInvestMDDataLoader(bucket=TokenBucket(rate=1000.0, window_seconds=1.0))
+
+        good_tqbr = [
+            TickerMeta(
+                ticker="SBER",
+                figi="BBG004730N88",
+                class_code="TQBR",
+                name="Sber",
+                lot=1,
+                source="tkf",
+            ),
+        ]
+        # _TRADABLE_CLASS_CODES has 10 entries; -2 bonds -1 ETF = 7 share
+        # classes. TQBR is the first after sorted(). list_shares_all is
+        # called once per class; first call returns the good ticker, the
+        # rest raise.
+        side_effects: list[Any] = [good_tqbr] + [RuntimeError("rate") for _ in range(6)]
+        with patch("src.data.tinkoff_loader.TinkoffInvestDataLoader") as GrpcCls:
+            inst = GrpcCls.return_value
+            inst.list_shares_all.side_effect = side_effects
+            inst.list_bonds.side_effect = RuntimeError("rate limit")
+            inst.list_etfs.side_effect = RuntimeError("auth")
+            metas = loader.list_tickers_with_figi()
+        # Only the TQBR success comes through; no exception.
+        tickers = {m.ticker for m in metas}
+        assert tickers == {"SBER"}, f"expected only TQBR success, got {tickers}"
+
+    def test_universe_partial_failure_with_bonds_succeeding(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """All share class_codes raise, but bonds() succeeds — still no raise.
+
+        Edge case for the ``attempts == failures`` guard: the guard
+        counts ``attempts`` and ``failures`` independently, so an
+        ``all-shares-failed-but-bonds-succeeded`` mix returns the bonds
+        without raising.
+        """
+        from src.data.token_bucket import TokenBucket
+
+        monkeypatch.setenv("TINKOFF_SANDBOX_TOKEN", "fake-token-1234567890")
+        loader = TinkoffInvestMDDataLoader(bucket=TokenBucket(rate=1000.0, window_seconds=1.0))
+
+        good_bond = [
+            TickerMeta(
+                ticker="RU000A0ZZZ",
+                figi="BBG00BOND001",
+                class_code="TQOB",
+                name="OFZ",
+                lot=1,
+                source="tkf",
+            ),
+        ]
+        with patch("src.data.tinkoff_loader.TinkoffInvestDataLoader") as GrpcCls:
+            inst = GrpcCls.return_value
+            # All 7 share class_codes raise.
+            inst.list_shares_all.side_effect = RuntimeError("auth")
+            # But bonds() returns a real OFZ.
+            inst.list_bonds.return_value = good_bond
+            inst.list_etfs.side_effect = RuntimeError("auth")
+            metas = loader.list_tickers_with_figi()
+        tickers = {m.ticker for m in metas}
+        assert tickers == {"RU000A0ZZZ"}, f"expected OFZ through despite all-shares-fail, got {tickers}"
+
+    def test_fallback_records_error_not_fallback_on_auth_outage(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Issue #319 (AC #2): ``FallbackDataLoader.list_tickers()``
+        must record ``stats["tinkoff_md"]["error"] == 1`` (not
+        ``["fallback"] == 1``) when ``tinkoff_md._fill_universe_cache``
+        raises, then proceed to the next chain step.
+        """
+        from src.data.fallback_loader import FallbackDataLoader
+        from src.data.loader import LoaderError
+        from src.data.token_bucket import TokenBucket
+
+        monkeypatch.setenv("TINKOFF_SANDBOX_TOKEN", "fake-token-1234567890")
+        md = TinkoffInvestMDDataLoader(bucket=TokenBucket(rate=1000.0, window_seconds=1.0))
+        grpc = MagicMock()
+        grpc.list_tickers.return_value = [
+            TickerMeta(
+                ticker="SBER",
+                figi="BBG004730N88",
+                class_code="TQBR",
+                name="Sber",
+                lot=1,
+                source="tkf",
+            ),
+        ]
+        iss = MagicMock()
+        iss.list_tickers.return_value = [
+            TickerMeta(
+                ticker="GAZP",
+                figi="BBG004730RP0",
+                class_code="TQBR",
+                name="Gazprom",
+                lot=10,
+                source="moex",
+            ),
+        ]
+
+        # tinkoff_md's internal broker gRPC: all calls fail → LoaderError.
+        # We can't patch the loader import from inside tinkoff_md_loader
+        # cleanly here, so monkeypatch ``_fill_universe_cache`` to raise.
+        err = LoaderError("auth outage")
+        monkeypatch.setattr(md, "_fill_universe_cache", MagicMock(side_effect=err))
+        # Also clear the cache so the next call re-invokes the mock.
+        md._universe_cache = None
+
+        fb = FallbackDataLoader(tinkoff_md=md, tinkoff_grpc=grpc, moex_iss=iss)
+        result = fb.list_tickers()
+        # tinkoff_md raised → stats["error"] += 1, NOT stats["fallback"].
+        assert fb.stats["tinkoff_md"]["error"] == 1, f"expected tinkoff_md.error=1 on auth outage, got {fb.stats}"
+        assert fb.stats["tinkoff_md"]["fallback"] == 0, f"expected tinkoff_md.fallback=0 on auth outage, got {fb.stats}"
+        # Chain proceeded to tinkoff_grpc (which returned a ticker).
+        assert fb.stats["tinkoff_grpc"]["ok"] == 1, f"expected tinkoff_grpc.ok=1, got {fb.stats}"
+        assert result and result[0].ticker == "SBER"
+
 
 # ---------------------------------------------------------------------------
 # Single-source-of-truth invariant (issue #189)
