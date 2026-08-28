@@ -262,7 +262,7 @@ def _resolve_universe(
 
     Issue #319 / PR followup: the fallback chain in ``loader.list_tickers()``
     is unreliable for universe discovery — local-stack observation (2026-08-28,
-    token ``t.55p…AU7uKA`` against the public broker gRPC) showed that the
+    token ``<REDACTED-token-prefix-t.55p>`` against the public broker gRPC) showed that the
     chain produces only the gRPC 252-TQBR subset even though ``tinkoff_md``
     itself returns 1765 shares + 1502 bonds = 3267 when called directly.
     Direct call to ``tinkoff_md.list_tickers_with_figi()`` bypasses the
