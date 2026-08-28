@@ -104,34 +104,24 @@ class FallbackDataLoader:
         though the broker gRPC endpoint still served 1927+ MOEX shares.
         That turned the supervisor into a 30s tight respawn loop.
 
-        User-correction: the correct order is gRPC FIRST (real token,
-        broker live-data endpoint, no separate auth), then tinkoff_md
-        (history-data archive, full 9y coverage including delisted), then
-        MOEX ISS (no auth, 1825d cap, last resort fallback). Each source
-        is independently guarded so a 401 on one does not kill the
-        discovery — we always try the next source on the chain. The first
-        non-empty result wins.
-        """
-        # 1. tinkoff_grpc (real-app token, broker live-data, auth works
-        #    with the SAME token used by daily_sync and chart_data).
-        try:
-            metas = self.tinkoff_grpc.list_tickers()
-            if metas:
-                self._stats["tinkoff_grpc"]["ok"] += 1
-                logger.info(f"FallbackDataLoader.list_tickers: gRPC OK ({len(metas)} tickers)")
-                return list(metas)
-            else:
-                self._stats["tinkoff_grpc"]["fallback"] += 1
-                logger.warning("FallbackDataLoader.list_tickers: gRPC returned 0 tickers, trying tinkoff_md")
-        except Exception as e:
-            self._stats["tinkoff_grpc"]["error"] += 1
-            logger.warning(
-                f"FallbackDataLoader.list_tickers: tinkoff_grpc failed ({type(e).__name__}: {e}); trying tinkoff_md"
-            )
+        User-correction (issue #316, 2026-08-28): the correct order is
+        tinkoff_md FIRST (history-data archive, covers all 4 MOEX classes
+        = ~3259 tickers including SPBXM, TQBR, TQCB, TQOB), then tinkoff_grpc
+        (broker live-data, TQBR-class only = 252 tickers), then MOEX ISS
+        (no auth, 1825d cap, last resort). Each source is independently
+        guarded so a 401 on one does not kill the discovery — we always
+        try the next source on the chain. The first non-empty result wins.
 
-        # 2. tinkoff_md (history-data archive; richer coverage including
-        #    delisted tickers, but separate auth — Tinkoff often rotates
-        #    this token independently of the broker gRPC token).
+        Why MD first not gRPC: tinkoff_md.list_tickers_with_figi() returns
+        ~3259 tickers (ALL MOEX classes incl. SPBXM, TQCB, TQOB, TQBR);
+        tinkoff_grpc.list_tickers() returns only TQBR (~252). If gRPC wins,
+        we lose ~3000 tickers from the universe.
+        """
+        # 1. tinkoff_md (history-data archive; covers all 4 MOEX classes
+        #    = SPBXM + TQBR + TQCB + TQOB = ~3259 tickers including delisted).
+        #    Separate auth from broker gRPC; Tinkoff often rotates this
+        #    token independently. With the REAL token (shared from gRPC
+        #    loader since PR #313) this returns the full universe.
         try:
             metas = self.tinkoff_md.list_tickers_with_figi()
             if metas:
@@ -140,11 +130,29 @@ class FallbackDataLoader:
                 return list(metas)
             else:
                 self._stats["tinkoff_md"]["fallback"] += 1
-                logger.warning("FallbackDataLoader.list_tickers: tinkoff_md returned 0 tickers, trying moex_iss")
+                logger.warning("FallbackDataLoader.list_tickers: tinkoff_md returned 0 tickers, trying tinkoff_grpc")
         except Exception as e:
             self._stats["tinkoff_md"]["error"] += 1
             logger.warning(
-                f"FallbackDataLoader.list_tickers: tinkoff_md failed ({type(e).__name__}: {e}); trying moex_iss"
+                f"FallbackDataLoader.list_tickers: tinkoff_md failed ({type(e).__name__}: {e}); trying tinkoff_grpc"
+            )
+
+        # 2. tinkoff_grpc (broker live-data, TQBR-class only = ~252 tickers).
+        #    Real-app token, no separate auth — auth works with the SAME
+        #    token used by daily_sync and chart_data.
+        try:
+            metas = self.tinkoff_grpc.list_tickers()
+            if metas:
+                self._stats["tinkoff_grpc"]["ok"] += 1
+                logger.info(f"FallbackDataLoader.list_tickers: tinkoff_grpc OK ({len(metas)} tickers)")
+                return list(metas)
+            else:
+                self._stats["tinkoff_grpc"]["fallback"] += 1
+                logger.warning("FallbackDataLoader.list_tickers: tinkoff_grpc returned 0 tickers, trying moex_iss")
+        except Exception as e:
+            self._stats["tinkoff_grpc"]["error"] += 1
+            logger.warning(
+                f"FallbackDataLoader.list_tickers: tinkoff_grpc failed ({type(e).__name__}: {e}); trying moex_iss"
             )
 
         # 3. moex_iss (no auth, MOEX web endpoint, 1825d lookback cap,
