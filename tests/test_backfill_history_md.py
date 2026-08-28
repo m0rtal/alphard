@@ -32,9 +32,7 @@ def test_resolve_universe_no_class_filter_returns_everything() -> None:
     fake_etfs = [MagicMock(ticker="FXUS", class_code="TQTE")]
 
     loader = MagicMock()
-    loader.tinkoff_md.list_tickers_with_figi.return_value = (
-        fake_tqbr + fake_spbxm + fake_bonds + fake_etfs
-    )
+    loader.tinkoff_md.list_tickers_with_figi.return_value = fake_tqbr + fake_spbxm + fake_bonds + fake_etfs
 
     out, _metas = bh._resolve_universe(loader, classes=None, limit=0)
 
