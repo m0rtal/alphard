@@ -617,9 +617,25 @@ def main() -> int:
     try:
         # Fallback chain: Tinkoff MD (history-data) → Tinkoff gRPC (broker
         # GetCandles) → MOEX ISS. All three wrap behind one iterator.
+        #
+        # Issue #311: BUGFIX (2026-08-28) — ``TinkoffInvestMDDataLoader()``
+        # resolves ``$TINKOFF_SANDBOX_TOKEN`` first (sandbox is the safe
+        # default per docstring). But the SANDBOX token is dead on .107
+        # since the last token rotation (UNAUTHENTICATED 40003 on every
+        # Shares/Bonds/ETFs call). The broker gRPC, on the other hand,
+        # uses ``$TINKOFF_REAL_TOKEN`` (the active token), which DOES work.
+        # Pre-fix the MD loader received SANDBOX via ``args.token or
+        # _resolve_token()``, so list_tickers_with_figi() returned 0 and
+        # every per-ticker history fetch hit UNAUTHENTICATED before falling
+        # through to the broker gRPC fallback (wasting rate-limit budget).
+        # Post-fix we resolve the gRPC loader first, then explicitly pass
+        # ITS token (REAL) to the MD loader so the two endpoints are
+        # consistent inside this backfill run.
+        tinkoff_grpc_loader = TinkoffInvestDataLoader()
+        tinkoff_md_loader = TinkoffInvestMDDataLoader(token=tinkoff_grpc_loader._token)
         loader = FallbackDataLoader(
-            tinkoff_md=TinkoffInvestMDDataLoader(token=args.token),
-            tinkoff_grpc=TinkoffInvestDataLoader(),
+            tinkoff_md=tinkoff_md_loader,
+            tinkoff_grpc=tinkoff_grpc_loader,
             moex_iss=MOEXDataLoader(),
         )
     except Exception as e:

@@ -415,3 +415,44 @@ def test_is_complete_full_history_from_md_archive_is_complete() -> None:
     store.ticker_meta.return_value = (date(2018, 1, 1), None)
 
     assert bh._is_complete(store, "DONE", min_bars=1300) is True
+
+
+# ---------------------------------------------------------------------------
+# Issue #311 (2026-08-28): tinkoff_md loader must share tinkoff_grpc._token
+# ---------------------------------------------------------------------------
+
+
+def test_md_loader_uses_grpc_token_not_args_token() -> None:
+    """Source-level contract check for issue #311.
+
+    ``scripts/backfill_history_md.py`` main() must construct the gRPC
+    loader first, then pass ``tinkoff_grpc_loader._token`` to the MD
+    loader. FAILURE MODE we are guarding against: passing
+    ``args.token or _resolve_token()`` to MD — that resolves to SANDBOX
+    first, which is UNAUTHENTICATED on .107. The grep markers below
+    pin the right construction; if a future refactor reintroduces the
+    SANDBOX bug the test fails immediately.
+    """
+    from pathlib import Path
+
+    src = Path("scripts/backfill_history_md.py").read_text(encoding="utf-8")
+    # gRPC loader constructed first (with no args — defaults to REAL).
+    assert (
+        "tinkoff_grpc_loader = TinkoffInvestDataLoader()" in src
+    ), "main() must construct tinkoff_grpc_loader first (no args → REAL)"
+    # MD loader constructed with gRPC loader's token.
+    assert "TinkoffInvestMDDataLoader(token=tinkoff_grpc_loader._token)" in src, (
+        "TinkoffInvestMDDataLoader() must receive tinkoff_grpc_loader._token "
+        "to share the authenticated token (not args.token which resolves to "
+        "SANDBOX first)"
+    )
+    # The OLD buggy construction must NOT be present.
+    assert "TinkoffInvestMDDataLoader(token=args.token)" not in src, (
+        "TinkoffInvestMDDataLoader(token=args.token) is the bug — args.token "
+        "is None by default, which falls through to $TINKOFF_SANDBOX_TOKEN "
+        "(dead on .107)"
+    )
+    # The MD loader must be passed via ``tinkoff_md=tinkoff_md_loader``
+    # to FallbackDataLoader (not by raw constructor).
+    assert "tinkoff_md=tinkoff_md_loader" in src
+    assert "tinkoff_grpc=tinkoff_grpc_loader" in src

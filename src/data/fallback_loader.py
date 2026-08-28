@@ -96,13 +96,82 @@ class FallbackDataLoader:
     # -- universe --------------------------------------------------------
 
     def list_tickers(self) -> list[Any]:  # noqa: D401
-        """Live universe = full Tinkoff MD universe (already includes
-        shares + bonds + ETFs from gRPC). Used as the primary source
-        for the ticker list; the per-year fallback chain only affects
-        how bars are fetched.
+        """Resolve ticker universe from the FULL fallback chain.
+
+        Issue #311 (2026-08-28): the previous implementation only called
+        ``tinkoff_md.list_tickers_with_figi()``. When Tinkoff history-data
+        auth was broken (UNAUTHENTICATED), this returned 0 tickers even
+        though the broker gRPC endpoint still served 1927+ MOEX shares.
+        That turned the supervisor into a 30s tight respawn loop.
+
+        User-correction: the correct order is gRPC FIRST (real token,
+        broker live-data endpoint, no separate auth), then tinkoff_md
+        (history-data archive, full 9y coverage including delisted), then
+        MOEX ISS (no auth, 1825d cap, last resort fallback). Each source
+        is independently guarded so a 401 on one does not kill the
+        discovery — we always try the next source on the chain. The first
+        non-empty result wins.
         """
-        metas = self.tinkoff_md.list_tickers_with_figi()
-        return list(metas)
+        # 1. tinkoff_grpc (real-app token, broker live-data, auth works
+        #    with the SAME token used by daily_sync and chart_data).
+        try:
+            metas = self.tinkoff_grpc.list_tickers()
+            if metas:
+                self._stats["tinkoff_grpc"]["ok"] += 1
+                logger.info(f"FallbackDataLoader.list_tickers: gRPC OK ({len(metas)} tickers)")
+                return list(metas)
+            else:
+                self._stats["tinkoff_grpc"]["fallback"] += 1
+                logger.warning("FallbackDataLoader.list_tickers: gRPC returned 0 tickers, trying tinkoff_md")
+        except Exception as e:
+            self._stats["tinkoff_grpc"]["error"] += 1
+            logger.warning(
+                f"FallbackDataLoader.list_tickers: tinkoff_grpc failed ({type(e).__name__}: {e}); trying tinkoff_md"
+            )
+
+        # 2. tinkoff_md (history-data archive; richer coverage including
+        #    delisted tickers, but separate auth — Tinkoff often rotates
+        #    this token independently of the broker gRPC token).
+        try:
+            metas = self.tinkoff_md.list_tickers_with_figi()
+            if metas:
+                self._stats["tinkoff_md"]["ok"] += 1
+                logger.info(f"FallbackDataLoader.list_tickers: tinkoff_md OK ({len(metas)} tickers)")
+                return list(metas)
+            else:
+                self._stats["tinkoff_md"]["fallback"] += 1
+                logger.warning("FallbackDataLoader.list_tickers: tinkoff_md returned 0 tickers, trying moex_iss")
+        except Exception as e:
+            self._stats["tinkoff_md"]["error"] += 1
+            logger.warning(
+                f"FallbackDataLoader.list_tickers: tinkoff_md failed ({type(e).__name__}: {e}); trying moex_iss"
+            )
+
+        # 3. moex_iss (no auth, MOEX web endpoint, 1825d lookback cap,
+        #    last resort). Returns the same TickerMeta shape as the
+        #    other two sources — filtered to TQBR by default.
+        try:
+            metas = self.moex_iss.list_tickers()
+            if metas:
+                self._stats["moex_iss"]["ok"] += 1
+                logger.info(f"FallbackDataLoader.list_tickers: moex_iss OK ({len(metas)} tickers)")
+                return list(metas)
+            else:
+                self._stats["moex_iss"]["fallback"] += 1
+                logger.warning("FallbackDataLoader.list_tickers: moex_iss returned 0 tickers")
+        except Exception as e:
+            self._stats["moex_iss"]["error"] += 1
+            logger.warning(f"FallbackDataLoader.list_tickers: moex_iss failed ({type(e).__name__}: {e})")
+
+        # All three sources failed. Return empty list — supervisor treats
+        # this as a clean exit (rc=0) and respawns after 30s; if the
+        # all-sources-fail state persists, the operator should check
+        # per-source stats and Tinkoff token health. PR #312 (closed
+        # without merge) introduced an rc=3 NO_UNIVERSE sentinel; the
+        # data-layer fix in this PR was preferred. The operator will see
+        # the per-source error stats in logs / Prometheus.
+        logger.error("FallbackDataLoader.list_tickers: ALL THREE SOURCES returned 0 tickers or failed")
+        return []
 
     # -- OHLCV ------------------------------------------------------------
 
