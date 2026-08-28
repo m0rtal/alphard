@@ -32,6 +32,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Fixed
 - **`_log_returns` leading-bad bar emits NaN gap** instead of silently-poisoning downstream `cross_source` validation. (Closes #278, #280 — issue first identified in #271 follow-up.)
+- **`backfill_history_md._resolve_universe` calls `tinkoff_md` directly** instead of routing through `FallbackDataLoader.list_tickers()`. The chain returned only the gRPC 252-TQBR subset even when `tinkoff_md` returned the full ~3264-ticker universe (TQBR + SPBXM + TQCB + TQOB) — local smoke 2026-08-28 confirmed 3264 vs 252. Treats "successful-but-empty" direct MD as a fallback signal so the chain IS consulted; raises `LoaderError` if BOTH paths return empty. `iter_ohlcv` keeps the chain (per-ticker-per-year resilience preserved). (Closes #319, #326.)
+- **`test_check_md_links` strips backtick-wrapped inline code spans** before matching — CommonMark says content inside backticks is literal and must not be parsed as a link. Closes the false-positive class on docs that document link syntax (e.g. `` `[text](relative/path.md)` ``). Also handles triple-backtick / triple-tilde fenced code blocks as a free extension. (Closes #324, #325.)
 - **`cross_source` NaN-poison silent-pass on data-glitched bar** — fail-loud instead of fail-silent. (Closes #271, #274.)
 - **`backfill_history_md.py` — drop `--on-empty-only`** (user rejected; conflates row count with MD archive completion). Per-ticker guard remains `_is_complete()` (expected-bars formula for full listed_at..today range, 15% HALTS_PCT slack). After backfill, `daily_sync` is broker-only. (Closes #276, #282 — issue #277 reverted.)
 - **Audit log (`PostgresAuditLog`) — `CREATE SCHEMA` + `close()` now surfaces commit error**; tests verify commit actually persists. (Closes #265, #266, #267, #273.)
@@ -65,19 +67,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 ### Maintenance
 - **Dead code dropped**: `deploy_monitoring.sh` + its tests (ADR-0008), dead `argparse` state in `bake_grafana_env` + dead doc link. (Closes #229.)
 - **`.gitignore` extended** — ignore stray nested clones (e.g. `git clone . alphard/`) to prevent recursive repo corruption. (`b0d71a4`, #242.)
+- **`CHANGELOG.md [Unreleased]` backfilled** — entries for the cycle103 PRs (#319 fix → #321, #320 fix → #322) added to keep the file in sync with `main`. Bundled with a `.gitignore` rule for the local-override `.claude/settings.local.json` (operator convenience, never committed). (PR #323.)
+- **Stale "in flight" note removed** from `CHANGELOG.md` — the referenced PRs (legacy banners #306, `ARCHITECTURE.md` #301, `API.md` #302, `TESTING.md` #303, `TROUBLESHOOTING.md` #304, `DOCS-INDEX.md` + `evidence/README.md` #305, Grafana provisioning #297/#300, `entrypoint.sh` `/root/.env` loop #296) have all landed on `main`. The note no longer reflects reality.
 
 ### Documentation
 - **`CHANGELOG.md`** (this file) — aggregated release view reconstructed from `git log` + per-PR descriptions. Closes #289.
-
-> **Note.** Legacy-banner work on `docs/AUDIT-Phase0.md`,
-> `docs/AUDIT-Phase0-FINAL.md`, `docs/PHASE1-AUDIT-2026-08-17.md`,
-> `docs/PHASE1-6-SERVICE-DIAGRAM.md` is owned by PR #306 (closes #292)
-> — kept out of this PR to avoid branch-hygiene overlap. Likewise
-> `ARCHITECTURE.md` (#285), `API.md` (#286), `TESTING.md` (#287),
-> `TROUBLESHOOTING.md` (#288), `DOCS-INDEX.md` / `evidence/README.md`
-> (#291, #293), Grafana provisioning bind-mount (#297), and the
-> `entrypoint.sh` `/root/.env` source loop (#295) are in flight in
-> their own PRs — they will be added here once those PRs are merged.
 
 ## [0.1.0] — 2026-08-26
 
