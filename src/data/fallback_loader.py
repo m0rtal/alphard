@@ -116,12 +116,53 @@ class FallbackDataLoader:
         ~3259 tickers (ALL MOEX classes incl. SPBXM, TQCB, TQOB, TQBR);
         tinkoff_grpc.list_tickers() returns only TQBR (~252). If gRPC wins,
         we lose ~3000 tickers from the universe.
+
+        Source-independence caveat (issue #319, 2026-08-28): the
+        ``list_tickers`` chain is **not three independent sources** the way
+        the ``iter_ohlcv`` chain is. ``tinkoff_md.list_tickers()`` does
+        NOT call the ``history-data`` HTTP endpoint — the archive exposes
+        no ticker-listing API — so it internally constructs a
+        ``TinkoffInvestDataLoader`` (broker gRPC) and harvests the
+        universe via ``list_shares_all()`` / ``list_bonds()`` /
+        ``list_etfs()`` (see ``src/data/tinkoff_md_loader.py:_fill_universe_cache``).
+        Therefore:
+
+          - Steps 1 + 2 share a single point of failure: the broker gRPC
+            endpoint + its token. A broker gRPC auth outage causes
+            ``tinkoff_md.list_tickers()`` AND ``tinkoff_grpc.list_tickers()``
+            to fail in lockstep. Only ``moex_iss`` is a genuinely
+            independent source for universe discovery.
+          - The only material difference between steps 1 and 2 is
+            **class-code breadth**: ``tinkoff_md`` walks every tradable
+            class (TQBR + SPBXM + TQCB + TQOB + TQTE + ...) — ~3259
+            tickers — while ``tinkoff_grpc`` is hardcoded to TQBR
+            (~252). See the issue #319 PoC for confirmation.
+          - The 252-vs-3259 difference observed in PR #317 is real and
+            reproducible, but its cause is class-code breadth, NOT a
+            different data source or different auth.
+
+        Since issue #319, ``tinkoff_md._fill_universe_cache`` raises
+        ``LoaderError`` (not returns ``[]``) when every sub-call failed.
+        That lets the ``except`` arm below record ``stats["error"] = 1``
+        (truthful: "source raised") instead of ``["fallback"] = 1``
+        (misleading: "source legitimately has no data"), so a broker
+        gRPC outage shows up as an actionable signal in operator logs
+        and Prometheus rather than silently degrading to MOEX ISS.
+
+        The "separate auth from broker gRPC; Tinkoff often rotates this
+        token independently" claim below is correct for ``download_year``
+        / OHLCV (the HTTP archive endpoint has historically accepted a
+        different token from the broker gRPC one) but is **not true**
+        for the universe-discovery path described above. Scope the claim
+        to OHLCV.
         """
-        # 1. tinkoff_md (history-data archive; covers all 4 MOEX classes
-        #    = SPBXM + TQBR + TQCB + TQOB = ~3259 tickers including delisted).
-        #    Separate auth from broker gRPC; Tinkoff often rotates this
-        #    token independently. With the REAL token (shared from gRPC
-        #    loader since PR #313) this returns the full universe.
+        # 1. tinkoff_md (history-data archive for OHLCV; for universe
+        #    discovery it actually delegates to broker gRPC — see caveat
+        #    above and ``src/data/tinkoff_md_loader.py:_fill_universe_cache``).
+        #    For OHLCV this source has historically had a separate auth
+        #    from broker gRPC; Tinkoff has rotated that token independently
+        #    in the past. With the REAL token (shared from gRPC loader
+        #    since PR #313) this returns the full universe.
         try:
             metas = self.tinkoff_md.list_tickers_with_figi()
             if metas:

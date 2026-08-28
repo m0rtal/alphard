@@ -322,30 +322,59 @@ class TinkoffInvestMDDataLoader(DataLoader):
         # automatically — see test_share_class_codes_match_tradable_constant.
         target_classes: tuple[str, ...] = tuple(sorted(_TRADABLE_CLASS_CODES - _BOND_CLASS_CODES - {_ETF_CLASS_CODE}))
         seen: dict[str, TickerMeta] = {}
+        # Issue #319: ``tinkoff_md`` universe discovery is a thin wrapper
+        # around ``TinkoffInvestDataLoader`` (same broker gRPC endpoint +
+        # same token — see ``TinkoffInvestDataLoader(token=self._token)``
+        # above). When ALL sub-calls fail (e.g. broker gRPC auth outage),
+        # we MUST NOT silently return ``[]`` — ``FallbackDataLoader`` would
+        # record ``stats[...]["fallback"] = 1`` (misleading: "source
+        # legitimately has no data") instead of ``["error"] = 1`` ("source
+        # call raised"), and the universe collapses to MOEX ISS without an
+        # actionable signal. Track per-call success/failure counts and
+        # re-raise ``LoaderError`` when every call failed; partial
+        # failures (e.g. only TQBR rate-limited) must STILL return the
+        # successful subset — per-class resilience is preserved.
+        attempts = 0
+        failures = 0
         # 1) Shares per class_code.
         for cls in target_classes:
+            attempts += 1
             try:
                 metas = grpc_loader.list_shares_all(class_code=cls)
             except Exception as e:  # noqa: BLE001 — broker may rate-limit one class
+                failures += 1
                 logger.warning("list_shares_all(%s) failed: %s", cls, e)
                 continue
             for m in metas:
                 if m.figi and m.ticker not in seen:
                     seen[m.ticker] = m
         # 2) Bonds (TQOB OFZ + TQCB corporate/muni).
+        attempts += 1
         try:
             for m in grpc_loader.list_bonds():
                 if m.figi and m.ticker not in seen:
                     seen[m.ticker] = m
         except Exception as e:  # noqa: BLE001
+            failures += 1
             logger.warning("list_bonds() failed: %s", e)
         # 3) ETFs (TQTE).
+        attempts += 1
         try:
             for m in grpc_loader.list_etfs():
                 if m.figi and m.ticker not in seen:
                     seen[m.ticker] = m
         except Exception as e:  # noqa: BLE001
+            failures += 1
             logger.warning("list_etfs() failed: %s", e)
+        # All sub-calls failed → broker gRPC auth / token outage. Refuse
+        # to report an empty universe; ``FallbackDataLoader`` will record
+        # ``error`` (not ``fallback``) and fall through to ``moex_iss`` with
+        # a truthful per-source stat.
+        if attempts and failures == attempts:
+            raise LoaderError(
+                f"tinkoff_md universe discovery: all {attempts} broker calls failed "
+                f"(likely token / auth outage), refusing to report an empty universe"
+            )
         return list(seen.values())
 
     def list_tickers_with_figi(self) -> list[TickerMeta]:
