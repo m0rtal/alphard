@@ -34,18 +34,17 @@ Alphard — автономный multi-agent trading system:
 
 ## Архитектура
 
-8 агентов + Coordinator. Phase 1 closed, Phase 2 in progress.
+Краткий обзор: 8 агентов + Coordinator, один контейнер `alphard-bot`,
+состояние в Postgres, метрики в Prometheus + Grafana. Полная архитектура,
+конвейер Coordinator (FETCH → VALIDATE → RISK → EXECUTE → AUDIT),
+политики fail-open/fail-closed и failure modes — в
+[`ARCHITECTURE.md`](ARCHITECTURE.md). Для публичного API контракта —
+[`API.md`](API.md).
 
-| Agent | Phase | Status |
-|---|---|---|
-| Data | 1.3 → 2.5/2.6 | ✅ Tinkoff (gRPC + history-data) + MOEX ISS + apply_adjustment (splits+dividends), multi-source ready |
-| Risk | 1.1 | ✅ 35 tests, fail-safe limits frozen, drawdown tracker (peak-equity) |
-| Quality | 1.2 | ✅ 3 уровня (CRITICAL/HIGH/MEDIUM/LOW), cross_source_smoke (PR #27) |
-| Broker | 1.3 → 1.4 | ✅ TinkoffAccount, sandbox switch, LIVE_TRADING=false hardlock |
-| Coordinator | 1.5 → 2.10 | ✅ decision log + fetch_lookback_days; event-driven loop planned |
-| Macro | 2.3 | 🟡 CBR+USD/RUB+IMOEX fetcher + deterministic regime classifier (in kanban) |
-| Quant | 2.4 | ⏳ ML pipeline (planned) |
-| Portfolio | 3 | � |
+**Phase status (HEAD):** Phase 1 closed (10/10 gaps), Phase 2 = 7/10 merged
+(2.6 step 1 cross-source, 2.7 delisted cron, 2.8 metrics, 2.9 step 1 backup,
+2.5 step 1 split adjust, 2.1 sandbox-token redeploy, 2.8 step 2 ohlcv rows panel).
+См. [`docs/PHASE2-ROADMAP.md`](docs/PHASE2-ROADMAP.md) для бэклога.
 
 Defensive infrastructure (added 2026-08-19/20):
 

@@ -1,4 +1,8 @@
-# Alphard service — current state (Phase 1.6)
+# Alphard service — current state (Phase 1.6) — **LEGACY**
+
+> **Status:** LEGACY. Frozen at Phase 1.6 (commit `c120eaf`, 2026-08-15).
+> Current architecture: see [`../ARCHITECTURE.md`](../ARCHITECTURE.md) at repo root.
+> This document is preserved for migration history only.
 
 Three diagrams: stack, runtime, fallback chain. Render in any mermaid viewer (GitHub, VSCode, mermaid.live).
 
