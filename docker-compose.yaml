@@ -595,47 +595,36 @@ services:
     network_mode: host
     security_opt:
       - apparmor=unconfined
-    # Override the upstream entrypoint (/run.sh) with our wrapper that
-    # decodes the *_B64 env vars before exec'ing /run.sh. The upstream
-    # entrypoint is still what configures GF_PATHS_* and starts
-    # grafana-server — we just prepend our decode step.
-    entrypoint: ["/entrypoint_grafana.sh"]
-    # Mount the entrypoint script into the container at /entrypoint_grafana.sh.
-    # We use a short-form bind for THIS file (not a dir) because:
-    # 1. The script is small (~7 KiB), no dir-vs-file quirk on .107
-    #    (the bind-mount leaf-vs-dir quirk only affected host PATHS,
-    #    not single file binds of read-only scripts).
-    # 2. Read-only mount (:ro) means the script can't be tampered with
-    #    inside the container — defence-in-depth against a hypothetical
-    #    grafana RCE that tries to backdoor the entrypoint.
-    # 3. We do NOT need chownfix for this — the file is bind-mounted
-    #    read-only from the repo source tree
-    #    (./docker/entrypoint_grafana.sh). Operators only need to keep
-    #    the source file executable in the repo (mode 0755 is committed;
-    #    `git ls-tree HEAD docker/entrypoint_grafana.sh` shows the bit).
-    #    No on-host install step is required, and no `tools/install_*.sh`
-    #    helper exists for this script — `compose` itself mounts the file
-    #    directly. (See kanban t_884fec4a for the full rationale.)
+    # Bind-mount provisioning + dashboards directly from the repo. This
+    # replaces the previous env-based approach (PR #246, issue #297) which
+    # relied on PROVISIONING_*_B64 env vars decoded by an in-container
+    # entrypoint wrapper (docker/entrypoint_grafana.sh). That approach
+    # hit the same Portainer 60-char env truncation bug as PROM_YML_B64
+    # (issue #283 / PR #284): after StackUpdate on .107 the *_B64 values
+    # were truncated to ~80 chars, base64 -d produced garbage or empty
+    # bytes, and Grafana started with no datasource and no dashboards
+    # ("No data" on every panel even though prometheus was scraping
+    # alphard-bot correctly).
+    #
+    # Trade-off: dashboards are now read-only (:ro), so Grafana's UI
+    # "save dashboard" button will fail with a permission error. This is
+    # intentional — dashboards are git-versioned (same model as
+    # docker/prometheus/prometheus.yml from PR #284). To edit a dashboard
+    # locally, modify the JSON in docker/grafana/dashboards/, commit,
+    # push, then Portainer StackUpdate on .107.
+    #
+    # Why no chownfix needed: bind-mounts from the repo retain their
+    # on-disk permissions (root:root 0644 in this case). The upstream
+    # Grafana image's /run.sh entrypoint tolerates this because it runs
+    # initial setup as root before dropping to uid 472 via gosu. Same
+    # reasoning as PR #284 for prometheus.yml.
     volumes:
       - ${APPDATA_DIR:-/srv/alphard}/grafana:/var/lib/grafana
-      - ./docker/entrypoint_grafana.sh:/entrypoint_grafana.sh:ro
-    # IMPORTANT: entrypoint runs as root (we need to chown the decoded
-    # files to 472:472). The grafana-server child process started by
-    # /run.sh internally drops to the grafana user (uid 472) via
-    # the upstream entrypoint's gosu wrapper, so this is safe.
-    # Container-level `user:` would block our root-owned decode +
-    # chown step.
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
     environment:
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-}
       GF_SERVER_HTTP_PORT: "3300"
-      # Baked provisioning + dashboards (compose refactor 2.0). See
-      # docker/entrypoint_grafana.sh and tools/bake_grafana_env.py.
-      # Portainer standalone contract (issue #149): MUST be declared
-      # explicitly in service.environment, not just at stack level.
-      PROVISIONING_DATASOURCES_YML_B64: ${PROVISIONING_DATASOURCES_YML_B64:-}
-      PROVISIONING_DASHBOARDS_PROVIDER_YML_B64: ${PROVISIONING_DASHBOARDS_PROVIDER_YML_B64:-}
-      DASHBOARD_PHASE0_JSON_B64: ${DASHBOARD_PHASE0_JSON_B64:-}
-      DASHBOARD_PHASE28_JSON_B64: ${DASHBOARD_PHASE28_JSON_B64:-}
     # Watchtower label — grafana is a long-running service we DO want
     # auto-updated on image push. Sister-label to chownfix's opt-out.
     labels:

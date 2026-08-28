@@ -17,10 +17,7 @@ expected SQL sources / bake tooling.
 
 from __future__ import annotations
 
-import base64
-import json
 import re
-import subprocess
 from pathlib import Path
 
 import yaml  # type: ignore[import-untyped]
@@ -154,91 +151,3 @@ def test_a1_pg_init_replay_uses_continue_on_error() -> None:
 
 
 # -----------------------------------------------------------------------
-# A2 — pre-baked Grafana B64 vars in .env.example
-# -----------------------------------------------------------------------
-
-
-def test_a2_env_example_has_prebaked_grafana_b64() -> None:
-    """`.env.example` must ship pre-baked Grafana B64 values.
-
-    Before A2, `.env.example` had empty strings for
-    PROVISIONING_*_B64 / DASHBOARD_*_B64. Operators running
-    `cp .env.example .env && docker compose up -d` (skipping
-    quickstart.sh) got Grafana FATAL: env var unset. Pre-baking the
-    values here lets raw docker compose work first-shot too.
-    """
-    text = ENV_EXAMPLE.read_text()
-    for k in (
-        "PROVISIONING_DATASOURCES_YML_B64",
-        "PROVISIONING_DASHBOARDS_PROVIDER_YML_B64",
-        "DASHBOARD_PHASE0_JSON_B64",
-        "DASHBOARD_PHASE28_JSON_B64",
-    ):
-        b64 = _b64_line(text, k)
-        assert b64 is not None, f"{k} must be present in .env.example"
-        assert b64 != "", (
-            f"{k} must NOT be empty in .env.example (A2: pre-bake so "
-            "`cp .env.example .env && docker compose up -d` works "
-            "without quickstart.sh)"
-        )
-
-
-def test_a2_env_example_b64_decodes_to_valid_grafana_payloads() -> None:
-    """Each pre-baked B64 value must decode to valid Grafana config.
-
-    - PROVISIONING_DATASOURCES_YML_B64       → YAML (datasources)
-    - PROVISIONING_DASHBOARDS_PROVIDER_YML_B64 → YAML (provider)
-    - DASHBOARD_*_JSON_B64                  → JSON (dashboard model)
-    """
-    text = ENV_EXAMPLE.read_text()
-    yaml_keys = (
-        "PROVISIONING_DATASOURCES_YML_B64",
-        "PROVISIONING_DASHBOARDS_PROVIDER_YML_B64",
-    )
-    json_keys = (
-        "DASHBOARD_PHASE0_JSON_B64",
-        "DASHBOARD_PHASE28_JSON_B64",
-    )
-    for k in yaml_keys:
-        b64 = _b64_line(text, k)
-        assert b64
-        decoded = base64.b64decode(b64).decode("utf-8")
-        loaded = yaml.safe_load(decoded)
-        assert isinstance(loaded, dict), f"{k} must decode to a YAML mapping"
-    for k in json_keys:
-        b64 = _b64_line(text, k)
-        assert b64
-        decoded = base64.b64decode(b64).decode("utf-8")
-        loaded = json.loads(decoded)
-        assert "title" in loaded, f"{k} must decode to a Grafana dashboard JSON"
-        assert isinstance(loaded.get("panels"), list)
-
-
-def test_a2_env_example_b64_matches_baker_output() -> None:
-    """The pre-baked values must equal what tools/bake_grafana_env.py emits.
-
-    Prevents drift: if someone edits docker/grafana/* without
-    regenerating .env.example, this test fails and forces the regen.
-    """
-    r = subprocess.run(
-        ["python3", "tools/bake_grafana_env.py"],
-        capture_output=True,
-        text=True,
-        cwd=str(REPO_ROOT),
-    )
-    assert r.returncode == 0, f"bake_grafana_env.py failed: {r.stderr}"
-    baked: dict[str, str] = {}
-    b64_re = re.compile(r"^([A-Z_]+_B64)=\"(.*)\"$")
-    for line in r.stdout.splitlines():
-        m = b64_re.match(line)
-        if m is not None:
-            baked[m.group(1)] = m.group(2)
-
-    text = ENV_EXAMPLE.read_text()
-    for k, expected in baked.items():
-        b64_value = _b64_line(text, k)
-        assert b64_value is not None, f"{k} not in .env.example"
-        assert b64_value == expected, (
-            f"{k} in .env.example differs from bake_grafana_env.py output. "
-            f"Regenerate with: cd {REPO_ROOT} && python3 tools/bake_grafana_env.py"
-        )

@@ -44,32 +44,12 @@ class TestGrafanaProviderPath:
         assert len(data["providers"]) >= 1
 
     def test_provider_path_matches_compose_mount(self) -> None:
-        """The provider must scan a path that actually contains
-        dashboards. Pre-fix the provider scanned
-        ``/etc/grafana/provisioning/dashboards`` while compose mounted
-        the JSONs at ``/var/lib/grafana/dashboards``, so Grafana
-        loaded zero dashboards.
-
-        Compose refactor 2.0 (kanban t_884fec4a): the grafana
-        service no longer bind-mounts ``/var/lib/grafana/dashboards``
-        from the host. Instead, the docker/entrypoint_grafana.sh
-        wrapper decodes DASHBOARD_*_JSON_B64 env vars and writes
-        the JSON files into ``/var/lib/grafana/dashboards`` at
-        container startup. The provider's ``path: /var/lib/grafana/dashboards``
-        remains the in-container scan target — just now it's
-        populated by the entrypoint rather than a host bind.
-
-        Why this still satisfies the issue #56 contract:
-          - Pre-refactor: provider scans target T, compose mounts
-            dashboards at target T from the host. ✅
-          - Post-refactor: provider scans target T, entrypoint writes
-            dashboards into target T from B64 env vars. ✅
-          - Same provider path, same in-container target — just a
-            different population mechanism.
-
-        This test verifies the entrypoint decodes at least one
-        DASHBOARD_*_B64 variable into ``/var/lib/grafana/dashboards``
-        and that the provider path matches.
+        """The provider must scan a path that contains dashboards.
+        Issue #297: provisioning + dashboards are bind-mounted from
+        the repo directly. The provider at
+        docker/grafana/provisioning/dashboards/provider.yml scans
+        ``/var/lib/grafana/dashboards``, which compose bind-mounts
+        from ``./docker/grafana/dashboards``. Verify both ends match.
         """
         provider = _load_provider()
         provider_path = provider["providers"][0]["options"]["path"]
@@ -77,47 +57,27 @@ class TestGrafanaProviderPath:
         compose = _load_compose()
         grafana = compose["services"].get("grafana", {})
 
-        # 1. Provider path must be /var/lib/grafana/dashboards (the
-        # upstream-default in-container target). Refactor 2.0 keeps
-        # this path — we just populate it via the entrypoint rather
-        # than a host bind-mount.
+        # Provider path must be /var/lib/grafana/dashboards (matches
+        # the bind-mount target in compose.yaml grafana.volumes).
         assert provider_path == "/var/lib/grafana/dashboards", (
-            f"provider path must be /var/lib/grafana/dashboards "
-            f"(matches the entrypoint write target + upstream "
-            f"default). Got: {provider_path!r}"
+            f"provider path must be /var/lib/grafana/dashboards. " f"Got: {provider_path!r}"
         )
 
-        # 2. The grafana service's entrypoint MUST write dashboards
-        # to the provider path. We grep the entrypoint script for
-        # the decode call + the provider path.
-        entrypoint = grafana.get("entrypoint")
-        assert entrypoint is not None, (
-            "grafana service must declare an entrypoint (compose "
-            "refactor 2.0 wraps the upstream /run.sh with our decoder)"
+        # grafana service must bind-mount /var/lib/grafana/dashboards
+        # from ./docker/grafana/dashboards.
+        volumes = grafana.get("volumes", [])
+        dash_mount = None
+        for v in volumes:
+            v_str = str(v)
+            if "/var/lib/grafana/dashboards" in v_str:
+                dash_mount = v_str
+                break
+        assert dash_mount is not None, (
+            f"grafana.volumes must bind-mount /var/lib/grafana/dashboards "
+            f"from ./docker/grafana/dashboards (issue #297); got: {volumes}"
         )
-        if isinstance(entrypoint, list):
-            entrypoint_str = " ".join(str(x) for x in entrypoint)
-        else:
-            entrypoint_str = str(entrypoint)
-        assert "/entrypoint_grafana.sh" in entrypoint_str, (
-            f"grafana entrypoint must point at /entrypoint_grafana.sh "
-            f"(our wrapper that decodes *_B64 env vars). Got: {entrypoint_str!r}"
-        )
-        # Read the entrypoint script and verify it writes to the
-        # provider path AND decodes at least one DASHBOARD_*_JSON_B64.
-        entrypoint_script = REPO / "docker" / "entrypoint_grafana.sh"
-        assert entrypoint_script.is_file(), (
-            f"docker/entrypoint_grafana.sh must exist at the repo root. " f"Got path: {entrypoint_script}"
-        )
-        script_text = entrypoint_script.read_text()
-        assert provider_path in script_text, (
-            f"entrypoint_grafana.sh must write to {provider_path} "
-            f"(the provider scan target). Got script:\n{script_text[:800]}"
-        )
-        assert "DASHBOARD_" in script_text and "_B64" in script_text, (
-            f"entrypoint_grafana.sh must decode at least one "
-            f"DASHBOARD_*_B64 env var. Got script:\n{script_text[:800]}"
-        )
+        # Must be read-only (dashboards are git-versioned, not UI-editable).
+        assert ":ro" in dash_mount, f"dashboards bind-mount must be :ro (issue #297); got: {dash_mount}"
 
     def test_dashboard_jsons_exist(self) -> None:
         """Sanity: at least one alphard dashboard JSON must exist under
