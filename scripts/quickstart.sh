@@ -258,7 +258,7 @@ ok "docker/prometheus/prometheus.yml present and contains alphard-bot:8765 targe
 # The remaining TIMEOUT_SEC=0 fast-fail path is checked AFTER compose
 # runs but BEFORE the health-gate polling loop.
 if [[ "$SKIP_COMPOSE" == "1" ]]; then
-    info "4/4 docker compose up — skipped (ALPHARD_SKIP_COMPOSE=1)"
+    info "5/5 docker compose up — skipped (ALPHARD_SKIP_COMPOSE=1)"
     info "  Bakes written; docker compose not invoked. Run \`docker compose --profile $PROFILE up -d\` yourself."
     if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
         docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' --filter "name=alphard-" 2>/dev/null || true
@@ -266,7 +266,7 @@ if [[ "$SKIP_COMPOSE" == "1" ]]; then
     ok "bakes complete; compose not invoked"
     exit 0
 fi
-info "4/4 docker compose up -d --profile $PROFILE"
+info "5/5 docker compose up -d --profile $PROFILE"
 
 # We do NOT `set -a; source .env; set +a` because that would export every
 # variable in .env (HTTP_PROXY, MATTERMOST_*, etc.) into the compose
