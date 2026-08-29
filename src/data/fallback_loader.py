@@ -146,14 +146,10 @@ class FallbackDataLoader:
             metas = self.tinkoff_grpc.list_tickers()
             if metas:
                 self._stats["tinkoff_grpc"]["ok"] += 1
-                logger.info(
-                    f"FallbackDataLoader.list_tickers: tinkoff_grpc OK ({len(metas)} tickers)"
-                )
+                logger.info(f"FallbackDataLoader.list_tickers: tinkoff_grpc OK ({len(metas)} tickers)")
                 return list(metas)
             self._stats["tinkoff_grpc"]["fallback"] += 1
-            logger.warning(
-                "FallbackDataLoader.list_tickers: tinkoff_grpc returned 0 tickers, trying moex_iss"
-            )
+            logger.warning("FallbackDataLoader.list_tickers: tinkoff_grpc returned 0 tickers, trying moex_iss")
         except Exception as e:
             self._stats["tinkoff_grpc"]["error"] += 1
             logger.warning(
@@ -165,21 +161,15 @@ class FallbackDataLoader:
             metas = self.moex_iss.list_tickers()
             if metas:
                 self._stats["moex_iss"]["ok"] += 1
-                logger.info(
-                    f"FallbackDataLoader.list_tickers: moex_iss OK ({len(metas)} tickers)"
-                )
+                logger.info(f"FallbackDataLoader.list_tickers: moex_iss OK ({len(metas)} tickers)")
                 return list(metas)
             self._stats["moex_iss"]["fallback"] += 1
             logger.warning("FallbackDataLoader.list_tickers: moex_iss returned 0 tickers")
         except Exception as e:
             self._stats["moex_iss"]["error"] += 1
-            logger.warning(
-                f"FallbackDataLoader.list_tickers: moex_iss failed ({type(e).__name__}: {e})"
-            )
+            logger.warning(f"FallbackDataLoader.list_tickers: moex_iss failed ({type(e).__name__}: {e})")
 
-        logger.error(
-            "FallbackDataLoader.list_tickers: ALL SOURCES returned 0 tickers or failed"
-        )
+        logger.error("FallbackDataLoader.list_tickers: ALL SOURCES returned 0 tickers or failed")
         return []
 
     # -- OHLCV ------------------------------------------------------------

@@ -816,16 +816,12 @@ class TestUniverse:
         fb = FallbackDataLoader(tinkoff_grpc=grpc, moex_iss=iss)
         result = fb.list_tickers()
         # tinkoff_grpc raised → stats["error"] += 1, NOT stats["fallback"].
-        assert fb.stats["tinkoff_grpc"]["error"] == 1, (
-            f"expected tinkoff_grpc.error=1 on auth outage, got {fb.stats}"
-        )
-        assert fb.stats["tinkoff_grpc"]["fallback"] == 0, (
-            f"expected tinkoff_grpc.fallback=0 on auth outage, got {fb.stats}"
-        )
+        assert fb.stats["tinkoff_grpc"]["error"] == 1, f"expected tinkoff_grpc.error=1 on auth outage, got {fb.stats}"
+        assert (
+            fb.stats["tinkoff_grpc"]["fallback"] == 0
+        ), f"expected tinkoff_grpc.fallback=0 on auth outage, got {fb.stats}"
         # Chain proceeded to moex_iss (which returned a ticker).
-        assert fb.stats["moex_iss"]["ok"] == 1, (
-            f"expected moex_iss.ok=1, got {fb.stats}"
-        )
+        assert fb.stats["moex_iss"]["ok"] == 1, f"expected moex_iss.ok=1, got {fb.stats}"
         assert result and result[0].ticker == "GAZP"
 
 

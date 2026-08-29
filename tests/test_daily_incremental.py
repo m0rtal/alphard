@@ -11,6 +11,7 @@ production stack. We cover:
       mocking broker gRPC + Postgres which is out of scope for
       these pure-Python tests).
 """
+
 from __future__ import annotations
 
 import sys
@@ -110,11 +111,11 @@ class TestFetchWithFallback:
             def iter_ohlcv(self, ticker, start, end):
                 return [f"moex-bar-{ticker}-{start}-{end}"]
 
-        with patch("daily_incremental.TinkoffInvestDataLoader", return_value=FakeBroker()), \
-             patch("daily_incremental.MOEXDataLoader", return_value=FakeMoex()):
-            result = daily_incremental._fetch_with_fallback(
-                "SBER", date(2026, 8, 28), date(2026, 8, 28)
-            )
+        with (
+            patch("daily_incremental.TinkoffInvestDataLoader", return_value=FakeBroker()),
+            patch("daily_incremental.MOEXDataLoader", return_value=FakeMoex()),
+        ):
+            result = daily_incremental._fetch_with_fallback("SBER", date(2026, 8, 28), date(2026, 8, 28))
         assert result == ["moex-bar-SBER-2026-08-28-2026-08-28"]
 
     def test_broker_success_skips_moex(self) -> None:
@@ -137,10 +138,10 @@ class TestFetchWithFallback:
         # that means our _fetch_with_fallback is constructing the MOEX
         # loader even on the happy path, which means we have a bug
         # to fix.
-        with patch("daily_incremental.TinkoffInvestDataLoader", return_value=FakeBroker()), \
-             patch("daily_incremental.MOEXDataLoader", side_effect=lambda *a, **kw: FakeMoex()):
-            result = daily_incremental._fetch_with_fallback(
-                "GAZP", date(2026, 8, 28), date(2026, 8, 28)
-            )
+        with (
+            patch("daily_incremental.TinkoffInvestDataLoader", return_value=FakeBroker()),
+            patch("daily_incremental.MOEXDataLoader", side_effect=lambda *a, **kw: FakeMoex()),
+        ):
+            result = daily_incremental._fetch_with_fallback("GAZP", date(2026, 8, 28), date(2026, 8, 28))
         assert result == ["broker-bar-GAZP"]
         assert broker_calls == [("GAZP", date(2026, 8, 28), date(2026, 8, 28))]

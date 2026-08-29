@@ -464,9 +464,7 @@ class TinkoffInvestDataLoader(DataLoader):
                 # backfill ``_resolve_universe`` / ``_is_complete`` formulas
                 # probe ``earliest_ts`` from the OHLCV table to derive
                 # a real floor.
-                for _attr in (
-                    "first_1day_candle_date",
-                ):
+                for _attr in ("first_1day_candle_date",):
                     _raw = getattr(inst, _attr, None)
                     if _raw is None:
                         continue
