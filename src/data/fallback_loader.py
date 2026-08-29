@@ -42,48 +42,60 @@ from src.data.models import OHLCVRow
 logger = logging.getLogger("alphard.fallback_loader")
 
 
-# Ordered list of fallback strategies. Tinkoff MD first because it has
-# the longest history at the lowest quota cost; Tinkoff gRPC next
-# because it's the broker-authoritative live source; MOEX ISS last
-# because pagination is slow but covers everything else.
-FALLBACK_ORDER: tuple[str, ...] = ("tinkoff_md", "tinkoff_grpc", "moex_iss")
+# Ordered list of fallback strategies. Per the 2026-08-29 contract
+# change (issue #331, m0rtal): broker gRPC is now FIRST because it is
+# the canonical live source and has full depth (back to
+# ``first_1day_candle_date``). MOEX ISS is the backup when broker is
+# unreachable. The old Tinkoff history-data HTTP archive
+# (``/history-data``) is REMOVED from the chain because that endpoint
+# is deprecated and only contains the last ~2y for most FIGI — for any
+# ticker listed before ~2024 it returns 0 bytes and silently burned a
+# network round-trip per year before falling through.
+FALLBACK_ORDER: tuple[str, ...] = ("tinkoff_grpc", "moex_iss")
 
 
 class FallbackDataLoader:
     """Multi-source OHLCV loader with automatic fallback chain.
 
-    Wraps three existing loaders behind a single ``iter_ohlcv`` /
+    Wraps two production loaders behind a single ``iter_ohlcv`` /
     ``list_tickers`` interface that mirrors the per-source loaders
     already used by ``backfill_history_md.py`` and ``daily_sync.py``.
 
+    Contract change 2026-08-29 (issue #331, m0rtal): the chain is now
+    ``tinkoff_grpc → moex_iss``. The Tinkoff history-data HTTP archive
+    (``/history-data``) is no longer wired into the chain. The legacy
+    ``tinkoff_md`` parameter is preserved as a deprecated keyword-only
+    argument for backward compatibility with code that still imports
+    ``TinkoffInvestMDDataLoader``; it is stored on the instance but
+    is **never** tried as part of the chain.
+
     Parameters
     ----------
-    tinkoff_md
-        ``TinkoffInvestMDDataLoader`` instance (history-data HTTP).
-        Required.
     tinkoff_grpc
-        ``TinkoffInvestDataLoader`` instance (broker gRPC).
-        Required.
+        ``TinkoffInvestDataLoader`` instance (broker gRPC). Required.
     moex_iss
         ``MOEXDataLoader`` instance. Required.
     order
         Tuple of source names in the order they should be tried.
         Defaults to ``FALLBACK_ORDER``.
+    tinkoff_md
+        Deprecated. Kept as a keyword-only argument so legacy callers
+        that still pass ``tinkoff_md=...`` don't raise; ignored.
     """
 
     def __init__(
         self,
-        tinkoff_md: Any,
         tinkoff_grpc: Any,
         moex_iss: Any,
         order: tuple[str, ...] = FALLBACK_ORDER,
+        *,
+        tinkoff_md: Any = None,  # deprecated, kept for back-compat; no longer in chain
     ) -> None:
         self.tinkoff_md = tinkoff_md
         self.tinkoff_grpc = tinkoff_grpc
         self.moex_iss = moex_iss
         self.order = order
         self._stats: dict[str, dict[str, int]] = {
-            "tinkoff_md": {"ok": 0, "fallback": 0, "error": 0},
             "tinkoff_grpc": {"ok": 0, "fallback": 0, "error": 0},
             "moex_iss": {"ok": 0, "fallback": 0, "error": 0},
         }
@@ -96,130 +108,78 @@ class FallbackDataLoader:
     # -- universe --------------------------------------------------------
 
     def list_tickers(self) -> list[Any]:  # noqa: D401
-        """Resolve ticker universe from the FULL fallback chain.
+        """Resolve ticker universe from the broker-first fallback chain.
 
-        Issue #311 (2026-08-28): the previous implementation only called
-        ``tinkoff_md.list_tickers_with_figi()``. When Tinkoff history-data
-        auth was broken (UNAUTHENTICATED), this returned 0 tickers even
-        though the broker gRPC endpoint still served 1927+ MOEX shares.
-        That turned the supervisor into a 30s tight respawn loop.
+        Contract change 2026-08-29 (issue #331, m0rtal): the chain is now
+        ``tinkoff_grpc → moex_iss``. The Tinkoff history-data HTTP archive
+        (``/history-data``) is removed from the universe-discovery path
+        because that endpoint is deprecated and exposes no ticker-listing
+        API — ``tinkoff_md.list_tickers_with_figi()`` was actually a
+        wrapper that delegated to broker gRPC anyway (see
+        ``src/data/tinkoff_md_loader.py:_fill_universe_cache``), so
+        including it as a separate chain step just created an extra
+        round-trip that returned the same data the broker gRPC step
+        would have returned on its own.
 
-        User-correction (issue #316, 2026-08-28): the correct order is
-        tinkoff_md FIRST (history-data archive, covers all 4 MOEX classes
-        = ~3259 tickers including SPBXM, TQBR, TQCB, TQOB), then tinkoff_grpc
-        (broker live-data, TQBR-class only = 252 tickers), then MOEX ISS
-        (no auth, 1825d cap, last resort). Each source is independently
-        guarded so a 401 on one does not kill the discovery — we always
-        try the next source on the chain. The first non-empty result wins.
+        Per source:
 
-        Why MD first not gRPC: tinkoff_md.list_tickers_with_figi() returns
-        ~3259 tickers (ALL MOEX classes incl. SPBXM, TQCB, TQOB, TQBR);
-        tinkoff_grpc.list_tickers() returns only TQBR (~252). If gRPC wins,
-        we lose ~3000 tickers from the universe.
+          1. tinkoff_grpc (broker gRPC live data). ``list_tickers()``
+             walks every tradable class (TQBR + SPBXM + TQCB + TQOB +
+             ...) and returns ~3259 tickers with FIGI. Single point of
+             failure: token health. The first non-empty result wins.
+          2. moex_iss (no auth, MOEX web endpoint, last resort). Returns
+             the same ``TickerMeta`` shape.
 
-        Source-independence caveat (issue #319, 2026-08-28): the
-        ``list_tickers`` chain is **not three independent sources** the way
-        the ``iter_ohlcv`` chain is. ``tinkoff_md.list_tickers()`` does
-        NOT call the ``history-data`` HTTP endpoint — the archive exposes
-        no ticker-listing API — so it internally constructs a
-        ``TinkoffInvestDataLoader`` (broker gRPC) and harvests the
-        universe via ``list_shares_all()`` / ``list_bonds()`` /
-        ``list_etfs()`` (see ``src/data/tinkoff_md_loader.py:_fill_universe_cache``).
-        Therefore:
+        ``tinkoff_md`` is preserved on the instance as an attribute (for
+        ``backfill_history_md.py`` which still uses it as a stand-alone
+        loader for one-off downloads), but it is no longer wired into
+        the chain. The ``_stats`` dict no longer contains a
+        ``tinkoff_md`` slot.
 
-          - Steps 1 + 2 share a single point of failure: the broker gRPC
-            endpoint + its token. A broker gRPC auth outage causes
-            ``tinkoff_md.list_tickers()`` AND ``tinkoff_grpc.list_tickers()``
-            to fail in lockstep. Only ``moex_iss`` is a genuinely
-            independent source for universe discovery.
-          - The only material difference between steps 1 and 2 is
-            **class-code breadth**: ``tinkoff_md`` walks every tradable
-            class (TQBR + SPBXM + TQCB + TQOB + TQTE + ...) — ~3259
-            tickers — while ``tinkoff_grpc`` is hardcoded to TQBR
-            (~252). See the issue #319 PoC for confirmation.
-          - The 252-vs-3259 difference observed in PR #317 is real and
-            reproducible, but its cause is class-code breadth, NOT a
-            different data source or different auth.
-
-        Since issue #319, ``tinkoff_md._fill_universe_cache`` raises
-        ``LoaderError`` (not returns ``[]``) when every sub-call failed.
-        That lets the ``except`` arm below record ``stats["error"] = 1``
-        (truthful: "source raised") instead of ``["fallback"] = 1``
-        (misleading: "source legitimately has no data"), so a broker
-        gRPC outage shows up as an actionable signal in operator logs
-        and Prometheus rather than silently degrading to MOEX ISS.
-
-        The "separate auth from broker gRPC; Tinkoff often rotates this
-        token independently" claim below is correct for ``download_year``
-        / OHLCV (the HTTP archive endpoint has historically accepted a
-        different token from the broker gRPC one) but is **not true**
-        for the universe-discovery path described above. Scope the claim
-        to OHLCV.
+        If both sources fail the function returns ``[]`` and the
+        supervisor treats this as a clean exit; the per-source error
+        counts show up in logs and Prometheus so the operator can
+        diagnose.
         """
-        # 1. tinkoff_md (history-data archive for OHLCV; for universe
-        #    discovery it actually delegates to broker gRPC — see caveat
-        #    above and ``src/data/tinkoff_md_loader.py:_fill_universe_cache``).
-        #    For OHLCV this source has historically had a separate auth
-        #    from broker gRPC; Tinkoff has rotated that token independently
-        #    in the past. With the REAL token (shared from gRPC loader
-        #    since PR #313) this returns the full universe.
-        try:
-            metas = self.tinkoff_md.list_tickers_with_figi()
-            if metas:
-                self._stats["tinkoff_md"]["ok"] += 1
-                logger.info(f"FallbackDataLoader.list_tickers: tinkoff_md OK ({len(metas)} tickers)")
-                return list(metas)
-            else:
-                self._stats["tinkoff_md"]["fallback"] += 1
-                logger.warning("FallbackDataLoader.list_tickers: tinkoff_md returned 0 tickers, trying tinkoff_grpc")
-        except Exception as e:
-            self._stats["tinkoff_md"]["error"] += 1
-            logger.warning(
-                f"FallbackDataLoader.list_tickers: tinkoff_md failed ({type(e).__name__}: {e}); trying tinkoff_grpc"
-            )
-
-        # 2. tinkoff_grpc (broker live-data, TQBR-class only = ~252 tickers).
-        #    Real-app token, no separate auth — auth works with the SAME
-        #    token used by daily_sync and chart_data.
+        # 1. tinkoff_grpc (broker gRPC; same REAL token as daily_sync).
         try:
             metas = self.tinkoff_grpc.list_tickers()
             if metas:
                 self._stats["tinkoff_grpc"]["ok"] += 1
-                logger.info(f"FallbackDataLoader.list_tickers: tinkoff_grpc OK ({len(metas)} tickers)")
+                logger.info(
+                    f"FallbackDataLoader.list_tickers: tinkoff_grpc OK ({len(metas)} tickers)"
+                )
                 return list(metas)
-            else:
-                self._stats["tinkoff_grpc"]["fallback"] += 1
-                logger.warning("FallbackDataLoader.list_tickers: tinkoff_grpc returned 0 tickers, trying moex_iss")
+            self._stats["tinkoff_grpc"]["fallback"] += 1
+            logger.warning(
+                "FallbackDataLoader.list_tickers: tinkoff_grpc returned 0 tickers, trying moex_iss"
+            )
         except Exception as e:
             self._stats["tinkoff_grpc"]["error"] += 1
             logger.warning(
                 f"FallbackDataLoader.list_tickers: tinkoff_grpc failed ({type(e).__name__}: {e}); trying moex_iss"
             )
 
-        # 3. moex_iss (no auth, MOEX web endpoint, 1825d lookback cap,
-        #    last resort). Returns the same TickerMeta shape as the
-        #    other two sources — filtered to TQBR by default.
+        # 2. moex_iss (no auth, MOEX web endpoint, 1825d cap, last resort).
         try:
             metas = self.moex_iss.list_tickers()
             if metas:
                 self._stats["moex_iss"]["ok"] += 1
-                logger.info(f"FallbackDataLoader.list_tickers: moex_iss OK ({len(metas)} tickers)")
+                logger.info(
+                    f"FallbackDataLoader.list_tickers: moex_iss OK ({len(metas)} tickers)"
+                )
                 return list(metas)
-            else:
-                self._stats["moex_iss"]["fallback"] += 1
-                logger.warning("FallbackDataLoader.list_tickers: moex_iss returned 0 tickers")
+            self._stats["moex_iss"]["fallback"] += 1
+            logger.warning("FallbackDataLoader.list_tickers: moex_iss returned 0 tickers")
         except Exception as e:
             self._stats["moex_iss"]["error"] += 1
-            logger.warning(f"FallbackDataLoader.list_tickers: moex_iss failed ({type(e).__name__}: {e})")
+            logger.warning(
+                f"FallbackDataLoader.list_tickers: moex_iss failed ({type(e).__name__}: {e})"
+            )
 
-        # All three sources failed. Return empty list — supervisor treats
-        # this as a clean exit (rc=0) and respawns after 30s; if the
-        # all-sources-fail state persists, the operator should check
-        # per-source stats and Tinkoff token health. PR #312 (closed
-        # without merge) introduced an rc=3 NO_UNIVERSE sentinel; the
-        # data-layer fix in this PR was preferred. The operator will see
-        # the per-source error stats in logs / Prometheus.
-        logger.error("FallbackDataLoader.list_tickers: ALL THREE SOURCES returned 0 tickers or failed")
+        logger.error(
+            "FallbackDataLoader.list_tickers: ALL SOURCES returned 0 tickers or failed"
+        )
         return []
 
     # -- OHLCV ------------------------------------------------------------
@@ -259,8 +219,6 @@ class FallbackDataLoader:
         logger.warning(f"{ticker}: ALL sources returned 0 bars")
 
     def _resolve(self, name: str) -> Any:
-        if name == "tinkoff_md":
-            return self.tinkoff_md
         if name == "tinkoff_grpc":
             return self.tinkoff_grpc
         if name == "moex_iss":
