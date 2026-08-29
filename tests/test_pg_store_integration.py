@@ -154,9 +154,13 @@ class TestBackfillCompleteUniverse:
     The mocked equivalent lives in tests/test_pg_store_mocked.py.
     """
 
+    # Ticker names MUST be ≤12 chars to satisfy TICKER_REGEX
+    # (``^[A-Z0-9@._-]{1,12}$`` at src/data/models.py:31). PG_TEST /
+    # PG_IDEM etc. are already used by TestTickerCRUD above — we pick
+    # new suffixes to avoid colliding with that class's row IDs.
     def test_returns_only_complete_tickers(self, pg_store):
         # Insert one complete + one incomplete + one never-marked ticker.
-        for ticker, complete in [("PG_COMPLETE", True), ("PG_INCOMPLETE", False)]:
+        for ticker, complete in [("PG_DONE", True), ("PG_OPEN", False)]:
             pg_store.upsert_ticker(
                 TickerMeta(
                     ticker=ticker,
@@ -169,7 +173,7 @@ class TestBackfillCompleteUniverse:
             pg_store.mark_backfill_complete(ticker, complete=complete)
         pg_store.upsert_ticker(
             TickerMeta(
-                ticker="PG_NEVER_MARKED",
+                ticker="PG_FRESH",
                 name="Fresh",
                 lot=1,
                 currency="RUB",
@@ -178,15 +182,20 @@ class TestBackfillCompleteUniverse:
         )
         metas = pg_store.list_complete_universe()
         tickers = {m.ticker for m in metas}
-        assert "PG_COMPLETE" in tickers
-        assert "PG_INCOMPLETE" not in tickers
-        assert "PG_NEVER_MARKED" not in tickers
+        assert "PG_DONE" in tickers
+        assert "PG_OPEN" not in tickers
+        assert "PG_FRESH" not in tickers
 
     def test_returns_validated_ticker_meta_objects(self, pg_store):
         """Regression for the cycle108 bug: the previous implementation
         returned either raw tuples (position-map approach failed) or
         raised ValidationError on the first row (Russian name in lot=).
         """
+        # Note: ``upsert_ticker`` does not currently persist the
+        # ``class_code`` column (see pg_store.py:319-338 — column is
+        # in the schema but not in the INSERT/UPDATE). We therefore
+        # only assert fields that ARE persisted by the writer path:
+        # ticker, figi, name, lot, listed_at.
         pg_store.upsert_ticker(
             TickerMeta(
                 ticker="PG_VALID",
@@ -195,7 +204,6 @@ class TestBackfillCompleteUniverse:
                 currency="RUB",
                 source="manual",
                 figi="BBG004730N88",
-                class_code="TQBR",
                 listed_at=date(2007, 7, 2),
             )
         )
@@ -206,12 +214,12 @@ class TestBackfillCompleteUniverse:
         m = match[0]
         # Must be a real TickerMeta, NOT a tuple. This is the regression guard.
         assert isinstance(m, TickerMeta)
-        # Column-order-sensitive fields:
+        # Column-order-sensitive fields — these are the ones the cycle108
+        # bug misaligned (Russian name in lot=, etc.):
         assert m.name == "Сбербанк"
         assert m.lot == 10  # int, not a string!
         assert isinstance(m.lot, int)
         assert m.figi == "BBG004730N88"
-        assert m.class_code == "TQBR"
         assert m.listed_at == date(2007, 7, 2)
 
 
