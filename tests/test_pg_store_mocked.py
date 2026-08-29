@@ -1614,6 +1614,76 @@ class TestBackfillCompleteFlag:
         result = PostgresDataStore.backfill_complete_tickers(store)
         assert result == []
 
+    def test_list_complete_universe_returns_ticker_meta(self) -> None:
+        """Issue #334 regression: list_complete_universe() must return
+        TickerMeta objects built via _row_to_ticker, NOT raw tuples.
+
+        The previous implementation (cycle108) SELECTed columns in the
+        wrong order and tried to position-map them into TickerMeta —
+        the very first row would ValidationError because ``r[2]``
+        (mapped to ``lot=``) was actually a Russian ``name`` string.
+        """
+        store = self._store(None)
+        # One row in SCHEMA order (matches ``list_tickers`` / ``_row_to_ticker``).
+        row = (
+            "SBER",  # ticker
+            "BBG004730N88",  # figi
+            "Сбербанк",  # name
+            10,  # lot (int)
+            "RU0009029540",  # isin
+            "RUB",  # currency
+            "TQBR",  # class_code
+            False,  # delisted
+            None,  # delisted_at
+            date(2007, 7, 2),  # listed_at
+            "tkf",  # source
+        )
+        store._conn.cursor.return_value.__enter__.return_value.fetchall.return_value = [row]
+        result = PostgresDataStore.list_complete_universe(store)
+        assert isinstance(result, list)
+        assert len(result) == 1
+        meta = result[0]
+        # Must be a TickerMeta, NOT a tuple. This is the regression guard.
+        assert isinstance(meta, TickerMeta), f"expected TickerMeta, got {type(meta)}"
+        assert meta.ticker == "SBER"
+        assert meta.figi == "BBG004730N88"
+        assert meta.name == "Сбербанк"
+        # The bug was here: lot got a Russian name string instead of int.
+        assert meta.lot == 10
+        assert isinstance(meta.lot, int), f"lot must be int, got {type(meta.lot)}"
+        assert meta.class_code == "TQBR"
+        assert meta.source == "tkf"
+        assert meta.listed_at == date(2007, 7, 2)
+
+    def test_list_complete_universe_issues_correct_select(self) -> None:
+        """The SQL must SELECT in the schema column order that
+        ``_row_to_ticker`` expects — otherwise the row positions are
+        misaligned and TickerMeta validation fails on the first row.
+        """
+        store = self._store(None)
+        store._conn.cursor.return_value.__enter__.return_value.fetchall.return_value = []
+        PostgresDataStore.list_complete_universe(store)
+        cur = store._conn.cursor().__enter__()
+        sql = cur.execute.call_args[0][0]
+        # Must SELECT in column order: ticker, figi, name, lot, isin, currency,
+        # class_code, delisted, delisted_at, listed_at, source
+        # (matches ticker_universe schema at src/data/schema.sql:29-50
+        # and the _row_to_ticker() helper).
+        assert "ticker, figi, name, lot, isin, currency, class_code" in sql
+        assert "delisted, delisted_at, listed_at, source" in sql
+        # Must filter on the backfill_complete flag.
+        assert "backfill_complete = TRUE" in sql
+        # Must ORDER BY for stable iteration.
+        assert "ORDER BY ticker" in sql
+
+    def test_list_complete_universe_empty(self) -> None:
+        """If no tickers are marked complete yet (first backfill pass
+        has not finished), return [] — not raise."""
+        store = self._store(None)
+        store._conn.cursor.return_value.__enter__.return_value.fetchall.return_value = []
+        result = PostgresDataStore.list_complete_universe(store)
+        assert result == []
+
 
 # ---------------------------------------------------------------------------
 # sync_universe_delisted — multi-row bulk UPSERT for delist dates
