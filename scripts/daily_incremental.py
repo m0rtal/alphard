@@ -119,21 +119,9 @@ def main() -> int:
 
     store = PostgresDataStore()
     try:
-        # Get full list of complete tickers from ticker_universe.
-        # Uses the same query shape as supervisor's _universe_metrics_loop.
-        all_meta = store.list_complete_universe()  # placeholder, will assert in tests
-    except AttributeError:
-        # Fallback path: store doesn't yet expose list_complete_universe.
-        # We rebuild from existing public methods. The supervisor in
-        # src/main.py uses store.upsert_tickers + SELECT; we do the
-        # same here. To keep this script self-contained for now, we
-        # delegate to backfill_history_md's _resolve_universe
-        # helper if available.
-        logger.error(
-            "PostgresDataStore.list_complete_universe() not implemented; "
-            "this script depends on issue #331 follow-up work"
-        )
-        return 2
+        # Full list of complete tickers from ticker_universe. Same query
+        # shape as the supervisor's _universe_metrics_loop.
+        all_meta = store.list_complete_universe()
     finally:
         store.close()
 
