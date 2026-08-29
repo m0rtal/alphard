@@ -421,6 +421,21 @@ def _is_complete(
             # backfill will populate at least one row.
             return False
         listed_at = earliest
+    # Issue #319 (2026-08-29): re-anchor the floor on the earliest bar
+    # actually written in the OHLCV table. ``listed_at_meta`` may carry
+    # an optimistic IPO/first_1min_candle date that predates available
+    # OHLCV by years for SPBXM ETFs / etc. The earliest DB bar is the
+    # most honest floor — it represents what the broker+gRPC actually
+    # returned, not what some metadata field claimed about a listing
+    # date. Real-world observation (2026-08-29 .107): 98% of 3265-ticker
+    # universe stuck at 0 bars because the formula demanded years of
+    # pre-2024 data the MD-archive does not have.
+    earliest_db_bar = store.earliest_ts(ticker=ticker)
+    # Mock-friendly guard: tests may use MagicMock without configuring
+    # earliest_ts (a default MagicMock returns another MagicMock, which
+    # is not comparable to a ``date``).
+    if isinstance(earliest_db_bar, date) and earliest_db_bar > listed_at:
+        listed_at = earliest_db_bar
     end = delisted_at if delisted_at else date.today()
     if end <= listed_at:
         # Delisted the same day it listed (or before). Nothing to pull.

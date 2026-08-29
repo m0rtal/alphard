@@ -474,8 +474,13 @@ def test_is_complete_partial_recent_bars_not_complete() -> None:
     store.ticker_meta.return_value = (date(2010, 1, 1), None)
     store.earliest_ts.return_value = date(2026, 8, 20)  # only 5 days
 
-    # _is_complete falls through to: count < expected → False
-    assert bh._is_complete(store, "PARTIAL", min_bars=1300) is False
+    # With Issue #319's earliest-db-bar anchor: floor rebases from
+    # listed_at=2010 to earliest_db_bar=2026-08-20, expected_bars now
+    # asks for ~5*0.85=4 bars. count=5 >= 4 → COMPLETE.
+    # Pre-#319 this was the broken case that produced 98% stuck-at-0-bars;
+    # post-#319 this is exactly the case that _is_complete correctly
+    # recognises as "we got what the API gave us, stop retrying".
+    assert bh._is_complete(store, "PARTIAL", min_bars=1300) is True
 
 
 def test_is_complete_full_history_from_md_archive_is_complete() -> None:
