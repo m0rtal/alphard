@@ -1289,3 +1289,94 @@ class TestTinkoffLoaderCoverage:
         spbxm_tickers = {m.ticker for m in loader._shares_all_cache["SPBXM"]}
         assert tqbr_tickers == {"SBER"}
         assert spbxm_tickers == {"AAPL"}
+
+
+class TestListedAtAnchor:
+    """Issue #319 regression: pin the contract that ``listed_at`` for
+    backfill-completion purposes anchors strictly on
+    ``first_1day_candle_date`` (the canonical "data from this date"
+    marker per Tinkoff docs).
+
+    Earlier iterations fell back to ``first_1min_candle_date`` /
+    ``ipo_date``, which predate actual daily-bar availability by
+    years for IPO'd-but-not-traded instruments like some SPBXM ETFs
+    and stuck 27/3265 (0.8%) of the universe in a perpetually-
+    incomplete backfill state (Closes #319). The PR #332 (cycle110)
+    fix landed the contract in code but the docstring of
+    ``_fill_shares_all`` drifted — it still claimed the old
+    fallback chain.
+
+    These tests are pure-textual: they grep the source for the
+    invariant docstring fragments and the literal field-attribute
+    lookup tuple, so a future refactor that re-introduces the
+    optimistic fallback will fail CI before it ships.
+    """
+
+    @staticmethod
+    def _read_source() -> str:
+        from pathlib import Path
+
+        src = Path(__file__).resolve().parent.parent / "src" / "data" / "tinkoff_loader.py"
+        return src.read_text(encoding="utf-8")
+
+    def test_fill_shares_all_docstring_anchors_on_first_1day_only(self) -> None:
+        """The ``_fill_shares_all`` docstring must NOT claim the legacy
+        fallback chain ``first_1min_candle_date / ipo_date``.
+
+        Pre-fix: the docstring read
+        ``listed_at`` field is the earliest of first_1day_candle_date
+        / first_1min_candle_date / ipo_date``.
+        Post-fix: the docstring explicitly anchors on
+        ``first_1day_candle_date`` and explains why the older fallbacks
+        are unsatisfiable (issue #319).
+        """
+        src = self._read_source()
+        # Locate the _fill_shares_all docstring body.
+        marker = "def _fill_shares_all(self, class_code: str)"
+        idx = src.find(marker)
+        assert idx >= 0, "_fill_shares_all method must exist in source"
+        # Take 1500 chars after the method header to cover the
+        # docstring body.
+        body = src[idx : idx + 1500]
+        # The legacy "first_1min_candle_date / ipo_date" claim must
+        # not appear in the docstring anymore.
+        legacy_claim = "first_1day_candle_date / first_1min_candle_date / ipo_date"
+        assert legacy_claim not in body, (
+            "_fill_shares_all docstring still claims the legacy "
+            "first_1min_candle_date / ipo_date fallback chain. "
+            "Issue #319 (2026-08-29) proved this yields an "
+            "unsatisfiable completion floor — anchor on "
+            "first_1day_candle_date only."
+        )
+
+    def test_field_lookup_tuple_is_first_1day_only(self) -> None:
+        """The literal attribute-iteration tuple in the per-class
+        loop must contain exactly one entry: ``first_1day_candle_date``.
+
+        If a future refactor re-adds ``first_1min_candle_date`` or
+        ``ipo_date`` to the tuple, the universe will re-acquire the
+        bug PR #332 fixed.
+        """
+        src = self._read_source()
+        # Find the for-loop that walks the date attributes.
+        marker = "for _attr in ("
+        idx = src.find(marker)
+        assert idx >= 0, "per-class date-attribute lookup loop missing"
+        # Capture the tuple body up to the closing paren.
+        end = src.find(")", idx)
+        tuple_body = src[idx:end]
+        assert '"first_1day_candle_date"' in tuple_body, "loop tuple must contain first_1day_candle_date"
+        assert '"first_1min_candle_date"' not in tuple_body, (
+            "first_1min_candle_date MUST NOT appear in the loop "
+            "tuple — it predates daily-bar availability for some "
+            "SPBXM ETFs and is the root cause of issue #319."
+        )
+        assert '"ipo_date"' not in tuple_body, (
+            "ipo_date MUST NOT appear in the loop tuple — same " "rationale as first_1min_candle_date."
+        )
+        # The tuple must contain exactly one attribute.
+        attrs = [a.strip().strip('"') for a in tuple_body.strip("for _attr in ()").split(",")]
+        # Tolerate whitespace and quote variants.
+        non_empty = [a for a in attrs if a]
+        assert len(non_empty) == 1, f"loop tuple must iterate exactly one attribute, " f"found: {non_empty}"
+        assert non_empty == ["first_1day_candle_date"]
