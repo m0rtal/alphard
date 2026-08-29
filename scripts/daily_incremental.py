@@ -27,6 +27,7 @@ is ``tinkoff_grpc, moex_iss``.
 Used by cron once per day after market close. Idempotent:
 ``upsert_ohlcv`` is upsert on (ticker, ts) PK.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -84,17 +85,12 @@ def _fetch_with_fallback(ticker: str, start: date, end: date) -> list:
     try:
         return TinkoffInvestDataLoader().fetch_ohlcv(ticker, start, end)
     except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            f"{ticker}: broker gRPC failed ({type(exc).__name__}: {exc}); "
-            f"falling back to MOEX ISS"
-        )
+        logger.warning(f"{ticker}: broker gRPC failed ({type(exc).__name__}: {exc}); " f"falling back to MOEX ISS")
     return list(MOEXDataLoader().iter_ohlcv(ticker, start, end))
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Daily incremental refresh of closed OHLCV bars."
-    )
+    parser = argparse.ArgumentParser(description="Daily incremental refresh of closed OHLCV bars.")
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -146,10 +142,7 @@ def main() -> int:
 
     today = date.today()
     end = today - timedelta(days=1)
-    logger.info(
-        f"=== Daily incremental refresh: end={end} (yesterday), "
-        f"{len(all_meta)} complete tickers ==="
-    )
+    logger.info(f"=== Daily incremental refresh: end={end} (yesterday), " f"{len(all_meta)} complete tickers ===")
 
     total_inserted = 0
     total_skipped = 0
@@ -168,9 +161,7 @@ def main() -> int:
 
             window_days = (end - start).days + 1
             if args.max_bars_per_ticker and window_days > args.max_bars_per_ticker:
-                logger.warning(
-                    f"{i}/{len(all_meta)} {ticker}: skipping, window {window_days}d > cap"
-                )
+                logger.warning(f"{i}/{len(all_meta)} {ticker}: skipping, window {window_days}d > cap")
                 total_skipped += 1
                 continue
 
@@ -184,9 +175,7 @@ def main() -> int:
             try:
                 bars = _fetch_with_fallback(ticker, start, end)
                 if not bars:
-                    logger.debug(
-                        f"{i}/{len(all_meta)} {ticker}: no bars in {start}..{end}"
-                    )
+                    logger.debug(f"{i}/{len(all_meta)} {ticker}: no bars in {start}..{end}")
                     total_skipped += 1
                     continue
                 # Final safety filter: never insert today or future
@@ -199,8 +188,7 @@ def main() -> int:
                     continue
                 written = store.upsert_ohlcv(bars)
                 logger.info(
-                    f"{i}/{len(all_meta)} {ticker}: +{written} bars "
-                    f"({start}..{end}, latest_in_db_was={latest})"
+                    f"{i}/{len(all_meta)} {ticker}: +{written} bars " f"({start}..{end}, latest_in_db_was={latest})"
                 )
                 total_inserted += written
             except Exception as exc:  # noqa: BLE001
@@ -210,8 +198,7 @@ def main() -> int:
         store.close()
 
     logger.info(
-        f"=== DONE: +{total_inserted} bars inserted, {total_skipped} skipped, "
-        f"{len(errors)} errors, end={end} ==="
+        f"=== DONE: +{total_inserted} bars inserted, {total_skipped} skipped, " f"{len(errors)} errors, end={end} ==="
     )
     return 0 if not errors else 1
 
