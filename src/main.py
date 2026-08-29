@@ -49,6 +49,16 @@ MSK_TZ = timezone(timedelta(hours=3))  # MOEX closes 18:40 MSK; sync at 20:00 MS
 DAILY_SYNC_INTERVAL_SECONDS = 3600  # Phase 1.6: user requirement — sync must always run.
 DAILY_SYNC_SUBPROCESS_TIMEOUT = 600  # 10 min hard cap per sync; longer = kill.
 
+# Issue #331 (2026-08-29): daily_incremental refresh for the full universe
+# of complete tickers. Runs ONCE per day at 18:30 MSK (right after MOEX
+# closes at 18:40 MSK — actually slightly before, which is safe because
+# daily_incremental.py only inserts closed bars ts < today, so a 0-second
+# gap on the same-day candle is irrelevant). Cadence is 24h; subprocess
+# isolates per-ticker fetch failures from the heartbeat.
+DAILY_INCREMENTAL_TARGET_HOUR_MSK = 18
+DAILY_INCREMENTAL_TARGET_MINUTE_MSK = 30
+DAILY_INCREMENTAL_SUBPROCESS_TIMEOUT = 3600  # 60 min hard cap; ~3265 tickers * broker round-trip.
+
 # Phase 2.7: delisted_at weekly cron. Backfills delisted_at via Tinkoff gRPC
 # market_data.get_candles, running on a weekly cadence (delisted events are
 # slow-moving). Mirrors daily_sync structure: subprocess + sentinel + watchdog.
@@ -341,6 +351,68 @@ def _daily_sync_loop() -> None:
         if _shutdown_event.is_set():
             logger.info("daily_sync daemon received shutdown signal, exiting")
             return
+        _sleep_interruptible(24 * 3600)
+
+
+def _daily_incremental_loop() -> None:
+    """Run scripts/daily_incremental.py daily after MOEX close.
+
+    Issue #331 (2026-08-29, m0rtal): post-backfill maintenance loop.
+
+    Contract:
+    - For every ticker with backfill_complete=True, pull the closed-bar
+      delta from (latest_db_ts + 1) through (today - 1) via broker gRPC
+      (with MOEX fallback). NEVER inserts today's bar.
+    - Schedule: 18:30 MSK daily (right after MOEX close at 18:40 MSK).
+      The 18:30-vs-18:40 delta is harmless because the script filters
+      ts < today — the still-forming today's bar is rejected even if
+      Tinkoff exposes it.
+    - Subprocess isolation: the script does per-ticker fetch + upsert;
+      a broker rate-limit or per-ticker OOM must NOT kill the heartbeat.
+
+    Failure isolation:
+    - Non-zero return code is logged at WARNING, loop continues. Next
+      run = tomorrow 18:30. (Same pattern as daily_sync.)
+    """
+    logger = logging.getLogger("alphard.daily_incremental")
+
+    seconds_to_first = _seconds_until_next_target_hour_msk(
+        DAILY_INCREMENTAL_TARGET_HOUR_MSK, DAILY_INCREMENTAL_TARGET_MINUTE_MSK
+    )
+    logger.info(
+        f"daily_incremental scheduled: next run at "
+        f"{DAILY_INCREMENTAL_TARGET_HOUR_MSK:02d}:{DAILY_INCREMENTAL_TARGET_MINUTE_MSK:02d} MSK "
+        f"(in {seconds_to_first / 3600:.1f}h), "
+        f"subprocess_timeout={DAILY_INCREMENTAL_SUBPROCESS_TIMEOUT}s"
+    )
+    _sleep_interruptible(seconds_to_first)
+
+    while not _shutdown_event.is_set():
+        logger.info("Triggering daily_incremental subprocess")
+        try:
+            r = subprocess.run(
+                ["python", "scripts/daily_incremental.py"],
+                capture_output=True,
+                text=True,
+                timeout=DAILY_INCREMENTAL_SUBPROCESS_TIMEOUT,
+                cwd="/app",
+            )
+            if r.returncode == 0:
+                tail = r.stdout[-500:] if r.stdout else ""
+                logger.info(f"daily_incremental OK rc={r.returncode}: {tail!r}")
+            else:
+                tail = (r.stderr or "")[-500:]
+                logger.warning(f"daily_incremental FAILED rc={r.returncode}: {tail!r}")
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                f"daily_incremental timeout after {DAILY_INCREMENTAL_SUBPROCESS_TIMEOUT}s; " f"subprocess killed"
+            )
+        except Exception as exc:  # noqa: BLE001 — never kill the heartbeat
+            logger.error(f"daily_incremental unexpected error: {exc}")
+        if _shutdown_event.is_set():
+            logger.info("daily_incremental daemon received shutdown signal, exiting")
+            return
+        # Wait 24h to the next 18:30 MSK.
         _sleep_interruptible(24 * 3600)
 
 
@@ -854,6 +926,21 @@ def main() -> None:
     )
 
     logger.info("daily-sync daemon started")
+
+    # Issue #331 (2026-08-29): post-backfill maintenance refresh. Runs
+    # daily_incremental.py once per day at 18:30 MSK, isolated as a
+    # subprocess so per-ticker fetch failures cannot wedge the heartbeat.
+    # Without this wiring, daily_incremental.py would never execute in
+    # production (was the cycle108 QA verdict gap).
+    daily_incremental_thread = threading.Thread(
+        target=_daily_incremental_loop, daemon=True, name="alphard-daily-incremental"
+    )
+    daily_incremental_thread.start()
+    logger.info(
+        f"daily-incremental daemon started "
+        f"(scheduled={DAILY_INCREMENTAL_TARGET_HOUR_MSK:02d}:{DAILY_INCREMENTAL_TARGET_MINUTE_MSK:02d} MSK, "
+        f"subprocess_timeout={DAILY_INCREMENTAL_SUBPROCESS_TIMEOUT}s)"
+    )
 
     # Phase 2.7: weekly delisted_at cron. Same daemon pattern as daily_sync:
     # subprocess + sentinel-able. First run waits 24h after launch.

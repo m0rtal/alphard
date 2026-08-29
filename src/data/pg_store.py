@@ -842,6 +842,38 @@ class PostgresDataStore(DataStore):
             cur.execute("SELECT ticker FROM ticker_universe WHERE backfill_complete = TRUE ORDER BY ticker")
             return [r[0] for r in cur.fetchall()]
 
+    def list_complete_universe(self) -> list[Any]:
+        """Return full ``TickerMeta`` rows for every ticker whose
+        ``backfill_complete = TRUE``.
+
+        Issue #331 (2026-08-29): daily_incremental.py needs the full
+        TickerMeta list (not just ticker strings) so it can build the
+        per-ticker fetch window without an extra round-trip to the
+        loader. Reuses the same query shape and column order as
+        ``list_tickers`` so the existing ``_row_to_ticker`` helper can
+        be reused verbatim (avoids the schema/position mismatch that
+        QA flagged in the cycle108 review — issue #334).
+
+        Returns an empty list if no tickers have been marked complete
+        yet (e.g. the first backfill pass has not finished).
+        """
+        self._connect()
+        # Column order MUST match ``list_tickers()`` and the
+        # ``_row_to_ticker`` helper — otherwise the row positions are
+        # misaligned (e.g. ``r[2]`` is the ``name`` TEXT in schema, not
+        # an ``int`` lot, so pydantic would ValidationError on first row).
+        sql = (
+            "SELECT ticker, figi, name, lot, isin, currency, class_code, "
+            "delisted, delisted_at, listed_at, source "
+            "FROM ticker_universe "
+            "WHERE backfill_complete = TRUE "
+            "ORDER BY ticker"
+        )
+        with self._conn.cursor() as cur:
+            cur.execute(sql)
+            rows = cur.fetchall()
+        return [_row_to_ticker(r) for r in rows]
+
     def is_backfill_complete(self, ticker: str) -> bool:
         """Check the flag without reading all bars. Cheap, no aggregates."""
         self._connect()

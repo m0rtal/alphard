@@ -445,11 +445,26 @@ class TinkoffInvestDataLoader(DataLoader):
                 from datetime import datetime as _dt
 
                 listed_at_attr = None
-                for _attr in (
-                    "first_1day_candle_date",
-                    "first_1min_candle_date",
-                    "ipo_date",
-                ):
+                # Issue #319 (2026-08-29): ``listed_at`` for backfill-
+                # completion purposes MUST anchor on ``first_1day_candle_date``
+                # — the earliest date the broker API actually has daily bars
+                # for this instrument. Falling back to ``first_1min_candle_date``
+                # or ``ipo_date`` (which can predate actual data availability
+                # by years for IPO'd-but-not-traded instruments like some
+                # SPBXM ETFs) yields an optimistic completion floor that
+                # _is_complete() formula cannot satisfy — the ticker is
+                # perpetually "missing data" even when all available data
+                # has been pulled (98% of universe on .107 was stuck at 0
+                # bars with this bug).
+                # Per Tinkoff docs, ``first_1day_candle_date`` is the
+                # canonical "data from this date" marker returned by every
+                # Instrument in Shares/Bonds/ETFs list responses. Falling
+                # back to ``first_1min_candle_date`` / ``ipo_date`` would
+                # be misleading; leave ``listed_at_attr = None`` so the
+                # backfill ``_resolve_universe`` / ``_is_complete`` formulas
+                # probe ``earliest_ts`` from the OHLCV table to derive
+                # a real floor.
+                for _attr in ("first_1day_candle_date",):
                     _raw = getattr(inst, _attr, None)
                     if _raw is None:
                         continue

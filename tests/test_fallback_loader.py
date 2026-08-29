@@ -1,15 +1,22 @@
 """Tests for FallbackDataLoader — the multi-source OHLCV loader.
 
-The loader wraps three existing data sources behind a single iterator
+The loader wraps two production data sources behind a single iterator
 and falls back when a source fails or returns no rows. These tests
 pin the contract:
 
-  1. Primary source (tinkoff_md) returns → its rows are yielded.
-  2. Primary returns 0 rows → falls back to secondary.
-  3. Primary raises → falls back to secondary.
-  4. All three return 0 → no rows yielded, ticker logged as empty.
+  1. Primary source (tinkoff_grpc / broker gRPC) returns → its rows are yielded.
+  2. Primary returns 0 rows → falls back to MOEX ISS.
+  3. Primary raises → falls back to MOEX ISS.
+  4. Both sources return 0 / raise → no rows yielded, ticker logged as empty.
   5. Per-source stats are tracked.
   6. Corporate actions use the same fallback contract.
+  7. ``tinkoff_md`` is no longer in the chain (issue #331, 2026-08-29);
+     the parameter is preserved for backward compatibility but ignored.
+
+Contract change 2026-08-29 (issue #331, m0rtal):
+    chain = tinkoff_grpc → moex_iss (MD-archive dropped).
+    tinkoff_md parameter kept as keyword-only for back-compat;
+    it is stored on self.tinkoff_md but never tried in the chain.
 """
 
 from __future__ import annotations
@@ -43,17 +50,35 @@ def _loader_empty() -> MagicMock:
 # ---------------------------------------------------------------------------
 
 
-def test_fallback_order_default_is_three_sources() -> None:
-    assert FALLBACK_ORDER == ("tinkoff_md", "tinkoff_grpc", "moex_iss")
+def test_fallback_order_default_is_broker_first() -> None:
+    # Contract change 2026-08-29 (issue #331): chain is now
+    # broker-first (tinkoff_grpc → moex_iss). Tinkoff history-data HTTP
+    # archive is no longer in the chain.
+    assert FALLBACK_ORDER == ("tinkoff_grpc", "moex_iss")
 
 
 def test_custom_order_supported() -> None:
-    md = _loader_empty()
     grpc = _loader_empty()
     moex = _loader_empty()
-    fl = FallbackDataLoader(tinkoff_md=md, tinkoff_grpc=grpc, moex_iss=moex, order=("moex_iss",))
+    fl = FallbackDataLoader(tinkoff_grpc=grpc, moex_iss=moex, order=("moex_iss",))
     assert fl.order == ("moex_iss",)
     assert fl._resolve("moex_iss") is moex
+    assert fl._resolve("tinkoff_md") is None  # never in chain any more
+
+
+def test_tinkoff_md_kwarg_kept_for_backcompat_but_not_in_chain() -> None:
+    """Issue #331: tinkoff_md is preserved as a keyword-only arg so legacy
+    callers don't raise, but it is never tried in the fallback chain."""
+    md = _loader_with_rows(["should_never_be_yielded"])
+    grpc = _loader_empty()
+    moex = _loader_empty()
+    fl = FallbackDataLoader(tinkoff_md=md, tinkoff_grpc=grpc, moex_iss=moex)
+    # Stored on instance for back-compat
+    assert fl.tinkoff_md is md
+    # But never tried: _resolve("tinkoff_md") returns None
+    assert fl._resolve("tinkoff_md") is None
+    # And FALLBACK_ORDER doesn't contain it
+    assert "tinkoff_md" not in FALLBACK_ORDER
 
 
 # ---------------------------------------------------------------------------
@@ -62,21 +87,25 @@ def test_custom_order_supported() -> None:
 
 
 def test_primary_source_returns_rows_immediately() -> None:
-    """If source 1 returns a non-empty result, no fallback happens."""
-    md_rows = ["row1", "row2", "row3"]
-    md = _loader_with_rows(md_rows)
+    """If source 1 (broker gRPC) returns a non-empty result, no fallback happens.
+
+    Contract change 2026-08-29 (issue #331): primary is now tinkoff_grpc
+    (broker gRPC). MD archive is no longer in the chain.
+    """
+    grpc_rows = ["row1", "row2", "row3"]
+    grpc = _loader_with_rows(grpc_rows)
     fl = FallbackDataLoader(
-        tinkoff_md=md,
-        tinkoff_grpc=_loader_empty(),
+        tinkoff_md=_loader_empty(),
+        tinkoff_grpc=grpc,
         moex_iss=_loader_empty(),
     )
 
     out = list(fl.iter_ohlcv("SBER", date(2026, 1, 1), date(2026, 1, 31)))
 
-    assert out == md_rows
-    md.iter_ohlcv.assert_called_once_with("SBER", date(2026, 1, 1), date(2026, 1, 31))
-    # grpc / moex never called
-    fl._resolve("tinkoff_grpc").iter_ohlcv.assert_not_called()  # type: ignore[attr-defined]
+    assert out == grpc_rows
+    grpc.iter_ohlcv.assert_called_once_with("SBER", date(2026, 1, 1), date(2026, 1, 31))
+    # md / moex never called
+    fl._resolve("tinkoff_md")  # would be None in chain
     fl._resolve("moex_iss").iter_ohlcv.assert_not_called()  # type: ignore[attr-defined]
 
 
@@ -86,35 +115,26 @@ def test_primary_source_returns_rows_immediately() -> None:
 
 
 def test_zero_rows_triggers_fallback() -> None:
-    """Source 1 returns 0 rows → fall through to source 2."""
-    md = _loader_empty()
-    grpc_rows = ["g1", "g2"]
-    grpc = _loader_with_rows(grpc_rows)
-    moex = _loader_empty()
-    fl = FallbackDataLoader(tinkoff_md=md, tinkoff_grpc=grpc, moex_iss=moex)
+    """Broker gRPC returns 0 rows → fall through to MOEX ISS."""
+    grpc = _loader_empty()
+    moex_rows = ["m1", "m2"]
+    moex = _loader_with_rows(moex_rows)
+    fl = FallbackDataLoader(tinkoff_md=_loader_empty(), tinkoff_grpc=grpc, moex_iss=moex)
 
     out = list(fl.iter_ohlcv("GAZP", date(2026, 1, 1), date(2026, 1, 31)))
 
-    assert out == grpc_rows
-    md.iter_ohlcv.assert_called_once()
-    grpc.iter_ohlcv.assert_called_once_with("GAZP", date(2026, 1, 1), date(2026, 1, 31))
-    moex.iter_ohlcv.assert_not_called()
-
-
-def test_zero_rows_then_zero_rows_then_data() -> None:
-    """All three sources tried in order; data comes from the third."""
-    md = _loader_empty()
-    grpc = _loader_empty()
-    moex_rows = ["m1"]
-    moex = _loader_with_rows(moex_rows)
-    fl = FallbackDataLoader(tinkoff_md=md, tinkoff_grpc=grpc, moex_iss=moex)
-
-    out = list(fl.iter_ohlcv("YDEX", date(2026, 1, 1), date(2026, 1, 31)))
-
     assert out == moex_rows
-    md.iter_ohlcv.assert_called_once()
     grpc.iter_ohlcv.assert_called_once()
-    moex.iter_ohlcv.assert_called_once()
+    moex.iter_ohlcv.assert_called_once_with("GAZP", date(2026, 1, 1), date(2026, 1, 31))
+
+
+def test_only_two_sources_in_chain() -> None:
+    """Defensive: the chain has exactly 2 sources. tinkoff_md is not in it."""
+    grpc = _loader_empty()
+    moex = _loader_empty()
+    fl = FallbackDataLoader(tinkoff_md=_loader_empty(), tinkoff_grpc=grpc, moex_iss=moex)
+    assert len(fl.order) == 2
+    assert "tinkoff_md" not in fl.order
 
 
 # ---------------------------------------------------------------------------
@@ -123,18 +143,17 @@ def test_zero_rows_then_zero_rows_then_data() -> None:
 
 
 def test_exception_triggers_fallback() -> None:
-    """A network error on source 1 must not abort — fall through."""
-    md = _loader_with_exc(RuntimeError("429 too many requests"))
-    grpc_rows = ["g1"]
-    grpc = _loader_with_rows(grpc_rows)
-    moex = _loader_empty()
-    fl = FallbackDataLoader(tinkoff_md=md, tinkoff_grpc=grpc, moex_iss=moex)
+    """A network error on broker gRPC must not abort — fall through to MOEX."""
+    grpc = _loader_with_exc(RuntimeError("429 too many requests"))
+    moex_rows = ["m1"]
+    moex = _loader_with_rows(moex_rows)
+    fl = FallbackDataLoader(tinkoff_md=_loader_empty(), tinkoff_grpc=grpc, moex_iss=moex)
 
     out = list(fl.iter_ohlcv("OZON", date(2026, 1, 1), date(2026, 1, 31)))
 
-    assert out == grpc_rows
-    md.iter_ohlcv.assert_called_once()
+    assert out == moex_rows
     grpc.iter_ohlcv.assert_called_once()
+    moex.iter_ohlcv.assert_called_once()
 
 
 def test_all_sources_fail_yields_nothing() -> None:
@@ -169,242 +188,232 @@ def test_all_sources_raise_yields_nothing() -> None:
 
 
 def test_stats_track_ok_fallback_error() -> None:
-    md = _loader_with_exc(RuntimeError("boom"))  # error → fallback
-    grpc = _loader_with_rows(["g1"])  # ok
-    moex = _loader_empty()  # not reached
-    fl = FallbackDataLoader(tinkoff_md=md, tinkoff_grpc=grpc, moex_iss=moex)
+    """When grpc raises, fallback to moex succeeds.
+
+    Per issue #331: tinkoff_md is no longer in chain; its stats slot is gone.
+    """
+    grpc = _loader_with_exc(RuntimeError("boom"))  # error → fallback
+    moex = _loader_with_rows(["m1"])  # ok
+    fl = FallbackDataLoader(tinkoff_md=_loader_empty(), tinkoff_grpc=grpc, moex_iss=moex)
 
     list(fl.iter_ohlcv("X", date(2026, 1, 1), date(2026, 1, 31)))
 
     stats = fl.stats
-    assert stats["tinkoff_md"]["error"] == 1
-    assert stats["tinkoff_md"]["fallback"] == 1
-    assert stats["tinkoff_grpc"]["ok"] == 1
-    assert stats["tinkoff_grpc"]["fallback"] == 0
-    assert stats["tinkoff_grpc"]["error"] == 0
-    assert stats["moex_iss"]["ok"] == 0
+    assert "tinkoff_md" not in stats  # dropped from stats dict (issue #331)
+    assert stats["tinkoff_grpc"]["error"] == 1
+    assert stats["tinkoff_grpc"]["fallback"] == 1
+    assert stats["moex_iss"]["ok"] == 1
     assert stats["moex_iss"]["fallback"] == 0
     assert stats["moex_iss"]["error"] == 0
 
 
 def test_stats_zero_rows_counts_as_fallback() -> None:
-    """Source returning 0 rows counts as fallback (not error, not ok)."""
+    """Source returning 0 rows counts as fallback (not error, not ok).
+
+    grpc returns 0 → fallback to moex; moex returns 0 → fallback (recorded).
+    """
     fl = FallbackDataLoader(
         tinkoff_md=_loader_empty(),
-        tinkoff_grpc=_loader_with_rows(["g1"]),
+        tinkoff_grpc=_loader_empty(),
         moex_iss=_loader_empty(),
     )
 
     list(fl.iter_ohlcv("X", date(2026, 1, 1), date(2026, 1, 31)))
 
-    assert fl.stats["tinkoff_md"]["fallback"] == 1
-    assert fl.stats["tinkoff_md"]["error"] == 0
-    assert fl.stats["tinkoff_grpc"]["ok"] == 1
+    assert fl.stats["tinkoff_grpc"]["fallback"] == 1
+    assert fl.stats["tinkoff_grpc"]["error"] == 0
+    assert fl.stats["moex_iss"]["fallback"] == 1
+    assert fl.stats["moex_iss"]["error"] == 0
+    # MD slot is gone (issue #331).
+    assert "tinkoff_md" not in fl.stats
 
 
 # ---------------------------------------------------------------------------
-# list_tickers + iter_corporate_actions
+# list_tickers + iter_corporate_actions (chain = grpc → moex)
 # ---------------------------------------------------------------------------
 
 
-def test_list_tickers_uses_tinkoff_md_first() -> None:
-    """Issue #316 (2026-08-28): tinkoff_md is the PRIMARY universe source.
+def test_list_tickers_uses_tinkoff_grpc_first() -> None:
+    """Issue #331 (2026-08-29): tinkoff_grpc is the PRIMARY universe source.
 
-    Reason: tinkoff_md (history-data archive) covers ALL 4 MOEX classes
-    (TQBR + SPBXM + TQCB + TQOB = ~3259 tickers including delisted). It
-    uses the same REAL token shared from gRPC loader (post PR #313). Why
-    not gRPC first? tinkoff_grpc.list_tickers() returns ONLY the TQBR
-    class (~252 tickers) — losing ~3000 from the universe. Pre-fix
-    (gRPC-first in PR #313) the universe had only 252 tickers when it
-    should have had 3259. Post-fix: MD wins → 3259 → gRPC fallback
-    (252) → MOEX ISS last-resort (~1927 TQBR).
+    Reason: broker gRPC walks every tradable class (TQBR + SPBXM + TQCB + TQOB +
+    ...) and returns ~3259 tickers with FIGI. The old chain (MD first) was
+    indirect — ``tinkoff_md.list_tickers_with_figi()`` delegated to broker
+    gRPC anyway (see ``src/data/tinkoff_md_loader.py:_fill_universe_cache``),
+    so dropping MD from the chain removes a redundant round-trip while
+    keeping the same ~3259-ticker universe.
     """
-    md = MagicMock()
-    md.list_tickers_with_figi.return_value = ["MD_T1", "MD_T2"]
     grpc = MagicMock()
     grpc.list_tickers.return_value = ["GRPC_T1", "GRPC_T2", "GRPC_T3"]
-    fl = FallbackDataLoader(tinkoff_md=md, tinkoff_grpc=grpc, moex_iss=_loader_empty())
+    moex = MagicMock()
+    fl = FallbackDataLoader(tinkoff_md=MagicMock(), tinkoff_grpc=grpc, moex_iss=moex)
 
     out = fl.list_tickers()
 
-    # MD wins (first non-empty in MD → gRPC → MOEX chain).
-    assert out == ["MD_T1", "MD_T2"]
-    md.list_tickers_with_figi.assert_called_once()
-    # gRPC must NOT have been called when MD succeeded.
-    grpc.list_tickers.assert_not_called()
-
-
-def test_list_tickers_falls_back_to_grpc_when_md_empty() -> None:
-    """When MD returns 0 tickers (degenerate case), fall back to gRPC."""
-    md = MagicMock()
-    md.list_tickers_with_figi.return_value = []
-    grpc = MagicMock()
-    grpc.list_tickers.return_value = ["GRPC_T1", "GRPC_T2"]
-    fl = FallbackDataLoader(tinkoff_md=md, tinkoff_grpc=grpc, moex_iss=_loader_empty())
-
-    out = fl.list_tickers()
-
-    assert out == ["GRPC_T1", "GRPC_T2"]
-    md.list_tickers_with_figi.assert_called_once()
+    # gRPC wins (first non-empty in chain).
+    assert out == ["GRPC_T1", "GRPC_T2", "GRPC_T3"]
     grpc.list_tickers.assert_called_once()
-    assert fl.stats["tinkoff_md"]["fallback"] == 1
-    assert fl.stats["tinkoff_grpc"]["ok"] == 1
+    # moex must NOT have been called when gRPC succeeded.
+    moex.list_tickers.assert_not_called()
 
 
-def test_list_tickers_falls_back_to_grpc_when_md_raises() -> None:
-    """When MD raises (UNAUTHENTICATED, network, etc.), fall back to gRPC."""
-    md = MagicMock()
-    md.list_tickers_with_figi.side_effect = RuntimeError("UNAUTHENTICATED")
+def test_list_tickers_falls_back_to_moex_when_grpc_empty() -> None:
+    """When gRPC returns 0 tickers (degenerate case), fall back to MOEX."""
     grpc = MagicMock()
-    grpc.list_tickers.return_value = ["GRPC_T1"]
-    fl = FallbackDataLoader(tinkoff_md=md, tinkoff_grpc=grpc, moex_iss=_loader_empty())
-
-    out = fl.list_tickers()
-
-    assert out == ["GRPC_T1"]
-    grpc.list_tickers.assert_called_once()
-    assert fl.stats["tinkoff_md"]["error"] == 1
-    assert fl.stats["tinkoff_grpc"]["ok"] == 1
-
-
-def test_list_tickers_falls_back_to_moex_when_md_and_grpc_fail() -> None:
-    """When both MD and gRPC fail, try MOEX ISS (no auth, last resort)."""
+    grpc.list_tickers.return_value = []
     moex = MagicMock()
     moex.list_tickers.return_value = ["MOEX_T1", "MOEX_T2"]
-    md = MagicMock()
-    md.list_tickers_with_figi.side_effect = RuntimeError("UNAUTHENTICATED")
-    grpc = MagicMock()
-    grpc.list_tickers.side_effect = RuntimeError("UNAUTHENTICATED")
-    fl = FallbackDataLoader(tinkoff_md=md, tinkoff_grpc=grpc, moex_iss=moex)
+    fl = FallbackDataLoader(tinkoff_md=MagicMock(), tinkoff_grpc=grpc, moex_iss=moex)
 
     out = fl.list_tickers()
 
     assert out == ["MOEX_T1", "MOEX_T2"]
-    assert fl.stats["tinkoff_md"]["error"] == 1
+    grpc.list_tickers.assert_called_once()
+    moex.list_tickers.assert_called_once()
+    assert fl.stats["tinkoff_grpc"]["fallback"] == 1
+    assert fl.stats["moex_iss"]["ok"] == 1
+
+
+def test_list_tickers_falls_back_to_moex_when_grpc_raises() -> None:
+    """When gRPC raises (UNAUTHENTICATED, network, etc.), fall back to MOEX."""
+    grpc = MagicMock()
+    grpc.list_tickers.side_effect = RuntimeError("UNAUTHENTICATED")
+    moex = MagicMock()
+    moex.list_tickers.return_value = ["MOEX_T1"]
+    fl = FallbackDataLoader(tinkoff_md=MagicMock(), tinkoff_grpc=grpc, moex_iss=moex)
+
+    out = fl.list_tickers()
+
+    assert out == ["MOEX_T1"]
+    moex.list_tickers.assert_called_once()
     assert fl.stats["tinkoff_grpc"]["error"] == 1
     assert fl.stats["moex_iss"]["ok"] == 1
 
 
 def test_list_tickers_returns_empty_when_all_sources_fail() -> None:
-    """When ALL THREE sources fail, return [] — supervisor treats this as
-    a clean exit (rc=0) and respawns after the fixed 30s
-    _BACKFILL_RESPAWN_BACKOFF_SECONDS (src/main.py:150). See
-    test_main_backfill_supervisor.py for the supervisor-loop coverage.
+    """When both sources fail, return [] — supervisor treats this as a clean
+    exit (rc=0) and respawns after the fixed 30s _BACKFILL_RESPAWN_BACKOFF_SECONDS
+    (src/main.py). Every source must be marked as errored.
     """
     moex = MagicMock()
     moex.list_tickers.side_effect = RuntimeError("network error")
-    md = MagicMock()
-    md.list_tickers_with_figi.side_effect = RuntimeError("UNAUTHENTICATED")
     grpc = MagicMock()
     grpc.list_tickers.side_effect = RuntimeError("UNAUTHENTICATED")
-    fl = FallbackDataLoader(tinkoff_md=md, tinkoff_grpc=grpc, moex_iss=moex)
+    fl = FallbackDataLoader(tinkoff_md=MagicMock(), tinkoff_grpc=grpc, moex_iss=moex)
 
     out = fl.list_tickers()
 
     assert out == []
     # Every source must be marked as errored.
-    assert fl.stats["tinkoff_md"]["error"] == 1
     assert fl.stats["tinkoff_grpc"]["error"] == 1
     assert fl.stats["moex_iss"]["error"] == 1
 
 
-def test_list_tickers_full_chain_md_empty_then_grpc_empty_then_moex_empty() -> None:
-    """All three sources return [] (not raise, just empty). Returns [].
+def test_list_tickers_full_chain_grpc_empty_then_moex_empty() -> None:
+    """Both sources return [] (not raise, just empty). Returns [].
 
     This is the path that triggers a clean supervisor respawn (rc=0,
-    fixed 30s backoff) without any error counters being incremented —
-    every source reports ``fallback`` (zero results) rather than
-    ``error`` (exception). Order is MD → gRPC → MOEX.
+    fixed 30s backoff) without any error counters being incremented — every
+    source reports fallback (zero results) rather than error (exception).
+    Order is gRPC → MOEX.
     """
     moex = MagicMock()
     moex.list_tickers.return_value = []
-    md = MagicMock()
-    md.list_tickers_with_figi.return_value = []
     grpc = MagicMock()
     grpc.list_tickers.return_value = []
-    fl = FallbackDataLoader(tinkoff_md=md, tinkoff_grpc=grpc, moex_iss=moex)
+    fl = FallbackDataLoader(tinkoff_md=MagicMock(), tinkoff_grpc=grpc, moex_iss=moex)
 
     out = fl.list_tickers()
 
     assert out == []
     # Each source reports fallback (zero results), NOT error (exception).
-    assert fl.stats["tinkoff_md"]["fallback"] == 1
     assert fl.stats["tinkoff_grpc"]["fallback"] == 1
     assert fl.stats["moex_iss"]["fallback"] == 1
 
 
-def test_iter_corporate_actions_falls_back() -> None:
-    """Same fallback contract for corporate actions."""
+def test_list_tickers_md_loader_is_never_consulted() -> None:
+    """Defensive: tinkoff_md.list_tickers_with_figi() must NEVER be called,
+    even if a tinkoff_md attribute is configured. This pins the chain order
+    so a future refactor cannot silently re-introduce the MD archive.
+    """
     md = MagicMock()
-    md.iter_corporate_actions.return_value = iter([])
+    md.list_tickers_with_figi.return_value = ["MD_T1"]
     grpc = MagicMock()
-    grpc.iter_corporate_actions.return_value = iter(["split"])
+    grpc.list_tickers.return_value = ["GRPC_T1"]
+    fl = FallbackDataLoader(tinkoff_md=md, tinkoff_grpc=grpc, moex_iss=MagicMock())
+
+    fl.list_tickers()
+
+    # The MD loader is stored on the instance but its universe API is never
+    # invoked from the chain.
+    md.list_tickers_with_figi.assert_not_called()
+    md.list_tickers.assert_not_called()
+
+
+def test_iter_corporate_actions_falls_back() -> None:
+    """Same fallback contract for corporate actions: gRPC → MOEX."""
+    grpc = MagicMock()
+    grpc.iter_corporate_actions.return_value = iter([])
     moex = MagicMock()
-    moex.iter_corporate_actions.return_value = iter([])
-    fl = FallbackDataLoader(tinkoff_md=md, tinkoff_grpc=grpc, moex_iss=moex)
+    moex.iter_corporate_actions.return_value = iter(["split"])
+    fl = FallbackDataLoader(tinkoff_md=MagicMock(), tinkoff_grpc=grpc, moex_iss=moex)
 
     out = list(fl.iter_corporate_actions("SBER", date(2026, 1, 1), date(2026, 1, 31)))
 
     assert out == ["split"]
-    md.iter_corporate_actions.assert_called_once()
     grpc.iter_corporate_actions.assert_called_once()
-    moex.iter_corporate_actions.assert_not_called()
+    moex.iter_corporate_actions.assert_called_once()
 
 
 def test_iter_corporate_actions_skips_sources_without_method() -> None:
     """If a source doesn't implement iter_corporate_actions, skip it."""
-    md = MagicMock(spec=["iter_ohlcv"])  # no iter_corporate_actions
+    # gRPC has iter_corporate_actions; moex has it too
     grpc = MagicMock()
     grpc.iter_corporate_actions.return_value = iter(["div"])
     moex = MagicMock()
     moex.iter_corporate_actions.return_value = iter([])
-    fl = FallbackDataLoader(tinkoff_md=md, tinkoff_grpc=grpc, moex_iss=moex)
+    fl = FallbackDataLoader(tinkoff_md=MagicMock(spec=["iter_ohlcv"]), tinkoff_grpc=grpc, moex_iss=moex)
 
     out = list(fl.iter_corporate_actions("X", date(2026, 1, 1), date(2026, 1, 31)))
 
     assert out == ["div"]
     grpc.iter_corporate_actions.assert_called_once()
-    # moex was called (has method), but no rows from grpc -> moex
+    # moex was NOT called (grpc returned data first).
     moex.iter_corporate_actions.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
-# C5 coverage: defensive paths in FallbackDataLoader
+# Defensive paths in FallbackDataLoader
 # ---------------------------------------------------------------------------
 
 
 def test_resolve_returns_none_for_unknown_source_name() -> None:
-    """Line 150: ``_resolve`` returns ``None`` for unknown name.
+    """``_resolve`` returns ``None`` for unknown source name.
 
-    Exercising this path requires passing a custom ``order`` that contains
-    a name not in {``tinkoff_md``, ``tinkoff_grpc``, ``moex_iss``}. The
-    fallback contract should treat unknown sources as 'not configured'
+    The fallback contract should treat unknown sources as 'not configured'
     rather than raise.
     """
-    md = _loader_with_rows(["row1"])
+    grpc = _loader_with_rows(["row1"])
     fl = FallbackDataLoader(
-        tinkoff_md=md,
-        tinkoff_grpc=None,
-        moex_iss=None,
+        tinkoff_grpc=grpc,
+        moex_iss=None,  # type: ignore[arg-type]
         order=("nonexistent_source",),
     )
     out = list(fl.iter_ohlcv("X", date(2026, 1, 1), date(2026, 1, 31)))
     assert out == []
     # The unknown source never reaches the underlying loader.
-    md.iter_ohlcv.assert_not_called()
+    grpc.iter_ohlcv.assert_not_called()
 
 
 def test_resolve_skips_missing_ohlcv_source_at_iter_time() -> None:
-    """Line 124: ``_resolve`` returns ``None`` for a configured-but-unset source.
+    """``_resolve`` returns ``None`` for a configured-but-unset source.
 
-    If you instantiate FallbackDataLoader with only tinkoff_md and leave
-    tinkoff_grpc/moex_iss at their defaults (``None``), ``_resolve("tinkoff_grpc")``
-    returns ``None`` and the loop skips to the next source.
+    If you instantiate FallbackDataLoader without moex_iss (``None``), the
+    loop's ``if source is None: continue`` branch must skip that source.
     """
-    md = _loader_with_rows(["bar"])
+    grpc = _loader_with_rows(["bar"])
     fl = FallbackDataLoader(
-        tinkoff_md=md,
-        tinkoff_grpc=None,  # type: ignore[arg-type]
+        tinkoff_grpc=grpc,
         moex_iss=None,  # type: ignore[arg-type]
     )
     out = list(fl.iter_ohlcv("X", date(2026, 1, 1), date(2026, 1, 31)))
@@ -412,26 +421,24 @@ def test_resolve_skips_missing_ohlcv_source_at_iter_time() -> None:
 
 
 def test_iter_corporate_actions_skips_when_method_missing() -> None:
-    """Lines 167-169: skip sources without ``iter_corporate_actions``.
+    """Skip sources without ``iter_corporate_actions``.
 
     The ``hasattr(source, 'iter_corporate_actions')`` check should skip
     sources that don't implement the method.
     """
-    md = MagicMock(spec=["iter_ohlcv"])  # no iter_corporate_actions
     grpc = MagicMock()
     grpc.iter_corporate_actions.return_value = iter(["div2"])
-    # md is configured as first in the order but lacks iter_corporate_actions.
-    fl = FallbackDataLoader(tinkoff_md=md, tinkoff_grpc=grpc, moex_iss=None)
+    fl = FallbackDataLoader(
+        tinkoff_md=MagicMock(spec=["iter_ohlcv"]),  # no iter_corporate_actions
+        tinkoff_grpc=grpc,
+        moex_iss=None,  # type: ignore[arg-type]
+    )
     out = list(fl.iter_corporate_actions("X", date(2026, 1, 1), date(2026, 1, 31)))
     assert out == ["div2"]
 
 
 def test_iter_corporate_actions_exception_falls_back() -> None:
-    """Lines 170-172: source raises during corp-actions → fall back.
-
-    Tinkoff gRPC raises; MOEX ISS returns rows. The exception branch
-    logs + continues; MOEX supplies the answer.
-    """
+    """Source raises during corp-actions → fall back."""
     grpc = MagicMock()
     grpc.iter_corporate_actions.side_effect = RuntimeError("grpc down")
     moex = MagicMock()
@@ -439,3 +446,12 @@ def test_iter_corporate_actions_exception_falls_back() -> None:
     fl = FallbackDataLoader(tinkoff_md=None, tinkoff_grpc=grpc, moex_iss=moex)
     out = list(fl.iter_corporate_actions("X", date(2026, 1, 1), date(2026, 1, 31)))
     assert out == ["corp_event"]
+
+
+def test_tinkoff_md_attribute_is_preserved() -> None:
+    """Back-compat: ``self.tinkoff_md`` is still set on the instance for any
+    caller that introspects it. The chain just doesn't consult it.
+    """
+    md = MagicMock()
+    fl = FallbackDataLoader(tinkoff_md=md, tinkoff_grpc=MagicMock(), moex_iss=MagicMock())
+    assert fl.tinkoff_md is md

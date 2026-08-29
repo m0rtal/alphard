@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Refuse to push unless scripts/pre_pr_smoke.sh passed recently for this
+# branch. Install with: git config core.hooksPath scripts/hooks
+#
+# The sentinel carries a TTL so that yesterday's pass cannot silently
+# validate today's code. Bypass with ALPHARD_SKIP_SMOKE=1 only when the
+# smoke has been run manually and reviewed.
+
+set -euo pipefail
+
+SENTINEL_TTL_MINUTES=30
+
+if [[ "${ALPHARD_SKIP_SMOKE:-0}" == "1" ]]; then
+    echo "[pre-push] ALPHARD_SKIP_SMOKE=1 — smoke gate bypassed by operator"
+    exit 0
+fi
+
+BRANCH="$(git rev-parse --abbrev-ref HEAD | tr '/' '-')"
+SENTINEL="/tmp/.alphard-pr-smoke-pass.${BRANCH}"
+
+if [[ ! -f "$SENTINEL" ]]; then
+    echo "[pre-push] REFUSED: no smoke sentinel for branch '$BRANCH'."
+    echo "[pre-push] Run: ./scripts/pre_pr_smoke.sh"
+    exit 1
+fi
+
+if [[ -n "$(find "$SENTINEL" -mmin "+${SENTINEL_TTL_MINUTES}" 2>/dev/null)" ]]; then
+    echo "[pre-push] REFUSED: smoke sentinel is older than ${SENTINEL_TTL_MINUTES} min."
+    echo "[pre-push] Re-run: ./scripts/pre_pr_smoke.sh"
+    exit 1
+fi
+
+echo "[pre-push] smoke sentinel OK for '$BRANCH'"

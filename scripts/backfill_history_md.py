@@ -206,6 +206,22 @@ def _alarm_handler(signum: int, frame: object) -> None:
 # on a doomed loop) but the threshold was wrong.
 _CIRCUIT_BREAKER_THRESHOLD = 50  # 2026-08-19: raised from 5 (user feedback)
 
+# Number of MOEX trading days per calendar year (used in _is_complete
+# to convert calendar_days into expected_bars). 252 is the canonical
+# Moscow Exchange trading-calendar value (Mon-Fri minus exchange
+# holidays). 2026-08-29: was missing from PR #330 commit 6002766 which
+# introduced the variable but never defined it — restore here so the
+# completion-floor arithmetic does not NameError on import.
+_TRADING_DAYS_PER_YEAR = 252
+
+# Fraction of trading days we *don't* expect to see for a fully-loaded
+# ticker. 15% slack covers the 2022 MOEX sanctions gap, delisted
+# tickers with truncated histories, and other exchange-driven gaps.
+# 2026-08-29: same as _TRADING_DAYS_PER_YEAR — was missing from
+# PR #330 commit 6002766 which introduced the symbol but never
+# defined it module-wide.
+_HALTS_PCT = 0.15
+
 # Hard per-ticker deadline. If _backfill_one() doesn't return within this
 # many seconds, the heartbeating watchdog inside it raises _LoaderTimeout
 # and the run moves on to the next ticker. SBER + 9 years of minute bars
@@ -305,17 +321,6 @@ def _resolve_universe(
     logger.info(f"Universe: {len(tickers)} tickers (classes={classes or 'ALL'}, limit={limit})")
     return tickers, metas_map
 
-
-# Trading days per calendar year on MOEX. ~252 sessions/year is the
-# standard accounting convention (excludes weekends + holidays).
-_TRADING_DAYS_PER_YEAR = 252
-
-# Fraction of trading days a "complete" ticker is allowed to be
-# missing without being flagged as incomplete. Covers normal
-# exchange halts, delisting days, and major disruption events
-# (2022 sanctions gap, etc.). 15% is well above the worst
-# historical Russian-market disruption.
-_HALTS_PCT = 0.15
 
 # Earliest year Tinkoff's history-data archive goes back to. Pre-2018
 # data requires a paid source (AlgoPack, etc.).
