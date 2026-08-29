@@ -842,6 +842,51 @@ class PostgresDataStore(DataStore):
             cur.execute("SELECT ticker FROM ticker_universe WHERE backfill_complete = TRUE ORDER BY ticker")
             return [r[0] for r in cur.fetchall()]
 
+    def list_complete_universe(self) -> list[Any]:
+        """Return full ``TickerMeta`` rows for every ticker whose
+        ``backfill_complete = TRUE``.
+
+        Issue #331 (2026-08-29): daily_incremental.py needs the full
+        TickerMeta list (not just ticker strings) so it can build the
+        per-ticker fetch window without an extra round-trip to the
+        loader. Reuses the same query shape as
+        ``backfill_complete_tickers`` but joins on the columns the
+        incremental script needs.
+
+        Returns an empty list if no tickers have been marked complete
+        yet (e.g. the first backfill pass has not finished).
+        """
+        self._connect()
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT ticker, name, lot, source, figi, class_code, "
+                "listed_at, delisted_at "
+                "FROM ticker_universe "
+                "WHERE backfill_complete = TRUE "
+                "ORDER BY ticker"
+            )
+            rows = cur.fetchall()
+        # Build proper TickerMeta objects — the dataclass is already
+        # imported at module top, and daily_incremental.py only
+        # consumes ``.ticker`` and (optionally) ``.listed_at``/``.figi``
+        # for diagnostic logging, so we pass empty defaults for the
+        # fields we don't have columns for.
+        result = []
+        for r in rows:
+            result.append(
+                TickerMeta(
+                    ticker=r[0],
+                    name=r[1] or r[0],
+                    lot=r[2] or 1,
+                    source=r[3] or "tkf",
+                    figi=r[4] or "",
+                    class_code=r[5] or "",
+                    listed_at=r[6],
+                    delisted_at=r[7],
+                )
+            )
+        return result
+
     def is_backfill_complete(self, ticker: str) -> bool:
         """Check the flag without reading all bars. Cheap, no aggregates."""
         self._connect()
