@@ -67,7 +67,6 @@ from collections.abc import Iterable
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
 
 import requests
 
@@ -82,7 +81,7 @@ if _SRC_PATH not in sys.path:
 import fetch_moex_corporate_actions as mca  # noqa: E402
 
 from src.data.adjustment import apply_adjustment  # noqa: E402
-from src.data.models import CorporateAction, OHLCVRow, TickerMeta  # noqa: E402
+from src.data.models import CorporateAction, TickerMeta  # noqa: E402
 from src.data.pg_store import PostgresDataStore  # noqa: E402
 from src.data.store import DataStore, StoreError  # noqa: E402
 

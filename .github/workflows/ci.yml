@@ -92,10 +92,10 @@ jobs:
       - name: Black formatting check
         run: |
           pip install --quiet 'black>=26.3.1,<27.0'
-          black --check src/ tests/
+          black --check src/ tests/ scripts/
 
       - name: Flake8
-        run: flake8 src/ tests/ --max-line-length=120 --extend-ignore=E203,W503
+        run: flake8 src/ tests/ scripts/ --max-line-length=120 --extend-ignore=E203,W503
 
       - name: Mypy
         run: mypy src/ --strict --ignore-missing-imports
