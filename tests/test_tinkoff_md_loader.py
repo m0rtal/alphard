@@ -776,10 +776,8 @@ class TestUniverse:
         """
         from src.data.fallback_loader import FallbackDataLoader
         from src.data.loader import LoaderError
-        from src.data.token_bucket import TokenBucket
 
         monkeypatch.setenv("TINKOFF_SANDBOX_TOKEN", "fake-token-1234567890")
-        md = TinkoffInvestMDDataLoader(bucket=TokenBucket(rate=1000.0, window_seconds=1.0))
         grpc = MagicMock()
         grpc.list_tickers.return_value = [
             TickerMeta(
