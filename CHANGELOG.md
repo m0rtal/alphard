@@ -76,6 +76,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - **`.gitignore` extended** — ignore stray nested clones (e.g. `git clone . alphard/`) to prevent recursive repo corruption. (`b0d71a4`, #242.)
 - **`CHANGELOG.md [Unreleased]` backfilled** — entries for the cycle103 PRs (#319 fix → #321, #320 fix → #322) added to keep the file in sync with `main`. Bundled with a `.gitignore` rule for the local-override `.claude/settings.local.json` (operator convenience, never committed). (PR #323.)
 - **Stale "in flight" note removed** from `CHANGELOG.md` — the referenced PRs (legacy banners #306, `ARCHITECTURE.md` #301, `API.md` #302, `TESTING.md` #303, `TROUBLESHOOTING.md` #304, `DOCS-INDEX.md` + `evidence/README.md` #305, Grafana provisioning #297/#300, `entrypoint.sh` `/root/.env` loop #296) have all landed on `main`. The note no longer reflects reality.
+- **`_fill_shares_all` docstring aligned with the #319 fix** — the docstring on `src/data/tinkoff_loader.py:412` previously listed three fallbacks (`first_1min_candle_date` / `ipo_date` / `first_1day_candle_date`) but the actual code only reads `first_1day_candle_date` (the other two fields predate real OHLCV availability for SPBXM-style instruments and were the root cause of #319). Added a `TestListedAtAnchor` regression test that pins the floor field to `first_1day_candle_date` so the docstring/code drift cannot recur. (Closes #339, #340.)
 
 ### Documentation
 - **`CHANGELOG.md`** (this file) — aggregated release view reconstructed from `git log` + per-PR descriptions. Closes #289.
