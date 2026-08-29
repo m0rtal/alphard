@@ -408,11 +408,18 @@ class TinkoffInvestDataLoader(DataLoader):
 
         Includes delisted tickers (``delisted=True`` is set based on the
         SecurityTradingStatus enum value: NOT_AVAILABLE_FOR_TRADING /
-        DELISTED / EXCLUDED). The ``listed_at`` field is the earliest
-        of first_1day_candle_date / first_1min_candle_date / ipo_date
-        that the proto exposes; delisted_at stays None because Tinkoff
-        does not surface a delisting date — ``delist_source.py`` fills
-        that separately via MOEX ISS.
+        DELISTED / EXCLUDED). The ``listed_at`` field anchors strictly
+        on ``first_1day_candle_date`` — the canonical "data from this
+        date" marker per Tinkoff docs. Earlier iterations fell back to
+        ``first_1min_candle_date`` / ``ipo_date`` (which can predate
+        actual daily-bar availability by years for IPO'd-but-not-traded
+        instruments like some SPBXM ETFs), but issue #319 (2026-08-29)
+        proved that the optimistic completion floor yielded by those
+        fallbacks is unsatisfiable for a non-trivial fraction of the
+        universe — see the body of the per-class loop below for the
+        contract. ``delisted_at`` stays None because Tinkoff does not
+        surface a delisting date — ``delist_source.py`` fills that
+        separately via MOEX ISS.
         """
         from t_tech.invest import Client, SecurityTradingStatus
 
