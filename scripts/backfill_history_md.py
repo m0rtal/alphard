@@ -206,6 +206,22 @@ def _alarm_handler(signum: int, frame: object) -> None:
 # on a doomed loop) but the threshold was wrong.
 _CIRCUIT_BREAKER_THRESHOLD = 50  # 2026-08-19: raised from 5 (user feedback)
 
+# Number of MOEX trading days per calendar year (used in _is_complete
+# to convert calendar_days into expected_bars). 252 is the canonical
+# Moscow Exchange trading-calendar value (Mon-Fri minus exchange
+# holidays). 2026-08-29: was missing from PR #330 commit 6002766 which
+# introduced the variable but never defined it — restore here so the
+# completion-floor arithmetic does not NameError on import.
+_TRADING_DAYS_PER_YEAR = 252
+
+# Fraction of trading days we *don't* expect to see for a fully-loaded
+# ticker. 15% slack covers the 2022 MOEX sanctions gap, delisted
+# tickers with truncated histories, and other exchange-driven gaps.
+# 2026-08-29: same as _TRADING_DAYS_PER_YEAR — was missing from
+# PR #330 commit 6002766 which introduced the symbol but never
+# defined it module-wide.
+_HALTS_PCT = 0.15
+
 # Hard per-ticker deadline. If _backfill_one() doesn't return within this
 # many seconds, the heartbeating watchdog inside it raises _LoaderTimeout
 # and the run moves on to the next ticker. SBER + 9 years of minute bars

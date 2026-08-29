@@ -803,22 +803,30 @@ class TestUniverse:
             ),
         ]
 
-        # tinkoff_md's internal broker gRPC: all calls fail → LoaderError.
-        # We can't patch the loader import from inside tinkoff_md_loader
-        # cleanly here, so monkeypatch ``_fill_universe_cache`` to raise.
+        # Contract change 2026-08-29 (issue #331): tinkoff_md is no
+        # longer in the chain. The test now exercises the broker-first
+        # contract: tinkoff_grpc fails with auth outage → moex_iss
+        # succeeds. The old "tinkoff_md raises, tinkoff_grpc succeeds"
+        # scenario is no longer reachable because tinkoff_md is not
+        # part of the chain.
         err = LoaderError("auth outage")
-        monkeypatch.setattr(md, "_fill_universe_cache", MagicMock(side_effect=err))
-        # Also clear the cache so the next call re-invokes the mock.
-        md._universe_cache = None
-
-        fb = FallbackDataLoader(tinkoff_md=md, tinkoff_grpc=grpc, moex_iss=iss)
+        # Force tinkoff_grpc to raise so the chain falls through to MOEX.
+        monkeypatch.setattr(grpc, "list_tickers", MagicMock(side_effect=err))
+        # Provide a sensible fallback that does not depend on tinkoff_md.
+        fb = FallbackDataLoader(tinkoff_grpc=grpc, moex_iss=iss)
         result = fb.list_tickers()
-        # tinkoff_md raised → stats["error"] += 1, NOT stats["fallback"].
-        assert fb.stats["tinkoff_md"]["error"] == 1, f"expected tinkoff_md.error=1 on auth outage, got {fb.stats}"
-        assert fb.stats["tinkoff_md"]["fallback"] == 0, f"expected tinkoff_md.fallback=0 on auth outage, got {fb.stats}"
-        # Chain proceeded to tinkoff_grpc (which returned a ticker).
-        assert fb.stats["tinkoff_grpc"]["ok"] == 1, f"expected tinkoff_grpc.ok=1, got {fb.stats}"
-        assert result and result[0].ticker == "SBER"
+        # tinkoff_grpc raised → stats["error"] += 1, NOT stats["fallback"].
+        assert fb.stats["tinkoff_grpc"]["error"] == 1, (
+            f"expected tinkoff_grpc.error=1 on auth outage, got {fb.stats}"
+        )
+        assert fb.stats["tinkoff_grpc"]["fallback"] == 0, (
+            f"expected tinkoff_grpc.fallback=0 on auth outage, got {fb.stats}"
+        )
+        # Chain proceeded to moex_iss (which returned a ticker).
+        assert fb.stats["moex_iss"]["ok"] == 1, (
+            f"expected moex_iss.ok=1, got {fb.stats}"
+        )
+        assert result and result[0].ticker == "GAZP"
 
 
 # ---------------------------------------------------------------------------
