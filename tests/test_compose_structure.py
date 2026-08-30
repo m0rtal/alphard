@@ -68,72 +68,12 @@ class TestCompose:
             "cron profile needed."
         )
 
-    def test_pg_init_service_exists(self) -> None:
-        """Phase 1.6 audit: init_postgres.sh must run automatically on
-        first deploy. Compose provides this via the one-shot ``pg-init``
-        service that injects a scoped trust line into pg_hba.conf after
-        postgres becomes healthy.
-
-        As of issue #97 the default trust CIDR is
-        ``${POSTGRES_TRUST_SUBNET:-172.16.0.0/12}`` (Docker bridge range),
-        not the legacy ``192.168.0.0/16`` LAN range.
-        """
-        data = _load_compose()
-        services = data["services"]
-        assert "pg-init" in services, (
-            "pg-init service must exist so init_postgres.sh runs on "
-            "first deploy; without it the bot hangs on auth_probe for "
-            "clusters with a fresh volume."
-        )
-        pg_init = services["pg-init"]
-        assert (
-            pg_init.get("restart") == "no"
-        ), "pg-init must be a one-shot (restart: no) — once the trust line is injected, the container exits."
-        # Issue #97: pg-init must source POSTGRES_TRUST_SUBNET from .env
-        # and default to the Docker bridge range, never the legacy LAN /16.
-        env = pg_init.get("environment", {})
-        if isinstance(env, list):
-            env_map = {}
-            for item in env:
-                if isinstance(item, str) and "=" in item:
-                    k, _, v = item.partition("=")
-                    env_map[k] = v
-                elif isinstance(item, str):
-                    env_map[item] = None
-            env = env_map
-        trust_subnet = env.get("POSTGRES_TRUST_SUBNET")
-        assert trust_subnet is not None, (
-            "pg-init.environment.POSTGRES_TRUST_SUBNET must be declared "
-            "so the trust range is overridable per deploy (issue #97)."
-        )
-        assert "172.16.0.0/12" in str(trust_subnet), (
-            f"POSTGRES_TRUST_SUBNET default must be 172.16.0.0/12 (Docker "
-            f"bridge range), got: {trust_subnet!r} (issue #97)"
-        )
-
-    def test_bot_depends_on_pg_init_completed(self) -> None:
-        """alphard-bot must wait for pg-init to finish before starting,
-        otherwise the first auth_probe runs before the trust line
-        is injected and silently falls back to scram auth.
-
-        BUGFIX (#120): Portainer standalone (compose up directly via
-        Docker socket) requires depends_on as an ARRAY, not a map with
-        conditions. We accept both forms here: array is the Portainer
-        canonical form, map is the Compose-CLI canonical form.
-        """
-        data = _load_compose()
-        bot = data["services"]["alphard-bot"]
-        deps = bot.get("depends_on", [])
-        if isinstance(deps, dict):
-            assert deps.get("pg-init", {}).get("condition") == ("service_completed_successfully"), (
-                "alphard-bot.depends_on.pg-init.condition must be "
-                "service_completed_successfully so the trust line is "
-                "applied before the bot tries to connect"
-            )
-        else:
-            assert "pg-init" in deps, (
-                "alphard-bot must depend on pg-init so the trust line is " "applied before the bot tries to connect"
-            )
+    # pg-init-related tests removed in issue #347 — pg-init was dropped
+    # from docker-compose.yaml because its single-file bind-mounts
+    # render as directories on LXC, breaking the schema-apply path.
+    # The bot's own init_schema() now applies the schema before the
+    # auth probe. See tests/test_347_pg_init_removal.py for the
+    # post-fix contract.
 
     def test_bot_depends_on_postgres_health(self) -> None:
         # BUGFIX (#120): see comment above — accept array or map form.

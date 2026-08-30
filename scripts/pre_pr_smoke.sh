@@ -70,7 +70,13 @@ services:
 YAML
 
 echo "[pre-pr-smoke] [1/4] bringing up stack..."
-if ! "${COMPOSE[@]}" up -d postgres pg-init alphard-bot >/dev/null 2>&1; then
+# BUGFIX (issue #347): bring up only postgres + alphard-bot. The previous
+# pg-init sidecar was dropped from docker-compose.yaml because its
+# single-file bind-mounts render as directories on LXC, so the schema
+# never applied and _auth_probe was missing. Schema application is now
+# handled by the bot's entrypoint via init_schema() before auth_probe()
+# — see tests/test_347_pg_init_removal.py.
+if ! "${COMPOSE[@]}" up -d postgres alphard-bot >/dev/null 2>&1; then
     echo "[pre-pr-smoke] FAIL: docker compose up failed"
     exit 1
 fi
