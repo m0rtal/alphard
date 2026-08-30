@@ -34,10 +34,11 @@ Why this is structured as ``chain
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import date, timedelta
 from typing import Any, Iterator
 
 from src.data.models import OHLCVRow
+from src.data.moex_loader import MAX_LOOKBACK as MOEX_MAX_LOOKBACK
 
 logger = logging.getLogger("alphard.fallback_loader")
 
@@ -185,13 +186,29 @@ class FallbackDataLoader:
         Tries each source in order. If a source returns zero rows or
         raises, falls through to the next. Stops at the first source
         that returned a non-empty result.
+
+        Per-source max-lookback awareness (issue #346, 2026-08-30,
+        m0rtal): each source has a different hard cap on request
+        window. ``MOEXDataLoader`` rejects any request longer than
+        1825 days with ``LoaderError``. Without chunking, the
+        supervisor's 9-year backfill window (--start-year 2018) trips
+        that cap for every ticker that falls through to MOEX, wasting
+        ~87% of all chain failures on .107 production. To avoid this,
+        when a source declares ``MAX_LOOKBACK`` (currently only
+        ``MOEXDataLoader`` does), the request is split into chunks no
+        longer than that cap and the chunks are concatenated. Sources
+        without a declared cap (e.g. ``TinkoffInvestDataLoader``,
+        which already 1-year-chunks internally up to 30y) receive the
+        full window as before.
         """
         for source_name in self.order:
             source = self._resolve(source_name)
             if source is None:
                 continue
+            chunk_cap = self._source_max_lookback(source_name)
             try:
-                rows = list(source.iter_ohlcv(ticker, start, end))
+                rows_iter = self._iter_source(source, ticker, start, end, chunk_cap)
+                rows = list(rows_iter)
             except Exception as exc:  # noqa: BLE001 — fallback contract
                 logger.warning(
                     f"{ticker}: {source_name} raised {type(exc).__name__}: {exc}; " f"falling back to next source"
@@ -207,6 +224,46 @@ class FallbackDataLoader:
             logger.info(f"{ticker}: {source_name} returned 0 bars; falling back")
             self._stats[source_name]["fallback"] += 1
         logger.warning(f"{ticker}: ALL sources returned 0 bars")
+
+    @staticmethod
+    def _source_max_lookback(source_name: str) -> timedelta | None:
+        """Return the per-source hard lookback cap, or ``None`` if unconstrained.
+
+        Single source of truth for which loaders declare a max-lookback
+        limit. Keeps the ``iter_ohlcv`` body free of source-name
+        special-cases while still allowing new sources to declare a
+        cap by adding a branch here.
+        """
+        if source_name == "moex_iss":
+            return MOEX_MAX_LOOKBACK
+        return None
+
+    @staticmethod
+    def _iter_source(
+        source: Any,
+        ticker: str,
+        start: date,
+        end: date,
+        chunk_cap: timedelta | None,
+    ) -> Iterator[OHLCVRow]:
+        """Yield rows from ``source``, chunking ``[start, end]`` if needed.
+
+        If ``chunk_cap`` is ``None`` the full window is delegated
+        unchanged. Otherwise the window is split into
+        ``<= chunk_cap`` sub-ranges and each is delegated in turn; the
+        union of yielded rows is returned to the caller. A sub-range
+        that raises propagates the exception so the chain can record
+        the per-source error and fall through.
+        """
+        if chunk_cap is None or (end - start) <= chunk_cap:
+            yield from source.iter_ohlcv(ticker, start, end)
+            return
+        chunk_span = chunk_cap.days
+        chunk_start = start
+        while chunk_start <= end:
+            chunk_end = min(chunk_start + timedelta(days=chunk_span), end)
+            yield from source.iter_ohlcv(ticker, chunk_start, chunk_end)
+            chunk_start = chunk_end + timedelta(days=1)
 
     def _resolve(self, name: str) -> Any:
         if name == "tinkoff_grpc":
