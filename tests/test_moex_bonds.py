@@ -330,3 +330,131 @@ class TestBondsRowMapping:
         loader = _make_loader(handlers)
         with pytest.raises(LoaderNotFoundError):
             list(loader.iter_ohlcv("SU-DOES-NOT-EXIST", date(2025, 8, 1), date(2025, 8, 2)))
+
+
+# ---------------------------------------------------------------------------
+# Issue #364 — vol_raw fallback chain must NOT include NUMTRADES.
+#
+# NUMTRADES on MOEX ISS is the *count of executed trades*, not traded volume.
+# When VOLUME is absent/zero on a real ISS row (illiquid session,
+# last-trade-day entry, delisted trailing bar), PR #362's fallback chain
+# silently substitutes NUMTRADES (typically 1..150) and we lot-multiply that
+# as if it were a share count. That's data corruption, not graceful
+# degradation. Original pre-#362 behaviour was `volume or VOLUME` → 0;
+# accurate silence is better than a fabricated value.
+# ---------------------------------------------------------------------------
+
+
+def _bonds_bar_with_volume(
+    d: date,
+    *,
+    ticker: str,
+    volume: Any = 100,
+    numtrades: int = 10,
+) -> list[Any]:
+    """Build a bonds row with explicit (possibly zero/absent) volume values.
+
+    Shares branch equivalent: see _shares_bar_zero_volume below.
+    """
+    lo = Decimal("99")
+    o = Decimal("100.5")
+    c = Decimal("100")
+    h = Decimal("102")
+    return [
+        "TQOB",
+        d.isoformat(),
+        ticker,
+        ticker,
+        numtrades,  # NUMTRADES — count of executed trades, NOT volume
+        Decimal("100000"),  # VALUE
+        Decimal(str(lo)),
+        Decimal(str(h)),
+        Decimal(str(c)),
+        Decimal(str(c)),
+        Decimal("0"),
+        Decimal(str(c)),
+        Decimal(str(o)),
+        volume,  # VOLUME
+    ]
+
+
+class TestVolumeFallbackExcludesNumtrades:
+    """Regression guard for issue #364."""
+
+    def test_bonds_volume_zero_does_not_silently_become_numtrades(self) -> None:
+        """A bonds row with VOLUME=0 must produce volume=0, NOT NUMTRADES (10).
+
+        This is the exact failure mode that PR #362 introduced: when ISS
+        returns a row with volume=0 for an illiquid OFZ session, the
+        fallback chain `VOLUME or NUMTRADES` would silently substitute 10
+        (the trade count) and persist that as the day's volume. That's
+        silent data corruption.
+        """
+        handlers = [
+            _FakeResponse(
+                _bonds_history_block(
+                    [
+                        _bonds_bar_with_volume(
+                            date(2025, 8, 1),
+                            ticker="SU46020RMFS2",
+                            volume=0,
+                            numtrades=10,
+                        ),
+                    ],
+                    total=1,
+                )
+            ),
+        ]
+        loader = _make_loader(handlers)
+        out = list(loader.iter_ohlcv("SU46020RMFS2", date(2025, 8, 1), date(2025, 8, 2)))
+        assert len(out) == 1
+        assert out[0].volume == 0, (
+            f"bonds VOLUME=0 must stay 0, not NUMTRADES; got volume={out[0].volume}"
+        )
+
+    def test_bonds_volume_missing_does_not_silently_become_numtrades(self) -> None:
+        """A bonds row with VOLUME absent (None) must produce volume=0, NOT NUMTRADES."""
+        handlers = [
+            _FakeResponse(
+                _bonds_history_block(
+                    [
+                        _bonds_bar_with_volume(
+                            date(2025, 8, 1),
+                            ticker="SU46020RMFS2",
+                            volume=None,
+                            numtrades=42,
+                        ),
+                    ],
+                    total=1,
+                )
+            ),
+        ]
+        loader = _make_loader(handlers)
+        out = list(loader.iter_ohlcv("SU46020RMFS2", date(2025, 8, 1), date(2025, 8, 2)))
+        assert len(out) == 1
+        assert out[0].volume == 0, (
+            f"bonds VOLUME=None must stay 0, not NUMTRADES; got volume={out[0].volume}"
+        )
+
+    def test_bonds_volume_present_is_used_directly(self) -> None:
+        """Sanity: when VOLUME is present, that exact value is used."""
+        handlers = [
+            _FakeResponse(
+                _bonds_history_block(
+                    [
+                        _bonds_bar_with_volume(
+                            date(2025, 8, 1),
+                            ticker="SU46020RMFS2",
+                            volume=500,
+                            numtrades=10,
+                        ),
+                    ],
+                    total=1,
+                )
+            ),
+        ]
+        loader = _make_loader(handlers)
+        out = list(loader.iter_ohlcv("SU46020RMFS2", date(2025, 8, 1), date(2025, 8, 2)))
+        assert len(out) == 1
+        # Bonds branch does NOT lot-multiply; volume == raw VOLUME column.
+        assert out[0].volume == 500
