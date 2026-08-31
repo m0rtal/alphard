@@ -12,13 +12,19 @@ version: "3.9"
 # mkdir -p's and chown's all four host-data leaves (postgres, redis,
 # grafana, prometheus) with the correct UID:GID for each in-image user
 # before any data service starts. This replaces the per-service
-# grafana-init / pg-init pattern from PR #217.
+# grafana-init pattern from PR #217.
 #
 # chownfix needs `cap_add: [CHOWN, DAC_OVERRIDE]` to bypass the .107
 # PVE LXC userns-mapping bug — root in-container cannot chown across
 # the bind-mount leaf boundary without these caps, even with
-# apparmor=unconfined. pg-init remains for hba_file rule injection
-# (uses postgresql-client, separate concern).
+# apparmor=unconfined. The earlier pg-init service (which used psql
+# to inject pg_hba.conf trust rules) was also removed in issue #347:
+# its single-file bind-mounts render as directories on LXC, breaking
+# the schema-apply path. Schema application is now handled by the
+# bot's own init_schema() at startup, before the fail-closed auth
+# probe. The hba trust rule, if needed for cross-container auth, is
+# now baked into the postgres image's pg_hba.conf directly or set via
+# environment-driven initdb. See tests/test_347_pg_init_removal.py.
 #
 # Why tmpfs for /app/logs and /prometheus (PR #119, #147)? Same root
 # cause as the /mnt/appdata userns-mapping bug — Docker 29.1.x on PVE
@@ -32,7 +38,6 @@ version: "3.9"
 #   - alphard-bot        : heartbeat + cron-launched daily_sync.py
 #   - postgres           : DataStore (ohlcv_daily, ticker_universe, decision_log)
 #   - redis              : cache for risk state, news, portfolio drift
-#   - pg-init            : injects Docker-bridge trust line into pg_hba.conf
 #   - chownfix           : host-data leaf chown (compose refactor 2.0)
 #
 # Phase 3+ additions (profiles: ["observability"]):
@@ -113,7 +118,6 @@ services:
     # otherwise the first store.count_ohlcv() crashes with connection refused.
     depends_on:
       - postgres
-      - pg-init
       # chownfix (compose refactor 2.0): not strictly needed for the
       # bot itself (alphard-bot bind-mounts /root/.env, not APPDATA_DIR),
       # but adding it here synchronises the bot's start with the rest
@@ -273,107 +277,6 @@ services:
     networks:
       - alphard-net
 
-  pg-init:
-    # BUGFIX (2026-08-26): switched image from alpine:3.20 to
-    # postgres:16-alpine. The alpine image's `apk add` was failing on
-    # hosts with restricted egress (`.107` PVE LXC, sandboxed CI runners)
-    # because `dl-cdn.alpinelinux.org` was unreachable. `postgres:16-alpine`
-    # ships with the matching `psql` client pre-installed — no `apk add`
-    # step required. The cmd still uses `sh -c` (busybox), not bash.
-    image: postgres:16-alpine
-    container_name: alphard-pg-init
-    restart: "no"
-    security_opt:
-      - apparmor=unconfined
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        set -e
-        # Wait for postgres to accept connections.
-        until PGPASSWORD="$$POSTGRES_PASSWORD" psql -h alphard-postgres \
-              -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -c 'SELECT 1' >/dev/null 2>&1; do
-          echo "[pg-init] waiting for postgres..."
-          sleep 3
-        done
-        # BUGFIX (issue #209): pg-init has been writing to hba_file locally
-        # since PR #97, but `hba_file` from SHOW is a path *inside the postgres
-        # container* — sed in this container can never touch it. The original
-        # flow only worked when hba_file was a bind-mount from outside both
-        # containers. Now that postgres uses a named volume (no bind), we can
-        # only edit it via SQL — which is exactly what \\connect /etc/postgresql
-        # can't do. So: detect whether the trust rule is already in effect via
-        # pg_hba view, and short-circuit.
-        TRUST_CIDR="${POSTGRES_TRUST_SUBNET:-172.16.0.0/12}"
-        # Try to detect the trust rule by listing existing rules via pg_hba_file_rules().
-        RULE_PRESENT=$$(PGPASSWORD="$$POSTGRES_PASSWORD" psql -h alphard-postgres -U "$$POSTGRES_USER" \
-                        -d "$$POSTGRES_DB" -tAc "SELECT count(*) FROM pg_hba_file_rules() \
-                        WHERE type='host' AND database=array['all']::text[] AND \
-                        user_name=array['all']::text[] AND address = '$${TRUST_CIDR}'")
-        if [ "$${RULE_PRESENT:-0}" -gt 0 ]; then
-          echo "[pg-init] trust line ($${TRUST_CIDR}) already in pg_hba_file_rules(), skipping"
-          HBA_REACHABLE=1
-        else
-          HBA=$$(PGPASSWORD="$$POSTGRES_PASSWORD" psql -h alphard-postgres -U "$$POSTGRES_USER" \
-                 -d "$$POSTGRES_DB" -tAc "SHOW hba_file")
-          if [ -z "$$HBA" ] || [ ! -e "$$HBA" ]; then
-            echo "[pg-init] hba_file ($$HBA) not reachable from this container; trust rule MUST be set via SQL or via initdb init script"
-            HBA_REACHABLE=0
-          else
-            HBA_REACHABLE=1
-            echo "[pg-init] injecting trust rule for $${TRUST_CIDR} into $$HBA"
-            sed -i '/^host all all 192\.168\.0\.0\/16 trust$/d' "$$HBA" 2>/dev/null || true
-            sed -i '/^host all all 0\.0\.0\.0\/0 trust$/d' "$$HBA" 2>/dev/null || true
-            sed -i "1i host all all $${TRUST_CIDR} trust" "$$HBA"
-            PGPASSWORD="$$POSTGRES_PASSWORD" psql -h alphard-postgres -U "$$POSTGRES_USER" \
-              -d "$$POSTGRES_DB" -c 'SELECT pg_reload_conf()' >/dev/null
-            echo "[pg-init] injected $${TRUST_CIDR} trust + pg_reload_conf()"
-          fi
-        fi
-        # BUGFIX (issue #243 A1, first-shot-friendly): on pre-existing
-        # postgres volumes, initdb never ran docker-entrypoint-initdb.d/
-        # scripts so tables may be missing entirely. We can't depend on
-        # initdb; instead we replay the idempotent init.sql + schema.sql
-        # every time pg-init starts. Both files use CREATE TABLE IF NOT
-        # EXISTS / CREATE INDEX IF NOT EXISTS / ON CONFLICT DO NOTHING,
-        # so this is safe to run on every deploy.
-        # - docker/postgres/init.sql creates the _auth_probe table.
-        # - src/data/schema.sql creates the runtime schema (trades,
-        #   decision_log, ticker_universe, _auth_probe, plus indexes).
-        # The bot's own init_schema() at startup is the authoritative
-        # source of truth, but pg-init covers the case where the bot
-        # has never run (no _auth_probe table to probe against).
-        echo "[pg-init] applying docker/postgres/init.sql (idempotent replay)"
-        PGPASSWORD="$$POSTGRES_PASSWORD" psql -h alphard-postgres -U "$$POSTGRES_USER" \
-          -d "$$POSTGRES_DB" -v ON_ERROR_STOP=1 \
-          -f /sql/docker_postgres_init.sql 2>&1 | sed 's/^/  /' || {
-            echo "[pg-init] init.sql apply failed (likely already applied on a normal initdb path; continuing)"
-        }
-        echo "[pg-init] applying src/data/schema.sql (idempotent replay)"
-        PGPASSWORD="$$POSTGRES_PASSWORD" psql -h alphard-postgres -U "$$POSTGRES_USER" \
-          -d "$$POSTGRES_DB" -v ON_ERROR_STOP=1 \
-          -f /sql/src_data_schema.sql 2>&1 | sed 's/^/  /' || {
-            echo "[pg-init] schema.sql apply failed (likely already applied by bot init_schema(); continuing)"
-        }
-        echo "[pg-init] OK"
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-alphard}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
-      POSTGRES_DB: ${POSTGRES_DB:-alphard}
-      # Issue #97: narrow the pg_hba.conf trust range to the RFC1918
-      # Docker bridge range by default. Operators can override via .env.
-      POSTGRES_TRUST_SUBNET: ${POSTGRES_TRUST_SUBNET:-172.16.0.0/12}
-    # BUGFIX (issue #243 A1): bind-mount the idempotent SQL sources so
-    # pg-init can replay them on every deploy against pre-existing
-    # volumes where docker-entrypoint-initdb.d/ never ran. See
-    # https://github.com/m0rtal/alphard/issues/245 — closes A1.
-    volumes:
-      - ./docker/postgres/init.sql:/sql/docker_postgres_init.sql:ro
-      - ./src/data/schema.sql:/sql/src_data_schema.sql:ro
-    networks:
-      - alphard-net
-    depends_on:
-      - postgres
-
   prometheus:
     image: prom/prometheus:latest
     container_name: alphard-prometheus
@@ -482,12 +385,13 @@ services:
   # per-service grafana-init (PR #217) with a single chownfix that
   # covers all four leaves (postgres, redis, grafana, prometheus).
   #
-  # Why one service instead of four (grafana-init, pg-init + future
-  # redis-init/prometheus-init):
-  # 1. ONE apk add (no postgresql-client binary, since we use plain
-  #    chown here — pg-init used psql to inject hba_file rules, but
-  #    that path is no longer needed: PR #147 + #209 moved hba_file
-  #    handling into the postgres initdb / pg_hba_file_rules() view).
+  # Why one service instead of two (grafana-init + a legacy pg-init):
+  # 1. ONE apk add (no postgresql-client binary — pg-init used psql to
+  #    inject hba_file rules, but that path was removed in issue #347:
+  #    pg-init's single-file bind-mounts render as directories on LXC,
+  #    so the schema-apply path was broken. Schema application now
+  #    happens inside the bot's entrypoint via init_schema(). See
+  #    tests/test_347_pg_init_removal.py for the post-fix contract).
   # 2. ONE chown pass per leaf instead of one container per leaf —
   #    faster cold start, less log noise.
   # 3. Single point of truth for the chown UID:GID mapping table;

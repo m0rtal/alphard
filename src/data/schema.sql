@@ -109,12 +109,12 @@ INSERT INTO _daily_sync_health (id, last_successful_run_at, last_run_status, upd
 -- table does not exist yet, init_schema() will create it on the next
 -- bot startup. If it does, the probe is non-destructive.
 --
--- Why not in docker/postgres/init.sql? init.sql only runs on first
--- `initdb` (empty data dir). On a volume that has been preserved
--- across redeploys, init.sql is NEVER executed — which is exactly the
--- case we want to detect. Putting the probe in src/data/schema.sql
--- (which init_schema() applies on every bot start) means the probe
--- always works, regardless of volume history.
+-- Why not in a docker-entrypoint-initdb.d/ init.sql? Such scripts only
+-- run on first `initdb` (empty data dir). On a volume that has been
+-- preserved across redeploys, the init script is NEVER executed — which
+-- is exactly the case we want to detect. Putting the probe in
+-- src/data/schema.sql (which init_schema() applies on every bot start)
+-- means the probe always works, regardless of volume history.
 CREATE TABLE IF NOT EXISTS _auth_probe (
     id         SMALLINT PRIMARY KEY,
     probed_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),

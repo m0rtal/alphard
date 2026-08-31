@@ -100,7 +100,7 @@ if [ "${DISABLE_BACKFILL:-false}" != "true" ]; then
     echo "Auth-probing postgres before launching backfill..."
 
     # Wait up to 60s for the database to be reachable on TCP. We do this
-    # before auth_probe because psycopg.OperationalError("connection
+    # before init_schema because psycopg.OperationalError("connection
     # refused") vs auth drift look the same to the bot.
     for i in $(seq 1 30); do
         if python -c "import socket,sys; s=socket.socket(); s.settimeout(1); s.connect(('alphard-postgres', 5432)); s.close(); sys.exit(0)" 2>/dev/null; then
@@ -108,6 +108,33 @@ if [ "${DISABLE_BACKFILL:-false}" != "true" ]; then
         fi
         sleep 2
     done
+
+    # BUGFIX (issue #347): init_schema() MUST run BEFORE auth_probe().
+    # auth_probe() does INSERT INTO _auth_probe ... ON CONFLICT DO UPDATE,
+    # and _auth_probe is created by src/data/schema.sql which is read by
+    # init_schema(). On a fresh volume (or any volume where the bot has
+    # never run) the table does not exist yet, so the probe fails with
+    # UndefinedTable and the entrypoint exits fail-closed.
+    #
+    # Pre-#347 ordering was: probe → init_schema. That was OK because
+    # the pg-init sidecar (since removed in #347) had already created
+    # _auth_probe via its docker/postgres/init.sql replay. With pg-init
+    # gone, init_schema() is the ONLY path that creates _auth_probe, so
+    # it must run first.
+    #
+    # init_schema() is idempotent (CREATE TABLE IF NOT EXISTS / ADD
+    # COLUMN IF NOT EXISTS throughout src/data/schema.sql), so re-running
+    # it on every boot is safe and picks up any ADD COLUMN migrations
+    # that have landed since the volume was last initialized.
+    echo "Applying schema migrations (before auth probe)..."
+    python -c "
+import sys
+sys.path.insert(0, 'src')
+from data.pg_store import PostgresDataStore
+PostgresDataStore().init_schema()
+print('schema OK')
+" || { echo "SCHEMA INIT FAILED: $?" >&2; exit 1; }
+    echo "  schema OK"
 
     # Detect password drift: if a fingerprint exists from a prior run
     # and the current DSN password differs, alert loudly. The fingerprint
@@ -161,22 +188,6 @@ sys.exit(0 if ok else 1)
         exit 1
     fi
     echo "  postgres auth OK"
-
-    # BUGFIX (2026-08-18 / Phase 1.6 audit): ensure the schema is in the
-    # expected state. On a fresh volume this is what creates tables;
-    # on a volume from an older image, the ADD COLUMN IF NOT EXISTS
-    # clauses in src/data/schema.sql add the columns that the current
-    # code expects (lot, listed_at, backfill_complete, adj_close, ...).
-    # init_schema() is idempotent and safe to run on every boot.
-    echo "Applying schema migrations..."
-    python -c "
-import sys
-sys.path.insert(0, 'src')
-from data.pg_store import PostgresDataStore
-PostgresDataStore().init_schema()
-print('schema OK')
-" || { echo "SCHEMA INIT FAILED: $?" >&2; exit 1; }
-    echo "  schema OK"
 
     echo "Launching backfill_history_md as background service..."
     BACKFILL_LOG="${BACKFILL_LOG:-/app/logs/backfill_history_md.log}"
