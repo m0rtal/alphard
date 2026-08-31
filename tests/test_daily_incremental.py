@@ -278,3 +278,56 @@ def test_fetch_with_fallback_uses_fallback_loader_chain() -> None:
     assert broker_fetch_calls == []
     assert fl_iter_calls == [("X", date(2026, 8, 28), date(2026, 8, 28))]
     assert list(result) == ["moex-X"]
+
+
+# ---------------------------------------------------------------------------
+# Issue #354 (2026-08-31, m0rtal) — daily_incremental._fetch_with_fallback
+# PR #353 hoisted the broker loader construction out of the try/except
+# guard, so when no Tinkoff token is set (``LoaderAuthError`` at
+# ``TinkoffInvestDataLoader.__init__`` time) the eager
+# ``TinkoffInvestDataLoader()`` raised before the chain was even built.
+# That silently broke the documented broker-first → MOEX-fallback contract
+# in the no-token / ``ALLOW_NO_BROKER=true`` Phase 0 stub path:
+# ``main()`` accumulated per-ticker ``LoaderAuthError``s and exited 1
+# instead of fetching MOEX bars.
+#
+# Fix contract: ``_fetch_with_fallback`` must wrap broker construction in
+# a try/except so the constructor failure becomes ``tinkoff_grpc=None``;
+# ``FallbackDataLoader._resolve`` already skips None sources.
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_with_fallback_skips_broker_when_token_missing() -> None:
+    """Regression guard for issue #354.
+
+    When ``TinkoffInvestDataLoader()`` raises (no token in env, the
+    documented ``ALLOW_NO_BROKER=true`` Phase 0 stub mode, or any
+    constructor-time failure), ``_fetch_with_fallback`` must NOT
+    propagate the exception — it must pass ``tinkoff_grpc=None`` to the
+    chain so ``FallbackDataLoader._resolve`` skips it and the request
+    silently degrades to MOEX.
+    """
+    from src.data.tinkoff_loader import LoaderAuthError
+
+    class FakeBroker:
+        def __init__(self) -> None:
+            raise LoaderAuthError("Tinkoff token not set: pass token= or export TINKOFF_SANDBOX_TOKEN")
+
+    class FakeMoex:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, date, date]] = []
+
+        def iter_ohlcv(self, ticker, start, end):
+            self.calls.append((ticker, start, end))
+            return iter([f"moex-{ticker}-{start}-{end}"])
+
+    moex = FakeMoex()
+    with (
+        patch("daily_incremental.TinkoffInvestDataLoader", FakeBroker),
+        patch("daily_incremental.MOEXDataLoader", return_value=moex),
+    ):
+        result = daily_incremental._fetch_with_fallback("GAZP", date(2026, 8, 28), date(2026, 8, 28))
+
+    # MOEX-only path: chain silently degraded, no exception leaked.
+    assert moex.calls == [("GAZP", date(2026, 8, 28), date(2026, 8, 28))]
+    assert list(result) == ["moex-GAZP-2026-08-28-2026-08-28"]

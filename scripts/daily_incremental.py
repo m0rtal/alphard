@@ -87,12 +87,21 @@ def _fetch_with_fallback(ticker: str, start: date, end: date) -> list:
     delisted tickers (or any ticker with stale ``latest_db_ts``) on
     days when broker gRPC happened to fail.
 
-    Both loaders are constructed eagerly so a successful broker fetch
-    still pays the MOEX import cost; the chain only constructs MOEX
-    when needed (see ``FallbackDataLoader.iter_ohlcv``).
+    Broker construction is wrapped in ``try/except``: when no Tinkoff
+    token is set (``TinkoffInvestDataLoader.__init__`` raises
+    ``LoaderAuthError`` in the documented ``ALLOW_NO_BROKER=true``
+    Phase 0 stub mode and in out-of-container dev runs without
+    ``.env``), the broker is passed as ``None`` to the chain. The
+    chain's ``_resolve`` already skips ``None`` sources, so the
+    request silently degrades to MOEX. Issue #354 regression guard.
     """
+    broker: object | None = None
+    try:
+        broker = TinkoffInvestDataLoader()
+    except Exception as exc:  # noqa: BLE001 — LoaderAuthError or any constructor-time failure
+        logger.warning(f"{ticker}: broker gRPC unavailable ({type(exc).__name__}: {exc}); " "falling back to MOEX ISS")
     fl = FallbackDataLoader(
-        tinkoff_grpc=TinkoffInvestDataLoader(),
+        tinkoff_grpc=broker,
         moex_iss=MOEXDataLoader(),
     )
     return list(fl.iter_ohlcv(ticker, start, end))
