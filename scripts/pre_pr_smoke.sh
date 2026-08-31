@@ -32,16 +32,17 @@ HEALTH_ATTEMPTS=60
 HEALTH_INTERVAL_SECONDS=3
 SMOKE_MAX_TICKERS=3
 
-# BUGFIX (cycle145 catastrophic guard, issue #363 follow-up): REFUSE to run
-# `docker compose down -v` against a remote (tcp://) daemon. On the dev host,
-# `docker context ls` shows default → tcp://192.168.1.107:2375 (production .107),
-# so an unset DOCKER_HOST in a session that already exported tcp://... will
-# silently tear down production. Require either unix:// (local smoke) or
-# explicit ALLOW_NONLOCAL_SMOKE=1.
-if [[ "${DOCKER_HOST:-}" =~ ^tcp:// ]]; then
+# BUGFIX (cycle146, issue #371): REFUSE to run `docker compose down -v` against
+# any non-local Docker daemon — not just tcp://. The original cycle145 guard
+# (issue #363 follow-up) only matched DOCKER_HOST=tcp://...; an SSH Docker
+# context (DOCKER_HOST=ssh://user@host) bypassed it and would still wipe the
+# remote volume. Invert to deny-by-default: only DOCKER_HOST=unix://... is
+# local, everything else (unset, tcp://, ssh://, fd://, npipe://, future
+# schemes) requires explicit ALLOW_NONLOCAL_SMOKE=1.
+if [[ -n "${DOCKER_HOST:-}" ]] && [[ ! "${DOCKER_HOST:-}" =~ ^unix:// ]]; then
     if [[ "${ALLOW_NONLOCAL_SMOKE:-0}" != "1" ]]; then
-        echo "[pre-pr-smoke] REFUSED: DOCKER_HOST=${DOCKER_HOST} points at a remote daemon."
-        echo "[pre-pr-smoke] Refusing to run 'docker compose down -v' against production."
+        echo "[pre-pr-smoke] REFUSED: DOCKER_HOST=${DOCKER_HOST} points at a non-local daemon."
+        echo "[pre-pr-smoke] Refusing to run 'docker compose down -v' against a remote stack."
         echo "[pre-pr-smoke] Set DOCKER_HOST=unix:///var/run/docker.sock for local smoke,"
         echo "[pre-pr-smoke] or ALLOW_NONLOCAL_SMOKE=1 only if you intentionally want"
         echo "[pre-pr-smoke] to exercise the gate against a remote stack."
