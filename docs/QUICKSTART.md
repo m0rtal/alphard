@@ -48,8 +48,9 @@ That is **all**. The script:
    prometheus container, no env-based config).
 8. Runs `docker compose --profile observability up -d`.
 9. Waits up to 180 s for every long-running service to report
-   `healthy` (one-shot services — `alphard-chownfix`,
-   `alphard-pg-init` — are checked separately for `Exited(0)`).
+   `healthy` (one-shot services — `alphard-chownfix` — are checked
+   separately for `Exited(0)`; `pg-init` was dropped in PR #351 /
+   issue #347).
 10. Prints the per-container status table and the URL of each
     service.
 
@@ -154,7 +155,7 @@ host fails in 4 places (PR #228 / this PR's notes):
 
 | # | Failure | Root cause |
 |---|---------|-----------|
-| 1 | `pg-init` hangs on `apk add postgresql-client` | `dl-cdn.alpinelinux.org` unreachable on hosts with restricted egress. **Fix**: `pg-init` uses `postgres:16-alpine` image (psql already in there). |
+| 1 | `init_schema()` fails: `_auth_probe` missing | Fresh `ohlcv_daily` volume where the bot's entrypoint guard fired before schema apply. **Fix**: `init_schema()` in `docker/entrypoint.sh` reads `src/data/schema.sql` and runs BEFORE `auth_probe()` (issue #347); if it didn't, rebuild the image so the entrypoint sequence is restored. |
 | 2 | `grafana` fails to start with `apparmor_parser: Access denied` | Grafana service was missing `security_opt: apparmor=unconfined`. **Fix**: added in compose. |
 | 3 | Prometheus starts with empty config, zero targets | `docker/prometheus/prometheus.yml` missing or wrong content. **Fix**: check the bind-mount target exists and contains the `alphard-bot:8765` scrape target. |
 | 4 | Grafana "No data" on every panel | `./docker/grafana/provisioning/datasources/prometheus.yml` missing. **Fix**: bind-mount from repo (issue #297). |

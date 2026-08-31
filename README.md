@@ -245,7 +245,7 @@ Branch protection на `main`:
 |---|---|---|
 | 1 | Network stall .107 | 3-layer: PR #47 tuple index, PR #50 token bucket, PR #46 statement_timeout + SIGUSR1 |
 | 2 | ~250 no-data tickers | `mark_terminally_failed.py` (commit 9d34663) |
-| 3 | cron/pg-init not deployed | Phase 1.6 in-process watchdog (PR #0dcf55b) + PR #37 |
+| 3 | Schema bootstrap on fresh volume | `init_schema()` in `docker/entrypoint.sh` (issue #347, runs BEFORE `auth_probe()`) |
 | 4 | Observability | Phase 2.8 — PR #52 metrics + PR #53 Grafana provisioning (✅ MERGED) |
 | 5 | Broker stub | Phase 1.3 TinkoffAccount + sandbox switch |
 | 6 | Coordinator | Phase 1.5 + PR #30 coordinator smoke + PR #33 drawdown tracker |

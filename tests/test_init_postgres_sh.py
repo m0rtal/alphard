@@ -154,14 +154,41 @@ class TestNoLiteralPassword:
         )
 
     def test_docstring_references_compose_path(self) -> None:
-        """Header comment must point operators to the active compose path."""
+        """Header comment must point operators to the post-#351 active schema path.
+
+        Issue #357 root cause (for this assertion): the previous
+        contract was ``assert "pg-init" in body`` with a message
+        describing ``pg-init`` as "the active bootstrap path". Post-#351
+        (PR #351, issue #347) ``pg-init`` is **dropped** from compose,
+        and the active schema bootstrap is ``init_schema()`` in
+        ``docker/entrypoint.sh`` (called BEFORE ``auth_probe()``).
+        ``init_postgres.sh`` is now the LEGACY recovery path.
+
+        Pin the post-#351 contract: the docstring must reference
+        ``init_schema()`` as the active path (positive assertion), so a
+        future refactor rewording the historical ``pg-init`` breadcrumb
+        cannot silently un-pin the contract. This mirrors the pattern in
+        ``tests/test_347_pg_init_removal.py::test_init_postgres_docstring_references_init_schema``.
+        """
         body = _read_script()
-        # The script's own docstring must mention the compose pg-init
-        # service as the active path, so future operators don't run
-        # this manual bootstrap by mistake on a normal deploy.
-        assert "pg-init" in body, (
-            "init_postgres.sh docstring must mention the compose "
-            "`pg-init` service as the active bootstrap path (issue #73)."
+        # Only inspect the header comment block — first contiguous run
+        # of # lines + blank lines after the shebang. We look for the
+        # positive reference ``init_schema()`` somewhere in there.
+        docstring_lines: list[str] = []
+        for line in body.splitlines():
+            if line.lstrip().startswith("#"):
+                docstring_lines.append(line)
+            elif not line.strip():
+                docstring_lines.append(line)
+            else:
+                break
+        docstring = "\n".join(docstring_lines)
+        assert "init_schema()" in docstring, (
+            "init_postgres.sh docstring must point operators at "
+            "`init_schema()` in docker/entrypoint.sh as the active "
+            "schema path (issue #347/#357 post-#351 contract). "
+            "`pg-init` is dropped; if this assertion fires, the "
+            "docstring was rewritten without preserving the new contract."
         )
 
 

@@ -86,12 +86,16 @@
 #### Level 2.1 — Postgres pg_hba.conf trust posture (issue #97)
 
 **Surface:**
-- `docker-compose.yaml` has a one-shot `pg-init` service that prepends
-  a `host all all <CIDR> trust` rule to `pg_hba.conf` so the bot can
-  authenticate under Docker-internal DNS even when scram hashes drift
-  (recovery safety net — see issue #73).
+- `docker/entrypoint.sh` runs `init_schema()` (idempotent, reads
+  `src/data/schema.sql`) on every bot startup, BEFORE `auth_probe()`,
+  to prepend a `host all all <CIDR> trust` rule to `pg_hba.conf` so the
+  bot can authenticate under Docker-internal DNS even when scram
+  hashes drift (recovery safety net — see issues #73 and #347). Note:
+  the pre-#347 compose `pg-init` sidecar was dropped because its
+  single-file bind-mounts rendered as directories on PVE LXC, breaking
+  schema application.
 - `scripts/init_postgres.sh` mirrors the same rule for off-compose
-  recovery runs.
+  recovery runs (LEGACY path — see the script's own docstring).
 - The legacy CIDR was `192.168.0.0/16` — ~65k LAN addresses covered,
   including any peer that might accidentally reach `alphard-postgres`
   via port-forwarding or a future bridge misconfig.
@@ -111,10 +115,10 @@
    scoped rule is added.
 
 **Defenses:**
-- `docker-compose.yaml` `pg-init` and `scripts/init_postgres.sh` now
-  default `POSTGRES_TRUST_SUBNET=172.16.0.0/12` (RFC1918 Docker bridge
-  range). Operators can override per-deploy via `.env` if their bridge
-  subnet differs.
+- `docker/entrypoint.sh` (`init_schema()`) and `scripts/init_postgres.sh`
+  both default `POSTGRES_TRUST_SUBNET=172.16.0.0/12` (RFC1918 Docker
+  bridge range). Operators can override per-deploy via `.env` if their
+  bridge subnet differs.
 - Both files strip the legacy `192.168.0.0/16` rule on the next
   redeploy — no manual cleanup required.
 - The bot's primary auth path is **password** (`POSTGRES_PASSWORD`
