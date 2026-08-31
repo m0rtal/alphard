@@ -129,7 +129,14 @@ if [ "${DISABLE_BACKFILL:-false}" != "true" ]; then
     echo "Applying schema migrations (before auth probe)..."
     python -c "
 import sys
-sys.path.insert(0, 'src')
+# BUGFIX (issue #363): use absolute /app/src instead of relative 'src'.
+# When the smoke script bind-mounts ./src → /app/src:ro on top of the
+# baked image, the relative path resolved a stale ZFS subvolume view
+# that exposed only a few low-layer files (e.g. schema.sql) and
+# triggered ModuleNotFoundError: No module named 'data.pg_store' on
+# every restart cycle. Absolute path is bind-mount safe and image-layer
+# independent. WORKDIR=/app is hardcoded in docker/Dockerfile.
+sys.path.insert(0, '/app/src')
 from data.pg_store import PostgresDataStore
 PostgresDataStore().init_schema()
 print('schema OK')
@@ -172,7 +179,8 @@ print('schema OK')
     # it must be noisy.
     AUTH_RESULT=$(python -c "
 import os, sys
-sys.path.insert(0, 'src')
+# BUGFIX (issue #363): absolute /app/src (see comment in init_schema block).
+sys.path.insert(0, '/app/src')
 from data.pg_store import PostgresDataStore
 s = PostgresDataStore()
 ok = s.auth_probe(source='entrypoint_smoke')
