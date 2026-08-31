@@ -434,7 +434,12 @@ class MOEXDataLoader(DataLoader):
             h = _d(row.get("high") or row.get("HIGH"))
             lo = _d(row.get("low") or row.get("LOW"))
             c = _d(row.get("close") or row.get("CLOSE"))
-            vol_raw = _d(row.get("volume") or row.get("VOLUME") or row.get("NUMTRADES"))
+            # Issue #364: NUMTRADES is *count of executed trades*, not traded
+            # volume. Falling back to it when VOLUME is 0/absent silently
+            # fabricates volume values for illiquid sessions, last-trade-day
+            # entries, and delisted-ticker trailing bars. Drop NUMTRADES from
+            # the chain — accurate silence (0) is better than a wrong value.
+            vol_raw = _d(row.get("volume") or row.get("VOLUME"))
             # volume is lots; multiply by lot size.
             vol_shares = vol_raw * Decimal(lot)
             return OHLCVRow(
@@ -480,7 +485,11 @@ class MOEXDataLoader(DataLoader):
             h = _d(row.get("HIGH") or row.get("high"))
             lo = _d(row.get("LOW") or row.get("low"))
             c = _d(row.get("CLOSE") or row.get("close"))
-            vol_raw = _d(row.get("VOLUME") or row.get("NUMTRADES") or 0)
+            # Issue #364: NUMTRADES is *count of executed trades*, not paper
+            # units traded. Substituting it when VOLUME is 0/absent silently
+            # fabricates bond volume values for illiquid sessions. Drop
+            # NUMTRADES from the chain — accurate silence (0) beats wrong.
+            vol_raw = _d(row.get("VOLUME") or 0)
             return OHLCVRow(
                 ticker=ticker,
                 ts=ts,
