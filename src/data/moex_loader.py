@@ -160,6 +160,94 @@ class MOEXDataLoader(DataLoader):
     ) -> Iterator[OHLCVRow]:
         self._validate_range(start, end, max_lookback=MAX_LOOKBACK)
         ticker = ticker.upper().strip()
+        # Routing: ISIN-prefixed tickers go to the bonds history endpoint.
+        # MOEX ISS serves bonds under /iss/history/engines/stock/markets/bonds/
+        # whereas shares are under /iss/engines/stock/markets/shares/. The
+        # two endpoints have different shapes (different columns, different
+        # pagination contract) so we dispatch by ticker prefix.
+        if self._looks_like_isin(ticker):
+            yield from self._iter_ohlcv_bonds(ticker, start, end)
+            return
+        yield from self._iter_ohlcv_shares(ticker, start, end)
+
+    @staticmethod
+    def _looks_like_isin(ticker: str) -> bool:
+        """True when ticker starts with an MOEX bond ISIN prefix (``SU`` or ``RU``).
+
+        ``SU...`` is the legacy Soviet-era prefix still in use for some
+        corporate and government bonds (e.g. ``SU46020RMFS2`` — ОФЗ 46020).
+        ``RU...`` is the modern ISIN prefix for OFZ and corporate bonds
+        (e.g. ``RU000A100FE5``).
+        """
+        return ticker.startswith("SU") or ticker.startswith("RU")
+
+    def _iter_ohlcv_bonds(
+        self,
+        ticker: str,
+        start: date,
+        end: date,
+    ) -> Iterator[OHLCVRow]:
+        """Iterate daily OHLCV via the MOEX ISS bonds history endpoint.
+
+        Endpoint::
+            GET https://iss.moex.com/iss/history/engines/stock/markets/
+                bonds/securities/{secid}.json?from=YYYY-MM-DD&till=YYYY-MM-DD
+                &start=N
+
+        Pagination uses ``?start=N`` offset; we stop when a page returns
+        fewer than ``_page_size`` rows (consistent with the shares branch).
+        Returns ``LoaderNotFoundError`` on 404 (ticker is not a bond) so
+        the FallbackDataLoader can record it and fall through.
+
+        Lot size is irrelevant for bonds (bond denomination is captured
+        via ``FACEVALUE`` in the securities endpoint, not in the history
+        endpoint); we emit bars with ``volume == lot_count`` and skip the
+        lot-multiplication step. The shares branch's ``_lot_for()`` is
+        also skipped because the bonds endpoint has no BOARDID/TQBR
+        dependency and the shares-universe cache doesn't cover bonds.
+        """
+        self._validate_range(start, end, max_lookback=MAX_LOOKBACK)
+        bonds_prefix = f"{BASE_URL}/iss/history/engines/stock/markets/bonds/securities/"
+        url = f"{bonds_prefix}{urllib.parse.quote(ticker)}.json"
+        page = 0
+        while True:
+            params = {
+                "from": start.isoformat(),
+                "till": end.isoformat(),
+                "start": page * self._page_size,
+            }
+            payload = self._get_json(url, params=params)
+            history = self._extract_block(payload, "history")
+            if not history.get("columns"):
+                return
+            data = self._rows_from_block(history)
+            if not data:
+                return
+            for row in data:
+                bar = self._row_to_ohlcv_bonds(ticker, row)
+                if bar is not None and start <= bar.ts <= end:
+                    yield bar
+            if len(data) < self._page_size:
+                return
+            page += 1
+
+    def _iter_ohlcv_shares(
+        self,
+        ticker: str,
+        start: date,
+        end: date,
+    ) -> Iterator[OHLCVRow]:
+        """Iterate daily OHLCV via the MOEX ISS shares candles endpoint.
+
+        Endpoint::
+            GET https://iss.moex.com/iss/engines/stock/markets/shares/
+                securities/{ticker}/candles.json?from=YYYY-MM-DD
+                &till=YYYY-MM-DD&interval=24&start=N
+
+        Pagination uses ``?start=N`` offset. ``_page_size`` defaults to
+        ``DEFAULT_PAGE_SIZE`` (500).
+        """
+        self._validate_range(start, end, max_lookback=MAX_LOOKBACK)
         lot = self._lot_for(ticker)
         page = 0
         while True:
@@ -337,16 +425,16 @@ class MOEXDataLoader(DataLoader):
         try:
             # ISS candles: open, close, high, low, value, volume, begin, end.
             # ``begin`` is ISO timestamp string; we keep the date portion.
-            ts_raw = row.get("begin") or row.get("tradedate")
+            ts_raw = row.get("begin") or row.get("tradedate") or row.get("TRADEDATE")
             if not ts_raw:
                 return None
             ts_str = str(ts_raw)[:10]  # 'YYYY-MM-DD'
             ts = date.fromisoformat(ts_str)
-            o = _d(row.get("open"))
-            h = _d(row.get("high"))
-            lo = _d(row.get("low"))
-            c = _d(row.get("close"))
-            vol_raw = _d(row.get("volume") or row.get("VOLUME"))
+            o = _d(row.get("open") or row.get("OPEN"))
+            h = _d(row.get("high") or row.get("HIGH"))
+            lo = _d(row.get("low") or row.get("LOW"))
+            c = _d(row.get("close") or row.get("CLOSE"))
+            vol_raw = _d(row.get("volume") or row.get("VOLUME") or row.get("NUMTRADES"))
             # volume is lots; multiply by lot size.
             vol_shares = vol_raw * Decimal(lot)
             return OHLCVRow(
@@ -361,6 +449,50 @@ class MOEXDataLoader(DataLoader):
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("skipping malformed MOEX OHLCV row %r: %s", row, exc)
+            return None
+
+    @staticmethod
+    def _row_to_ohlcv_bonds(
+        ticker: str,
+        row: dict[str, Any],
+    ) -> OHLCVRow | None:
+        """Map a single row from the bonds history endpoint to ``OHLCVRow``.
+
+        The bonds endpoint returns UPPERCASE column names (``TRADEDATE``,
+        ``OPEN``, ``HIGH``, ``LOW``, ``CLOSE``, ``VOLUME``, ``NUMTRADES``).
+        We look up either case (the shares branch uses lowercase) so a
+        future column rename on the ISS side doesn't break parsing.
+
+        Volume semantics for bonds: ISS reports ``VOLUME`` as a count of
+        *paper units* traded (not number of trades, not RUB volume —
+        ``VALUE`` and ``NUMTRADES`` cover those). We pass it through
+        without lot-multiplication (bonds are 1-paper-per-record at the
+        ISS level; ``FACEVALUE`` handles par-value scaling at the
+        portfolio level).
+        """
+        try:
+            ts_raw = row.get("TRADEDATE") or row.get("tradedate")
+            if not ts_raw:
+                return None
+            ts_str = str(ts_raw)[:10]  # 'YYYY-MM-DD'
+            ts = date.fromisoformat(ts_str)
+            o = _d(row.get("OPEN") or row.get("open"))
+            h = _d(row.get("HIGH") or row.get("high"))
+            lo = _d(row.get("LOW") or row.get("low"))
+            c = _d(row.get("CLOSE") or row.get("close"))
+            vol_raw = _d(row.get("VOLUME") or row.get("NUMTRADES") or 0)
+            return OHLCVRow(
+                ticker=ticker,
+                ts=ts,
+                open=o,
+                high=h,
+                low=lo,
+                close=c,
+                volume=vol_raw,
+                adj_close=c,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("skipping malformed MOEX bonds OHLCV row %r: %s", row, exc)
             return None
 
 
