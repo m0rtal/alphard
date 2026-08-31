@@ -1,14 +1,11 @@
-"""Regression test for the cycle145 catastrophic guard.
+"""Regression test for the cycle145 DOCKER_HOST guard.
 
 scripts/pre_pr_smoke.sh runs `docker compose down -v`, which wipes the
-alphard-postgres-data volume. On the dev host, `docker context` defaults
-to tcp://192.168.1.107:2375 (production .107) whenever DOCKER_HOST is
-exported in the session. A previous run on 2026-09-02 (cycle145-2)
-wiped 1.34M OHLCV rows + 3263 universe entries from production by
-running this script with the wrong daemon.
-
-The fix is to refuse to start unless DOCKER_HOST is unix:// (local
-smoke) or the operator explicitly opts in via ALLOW_NONLOCAL_SMOKE=1.
+alphard-postgres-data volume on whatever daemon the active docker
+context points at. On a host where `docker context` defaults to a
+remote tcp:// endpoint (e.g. production), the unset-DOCKER_HOST path
+silently targets production. This guard pins the contract: refuse
+DOCKER_HOST=tcp:// unless ALLOW_NONLOCAL_SMOKE=1.
 
 This test pins the contract by reading pre_pr_smoke.sh as text and
 asserting the guard's structure. Pure pytest; no docker, no LXC/ZFS.
