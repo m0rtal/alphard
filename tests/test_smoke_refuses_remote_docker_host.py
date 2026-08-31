@@ -22,7 +22,6 @@ from pathlib import Path
 
 import pytest
 
-
 REPO = Path(__file__).resolve().parent.parent
 SMOKE = REPO / "scripts" / "pre_pr_smoke.sh"
 
@@ -42,11 +41,11 @@ class TestSmokeRefusesRemoteDockerHost:
         # Pattern: if DOCKER_HOST starts with tcp://, refuse to proceed.
         # Match the structural shape, not the exact wording.
         assert re.search(
-            r'DOCKER_HOST.*tcp://',
+            r"DOCKER_HOST.*tcp://",
             content,
         ), "smoke script must check DOCKER_HOST against tcp:// scheme"
         assert re.search(
-            r'(ALLOW_NONLOCAL_SMOKE|ALLOW_REMOTE_SMOKE)',
+            r"(ALLOW_NONLOCAL_SMOKE|ALLOW_REMOTE_SMOKE)",
             content,
         ), "smoke script must define an explicit opt-in env var for remote runs"
 
@@ -56,7 +55,7 @@ class TestSmokeRefusesRemoteDockerHost:
         # Accept any of: exit 1, exit 9, exit 99. We use 9 to keep it distinct
         # from the existing fatal gates (1 stack unhealthy | 2 pytest | 3 dry-run).
         assert re.search(
-            r'exit\s+[1-9][0-9]?',
+            r"exit\s+[1-9][0-9]?",
             content,
         ), "smoke script guard must exit with a non-zero code"
 
@@ -70,13 +69,11 @@ class TestSmokeRefusesRemoteDockerHost:
         the remote volume when the trap fires on EXIT.
         """
         content = _read_smoke()
-        guard_pos = content.find('DOCKER_HOST')
+        guard_pos = content.find("DOCKER_HOST")
         # The actual docker compose down -v command (not the comment).
         down_call_pos = content.find('COMPOSE[@]}" down -v')
         assert guard_pos > 0, "smoke script must have the DOCKER_HOST guard"
-        assert down_call_pos > 0, (
-            "smoke script must still tear down the stack via the cleanup trap"
-        )
+        assert down_call_pos > 0, "smoke script must still tear down the stack via the cleanup trap"
         assert guard_pos < down_call_pos, (
             f"DOCKER_HOST guard at offset {guard_pos} must run BEFORE "
             f"the cleanup-trap docker compose down -v at offset "
@@ -104,8 +101,7 @@ class TestSmokeRemoteGuardRuntime:
             f"got returncode={proc.returncode}, stdout={proc.stdout!r}"
         )
         assert "REFUSED" in proc.stdout, (
-            f"smoke refusal must print a clear REFUSED message; "
-            f"got stdout={proc.stdout!r}"
+            f"smoke refusal must print a clear REFUSED message; " f"got stdout={proc.stdout!r}"
         )
 
     def test_local_docker_host_is_allowed_through(self) -> None:
@@ -132,6 +128,5 @@ class TestSmokeRemoteGuardRuntime:
             # we're checking. Timeout is fine here.
             return
         assert "REFUSED" not in proc.stdout, (
-            f"smoke must NOT print REFUSED with DOCKER_HOST=unix://...; "
-            f"got stdout={proc.stdout!r}"
+            f"smoke must NOT print REFUSED with DOCKER_HOST=unix://...; " f"got stdout={proc.stdout!r}"
         )
