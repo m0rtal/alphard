@@ -41,6 +41,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 COMPOSE = REPO_ROOT / "docker-compose.yaml"
 ENTRYPOINT = REPO_ROOT / "docker" / "entrypoint.sh"
 PRE_PR_SMOKE = REPO_ROOT / "scripts" / "pre_pr_smoke.sh"
+QUICKSTART = REPO_ROOT / "scripts" / "quickstart.sh"
+INIT_POSTGRES = REPO_ROOT / "scripts" / "init_postgres.sh"
 SCHEMA_SQL = REPO_ROOT / "src" / "data" / "schema.sql"
 
 
@@ -202,4 +204,72 @@ def test_schema_sql_creates_auth_probe() -> None:
         "init_schema() reads schema.sql — if _auth_probe isn't there, "
         "auth_probe() fails on every fresh volume and the bot won't "
         "start. Restore the _auth_probe CREATE TABLE in schema.sql."
+    )
+
+
+def test_quickstart_one_shot_drops_pg_init() -> None:
+    """scripts/quickstart.sh ONE_SHOT MUST NOT list alphard-pg-init (issue #355).
+
+    Pre-fix, the ONE_SHOT array on line 311 still listed alphard-pg-init
+    even though PR #351 (issue #347) removed the service from
+    docker-compose.yaml. The one-shot health-loop on line 332-340 then
+    emitted ``warn "one-shot alphard-pg-init missing (compose didn't
+    run it?)"`` on every quickstart.sh run, polluting the gate output
+    with a false-positive signal that confused new operators
+    ("alphard-pg-init should be running?").
+
+    Pin the post-fix contract: ONE_SHOT lists ONLY the services that
+    compose actually brings up (alphard-chownfix at the time of
+    writing). Re-introducing alphard-pg-init to ONE_SHOT is a
+    regression unless pg-init is re-added to docker-compose.yaml too.
+    """
+    text = QUICKSTART.read_text()
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        stripped = line.lstrip()
+        # Skip comments — the post-fix comment block on lines 308-313
+        # MENTIONS alphard-pg-init by name to point readers at this
+        # regression test. That's intentional archaeology, not a
+        # runtime contract.
+        if stripped.startswith("#"):
+            continue
+        # ONE_SHOT=("alphard-chownfix" ...) — find any non-comment
+        # line that names alphard-pg-init as an array element. Use
+        # a word-boundary match so 'pg-init-pattern' / 'pg-init.sh'
+        # don't trigger.
+        if "alphard-pg-init" in stripped:
+            # Tolerate benign contexts: inside a heredoc body, a
+            # bash regex, or after a 'check'-style test marker. None
+            # of those exist in quickstart.sh today, so any hit is a
+            # bug — fail loudly.
+            raise AssertionError(
+                f"scripts/quickstart.sh:{line_no} still references "
+                f"alphard-pg-init in a runtime (non-comment) line: "
+                f"{line.rstrip()!r}. Issue #355: PR #351 (issue #347) "
+                f"dropped pg-init from docker-compose.yaml; quickstart.sh "
+                f"ONE_SHOT must not list it."
+            )
+
+
+def test_init_postgres_docstring_references_init_schema() -> None:
+    """scripts/init_postgres.sh docstring MUST point at init_schema() (issue #355).
+
+    Pre-fix, the docstring on lines 26-31 said the compose ``pg-init``
+    service was the active schema path. Post-#347/PR-#351, pg-init is
+    gone and the bot's ``init_schema()`` (called from
+    ``docker/entrypoint.sh`` before auth_probe) is the active path.
+    Leaving the docstring pointing at a non-existent service is the
+    same cycle126 lesson as #355's quickstart.sh hit: when a service
+    is removed from compose, scan every script docstring that
+    references it.
+
+    The test only asserts the post-fix phrasing is present — it does
+    NOT assert the old phrasing is absent, so future rewording is fine.
+    """
+    text = INIT_POSTGRES.read_text()
+    assert "init_schema()" in text, (
+        "scripts/init_postgres.sh docstring does not mention "
+        "init_schema(). Issue #355: post-#347, init_schema() in "
+        "docker/entrypoint.sh is the active schema path; the legacy "
+        "docstring still points at the dropped `pg-init` service. "
+        "Update the docstring to reference init_schema()."
     )

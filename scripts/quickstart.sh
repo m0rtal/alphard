@@ -305,10 +305,13 @@ if [[ "$TIMEOUT_SEC" -lt 1 ]]; then
 fi
 info "Health gate (up to ${TIMEOUT_SEC}s)"
 
-# One-shot services (Exited(0) is success): alphard-chownfix,
-# alphard-pg-init. These must NOT be in EXPECTED — the health gate
-# requires State.Status == "running", which one-shots never satisfy.
-ONE_SHOT=("alphard-chownfix" "alphard-pg-init")
+# One-shot services (Exited(0) is success): alphard-chownfix.
+# These must NOT be in EXPECTED — the health gate requires
+# State.Status == "running", which one-shots never satisfy.
+# Note: alphard-pg-init was removed in PR #351 (issue #347); see
+# tests/test_347_pg_init_removal.py and the issue #355 regression
+# test for the post-#347 contract.
+ONE_SHOT=("alphard-chownfix")
 # Long-running services we wait for:
 EXPECTED=("alphard-postgres" "alphard-redis" "alphard-bot")
 if [[ "$PROFILE" == "observability" ]]; then

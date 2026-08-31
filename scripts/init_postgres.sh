@@ -24,11 +24,13 @@
 #   docker exec alphard-postgres bash /usr/local/bin/init_postgres.sh
 #
 # This is the LEGACY manual bootstrap path. For normal container
-# deploys, the compose `pg-init` service in docker-compose.yaml
-# (sources POSTGRES_USER / POSTGRES_DB / POSTGRES_PASSWORD from
-# /root/.env via `$$POSTGRES_PASSWORD`) is the active path. Use
-# this script only when running postgres outside compose or
-# recovering from a state where pg-init cannot be re-invoked.
+# deploys, the bot's own `init_schema()` (called from
+# `docker/entrypoint.sh` BEFORE `auth_probe()`, see issue #347 /
+# PR #351 — `pg-init` was dropped because its single-file
+# bind-mounts rendered as directories on PVE LXC, breaking
+# schema application) is the active path. Use this script only
+# when running postgres outside compose or recovering from a
+# state where the bot's entrypoint cannot be re-invoked.
 
 set -e
 
