@@ -283,16 +283,67 @@ class FallbackDataLoader:
         """Corporate actions = same fallback contract as OHLCV. Tinkoff
         gRPC is authoritative; MOEX ISS fills gaps for tickers that
         only MOEX knows about (most bonds/ETFs delisted).
+
+        Per-source max-lookback awareness on the corp-actions path
+        (issue #349, 2026-08-30, m0rtal): same contract as the OHLCV
+        path. Each source has a hard cap on request window
+        (``MOEXDataLoader`` rejects any request longer than 1825 days
+        with ``LoaderError``). Without chunking, a 9-year supervisor
+        call whose broker gRPC fetch returns 0 actions falls through
+        to ``moex_iss`` and aborts — silently losing the synthetic
+        delisted-event signal the backtester needs. When a source
+        declares ``MAX_LOOKBACK`` (currently only ``MOEXDataLoader``),
+        the request is split into chunks no longer than that cap and
+        concatenated; sources without a declared cap receive the full
+        window. Partial-chunk success followed by a later-chunk raise
+        marks the source failed (no rows yielded).
         """
         for source_name in self.order:
             source = self._resolve(source_name)
             if source is None or not hasattr(source, "iter_corporate_actions"):
                 continue
+            chunk_cap = self._source_max_lookback(source_name)
             try:
-                rows = list(source.iter_corporate_actions(ticker, start, end))
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(f"{ticker} corp-actions {source_name}: {type(exc).__name__}: {exc}; falling back")
+                rows_iter = self._iter_source_corp_actions(source, ticker, start, end, chunk_cap)
+                rows = list(rows_iter)
+            except Exception as exc:  # noqa: BLE001 — fallback contract
+                logger.warning(
+                    f"{ticker} corp-actions {source_name}: {type(exc).__name__}: {exc}; " f"falling back to next source"
+                )
+                self._stats[source_name]["error"] += 1
+                self._stats[source_name]["fallback"] += 1
                 continue
             if rows:
+                self._stats[source_name]["ok"] += 1
                 yield from rows
                 return
+            self._stats[source_name]["fallback"] += 1
+        logger.warning(f"{ticker}: ALL sources returned 0 corp-actions")
+
+    @staticmethod
+    def _iter_source_corp_actions(
+        source: Any,
+        ticker: str,
+        start: date,
+        end: date,
+        chunk_cap: timedelta | None,
+    ) -> Iterator[Any]:
+        """Yield corporate actions from ``source``, chunking ``[start, end]`` if needed.
+
+        Mirrors ``_iter_source`` for the OHLCV path. If ``chunk_cap``
+        is ``None`` the full window is delegated unchanged. Otherwise
+        the window is split into ``<= chunk_cap`` sub-ranges and each
+        is delegated in turn; the union of yielded rows is returned
+        to the caller. A sub-range that raises propagates the
+        exception so the chain can record the per-source error and
+        fall through.
+        """
+        if chunk_cap is None or (end - start) <= chunk_cap:
+            yield from source.iter_corporate_actions(ticker, start, end)
+            return
+        chunk_span = chunk_cap.days
+        chunk_start = start
+        while chunk_start <= end:
+            chunk_end = min(chunk_start + timedelta(days=chunk_span), end)
+            yield from source.iter_corporate_actions(ticker, chunk_start, chunk_end)
+            chunk_start = chunk_end + timedelta(days=1)
