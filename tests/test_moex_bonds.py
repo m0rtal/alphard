@@ -408,9 +408,7 @@ class TestVolumeFallbackExcludesNumtrades:
         loader = _make_loader(handlers)
         out = list(loader.iter_ohlcv("SU46020RMFS2", date(2025, 8, 1), date(2025, 8, 2)))
         assert len(out) == 1
-        assert out[0].volume == 0, (
-            f"bonds VOLUME=0 must stay 0, not NUMTRADES; got volume={out[0].volume}"
-        )
+        assert out[0].volume == 0, f"bonds VOLUME=0 must stay 0, not NUMTRADES; got volume={out[0].volume}"
 
     def test_bonds_volume_missing_does_not_silently_become_numtrades(self) -> None:
         """A bonds row with VOLUME absent (None) must produce volume=0, NOT NUMTRADES."""
@@ -432,9 +430,7 @@ class TestVolumeFallbackExcludesNumtrades:
         loader = _make_loader(handlers)
         out = list(loader.iter_ohlcv("SU46020RMFS2", date(2025, 8, 1), date(2025, 8, 2)))
         assert len(out) == 1
-        assert out[0].volume == 0, (
-            f"bonds VOLUME=None must stay 0, not NUMTRADES; got volume={out[0].volume}"
-        )
+        assert out[0].volume == 0, f"bonds VOLUME=None must stay 0, not NUMTRADES; got volume={out[0].volume}"
 
     def test_bonds_volume_present_is_used_directly(self) -> None:
         """Sanity: when VOLUME is present, that exact value is used."""
