@@ -451,6 +451,119 @@ def test_iter_corporate_actions_exception_falls_back() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Issue #349 — per-source max-lookback awareness on the corp-actions path
+# (2026-08-30, m0rtal). Same defect class as #346: PR #348 added
+# chunking to ``iter_ohlcv`` but the sibling ``iter_corporate_actions``
+# still passed the outer window unchanged to ``MOEXDataLoader``. The
+# moex cap is 1825d (same for corp-actions and OHLCV), so a 9-year
+# supervisor call on a ticker whose broker fetch returned 0 actions
+# would fall through to moex_iss and raise ``LoaderError`` instead of
+# yielding the synthetic delisted-event signal.
+#
+# Fix contract (mirrors PR #348's OHLCV fix): when a source has a
+# known ``MAX_LOOKBACK``, the corp-actions fallback must split the
+# request into chunks no longer than that cap and concatenate the
+# results. Partial-chunk success followed by a later-chunk raise
+# marks the source failed (same contract as OHLCV).
+# ---------------------------------------------------------------------------
+
+
+def test_iter_corporate_actions_splits_window_for_moex_lookback_cap() -> None:
+    """9-year window that would trip MOEX's 1825d cap gets chunked.
+
+    Regression test for issue #349. ``tinkoff_grpc`` returns 0 actions
+    (simulating a broker-no-data outcome); without chunking, moex_iss
+    would receive ``2018-01-01..2026-12-31`` and raise ``LoaderError``.
+    With chunking, moex_iss receives two sub-ranges that each fit
+    under the 1825d cap and yields their concatenated rows.
+    """
+    grpc = MagicMock()
+    grpc.iter_corporate_actions.return_value = iter([])
+    moex = MagicMock()
+    cap = MOEX_MAX_LOOKBACK.days  # 1825
+    chunk_a_end = date(2018, 1, 1) + timedelta(days=cap)
+    chunk_b_start = chunk_a_end + timedelta(days=1)
+
+    moex_rows_a = [f"a{i}" for i in range(3)]
+    moex_rows_b = [f"b{i}" for i in range(2)]
+
+    def moex_side_effect(ticker: str, start: date, end: date) -> Any:
+        if end == chunk_a_end:
+            return iter(moex_rows_a)
+        if start == chunk_b_start:
+            return iter(moex_rows_b)
+        raise AssertionError(f"Unexpected moex window: {start}..{end}")
+
+    moex.iter_corporate_actions.side_effect = moex_side_effect
+
+    fl = FallbackDataLoader(tinkoff_grpc=grpc, moex_iss=moex)
+
+    out = list(fl.iter_corporate_actions("X", date(2018, 1, 1), date(2026, 12, 31)))
+
+    assert out == moex_rows_a + moex_rows_b
+    # grpc got the full window first (broker-first contract).
+    grpc.iter_corporate_actions.assert_called_once_with("X", date(2018, 1, 1), date(2026, 12, 31))
+    # moex was called with two sub-windows, each within the cap.
+    assert moex.iter_corporate_actions.call_count == 2
+    call_args = [c.args for c in moex.iter_corporate_actions.call_args_list]
+    assert ("X", date(2018, 1, 1), chunk_a_end) in call_args
+    assert ("X", chunk_b_start, date(2026, 12, 31)) in call_args
+
+
+def test_iter_corporate_actions_no_chunking_when_window_fits_cap() -> None:
+    """Window ≤ MOEX_MAX_LOOKBACK passes through unmodified.
+
+    Regression guard for issue #349: short corp-actions windows must
+    not be split (would add unnecessary HTTP calls and break call-args
+    equality tests in earlier blocks).
+    """
+    grpc = MagicMock()
+    grpc.iter_corporate_actions.return_value = iter([])
+    moex = MagicMock()
+    moex.iter_corporate_actions.return_value = iter(["m1", "m2"])
+
+    fl = FallbackDataLoader(tinkoff_grpc=grpc, moex_iss=moex)
+
+    out = list(fl.iter_corporate_actions("X", date(2026, 1, 1), date(2026, 1, 31)))
+
+    assert out == ["m1", "m2"]
+    moex.iter_corporate_actions.assert_called_once_with("X", date(2026, 1, 1), date(2026, 1, 31))
+
+
+def test_iter_corporate_actions_chunked_moex_partial_failure_marks_source_failed() -> None:
+    """If any chunk raises, moex is marked failed for the whole range.
+
+    Regression test for issue #349: partial chunk success followed by
+    a mid-window failure cannot be trusted — we may have a partial
+    series whose coverage is not what the caller expected. The chain
+    marks the source as failed and yields no rows from that source.
+    (The caller can choose to retry with a shorter window.)
+    """
+    grpc = MagicMock()
+    grpc.iter_corporate_actions.return_value = iter([])
+    moex = MagicMock()
+
+    def moex_side_effect(ticker: str, start: date, end: date) -> Any:
+        # First chunk succeeds, second raises.
+        if start == date(2018, 1, 1):
+            return iter(["first"])
+        raise LoaderError("range ... exceeds upstream max lookback 1825d")
+
+    moex.iter_corporate_actions.side_effect = moex_side_effect
+    fl = FallbackDataLoader(tinkoff_grpc=grpc, moex_iss=moex)
+
+    # No rows yielded — the partial chunk success is dropped so the
+    # caller doesn't silently persist a partial series.
+    out = list(fl.iter_corporate_actions("X", date(2018, 1, 1), date(2026, 12, 31)))
+
+    assert out == []
+    # moex was tried for every chunk; the second attempt errored.
+    assert moex.iter_corporate_actions.call_count == 2
+    assert fl.stats["moex_iss"]["error"] == 1
+    assert fl.stats["moex_iss"]["ok"] == 0
+
+
+# ---------------------------------------------------------------------------
 # Issue #346 — per-source max-lookback awareness (2026-08-30, m0rtal).
 #
 # Regression: ``FallbackDataLoader.iter_ohlcv`` previously passed the
