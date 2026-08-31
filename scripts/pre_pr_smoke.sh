@@ -32,6 +32,24 @@ HEALTH_ATTEMPTS=60
 HEALTH_INTERVAL_SECONDS=3
 SMOKE_MAX_TICKERS=3
 
+# BUGFIX (cycle145 catastrophic guard, issue #363 follow-up): REFUSE to run
+# `docker compose down -v` against a remote (tcp://) daemon. On the dev host,
+# `docker context ls` shows default → tcp://192.168.1.107:2375 (production .107),
+# so an unset DOCKER_HOST in a session that already exported tcp://... will
+# silently tear down production. Require either unix:// (local smoke) or
+# explicit ALLOW_NONLOCAL_SMOKE=1.
+if [[ "${DOCKER_HOST:-}" =~ ^tcp:// ]]; then
+    if [[ "${ALLOW_NONLOCAL_SMOKE:-0}" != "1" ]]; then
+        echo "[pre-pr-smoke] REFUSED: DOCKER_HOST=${DOCKER_HOST} points at a remote daemon."
+        echo "[pre-pr-smoke] Refusing to run 'docker compose down -v' against production."
+        echo "[pre-pr-smoke] Set DOCKER_HOST=unix:///var/run/docker.sock for local smoke,"
+        echo "[pre-pr-smoke] or ALLOW_NONLOCAL_SMOKE=1 only if you intentionally want"
+        echo "[pre-pr-smoke] to exercise the gate against a remote stack."
+        exit 9
+    fi
+    echo "[pre-pr-smoke] WARNING: DOCKER_HOST=${DOCKER_HOST} (non-local) — proceeding because ALLOW_NONLOCAL_SMOKE=1"
+fi
+
 echo "[pre-pr-smoke] === alphard pre-PR smoke gate ==="
 echo "[pre-pr-smoke] branch: $(git rev-parse --abbrev-ref HEAD)"
 echo "[pre-pr-smoke] commit: $(git rev-parse --short HEAD)"
