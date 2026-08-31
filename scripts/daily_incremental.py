@@ -22,7 +22,10 @@ Differences from ``scripts/daily_sync.py``:
 
 Source priority: broker gRPC (Tinkoff) first, MOEX ISS fallback.
 Same chain as ``FallbackDataLoader`` (issue #331): the chain order
-is ``tinkoff_grpc, moex_iss``.
+is ``tinkoff_grpc, moex_iss``. The fetch helper routes through
+``FallbackDataLoader.iter_ohlcv`` so it automatically inherits
+the per-source lookback-aware chunking from PR #348 (closes #350).
+A successful broker fetch never touches the MOEX loader.
 
 Used by cron once per day after market close. Idempotent:
 ``upsert_ohlcv`` is upsert on (ticker, ts) PK.
@@ -43,6 +46,7 @@ sys.path.insert(0, "/app/src")
 from src.data.pg_store import PostgresDataStore  # noqa: E402
 from src.data.tinkoff_loader import TinkoffInvestDataLoader  # noqa: E402
 from src.data.moex_loader import MOEXDataLoader  # noqa: E402
+from src.data.fallback_loader import FallbackDataLoader  # noqa: E402
 
 logger = logging.getLogger("alphard.daily_incremental")
 
@@ -71,22 +75,36 @@ def _closed_bar_window(latest_db_ts: date | None) -> tuple[date, date]:
 
 
 def _fetch_with_fallback(ticker: str, start: date, end: date) -> list:
-    """Fetch bars for [start, end] from broker gRPC, fall back to MOEX.
+    """Fetch bars for [start, end] via the broker-first fallback chain.
 
-    Mirrors the chain in FallbackDataLoader but inlined here so the
-    script remains self-contained (matches daily_sync.py's pattern
-    of constructing loaders directly rather than going through
-    FallbackDataLoader). The shared chain is enforced by tests.
+    Routes through ``FallbackDataLoader.iter_ohlcv`` so the chain's
+    per-source lookback-aware chunking (PR #348) applies. Before
+    issue #350 was fixed, this helper inlined the chain with a direct
+    ``MOEXDataLoader().iter_ohlcv(ticker, start, end)`` call on the
+    fallback path — MOEX enforces a 1825-day cap and any longer
+    window raised ``LoaderError: range ... exceeds upstream max
+    lookback 1825d``, silently losing the incremental update for
+    delisted tickers (or any ticker with stale ``latest_db_ts``) on
+    days when broker gRPC happened to fail.
 
-    MOEX loader is constructed only on the fallback path, so a
-    successful broker fetch does not pay the MOEX import /
-    connection cost.
+    Broker construction is wrapped in ``try/except``: when no Tinkoff
+    token is set (``TinkoffInvestDataLoader.__init__`` raises
+    ``LoaderAuthError`` in the documented ``ALLOW_NO_BROKER=true``
+    Phase 0 stub mode and in out-of-container dev runs without
+    ``.env``), the broker is passed as ``None`` to the chain. The
+    chain's ``_resolve`` already skips ``None`` sources, so the
+    request silently degrades to MOEX. Issue #354 regression guard.
     """
+    broker: object | None = None
     try:
-        return TinkoffInvestDataLoader().fetch_ohlcv(ticker, start, end)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(f"{ticker}: broker gRPC failed ({type(exc).__name__}: {exc}); " f"falling back to MOEX ISS")
-    return list(MOEXDataLoader().iter_ohlcv(ticker, start, end))
+        broker = TinkoffInvestDataLoader()
+    except Exception as exc:  # noqa: BLE001 — LoaderAuthError or any constructor-time failure
+        logger.warning(f"{ticker}: broker gRPC unavailable ({type(exc).__name__}: {exc}); " "falling back to MOEX ISS")
+    fl = FallbackDataLoader(
+        tinkoff_grpc=broker,
+        moex_iss=MOEXDataLoader(),
+    )
+    return list(fl.iter_ohlcv(ticker, start, end))
 
 
 def main() -> int:
