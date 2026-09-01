@@ -158,6 +158,10 @@ services:
   alphard-web:
     image: ghcr.io/m0rtal/alphard:latest
     container_name: alphard-web
+    # Operator UI — bound to host port 8081 (8080 is taken by
+    # watchtower + qbittorrent on .107). Issue #395 / PR #394.
+    ports:
+      - "8081:8080"
     restart: unless-stopped
     user: root
     security_opt:
