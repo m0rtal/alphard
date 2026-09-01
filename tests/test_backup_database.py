@@ -52,6 +52,15 @@ def argparse_namespace(**kwargs):
     return argparse.Namespace(**kwargs)
 
 
+def _valid_dump(body: bytes = b"CREATE TABLE bars (id int);\n") -> bytes:
+    """Wrap `body` in the header/trailer that real pg_dump --format=plain emits.
+
+    The sanity gate (issue #387) rejects dumps missing the completion
+    trailer, so fixtures must mirror real pg_dump output.
+    """
+    return b"--\n-- PostgreSQL database dump\n--\n" + body + b"--\n-- PostgreSQL database dump complete\n--\n"
+
+
 # ---------- _backup_path ----------
 
 
@@ -226,7 +235,7 @@ def test_run_backup_invokes_docker_exec(tmp_path: Path, monkeypatch):
     def fake_run(cmd, **kw):
         captured["cmd"] = cmd
         captured["kwargs"] = kw
-        result = subprocess.CompletedProcess(args=cmd, returncode=0, stdout=b"CREATE TABLE foo;\n", stderr=b"")
+        result = subprocess.CompletedProcess(args=cmd, returncode=0, stdout=_valid_dump(b"CREATE TABLE foo;\n"), stderr=b"")
         return result
 
     monkeypatch.setattr("subprocess.run", fake_run)
@@ -255,7 +264,7 @@ def test_run_backup_writes_gzipped_file(tmp_path: Path, monkeypatch):
         result = subprocess.CompletedProcess(
             args=cmd,
             returncode=0,
-            stdout=b"CREATE TABLE bars (id int);\nINSERT INTO bars VALUES (1);\n",
+            stdout=_valid_dump(b"CREATE TABLE bars (id int);\nINSERT INTO bars VALUES (1);\n"),
             stderr=b"",
         )
         return result
@@ -272,7 +281,7 @@ def test_run_backup_writes_gzipped_file(tmp_path: Path, monkeypatch):
 
     # The file is gzipped and round-trips back to the original text.
     body = files[0].read_bytes()
-    assert gzip.decompress(body).startswith(b"CREATE TABLE bars")
+    assert b"CREATE TABLE bars" in gzip.decompress(body)
 
 
 def test_run_backup_returns_pg_dump_failure_code(tmp_path: Path, monkeypatch):
@@ -311,7 +320,7 @@ def test_run_backup_logs_stderr_as_info(tmp_path: Path, monkeypatch, caplog):
         return subprocess.CompletedProcess(
             args=cmd,
             returncode=0,
-            stdout=b"-- Dumped\n",
+            stdout=_valid_dump(),
             stderr=b"pg_dump: NOTICE: there were 5 unread messages\n",
         )
 
@@ -328,7 +337,7 @@ def test_run_backup_creates_backup_dir(tmp_path: Path, monkeypatch):
     """If backup_dir doesn't exist, it must be created."""
 
     def fake_run(cmd, **kw):
-        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=b"", stderr=b"")
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=_valid_dump(), stderr=b"")
 
     monkeypatch.setattr("subprocess.run", fake_run)
 
@@ -468,3 +477,85 @@ def test_prune_weekly_does_not_double_count_adjacent_iso_weeks(tmp_path: Path):
     remaining = [p for _, p in backups if p.exists()]
     # 2 dailies + 4 weeklies = 6
     assert len(remaining) == 6, f"expected 2+4=6; got {len(remaining)}: " f"{sorted(p.name for p in remaining)}"
+
+
+# ---------- dump sanity gate (issue #387) ----------
+
+
+def test_run_backup_rejects_empty_dump(tmp_path: Path, monkeypatch):
+    """BUGFIX (#387): pg_dump rc=0 with empty stdout must NOT be written.
+
+    Root cause of the data-loss path: pg_dump can exit 0 while emitting
+    nothing useful (wrong -d target on a freshly-created empty database,
+    a dump interrupted at the protocol level). run_backup used to gzip
+    those zero bytes, write them as the newest daily backup, and then
+    prune a genuinely-valid older file out of the retention window. Seven
+    cron runs of a silently-broken dump destroyed every real backup.
+    """
+
+    def fake_run(cmd, **kw):
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    args = _make_args(tmp_path)
+    rc = bd.run_backup(args)
+
+    assert rc != 0, "empty dump must be reported as a failure"
+    assert list((tmp_path / "backups").iterdir()) == [], "no file may be written for an empty dump"
+
+
+def test_run_backup_rejects_truncated_dump(tmp_path: Path, monkeypatch):
+    """BUGFIX (#387): a dump lacking the pg_dump trailer is truncated."""
+
+    def fake_run(cmd, **kw):
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=0,
+            stdout=b"--\n-- PostgreSQL database dump\n--\nCREATE TABLE bars (id int);\n",
+            stderr=b"",
+        )
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    args = _make_args(tmp_path)
+    rc = bd.run_backup(args)
+
+    assert rc != 0, "dump without the completion trailer must be reported as a failure"
+    assert list((tmp_path / "backups").iterdir()) == [], "no file may be written for a truncated dump"
+
+
+def test_rejected_dump_does_not_prune_existing_backups(tmp_path: Path, monkeypatch):
+    """BUGFIX (#387): a rejected dump must leave the retention window untouched.
+
+    This is the actual data-loss assertion: an existing valid backup
+    survives a broken run.
+    """
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir(parents=True)
+    survivor = backup_dir / "alphard_2026-08-01_120000.sql.gz"
+    survivor.write_bytes(bd._compress(b"real dump\n"))
+
+    def fake_run(cmd, **kw):
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    rc = bd.run_backup(_make_args(tmp_path, daily_keep=1, weekly_keep=0))
+
+    assert rc != 0
+    assert survivor.exists(), "existing valid backup must not be pruned by a rejected run"
+
+
+def test_run_backup_accepts_complete_dump(tmp_path: Path, monkeypatch):
+    """A well-formed dump with the pg_dump trailer is accepted."""
+
+    def fake_run(cmd, **kw):
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=_valid_dump(), stderr=b"")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    rc = bd.run_backup(_make_args(tmp_path))
+
+    assert rc == 0
+    assert len(list((tmp_path / "backups").iterdir())) == 1
