@@ -3,6 +3,7 @@
 Used by docker-compose healthcheck. Avoids shell-quoting gymnastics by
 not nesting quotes inside a YAML string.
 """
+
 from __future__ import annotations
 
 import sys

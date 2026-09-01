@@ -26,6 +26,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 > Open PRs not yet on `main` are tracked on the [Kanban board](#) and
 > will be added here once merged — do not list unmerged work.
 
+### Backfilled drift
+- **PRs #385, #388, #391** — pre-existing changelog drift surfaced by the
+  drift-window guard during preparation of PR #394 (rebase of
+  `feature/alphard-web-v2` onto `main` at d5df91b). These PRs were
+  merged to `main` before this drift-window guard became strict
+  enough to catch them. Backfilled to keep the changelog complete.
+
 ### Added
 - **`scripts/daily_incremental.py`** — daily closed-bar refresh orchestrator. For each `backfill_complete=TRUE` ticker: `start = latest_db_ts + 1`, `end = today - 1`, source = `tinkoff_grpc` (fallback `moex_iss`). Never inserts today's bar (still forming); never re-fetches history already in DB. Defensive `b.ts <= end` filter guards against Tinkoff occasionally returning today's incomplete bar. Driven by cron once per day post-market-close. (PR #332.)
 - **`ohlcv_daily` row accumulation gauge** + Grafana panel — surfaces backfill drift between Tinkoff MD archive and broker gRPC. (PR #294, #290)
