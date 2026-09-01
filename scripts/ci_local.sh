@@ -48,11 +48,11 @@ run_step "pytest + coverage" python3 -m pytest tests/ \
     --cov-report=term-missing \
     -q
 
-# Step 2: black format check
-run_step "black format check" python3 -m black --check src/ tests/
+# Step 2: black format check (CI checks src/ + tests/ + scripts/)
+run_step "black format check" python3 -m black --check src/ tests/ scripts/
 
-# Step 3: flake8
-run_step "flake8 lint" python3 -m flake8 src/ tests/ \
+# Step 3: flake8 (CI checks src/ + tests/ + scripts/)
+run_step "flake8 lint" python3 -m flake8 src/ tests/ scripts/ \
     --max-line-length=120 \
     --extend-ignore=E203,W503
 

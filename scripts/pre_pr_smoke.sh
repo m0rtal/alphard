@@ -198,6 +198,22 @@ if [[ $healthy -ne 1 ]]; then
     exit 1
 fi
 
+echo "[pre-pr-smoke] [2.5/4] lint+format gate (CI parity: flake8 + black on src/ tests/ scripts/)..."
+# BUGFIX (cycle154, issue #389): CI lints scripts/ too; local smoke gate
+# only lints src/ tests/, which let the PR #388 style() commit slip
+# through and cost an extra round trip. Mirror CI exactly here so a
+# flake8/black violation on any script/ file fails the smoke the same
+# way CI would — before we waste a PR cycle on it.
+if ! python3 -m flake8 src/ tests/ scripts/ \
+        --max-line-length=120 --extend-ignore=E203,W503; then
+    echo "[pre-pr-smoke] FAIL: flake8 reported issues"
+    exit 2
+fi
+if ! python3 -m black --check src/ tests/ scripts/; then
+    echo "[pre-pr-smoke] FAIL: black format check failed"
+    exit 2
+fi
+
 echo "[pre-pr-smoke] [3/4] running pytest..."
 if ! python3 -m pytest tests/ --no-cov -p no:cacheprovider -q 2>&1 | tail -15; then
     echo "[pre-pr-smoke] FAIL: pytest failed"
