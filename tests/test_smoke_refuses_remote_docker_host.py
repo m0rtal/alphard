@@ -339,3 +339,210 @@ class TestSmokeProjectIsolation:
             "`docker compose down -v`) cannot fire after the test returns. "
             "Regression for issue #374."
         )
+
+
+class TestSmokeContainerNameOverride:
+    """Regression for issue #379: hardcoded container_name in
+    docker-compose.yaml collides with the operator's running stack
+    even when the smoke uses `-p alphard-smoke-<PID>`.
+
+    The `-p` flag scopes volumes and networks, but Docker Compose
+    honours `container_name:` literally and does NOT prefix it with
+    the project name. So `compose up` still fails at step [1/4] with
+    "Conflict. The container name '/alphard-bot' is already in use"
+    on a host where the operator's stack is running.
+
+    Fix: the smoke override file redefines each hardcoded
+    container_name with the per-PID-scoped name
+    (`${COMPOSE_PROJECT_NAME}-<service>-1`), matching Compose's
+    project-scoped default naming convention.
+    """
+
+    def test_override_redefines_every_hardcoded_container_name(self) -> None:
+        """The OVERRIDE_FILE written by pre_pr_smoke.sh must redefine
+        every hardcoded container_name from docker-compose.yaml.
+
+        Regression for issue #379: if any of the 6 hardcoded names is
+        missing from the override, `compose up` collides with the
+        operator's running stack on a host where the operator stack is
+        active.
+        """
+        text = _read_smoke()
+
+        # Locate the heredoc that writes OVERRIDE_FILE. It uses
+        # non-quoted `<<YAML` (not `<<'YAML'`) so that
+        # ${COMPOSE_PROJECT_NAME} expands. The heredoc must include
+        # `container_name:` entries for every hardcoded service.
+        override_match = re.search(
+            r'cat\s+>\s+"\$OVERRIDE_FILE"\s+<<YAML\n(?P<body>.*?)\nYAML',
+            text,
+            re.DOTALL,
+        )
+        assert override_match, (
+            "smoke script must contain a heredoc writing the override "
+            "file with non-quoted `<<YAML` so $COMPOSE_PROJECT_NAME "
+            "expands."
+        )
+        body = override_match.group("body")
+
+        # All six hardcoded services must be redefined in the override.
+        # Map: service-key -> Compose's project-scoped default name.
+        # Compose derives project-scoped names from the service key, not
+        # the hardcoded container_name, so we override each one to
+        # `${COMPOSE_PROJECT_NAME}-<service-key>-1`.
+        services_and_names = {
+            "alphard-bot": "alphard-bot",
+            "postgres": "postgres",
+            "redis": "redis",
+            "prometheus": "prometheus",
+            "chownfix": "chownfix",
+            "grafana": "grafana",
+        }
+        for service_key, project_scoped_name in services_and_names.items():
+            # Each service-key section must set container_name using
+            # ${COMPOSE_PROJECT_NAME} (per-PID scoping) — not the literal
+            # hardcoded name.
+            section_re = re.compile(
+                rf"^\s{{2}}{re.escape(service_key)}:\s*\n"
+                rf"(?:\s{{4,}}[^:]+:[^\n]*\n)*?"  # optional other keys
+                rf"\s{{4}}container_name:\s*\${{COMPOSE_PROJECT_NAME}}-{re.escape(project_scoped_name)}-1\b",
+                re.MULTILINE,
+            )
+            assert section_re.search(body), (
+                f"override file must redefine `container_name:` for "
+                f"service `{service_key}` using "
+                f"`${{COMPOSE_PROJECT_NAME}}-{project_scoped_name}-1` so "
+                f"the smoke container is named "
+                f"`alphard-smoke-<PID>-{project_scoped_name}-1` and does "
+                f"not collide with the operator's running "
+                f"`alphard-{service_key}` container. Issue #379."
+            )
+
+    def test_smoke_aliases_match_overridden_names(self) -> None:
+        """$SMOKE_BOT and $SMOKE_PG must equal the per-PID-scoped
+        container_name values the override sets.
+
+        Otherwise the script's `docker exec $SMOKE_BOT` would target
+        the operator's literal-name container (the alias is correct
+        only because the override makes those literal names obsolete).
+        """
+        text = _read_smoke()
+
+        # SMOKE_BOT and SMOKE_PG are defined right after COMPOSE_PROJECT_NAME.
+        assert re.search(
+            r'SMOKE_BOT="\$COMPOSE_PROJECT_NAME-alphard-bot-1"',
+            text,
+        ), (
+            "SMOKE_BOT must be defined as "
+            "`$COMPOSE_PROJECT_NAME-alphard-bot-1` so it matches the "
+            "container_name set by the override."
+        )
+        assert re.search(
+            r'SMOKE_PG="\$COMPOSE_PROJECT_NAME-postgres-1"',
+            text,
+        ), (
+            "SMOKE_PG must be defined as "
+            "`$COMPOSE_PROJECT_NAME-postgres-1` so it matches the "
+            "container_name set by the override."
+        )
+
+        # The script must use $SMOKE_BOT / $SMOKE_PG in its docker
+        # exec / docker inspect calls — never the hardcoded names.
+        assert "docker exec alphard-bot" not in text, (
+            "smoke must not hardcode `docker exec alphard-bot`; use "
+            "$SMOKE_BOT so the exec targets the smoke's own container."
+        )
+        assert "docker exec alphard-postgres" not in text, (
+            "smoke must not hardcode `docker exec alphard-postgres`; "
+            "use $SMOKE_PG so the exec targets the smoke's own "
+            "container."
+        )
+        assert "docker inspect alphard-postgres" not in text, (
+            "smoke must not hardcode `docker inspect alphard-postgres`; "
+            "use $SMOKE_PG so the inspect targets the smoke's own "
+            "container."
+        )
+
+    def test_override_heredoc_is_unquoted_not_quoted(self) -> None:
+        """The override heredoc must use `<<YAML` (unquoted), not
+        `<<'YAML'` (quoted), so that ${COMPOSE_PROJECT_NAME} expands.
+
+        Quoting the delimiter prevents parameter expansion, which
+        would leave the literal string `${COMPOSE_PROJECT_NAME}-...`
+        in the override file and break Compose parsing.
+        """
+        text = _read_smoke()
+        assert "<<'YAML'" not in text or text.count("<<YAML") >= 1, (
+            "smoke script's override heredoc must be `<<YAML` (not "
+            "`<<'YAML'`) so $COMPOSE_PROJECT_NAME expands at write time."
+        )
+        # Specifically: there must be at least one unquoted heredoc
+        # writing OVERRIDE_FILE.
+        assert re.search(r'cat\s+>\s+"\$OVERRIDE_FILE"\s+<<YAML\b', text), (
+            "smoke script must write OVERRIDE_FILE with an unquoted "
+            "heredoc delimiter `<<YAML` so $COMPOSE_PROJECT_NAME is "
+            "expanded when the file is written."
+        )
+
+    def test_chownfix_orphan_cleanup_still_present(self) -> None:
+        """Issue #379 acceptance criterion #3: the
+        `docker rm alphard-chownfix` orphan cleanup must NOT be
+        removed by this fix — it is still valid belt-and-suspenders
+        defence against a previous aborted smoke run that left an
+        Exited `alphard-chownfix` (under the operator's literal name)
+        lying around.
+        """
+        text = _read_smoke()
+        assert "docker rm alphard-chownfix" in text, (
+            "smoke script must keep `docker rm alphard-chownfix` even "
+            "after the per-PID container_name override is in place — "
+            "issue #379 acceptance criterion #3."
+        )
+        # And it must run BEFORE `compose up`.
+        rm_pos = text.find("docker rm alphard-chownfix")
+        up_pos = text.find("bringing up stack")
+        assert rm_pos > 0 and up_pos > 0, (
+            "smoke script must contain both `docker rm alphard-chownfix` " "and `bringing up stack`."
+        )
+        assert rm_pos < up_pos, "alphard-chownfix orphan cleanup must run BEFORE `compose up`."
+
+    def test_postgres_service_has_alphard_postgres_network_alias(self) -> None:
+        """The override file must re-add `alphard-postgres` as a network
+        alias on the postgres service.
+
+        The bot's entrypoint (docker/entrypoint.sh) hardcodes the
+        hostname `alphard-postgres` for its TCP probe. Compose only
+        auto-adds the service key (`postgres`) as a DNS alias when
+        container_name is not set — without an explicit network alias
+        override, the bot would fail to resolve postgres inside the
+        smoke's alphard-net.
+
+        Regression for issue #379.
+        """
+        text = _read_smoke()
+        override_match = re.search(
+            r'cat\s+>\s+"\$OVERRIDE_FILE"\s+<<YAML\n(?P<body>.*?)\nYAML',
+            text,
+            re.DOTALL,
+        )
+        assert override_match, "smoke script must contain the override heredoc."
+        body = override_match.group("body")
+
+        # Postgres service must declare alphard-postgres as a network
+        # alias on alphard-net.
+        postgres_section_re = re.compile(
+            r"^\s{2}postgres:\s*\n"
+            r"(?:\s{4,}[^:]+:[^\n]*\n)*?"  # optional other keys (container_name etc.)
+            r"\s{4}networks:\s*\n"
+            r"\s{6}alphard-net:\s*\n"
+            r"\s{8}aliases:\s*\n"
+            r"\s{10}-\s*alphard-postgres\s*$",
+            re.MULTILINE,
+        )
+        assert postgres_section_re.search(body), (
+            "override file must add `alphard-postgres` as a network "
+            "alias on alphard-net for the postgres service — without "
+            "this, the bot's entrypoint (which hardcodes hostname "
+            "`alphard-postgres` in docker/entrypoint.sh) cannot "
+            "resolve the smoke's postgres container. Issue #379."
+        )
