@@ -100,6 +100,17 @@ class FallbackDataLoader:
             "tinkoff_grpc": {"ok": 0, "fallback": 0, "error": 0},
             "moex_iss": {"ok": 0, "fallback": 0, "error": 0},
         }
+        # Per-ticker, per-source skip cache. Populated when a source either
+        # raises LoaderNotFoundError or returns zero rows. Subsequent
+        # calls short-circuit past that source for the lifetime of this
+        # loader instance, which lives for the entire backfill run
+        # (the supervisor's subprocess). Cycle146 speedup: for SPBXM-
+        # foreign tickers that both sources fail to find, we no longer
+        # spend ~5s per ticker retrying the same 0-bar calls. Cache
+        # resets naturally when the supervisor restarts (which it does
+        # on crash or daily sync boundary) and re-fetches the same
+        # tickers once. Bounded by `len(tickers) * len(sources)` entries.
+        self._skip: dict[str, set[str]] = {}
 
     @property
     def stats(self) -> dict[str, dict[str, int]]:
@@ -205,6 +216,12 @@ class FallbackDataLoader:
             source = self._resolve(source_name)
             if source is None:
                 continue
+            # Skip cache short-circuit: this source already failed for
+            # this ticker in a previous call. Avoids repeating the same
+            # 2-3s of network I/O for tickers that will fail identically
+            # (LoaderNotFoundError, 0-bar responses). Cycle146 fix.
+            if source_name in self._skip.get(ticker, set()):
+                continue
             chunk_cap = self._source_max_lookback(source_name)
             try:
                 rows_iter = self._iter_source(source, ticker, start, end, chunk_cap)
@@ -215,6 +232,14 @@ class FallbackDataLoader:
                 )
                 self._stats[source_name]["error"] += 1
                 self._stats[source_name]["fallback"] += 1
+                # Mark this source as known-bad for this ticker for the
+                # remainder of the loader's lifetime. LoaderNotFoundError
+                # is permanent (ticker will never enter that source's
+                # universe) but other exceptions may be transient — for
+                # safety we cache them all. The cost of a transient
+                # miss is one stale "this source returned 0" entry that
+                # will resolve on the next supervisor restart.
+                self._skip.setdefault(ticker, set()).add(source_name)
                 continue
             if rows:
                 logger.info(f"{ticker}: {source_name} returned {len(rows)} bars")
@@ -223,6 +248,11 @@ class FallbackDataLoader:
                 return
             logger.info(f"{ticker}: {source_name} returned 0 bars; falling back")
             self._stats[source_name]["fallback"] += 1
+            # 0 bars is also worth caching: a source that returns empty
+            # for a given ticker in this run will keep returning empty.
+            # Cache the skip so the next iteration short-circuits past
+            # this source for this ticker.
+            self._skip.setdefault(ticker, set()).add(source_name)
         logger.warning(f"{ticker}: ALL sources returned 0 bars")
 
     @staticmethod
