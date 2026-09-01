@@ -23,49 +23,6 @@
   "liveNow": false,
   "panels": [
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "PBFA97CFB590B2093"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {"mode": "thresholds"},
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {"color": "red", "value": null},
-              {"color": "green", "value": 60}
-            ]
-          },
-          "unit": "s"
-        },
-        "overrides": []
-      },
-      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 0},
-      "id": 1,
-      "options": {
-        "colorMode": "background",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
-        "showPercentLabels": false,
-        "textMode": "auto"
-      },
-      "pluginVersion": "10.0.0",
-      "targets": [
-        {
-          "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
-          "expr": "time() - alphard_heartbeat_last_tick_timestamp",
-          "legendFormat": "seconds since last heartbeat",
-          "refId": "A"
-        }
-      ],
-      "title": "Heartbeat lag (alerts if > 60s)",
-      "type": "stat"
-    },
-    {
       "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
       "fieldConfig": {
         "defaults": {
@@ -87,50 +44,6 @@
       ],
       "title": "Alphard uptime",
       "type": "stat"
-    },
-    {
-      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
-      "fieldConfig": {
-        "defaults": {
-          "color": {"mode": "palette-classic"},
-          "custom": {
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {"legend": false, "tooltip": false, "viz": false},
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {"type": "linear"},
-            "showPoints": "never",
-            "spanNulls": false,
-            "stacking": {"group": "A", "mode": "none"},
-            "thresholdsStyle": {"mode": "off"}
-          },
-          "unit": "short"
-        }
-      },
-      "gridPos": {"h": 8, "w": 16, "x": 0, "y": 12},
-      "id": 3,
-      "options": {
-        "legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true},
-        "tooltip": {"mode": "single", "sort": "none"}
-      },
-      "targets": [
-        {
-          "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
-          "expr": "increase(alphard_heartbeats_total[5m])",
-          "legendFormat": "heartbeats per 5m",
-          "refId": "A"
-        }
-      ],
-      "title": "Heartbeat rate (5m window)",
-      "type": "timeseries"
     },
     {
       "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
@@ -243,6 +156,7 @@
       "title": "Daily-candle row accumulation (ohlcv_daily)",
       "type": "stat"
     }
+
   ],
   "refresh": "30s",
   "schemaVersion": 38,
