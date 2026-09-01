@@ -151,10 +151,13 @@ case "$1" in
     exit 0
     ;;
   inspect)
-    # Health-gate inspect call: report State.Status=running, State.Health.Status=healthy
-    # so the gate would loop forever if TIMEOUT_SEC > 0 (we use 0 in tests).
-    echo "running"
-    exit 0
+    # No containers exist on this fake daemon: compose never actually ran.
+    # Real docker exits 1 with "No such object", which is what the issue
+    # #382 conflict precheck relies on to distinguish "nothing running"
+    # from "foreign container holds the literal name". The health gate
+    # never reaches here because every caller sets ALPHARD_TIMEOUT_SEC=0.
+    echo "Error: No such object" >&2
+    exit 1
     ;;
   ps)
     # ALPHARD_SKIP_COMPOSE path prints `docker ps` — return empty.
@@ -506,12 +509,18 @@ def test_timeout_zero_with_successful_compose_exits_1(tmp_path: Path) -> None:
     env_dir = _quickstart_skel(tmp_path, with_gpw=True)
     _fill_all_b64(env_dir)
 
-    # Custom fake docker: ALL commands succeed (including `compose up`).
+    # Custom fake docker: ALL commands succeed (including `compose up`),
+    # except `inspect`, which reports no such container — this fake models
+    # an empty daemon, so the issue #382 conflict precheck must see nothing
+    # holding the literal alphard-* names and fall through to compose.
     fake_docker_dir = tmp_path / "fakebin_success"
     fake_docker_dir.mkdir(exist_ok=True)
     fake_docker = fake_docker_dir / "docker"
     fake_docker.write_text(
-        "#!/bin/sh\n" 'echo "fake docker $*"\n' "exit 0\n",
+        "#!/bin/sh\n"
+        'if [ "$1" = "inspect" ]; then echo "Error: No such object" >&2; exit 1; fi\n'
+        'echo "fake docker $*"\n'
+        "exit 0\n",
         encoding="utf-8",
     )
     fake_docker.chmod(0o755)

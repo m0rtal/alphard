@@ -41,6 +41,13 @@
 #                           operator is then expected to run
 #                           `docker compose up` themselves.
 #   ALPHARD_QUIET         = "1" suppress progress dots.
+#   ALLOW_QUICKSTART_OVERWRITE = "1" proceed even when a literal
+#                           alphard-* container owned by a DIFFERENT
+#                           compose project is already up. Off by
+#                           default: docker-compose.yaml hardcodes
+#                           container_name:, so an unscoped `compose up`
+#                           would abort with an opaque "container name
+#                           already in use" conflict (issue #382).
 #
 # Why this script exists: a clean-host `git clone + docker compose up`
 # on the original repo failed in 4 places (PR #228 / this PR's notes):
@@ -267,6 +274,55 @@ if [[ "$SKIP_COMPOSE" == "1" ]]; then
     exit 0
 fi
 info "5/5 docker compose up -d --profile $PROFILE"
+
+# ---- Container-name conflict precheck (issue #382) ----
+# docker-compose.yaml hardcodes `container_name:` for the six long-running
+# services, and this script runs `docker compose up` UNSCOPED (no -p, no
+# override). So any literal alphard-* container held by a different compose
+# project makes compose abort with:
+#
+#   Conflict. The container name "/alphard-bot" is already in use
+#
+# That message is opaque to a first-time operator, and quickstart is the
+# only documented bootstrap path. Fail early with the owning project name
+# and the teardown command instead. Same opt-in shape as
+# ALLOW_NONLOCAL_SMOKE=1 in scripts/pre_pr_smoke.sh: warn loudly, proceed.
+#
+# A container owned by QUICKSTART_PROJECT is this script's own stack — that
+# is a re-run, which is documented as idempotent, so compose reconciles it.
+QUICKSTART_PROJECT="$(basename "$REPO_ROOT")"
+CONFLICT_EXIT_CODE=9
+GUARDED_CONTAINERS=(
+    "alphard-bot"
+    "alphard-postgres"
+    "alphard-redis"
+    "alphard-prometheus"
+    "alphard-grafana"
+    "alphard-chownfix"
+)
+
+for _c in "${GUARDED_CONTAINERS[@]}"; do
+    docker inspect "$_c" >/dev/null 2>&1 || continue
+
+    _owner="$(docker inspect "$_c" --format '{{ index .Config.Labels "com.docker.compose.project" }}' 2>/dev/null || true)"
+    _owner="${_owner:-<unknown>}"
+
+    if [[ "$_owner" == "$QUICKSTART_PROJECT" ]]; then
+        log "  $_c already up (project $_owner) — re-run, compose will reconcile"
+        continue
+    fi
+
+    if [[ "${ALLOW_QUICKSTART_OVERWRITE:-0}" == "1" ]]; then
+        warn "$_c is already up under compose project '$_owner' — proceeding because ALLOW_QUICKSTART_OVERWRITE=1"
+        continue
+    fi
+
+    err "container '$_c' is already up under compose project '$_owner'"
+    err "  docker-compose.yaml pins container_name: $_c, so 'compose up' would conflict."
+    err "  Stop the other stack:  docker compose -p $_owner down"
+    err "  Or attach anyway:      ALLOW_QUICKSTART_OVERWRITE=1 bash scripts/quickstart.sh"
+    exit "$CONFLICT_EXIT_CODE"
+done
 
 # We do NOT `set -a; source .env; set +a` because that would export every
 # variable in .env (HTTP_PROXY, MATTERMOST_*, etc.) into the compose
