@@ -133,6 +133,10 @@ services:
     volumes:
       - ./src:/app/src:ro
       - ./scripts:/app/scripts:ro
+  alphard-web:
+    container_name: ${COMPOSE_PROJECT_NAME}-alphard-web-1
+    volumes:
+      - ./src:/app/src:ro
   postgres:
     container_name: ${COMPOSE_PROJECT_NAME}-postgres-1
     networks:
@@ -166,7 +170,7 @@ echo "[pre-pr-smoke] [1/4] bringing up stack..."
 # never applied and _auth_probe was missing. Schema application is now
 # handled by the bot's entrypoint via init_schema() before auth_probe()
 # — see tests/test_347_pg_init_removal.py.
-if ! "${COMPOSE[@]}" up -d postgres alphard-bot >/dev/null 2>&1; then
+if ! "${COMPOSE[@]}" up -d postgres alphard-bot alphard-web >/dev/null 2>&1; then
     echo "[pre-pr-smoke] FAIL: docker compose up failed"
     exit 1
 fi

@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>alphard-web</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f5f5f5; --fg: #1a1a1a; --card: #ffffff; --muted: #666;
+      --border: #e1e1e1; --accent: #2563eb;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg: #0f0f10; --fg: #e8e8e8; --card: #1a1a1c;
+              --muted: #999; --border: #2a2a2c; --accent: #60a5fa; }
+    }
+    body { font-family: -apple-system, system-ui, sans-serif;
+           background: var(--bg); color: var(--fg);
+           margin: 0; padding: 24px; }
+    h1 { font-weight: 600; margin: 0 0 4px; }
+    .updated { color: var(--muted); font-size: 12px; margin-bottom: 24px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 16px; margin-bottom: 24px; }
+    .card { background: var(--card); border: 1px solid var(--border);
+            border-radius: 8px; padding: 16px; }
+    .card .label { color: var(--muted); font-size: 12px;
+                   text-transform: uppercase; letter-spacing: 0.05em; }
+    .card .value { font-size: 28px; font-weight: 600; margin-top: 4px; }
+    .chart-card { background: var(--card); border: 1px solid var(--border);
+                  border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+    .chart-card h2 { font-size: 14px; margin: 0 0 12px; color: var(--muted); }
+    .top-list { background: var(--card); border: 1px solid var(--border);
+                border-radius: 8px; padding: 16px; }
+    .top-list h2 { font-size: 14px; margin: 0 0 12px; color: var(--muted); }
+    .top-list table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    .top-list td { padding: 6px 0; border-bottom: 1px solid var(--border); }
+    .top-list td:last-child { text-align: right; font-variant-numeric: tabular-nums; }
+    canvas { max-height: 240px; }
+  </style>
+</head>
+<body>
+  <h1>alphard-web</h1>
+  <div class="updated" id="updated">loading&hellip;</div>
+
+  <div class="grid">
+    <div class="card">
+      <div class="label">Universe size</div>
+      <div class="value" id="kpi-universe">&mdash;</div>
+    </div>
+    <div class="card">
+      <div class="label">Tickers complete</div>
+      <div class="value" id="kpi-complete">&mdash;</div>
+    </div>
+    <div class="card">
+      <div class="label">OHLCV rows</div>
+      <div class="value" id="kpi-rows">&mdash;</div>
+    </div>
+    <div class="card">
+      <div class="label">Last bar</div>
+      <div class="value" id="kpi-last-bar">&mdash;</div>
+    </div>
+  </div>
+
+  <div class="chart-card">
+    <h2>OHLCV rows &mdash; last 30 days (cumulative)</h2>
+    <canvas id="chart-ts"></canvas>
+  </div>
+
+  <div class="top-list">
+    <h2>Top 10 tickers by bar count</h2>
+    <table><tbody id="top-rows"></tbody></table>
+  </div>
+
+<script>
+const fmt = new Intl.NumberFormat();
+async function getJSON(url) {
+  const r = await fetch(url, {cache: "no-store"});
+  if (!r.ok) throw new Error(url + " -> HTTP " + r.status);
+  return r.json();
+}
+
+let chart;
+async function refresh() {
+  try {
+    const [kpis, ts, top] = await Promise.all([
+      getJSON("/api/kpis"),
+      getJSON("/api/ohlcv_timeseries?days=30"),
+      getJSON("/api/top_tickers?limit=10"),
+    ]);
+    document.getElementById("kpi-universe").textContent = fmt.format(kpis.universe_size);
+    document.getElementById("kpi-complete").textContent = fmt.format(kpis.tickers_complete);
+    document.getElementById("kpi-rows").textContent = fmt.format(kpis.ohlcv_rows);
+    document.getElementById("kpi-last-bar").textContent = kpis.last_bar_at || "\u2014";
+    document.getElementById("updated").textContent =
+      "updated " + new Date().toLocaleTimeString();
+
+    const labels = ts.map(r => r.bucket);
+    const data = ts.map(r => Number(r.cum_rows));
+    if (!chart) {
+      chart = new Chart(document.getElementById("chart-ts"), {
+        type: "line",
+        data: {labels, datasets: [{label: "cum_rows", data,
+                                   borderColor: "#2563eb",
+                                   backgroundColor: "rgba(37,99,235,0.1)",
+                                   fill: true, tension: 0.2}]},
+        options: {responsive: true, plugins: {legend: {display: false}},
+                   scales: {y: {beginAtZero: true}}}
+      });
+    } else {
+      chart.data.labels = labels; chart.data.datasets[0].data = data; chart.update();
+    }
+
+    document.getElementById("top-rows").innerHTML = top.map(r =>
+      `<tr><td>${r.ticker}</td><td>${fmt.format(Number(r.bar_count))}</td></tr>`
+    ).join("");
+  } catch (e) {
+    document.getElementById("updated").textContent = "error: " + e.message;
+  }
+}
+refresh();
+setInterval(refresh, 30000);
+</script>
+</body>
+</html>
