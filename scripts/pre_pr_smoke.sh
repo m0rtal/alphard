@@ -68,21 +68,49 @@ if [[ ! -f "$REPO_ROOT/.env" ]]; then
         | grep -E '^[A-Za-z_][A-Za-z0-9_]*=' > "$REPO_ROOT/.env"
 fi
 
-# BUGFIX (cycle148, issue #374): scope every compose invocation to a
-# per-PID project name so the smoke stack gets unique container names
-# (alphard-smoke-<PID>-postgres-1, alphard-smoke-<PID>-alphard-bot-1)
-# and never collides with the operator's running alphard-* stack on
-# the same daemon. Without this, the cleanup trap's `docker compose
-# down -v` reuses the operator's existing alphard-postgres/alphard-bot
-# containers (docker-compose.yaml hardcodes container_name:) and wipes
-# their volumes — a destructive collision when any other process on
-# the host is running the operator stack.
+# BUGFIX (cycle148/149, issue #374 + #379): scope every compose
+# invocation to a per-PID project name AND redefine every hardcoded
+# `container_name:` in docker-compose.yaml, so the smoke stack gets
+# unique per-PID container names (alphard-smoke-<PID>-alphard-bot-1,
+# alphard-smoke-<PID>-postgres-1, etc.) and never collides with the
+# operator's running alphard-* stack on the same daemon.
+#
+# Why the override is necessary: docker-compose.yaml hardcodes
+# `container_name: alphard-bot`, `alphard-postgres`, `alphard-redis`,
+# `alphard-prometheus`, `alphard-chownfix`, `alphard-grafana`. Docker
+# Compose honours these literal names and does NOT prefix them with
+# the project name — the `-p alphard-smoke-<PID>` flag scopes
+# volumes/networks only, not hardcoded container names. On a host
+# where the operator's stack is already running, `compose up` fails at
+# step [1/4] with "Conflict. The container name '/alphard-bot' is
+# already in use".
+#
+# The override below redefines each hardcoded container_name with the
+# per-PID-scoped name (matching Compose's default project-scoped
+# naming convention `<project>-<service>-1`). This is the safe,
+# non-destructive fix: no operator containers are touched.
+#
+# We also re-add `alphard-postgres` as a network alias for the
+# postgres service. Without `container_name: alphard-postgres`,
+# Compose only adds the service key (`postgres`) as a DNS alias on
+# the alphard-net network — the bot's entrypoint hardcodes the
+# hostname `alphard-postgres` (docker/entrypoint.sh:106), so the bot
+# would fail to resolve postgres. The smoke's alphard-net is a
+# separate Docker network (named `alphard-smoke-<PID>_alphard-net`),
+# so the alias resolves only inside the smoke stack and never leaks
+# into the operator's stack.
+#
+# `!reset null` would be cleaner but is not supported by Compose v2.40
+# on this host — verified via `docker compose ... config` that `!reset`
+# is silently ignored. We redefine explicitly instead.
 OVERRIDE_FILE="/tmp/alphard-pre-pr-smoke-$$.yaml"
 COMPOSE_PROJECT_NAME="alphard-smoke-$$"
 COMPOSE=(docker compose -p "$COMPOSE_PROJECT_NAME" -f docker-compose.yaml -f "$OVERRIDE_FILE")
-# Convenience aliases that route through compose so container-name
-# hardcoding in docker-compose.yaml does not leak into the script's
-# own docker exec / docker inspect calls.
+# Convenience aliases for docker exec / docker inspect calls. These
+# now match Compose's project-scoped naming convention (the override
+# below sets container_name to exactly these values), so there is no
+# leak from docker-compose.yaml's hardcoded names into the script's
+# own docker invocations.
 SMOKE_BOT="$COMPOSE_PROJECT_NAME-alphard-bot-1"
 SMOKE_PG="$COMPOSE_PROJECT_NAME-postgres-1"
 
@@ -95,13 +123,41 @@ trap cleanup EXIT
 # Bind-mount the branch tree so the container runs THIS code. Paths are
 # repo-relative: hardcoding an absolute checkout path breaks every
 # worktree and every other machine.
-cat > "$OVERRIDE_FILE" <<'YAML'
+#
+# ALSO redefine every hardcoded container_name from docker-compose.yaml
+# to its per-PID-scoped equivalent. See the BUGFIX comment above.
+cat > "$OVERRIDE_FILE" <<YAML
 services:
   alphard-bot:
+    container_name: ${COMPOSE_PROJECT_NAME}-alphard-bot-1
     volumes:
       - ./src:/app/src:ro
       - ./scripts:/app/scripts:ro
+  postgres:
+    container_name: ${COMPOSE_PROJECT_NAME}-postgres-1
+    networks:
+      alphard-net:
+        aliases:
+          - alphard-postgres
+  redis:
+    container_name: ${COMPOSE_PROJECT_NAME}-redis-1
+  prometheus:
+    container_name: ${COMPOSE_PROJECT_NAME}-prometheus-1
+  chownfix:
+    container_name: ${COMPOSE_PROJECT_NAME}-chownfix-1
+  grafana:
+    container_name: ${COMPOSE_PROJECT_NAME}-grafana-1
 YAML
+
+# BUGFIX (cycle148, followup to #374): the alphard-chownfix sidecar is
+# declared with restart:"no" in docker-compose.yaml, so its container
+# is left in Exited state after the chown pass. Even with the per-PID
+# container_name override above, if a previous aborted smoke run left
+# an Exited `alphard-chownfix` (under the operator's literal name)
+# lying around, drop it here as belt-and-suspenders. `docker rm` of an
+# exited container is a safe no-op against running ones.
+echo "[pre-pr-smoke] [0/4] clearing stale alphard-chownfix orphan..."
+docker rm alphard-chownfix >/dev/null 2>&1 || true
 
 echo "[pre-pr-smoke] [1/4] bringing up stack..."
 # BUGFIX (issue #347): bring up only postgres + alphard-bot. The previous
