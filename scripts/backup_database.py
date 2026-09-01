@@ -163,10 +163,7 @@ def _dump_rejection_reason(sql: bytes) -> str | None:
         return "pg_dump exited 0 but produced no output"
 
     if PG_DUMP_TRAILER not in sql:
-        return (
-            f"pg_dump output is missing the completion trailer "
-            f"({PG_DUMP_TRAILER.decode()}) — dump is truncated"
-        )
+        return f"pg_dump output is missing the completion trailer ({PG_DUMP_TRAILER.decode()}) — dump is truncated"
 
     return None
 

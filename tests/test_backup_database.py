@@ -235,7 +235,9 @@ def test_run_backup_invokes_docker_exec(tmp_path: Path, monkeypatch):
     def fake_run(cmd, **kw):
         captured["cmd"] = cmd
         captured["kwargs"] = kw
-        result = subprocess.CompletedProcess(args=cmd, returncode=0, stdout=_valid_dump(b"CREATE TABLE foo;\n"), stderr=b"")
+        result = subprocess.CompletedProcess(
+            args=cmd, returncode=0, stdout=_valid_dump(b"CREATE TABLE foo;\n"), stderr=b""
+        )
         return result
 
     monkeypatch.setattr("subprocess.run", fake_run)
