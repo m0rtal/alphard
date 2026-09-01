@@ -8,26 +8,17 @@
 #   - ~3 GiB disk free (alphard-bot 405 MB, postgres 80 MB, redis 40 MB,
 #     + image caches)
 #   - Ports 5432, 6379 free on the host
-#     which lives on host network namespace; 3000 is taken by forgejo
-#     on .103, hence 3300 is the override)
 #
 # What it does (idempotent — re-running is safe):
 #   1. Sanity-checks: docker is up, compose v2 present, repo root
 #      contains docker-compose.yaml and .env.example.
-#   2. Creates .env from .env.example if missing. Refuses to start
-
+#   2. Creates .env from .env.example if missing.
 #      Auto-generates POSTGRES_PASSWORD and REDIS_PASSWORD if missing.
-#   3. Bakes the (legacy) Grafana/Prometheus B64 vars. Skipped if
-#      already populated. (Both stacks removed in PR #396.)
-#      already populated.
-#   5. `docker compose --profile observability up -d`.
-#   6. Polls container healthchecks for up to 180s; prints a clear
+#   3. `docker compose up -d` (no --profile filter; see #402).
+#   4. Polls container healthchecks for up to 180s; prints a clear
 #      status table (or a failure table with `docker logs <svc>` hints).
 #
 # Run-time knobs (env vars, all optional):
-#   ALPHARD_PROFILE       = "observability" (default) or "data" (skip
-#                           bot + postgres + redis
-#                           only — for memory-constrained hosts).
 #   ALPHARD_TIMEOUT_SEC   = 180 (default; how long to wait for healthy).
 #                           Set to 0 to run bake stages + compose up,
 #                           skip the health-gate polling, and exit
@@ -62,7 +53,7 @@
 #   - PROVISIONING_*_B64 were empty in .env.example, so Grafana's
 #     entrypoint bailed at `FATAL: ... is unset or empty`. THIS SCRIPT
 #     bakes them on first run.
-#     (Both removed in PR #396; entries kept as historical context.)
+#     (Both removed in PR #399; entries kept as historical context.)
 #
 # Idempotency: every step short-circuits if its artifact already exists.
 # Re-running on a healthy stack is a no-op (compose up -d skips
@@ -75,15 +66,15 @@ set -euo pipefail
 # BASH_SOURCE[0] is the path AS INVOKED (e.g. "/usr/local/bin/qs" when
 # the script is invoked via a symlink), not the real path. Deriving
 # REPO_ROOT from it directly makes the script read .env / docker-
-# compose.yaml / tools/ from the symlink's parent
+# compose.yaml / .env from the symlink's parent
 # directory instead of the real repo, which silently breaks for
 #   cp scripts/quickstart.sh /usr/local/bin/alphard-quickstart
 # or any CI flow that copies the script into a shared /usr/local/bin.
 # (issues #248, #249).
 #
 # We resolve symlinks via `python3 -c 'os.path.realpath'`. python3 is
-# already a hard dependency of this script (tools/
-# requires it), so the cost is zero. We deliberately avoid `readlink -f`
+# already a hard dependency of this script, so the cost is zero. We
+# deliberately avoid `readlink -f`
 # and `dirname` because:
 #   - busybox-alpine (the base of alphard-pg-init) ships readlink
 #     without `-f` support on some images.
@@ -105,7 +96,9 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
 # ---- Config knobs (env-driven with defaults) ----
-PROFILE="${ALPHARD_PROFILE:-observability}"
+# No --profile filter: PR #399 deleted the only services that declared
+# `profiles: ["observability"]` (grafana, prometheus, chownfix), so every
+# profile value now selects the identical three-service set (#402).
 TIMEOUT_SEC="${ALPHARD_TIMEOUT_SEC:-180}"
 SKIP_COMPOSE="${ALPHARD_SKIP_COMPOSE:-0}"
 QUIET="${ALPHARD_QUIET:-0}"
@@ -211,7 +204,7 @@ fi
 # off mid-keyword. Bind-mount from the repo is the same fix PR #284 used
 # Nothing extra to bake — the bot's metrics server is bind-mounted.
 
-ok "prometheus stack removed (PR #396); bot exposes /metrics on port 8765"
+ok "prometheus stack removed (PR #399); bot exposes /metrics on port 8765"
 
 # ---- 5. docker compose up ----
 # Two early-exit paths:
@@ -224,14 +217,14 @@ ok "prometheus stack removed (PR #396); bot exposes /metrics on port 8765"
 # runs but BEFORE the health-gate polling loop.
 if [[ "$SKIP_COMPOSE" == "1" ]]; then
     info "5/5 docker compose up — skipped (ALPHARD_SKIP_COMPOSE=1)"
-    info "  Bakes written; docker compose not invoked. Run \`docker compose --profile $PROFILE up -d\` yourself."
+    info "  Bakes written; docker compose not invoked. Run \`docker compose up -d\` yourself."
     if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
         docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' --filter "name=alphard-" 2>/dev/null || true
     fi
     ok "bakes complete; compose not invoked"
     exit 0
 fi
-info "5/5 docker compose up -d --profile $PROFILE"
+info "5/5 docker compose up -d"
 
 # ---- Container-name conflict precheck (issue #382) ----
 # docker-compose.yaml hardcodes `container_name:` for the six long-running
@@ -293,7 +286,7 @@ done
 # idiomatic alternative: bash checks the exit status of the assignment
 # without killing the script, the output is preserved in full for
 # diagnostics, and the trailing `sed` re-indents for log readability.
-_compose_output="$(docker compose "--profile=$PROFILE" up -d 2>&1)" || _compose_rc=$?
+_compose_output="$(docker compose up -d 2>&1)" || _compose_rc=$?
 _compose_rc="${_compose_rc:-0}"
 printf '%s\n' "$_compose_output" | sed 's/^/  /'
 if [[ "$_compose_rc" -ne 0 ]]; then
@@ -316,7 +309,7 @@ if [[ "$TIMEOUT_SEC" -lt 1 ]]; then
 fi
 info "Health gate (up to ${TIMEOUT_SEC}s)"
 
-# One-shot services: none. chownfix was removed in PR #396
+# One-shot services: none. chownfix was removed in PR #399
 # (its only job was chown'ing Grafana/Prometheus leaf directories).
 # These must NOT be in EXPECTED — the health gate requires
 # State.Status == "running", which one-shots never satisfy.
@@ -326,8 +319,9 @@ info "Health gate (up to ${TIMEOUT_SEC}s)"
 ONE_SHOT=()
 # Long-running services we wait for:
 EXPECTED=("alphard-postgres" "alphard-redis" "alphard-bot")
-# PR #396 removed Grafana and Prometheus; the "observability" profile
-# is preserved as a synonym for "full stack" until a future PR retires it.
+# PR #399 removed Grafana and Prometheus, and with them the only
+# services that declared a profile — so there is no profile left to
+# filter on (#402).
 
 elapsed=0
 interval=5
@@ -366,26 +360,14 @@ docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' --filter "name=al
 
 if [[ $all_healthy -eq 1 ]]; then
     ok "stack is up"
-    if [[ "$PROFILE" == "observability" ]]; then
-        cat <<EOF
+    cat <<EOF
 
   Next steps:
     - Bot health/metrics (in-network only):  alphard-bot:8765/health, /metrics
-    - alphard-web:                           http://localhost:8080/  (operator UI; replaces Grafana)
     - Postgres + Redis:                      docker exec alphard-postgres psql -U \$POSTGRES_USER -d \$POSTGRES_DB
-    - Stop:                                   docker compose --profile $PROFILE down
-    - Stop + wipe volumes:                   docker compose --profile $PROFILE down -v
+    - Stop:                                  docker compose down
+    - Stop + wipe volumes:                   docker compose down -v
 EOF
-    else
-        cat <<EOF
-
-  Next steps:
-    - Bot health/metrics:                    alphard-bot:8765/health, /metrics
-    - Postgres + Redis:                      docker exec alphard-postgres psql -U \$POSTGRES_USER -d \$POSTGRES_DB
-    - Stop:                                   docker compose --profile $PROFILE down
-    - Stop + wipe volumes:                   docker compose --profile $PROFILE down -v
-EOF
-    fi
     exit 0
 else
     err "stack did not reach healthy state in ${TIMEOUT_SEC}s"
