@@ -580,3 +580,219 @@ def test_log_message_writes_to_stderr(capsys: pytest.CaptureFixture[str]) -> Non
     captured = capsys.readouterr()
     assert "[alphard-web]" in captured.err
     assert "test hello" in captured.err
+
+
+# --- auth gate (issue #406) --------------------------------------------
+#
+# Regression for Security: High — PR #394 dashboard had no authentication.
+# /api/settings, /api/backups, /api/tickers, /api/ticker/<sym>, /api/backfill,
+# /api/events, /api/macro, /api/summary, /api/sparkline, /api/tickers/count
+# all returned sensitive data (DSN-derived values, backup paths, full
+# universe) without any check.
+#
+# Fix: dispatch() requires an ALPHARD_WEB_TOKEN env var to be set; an
+# Authorization: Bearer header carrying the same value is required for
+# every /api/* route. /api/health remains open so container healthchecks
+# keep working. / (HTML root) is gated too so the page itself is not
+# reachable from the LAN without the token.
+
+
+# Paths that DO NOT require auth (must stay open for the orchestrator).
+_OPEN_PATHS: frozenset[str] = frozenset({"/api/health"})
+
+
+def _auth_dispatch(
+    path: str,
+    headers: dict[str, str] | None = None,
+    *,
+    monkeypatch: pytest.MonkeyPatch,
+    executor: _FakeExecutor | None = None,
+) -> tuple[int, str, Any]:
+    """Call HttpHandler.do_GET with optional auth headers.
+
+    Patches dispatch's executor to a stub and forces ALPHARD_PG_DSN so
+    the handler reaches the router. The Authorization header is read
+    by the handler from self.headers (BaseHTTPRequestHandler contract).
+    """
+    ex = executor or _ok_executor()
+
+    original_dispatch = server_mod.dispatch
+
+    def patched(
+        path_arg: str,
+        query: str,
+        dsn: str,
+        executor: Any = server_mod.execute_query,
+        **kw: Any,
+    ) -> tuple[int, str, Any]:
+        return original_dispatch(path_arg, query, dsn, executor=ex, **kw)
+
+    monkeypatch.setattr(server_mod, "dispatch", patched)
+    monkeypatch.setenv("ALPHARD_PG_DSN", "postgresql://x")
+    if headers is not None:
+        for k, v in headers.items():
+            monkeypatch.setenv(k, v)
+
+    h = _StubHandler(path=path)
+    h.headers = dict(headers) if headers else {}
+    h.do_GET()
+    return h.response_code, h._headers.get("Content-Type", ""), h._captured
+
+
+def test_auth_required_when_token_env_set_no_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #406: ALPHARD_WEB_TOKEN set but no Authorization header → 401."""
+    monkeypatch.setenv("ALPHARD_WEB_TOKEN", "secret-token-abc")
+    code, _ctype, _body = _auth_dispatch("/api/summary", monkeypatch=monkeypatch)
+    assert code == 401
+
+
+def test_auth_required_when_token_env_set_wrong_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #406: bearer token mismatch → 401."""
+    monkeypatch.setenv("ALPHARD_WEB_TOKEN", "secret-token-abc")
+    code, _ctype, _body = _auth_dispatch(
+        "/api/summary",
+        headers={"Authorization": "Bearer wrong"},
+        monkeypatch=monkeypatch,
+    )
+    assert code == 401
+
+
+def test_auth_passes_with_matching_bearer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #406: matching bearer token → 200."""
+    monkeypatch.setenv("ALPHARD_WEB_TOKEN", "secret-token-abc")
+    code, _ctype, _body = _auth_dispatch(
+        "/api/summary",
+        headers={"Authorization": "Bearer secret-token-abc"},
+        monkeypatch=monkeypatch,
+    )
+    assert code == 200
+
+
+def test_auth_disabled_when_token_env_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #406: ALPHARD_WEB_TOKEN unset → auth gate disabled (legacy/dev).
+
+    This is the fail-open fallback for local dev where the operator has
+    not yet set a token. In production, the compose file MUST inject
+    ALPHARD_WEB_TOKEN; the compose-structure test pins that contract.
+    """
+    monkeypatch.delenv("ALPHARD_WEB_TOKEN", raising=False)
+    code, _ctype, _body = _auth_dispatch("/api/summary", monkeypatch=monkeypatch)
+    assert code == 200
+
+
+def test_auth_open_paths_skip_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #406: /api/health stays open for container healthchecks."""
+    monkeypatch.setenv("ALPHARD_WEB_TOKEN", "secret-token-abc")
+    # No Authorization header — would normally 401, but health is open.
+    code, _ctype, _body = _auth_dispatch("/api/health", monkeypatch=monkeypatch)
+    assert code == 200
+
+
+def test_auth_gate_404_also_requires_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #406: unknown paths don't leak routing info without auth."""
+    monkeypatch.setenv("ALPHARD_WEB_TOKEN", "secret-token-abc")
+    code, _ctype, _body = _auth_dispatch(
+        "/api/does-not-exist",
+        monkeypatch=monkeypatch,
+    )
+    assert code == 401
+
+
+def test_auth_challenge_includes_www_authenticate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #406: 401 response carries WWW-Authenticate so curl/HTTPie can prompt."""
+    monkeypatch.setenv("ALPHARD_WEB_TOKEN", "secret-token-abc")
+    _code, _ctype, _body = _auth_dispatch("/api/summary", monkeypatch=monkeypatch)
+    # Use a fresh dispatch via the live handler to inspect headers.
+    # _auth_dispatch already invoked do_GET; we need to look at the
+    # captured headers from that call by re-running with capture.
+    ex = _ok_executor()
+    original_dispatch = server_mod.dispatch
+
+    def patched(
+        path: str,
+        query: str,
+        dsn: str,
+        executor: Any = server_mod.execute_query,
+        **kw: Any,
+    ) -> tuple[int, str, Any]:
+        return original_dispatch(path, query, dsn, executor=ex, **kw)
+
+    monkeypatch.setattr(server_mod, "dispatch", patched)
+    monkeypatch.setenv("ALPHARD_PG_DSN", "postgresql://x")
+    monkeypatch.setenv("ALPHARD_WEB_TOKEN", "secret-token-abc")
+    h = _StubHandler(path="/api/summary")
+    h.headers = {}
+    h.do_GET()
+    assert h.response_code == 401
+    assert "WWW-Authenticate" in h._headers
+    assert "Bearer" in h._headers["WWW-Authenticate"]
+
+
+# --- check_auth pure-function tests ------------------------------------
+
+
+def test_check_auth_disabled_when_token_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #406: ALPHARD_WEB_TOKEN unset → gate is off (dev mode)."""
+    monkeypatch.delenv("ALPHARD_WEB_TOKEN", raising=False)
+    assert server_mod.check_auth("/api/summary", None) is True
+    assert server_mod.check_auth("/api/summary", "Bearer x") is True
+
+
+def test_check_auth_enabled_requires_bearer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #406: token set but no/empty header → denied."""
+    monkeypatch.setenv("ALPHARD_WEB_TOKEN", "secret-token-abc")
+    assert server_mod.check_auth("/api/summary", None) is False
+    assert server_mod.check_auth("/api/summary", "") is False
+
+
+def test_check_auth_wrong_scheme_denied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #406: Basic auth / non-bearer schemes are denied."""
+    monkeypatch.setenv("ALPHARD_WEB_TOKEN", "secret-token-abc")
+    assert server_mod.check_auth("/api/summary", "Basic dXNlcjpwYXNz") is False
+    assert server_mod.check_auth("/api/summary", "secret-token-abc") is False
+
+
+def test_check_auth_open_paths_skip_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #406: /api/health bypasses the gate."""
+    monkeypatch.setenv("ALPHARD_WEB_TOKEN", "secret-token-abc")
+    assert server_mod.check_auth("/api/health", None) is True
+    assert server_mod.check_auth("/api/health", "Bearer wrong") is True
+
+
+def test_check_auth_html_root_is_protected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #406: HTML root path requires auth (the page itself leaks)."""
+    monkeypatch.setenv("ALPHARD_WEB_TOKEN", "secret-token-abc")
+    assert server_mod.check_auth("/", None) is False
+    assert server_mod.check_auth("/", "Bearer secret-token-abc") is True
+
+
+def test_check_auth_matching_bearer_passes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #406: matching bearer passes."""
+    monkeypatch.setenv("ALPHARD_WEB_TOKEN", "secret-token-abc")
+    assert server_mod.check_auth("/api/summary", "Bearer secret-token-abc") is True

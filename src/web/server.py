@@ -13,10 +13,17 @@ Layering (per SOUL.md):
 - This module is the HTTP layer. It imports from ``pg_store`` only
   for the psycopg connection helper. It does NOT call into the loader
   chain, supervisor, or coordinator.
+
+Issue #406 — auth gate: every /api/* endpoint (except /api/health) and
+the HTML root require ``Authorization: Bearer <ALPHARD_WEB_TOKEN>`` when
+``ALPHARD_WEB_TOKEN`` is set in the environment. If unset, the gate
+fails open so local dev still works; the compose file MUST inject the
+env in production (see ``tests/test_compose_structure.py``).
 """
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import re
@@ -55,6 +62,17 @@ from src.web.queries import (
 #: before matching, so a trailing '?...' never reaches the capture group.
 _TICKER_PATH_RE: re.Pattern[str] = re.compile(r"^/api/ticker/(?P<ticker>[A-Za-z0-9._-]+)$")
 
+#: Issue #406 — auth gate. Set ``ALPHARD_WEB_TOKEN`` in the env to require
+#: ``Authorization: Bearer <token>`` on every protected request. Empty
+#: / unset disables the gate (local-dev fail-open). The compose file MUST
+#: inject the env in production; ``tests/test_compose_structure.py``
+#: pins that contract.
+_AUTH_TOKEN_ENV: str = "ALPHARD_WEB_TOKEN"
+#: Paths that stay open even when ``_AUTH_TOKEN_ENV`` is set.
+#: /api/health is required by the container healthcheck; the LAN-side
+#: operator dashboard scrape should not depend on injecting the header.
+_AUTH_OPEN_PATHS: frozenset[str] = frozenset({"/api/health"})
+
 
 def execute_query(dsn: str, sql: str, params: dict[str, Any]) -> list[dict[str, Any]]:
     """Run a single-row or multi-row query and return rows as dicts."""
@@ -64,6 +82,37 @@ def execute_query(dsn: str, sql: str, params: dict[str, Any]) -> list[dict[str, 
             cols = [d.name for d in cur.description] if cur.description else []
             rows = cur.fetchall()
     return [dict(zip(cols, row)) for row in rows]
+
+
+# --- Auth gate (issue #406) ---------------------------------------------
+def check_auth(path: str, authorization_header: str | None) -> bool:
+    """Return True iff the request is authorised.
+
+    Pure function: takes the URL path and the raw ``Authorization``
+    header value (or ``None``), reads the token from the env, and
+    returns whether the request should proceed.
+
+    Rules:
+    - If ``ALPHARD_WEB_TOKEN`` is unset / empty, fail open (dev mode).
+    - If set, every protected path requires ``Authorization: Bearer <token>``.
+    - Paths in ``_AUTH_OPEN_PATHS`` (currently just ``/api/health``)
+      bypass the gate so container healthchecks keep working.
+    - Constant-time string comparison avoids leaking token length via
+      timing; ``hmac.compare_digest`` is the stdlib tool for this.
+    """
+    expected = os.environ.get(_AUTH_TOKEN_ENV, "") or ""
+    if not expected:
+        # Auth disabled (local dev). Keep the gate here so the rule is
+        # obvious in code; the compose file is the production gate.
+        return True
+    if path in _AUTH_OPEN_PATHS:
+        return True
+    if not authorization_header:
+        return False
+    scheme, _, supplied = authorization_header.partition(" ")
+    if scheme.lower() != "bearer" or not supplied:
+        return False
+    return hmac.compare_digest(supplied, expected)
 
 
 # --- Pure dispatch ------------------------------------------------------
@@ -333,7 +382,21 @@ class HttpHandler(BaseHTTPRequestHandler):
         sys.stderr.flush()
 
     def do_GET(self) -> None:  # noqa: N802 — stdlib API
+        # Issue #406 — auth gate runs BEFORE the DSN check so a 401
+        # response does not require a Postgres connection. Headers are
+        # read via ``self.headers`` (BaseHTTPRequestHandler contract):
+        # the case-insensitive ``.get()`` keeps the lookup resilient to
+        # client-side header casing (e.g. ``authorization`` vs
+        # ``Authorization``).
         url = urlparse(self.path)
+        auth_header = self.headers.get("Authorization") if self.headers else None
+        if not check_auth(url.path, auth_header):
+            sys.stderr.write(
+                f"[alphard-web] AUTH-FAIL {self.address_string()} {url.path}: " "missing or wrong bearer token\n"
+            )
+            sys.stderr.flush()
+            self._send_unauthorized()
+            return
         dsn = os.environ.get("ALPHARD_PG_DSN")
         if not dsn:
             sys.stderr.write(f"[alphard-web] ERROR {self.address_string()} {url.path}: " "ALPHARD_PG_DSN is not set\n")
@@ -379,13 +442,33 @@ class HttpHandler(BaseHTTPRequestHandler):
     def _send_json(self, payload: Any, status: int = 200) -> None:
         self._respond(status, "application/json; charset=utf-8", payload)
 
+    def _send_unauthorized(self) -> None:
+        """Issue #406 — 401 with WWW-Authenticate: Bearer challenge."""
+        body = json.dumps({"error": "unauthorized", "type": "AuthError"}).encode("utf-8")
+        self.send_response(401)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("WWW-Authenticate", 'Bearer realm="alphard-web"')
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
 
 # --- Server entrypoint --------------------------------------------------
 
 
-def make_server(host: str = "0.0.0.0", port: int = 8080) -> ThreadingHTTPServer:  # noqa: S104 — internal-only
-    """Build a configured HTTP server. Caller invokes ``serve_forever()``."""
-    return ThreadingHTTPServer((host, port), HttpHandler)
+def make_server(host: str = "127.0.0.1", port: int = 8080) -> ThreadingHTTPServer:
+    """Build a configured HTTP server. Caller invokes ``serve_forever()``.
+
+    Issue #406 — default bind is ``127.0.0.1`` (loopback only). The
+    previous default of ``0.0.0.0`` exposed the dashboard on every
+    interface the container saw. Operators who really need LAN access
+    can pass ``ALPHARD_WEB_HOST=0.0.0.0`` and combine it with the
+    bearer-token gate; the compose file pins 127.0.0.1 as the safe
+    production default.
+    """
+    bind_host = os.environ.get("ALPHARD_WEB_HOST", host)
+    return ThreadingHTTPServer((bind_host, port), HttpHandler)
 
 
 if __name__ == "__main__":  # pragma: no cover — exercised in pre_pr_smoke

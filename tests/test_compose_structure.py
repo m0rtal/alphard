@@ -1458,3 +1458,64 @@ class TestNoRelativeBindMounts:
         assert not offenders, (
             f"No service may bind-mount host config files into /etc/. " f"Found offenders: {offenders!r}"
         )
+
+
+class TestAlphardWebSecurity:
+    """Issue #406 — security contract for the alphard-web service.
+
+    Pins three production invariants so a future compose refactor
+    cannot silently re-introduce the LAN-exposure defect:
+
+    1. ALPHARD_WEB_TOKEN env var MUST be injected (auth gate enabled
+       on every protected endpoint — see src/web/server.py check_auth).
+    2. Container port MUST NOT publish to a host LAN-reachable address
+       in a way that bypasses the gate (the compose port mapping is
+       `127.0.0.1:8081:8080` so only loopback can reach it directly;
+       operators who want LAN access must front it with a reverse
+       proxy that injects the bearer header).
+    """
+
+    def test_alphard_web_injects_auth_token_env(self) -> None:
+        """Issue #406: ALPHARD_WEB_TOKEN MUST be in alphard-web's env.
+
+        Without this env var, src/web/server.py::check_auth fails open
+        and every protected endpoint returns sensitive data (DSN-derived
+        values, full universe, backup paths) to any LAN peer.
+        """
+        data = _load_compose()
+        web = data["services"].get("alphard-web")
+        assert web is not None, "alphard-web service must exist"
+        env = web.get("environment", {})
+        if isinstance(env, list):
+            keys = {item.split("=", 1)[0] for item in env if isinstance(item, str) and "=" in item}
+            keys |= {item for item in env if isinstance(item, str) and "=" not in item}
+        else:
+            keys = set(env.keys())
+        assert "ALPHARD_WEB_TOKEN" in keys, (
+            "alphard-web.environment MUST declare ALPHARD_WEB_TOKEN "
+            "(issue #406: auth gate fails open without it). Got: "
+            f"{sorted(keys)}"
+        )
+
+    def test_alphard_web_port_is_loopback_only(self) -> None:
+        """Issue #406: published port MUST bind to 127.0.0.1 (loopback).
+
+        The compose port mapping for alphard-web must be the long
+        ``HOST_IP:HOST_PORT:CONTAINER_PORT`` form with ``127.0.0.1``
+        as the host IP. Short form (``"8081:8080"``) or
+        ``"0.0.0.0:8081:8080"`` would expose the dashboard on every
+        interface the container sees.
+        """
+        data = _load_compose()
+        web = data["services"]["alphard-web"]
+        ports = web.get("ports", [])
+        web_ports = [p for p in ports if "8081" in str(p)]
+        assert web_ports, f"alphard-web MUST publish port 8081; got: {ports}"
+        for port_mapping in web_ports:
+            s = str(port_mapping)
+            # Long form must start with 127.0.0.1:
+            assert "127.0.0.1:8081:8080" in s, (
+                f"alphard-web port mapping must bind 127.0.0.1:8081:8080 "
+                f"(issue #406: 0.0.0.0/short form exposes dashboard to LAN); "
+                f"got: {s}"
+            )

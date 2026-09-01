@@ -533,7 +533,6 @@ function el(tag, props, ...children) {
   const e = document.createElement(tag);
   if (props) for (const k in props) {
     if (k === 'class') e.className = props[k];
-    else if (k === 'html') e.innerHTML = props[k];
     else if (k.startsWith('on')) e[k] = props[k];
     else e.setAttribute(k, props[k]);
   }
@@ -621,25 +620,43 @@ function renderDash() {
   document.getElementById('r-regime').className = 'regime ' + (s.regime === 'risk_off' ? 'risk_off' : s.regime === 'risk_on_reduced' ? 'risk_on_reduced' : 'neutral');
   document.getElementById('r-budget').textContent = s.regime ? ('budget ×' + (s.regime_multiplier ?? '?')) : '—';
   document.getElementById('r-universe').textContent = fmt(s.universe_size);
-  document.getElementById('r-backfill').innerHTML = fmt(s.backfill_done) + ' <small>/ ' + fmt(s.universe_size) + '</small>';
+  // Issue #405: r-backfill, r-daily, r-drawdown, r-backup-files
+  // previously used innerHTML with template literals. The values
+  // come from server JSON and are NOT sanitised server-side, so any
+  // user-editable broker metadata (figi, listed_at, delisted_at, msg)
+  // could carry a payload like ``<img src=x onerror=alert(1)>``. Build
+  // DOM nodes with createElement + textContent so the browser never
+  // parses values as HTML.
+  const bfEl = document.getElementById('r-backfill');
+  bfEl.replaceChildren(fmt(s.backfill_done), el('small', {}, '/ ' + fmt(s.universe_size)));
   document.getElementById('r-backfill-pct').style.width = (s.backfill_pct || 0) + '%';
   document.getElementById('r-backfill-meta').textContent = fmtPct(s.backfill_pct) + ' done';
-  document.getElementById('r-daily').innerHTML = fmt(s.daily_sync_bars) + ' <small>баров</small>';
+  const dailyEl = document.getElementById('r-daily');
+  dailyEl.replaceChildren(fmt(s.daily_sync_bars), el('small', {}, 'баров'));
   document.getElementById('r-daily-at').textContent = s.daily_sync_at ? isoLocal(s.daily_sync_at) : '—';
-  document.getElementById('r-drawdown').innerHTML = '— <small>%</small>';
-  document.getElementById('r-backup-files').innerHTML = '— <small>files</small>';
+  const drawdownEl = document.getElementById('r-drawdown');
+  drawdownEl.replaceChildren('—', el('small', {}, '%'));
+  const backupFilesEl = document.getElementById('r-backup-files');
+  backupFilesEl.replaceChildren('—', el('small', {}, 'files'));
   document.getElementById('r-backup-at').textContent = '—';
 
   // Recent events table
   const evTbody = document.getElementById('r-events');
-  evTbody.innerHTML = '';
+  evTbody.replaceChildren();
   if (!state.events.length) {
-    evTbody.innerHTML = '<tr><td colspan="4" style="color:var(--dim);text-align:center">no events yet</td></tr>';
+    evTbody.appendChild(
+      el('tr', {}, el('td', {colspan: '4', style: 'color:var(--dim);text-align:center'}, 'no events yet'))
+    );
   } else {
     state.events.forEach(e => {
-      const tr = document.createElement('tr');
-      tr.innerHTML = `<td>${isoLocal(e.at)}</td><td>${e.kind}</td><td><span class="badge ${e.status === 'ok' ? 'ok' : 'warn'}">${e.status || '?'}</span></td><td>${e.msg || ''}</td>`;
-      evTbody.appendChild(tr);
+      evTbody.appendChild(
+        el('tr', {},
+          el('td', {}, isoLocal(e.at)),
+          el('td', {}, e.kind),
+          el('td', {}, el('span', {class: 'badge ' + (e.status === 'ok' ? 'ok' : 'warn')}, e.status || '?')),
+          el('td', {}, e.msg || '')
+        )
+      );
     });
   }
 }
@@ -647,16 +664,28 @@ function renderDash() {
 // ─── render: universe ─────────────────────────────────────
 function renderUniverse() {
   const tb = document.getElementById('universe-table').querySelector('tbody');
-  tb.innerHTML = '';
+  tb.replaceChildren();
   if (!state.tickers.length) {
-    tb.innerHTML = '<tr><td colspan="9" style="color:var(--dim);text-align:center">no tickers match the current filter</td></tr>';
+    tb.appendChild(
+      el('tr', {}, el('td', {colspan: '9', style: 'color:var(--dim);text-align:center'}, 'no tickers match the current filter'))
+    );
   } else {
     state.tickers.forEach(t => {
       const status = t.backfill_complete ? 'done' : (t.bar_count === 0 ? 'no-data' : 'pending');
       const sBadge = {done:'ok', running:'run', 'no-data':'warn', failed:'err', delisted:'dim', pending:'dim'}[status];
-      const tr = document.createElement('tr');
-      tr.innerHTML = `<td><b>${t.ticker}</b></td><td style="color:var(--dim)">${t.figi || '—'}</td><td><span class="badge ${sBadge}">${status}</span></td><td class="num">${fmt(t.bar_count)}</td><td>${t.listed_at || '—'}</td><td>${t.delisted_at || '—'}</td><td class="num">${t.last_bar_at || '—'}</td><td class="num">—</td><td><button data-ticker="${t.ticker}">···</button></td>`;
-      tr.onclick = (e) => { if (e.target.tagName === 'BUTTON') openDrawer(t.ticker); };
+      const btn = el('button', {'data-ticker': t.ticker}, '···');
+      btn.onclick = (ev) => { ev.stopPropagation(); openDrawer(t.ticker); };
+      const tr = el('tr', {},
+        el('td', {}, el('b', {}, t.ticker)),
+        el('td', {style: 'color:var(--dim)'}, t.figi || '—'),
+        el('td', {}, el('span', {class: 'badge ' + sBadge}, status)),
+        el('td', {class: 'num'}, fmt(t.bar_count)),
+        el('td', {}, t.listed_at || '—'),
+        el('td', {}, t.delisted_at || '—'),
+        el('td', {class: 'num'}, t.last_bar_at || '—'),
+        el('td', {class: 'num'}, '—'),
+        el('td', {}, btn)
+      );
       tb.appendChild(tr);
     });
   }
@@ -675,7 +704,7 @@ function renderBackfill() {
   const total = b.total || 0;
   const done = b.done || 0;
   const pct = total ? Math.round(1000 * done / total) / 10 : 0;
-  document.getElementById('r-bf-pct').innerHTML = fmtPct(pct) + '';
+  document.getElementById('r-bf-pct').textContent = fmtPct(pct);
   document.getElementById('r-bf-bar').style.width = pct + '%';
   document.getElementById('r-bf-count').textContent = `${fmt(done)} / ${fmt(total)}`;
   document.getElementById('r-bf-cur-ticker').textContent = b.current_ticker || '—';
@@ -687,13 +716,15 @@ function renderMacro() {
   const m = state.macro || {};
   if (!m.regime) {
     document.getElementById('r-macro-regime').textContent = '—';
-    document.getElementById('r-macro-cbr').innerHTML = '— <small>%</small>';
+    const cbrEmpty = document.getElementById('r-macro-cbr');
+    cbrEmpty.replaceChildren('—', el('small', {}, '%'));
     document.getElementById('r-macro-usdrub').textContent = '—';
     document.getElementById('r-macro-imoex').textContent = '—';
     return;
   }
   document.getElementById('r-macro-regime').textContent = m.regime.toUpperCase();
-  document.getElementById('r-macro-cbr').innerHTML = (m.cbr_key_rate ?? '—') + ' <small>%</small>';
+  const cbrEl = document.getElementById('r-macro-cbr');
+  cbrEl.replaceChildren(String(m.cbr_key_rate ?? '—'), el('small', {}, '%'));
   document.getElementById('r-macro-usdrub').textContent = m.usdrub_close ?? '—';
   document.getElementById('r-macro-imoex').textContent = m.imoex_close ?? '—';
 }
@@ -701,15 +732,24 @@ function renderMacro() {
 // ─── render: backups ──────────────────────────────────────
 function renderBackups() {
   const tb = document.getElementById('backups-body');
-  tb.innerHTML = '';
+  tb.replaceChildren();
   if (!state.backups.length) {
-    tb.innerHTML = '<tr><td colspan="6" style="color:var(--dim);text-align:center">no backups found</td></tr>';
+    tb.appendChild(
+      el('tr', {}, el('td', {colspan: '6', style: 'color:var(--dim);text-align:center'}, 'no backups found'))
+    );
     return;
   }
   state.backups.forEach(b => {
-    const tr = document.createElement('tr');
-    tr.innerHTML = `<td><code>${b.file}</code></td><td class="num">${b.size}</td><td class="num">${b.duration || '—'}</td><td>${b.started}</td><td>${b.kind || '—'}</td><td><button>⬇</button> <button class="danger">↺ restore</button></td>`;
-    tb.appendChild(tr);
+    tb.appendChild(
+      el('tr', {},
+        el('td', {}, el('code', {}, b.file)),
+        el('td', {class: 'num'}, b.size),
+        el('td', {class: 'num'}, b.duration || '—'),
+        el('td', {}, b.started),
+        el('td', {}, b.kind || '—'),
+        el('td', {}, el('button', {}, '⬇'), el('button', {class: 'danger'}, '↺ restore'))
+      )
+    );
   });
 }
 
@@ -738,21 +778,55 @@ async function openDrawer(ticker) {
     const detail = await api('/api/ticker/' + encodeURIComponent(ticker));
     state.tickerDetail = detail;
     document.getElementById('drawer-title').textContent = ticker + ' · ' + (detail.figi || '');
-    let html = '<dl class="kv">';
-    html += `<dt>FIGI</dt><dd>${detail.figi || '—'}</dd>`;
-    html += `<dt>Status</dt><dd>${detail.backfill_complete ? 'done' : 'pending'}</dd>`;
-    html += `<dt>Bars in DB</dt><dd>${fmt(detail.bar_count)}</dd>`;
-    html += `<dt>Listed</dt><dd>${detail.listed_at || '—'}</dd>`;
-    html += `<dt>Delisted</dt><dd>${detail.delisted_at || '—'}</dd>`;
-    html += '</dl>';
+    // Issue #405: every value below is server-controlled JSON
+    // (figi, listed_at, delisted_at, status, bar values). Pre-fix
+    // this whole block was a template literal assigned to innerHTML;
+    // any of those fields carrying ``<img src=x onerror=alert(1)>``
+    // would execute in the operator's browser. Build DOM nodes with
+    // textContent so the browser treats values as text.
+    const body = document.getElementById('drawer-body');
+    body.replaceChildren(
+      el('dl', {class: 'kv'},
+        el('dt', {}, 'FIGI'),
+        el('dd', {}, detail.figi || '—'),
+        el('dt', {}, 'Status'),
+        el('dd', {}, detail.backfill_complete ? 'done' : 'pending'),
+        el('dt', {}, 'Bars in DB'),
+        el('dd', {}, fmt(detail.bar_count)),
+        el('dt', {}, 'Listed'),
+        el('dd', {}, detail.listed_at || '—'),
+        el('dt', {}, 'Delisted'),
+        el('dd', {}, detail.delisted_at || '—')
+      )
+    );
     if (detail.recent_bars && detail.recent_bars.length) {
-      html += '<h3 style="margin-top:20px">Свежие бары</h3><table><thead><tr><th>ts</th><th class="num">o</th><th class="num">h</th><th class="num">l</th><th class="num">c</th><th class="num">v</th></tr></thead><tbody>';
+      const tbl = el('table', {},
+        el('thead', {}, el('tr', {},
+          el('th', {}, 'ts'),
+          el('th', {class: 'num'}, 'o'),
+          el('th', {class: 'num'}, 'h'),
+          el('th', {class: 'num'}, 'l'),
+          el('th', {class: 'num'}, 'c'),
+          el('th', {class: 'num'}, 'v')
+        )),
+        el('tbody')
+      );
+      const tb = tbl.querySelector('tbody');
       detail.recent_bars.forEach(b => {
-        html += `<tr><td>${b.ts}</td><td class="num">${b.open}</td><td class="num">${b.high}</td><td class="num">${b.low}</td><td class="num">${b.close}</td><td class="num">${fmt(b.volume)}</td></tr>`;
+        tb.appendChild(
+          el('tr', {},
+            el('td', {}, String(b.ts)),
+            el('td', {class: 'num'}, String(b.open)),
+            el('td', {class: 'num'}, String(b.high)),
+            el('td', {class: 'num'}, String(b.low)),
+            el('td', {class: 'num'}, String(b.close)),
+            el('td', {class: 'num'}, fmt(b.volume))
+          )
+        );
       });
-      html += '</tbody></table>';
+      body.appendChild(el('h3', {style: 'margin-top:20px'}, 'Свежие бары'));
+      body.appendChild(tbl);
     }
-    document.getElementById('drawer-body').innerHTML = html;
     document.getElementById('drawer').classList.add('open');
   } catch (e) {
     console.error('openDrawer failed', e);
