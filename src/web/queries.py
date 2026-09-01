@@ -13,7 +13,11 @@ It does NOT call into the loader chain, supervisor, or coordinator.
 
 from __future__ import annotations
 
-from typing import Any
+import os
+import re
+from datetime import datetime
+from pathlib import Path
+from typing import Any, cast
 
 # --- Default window for sparkline queries -------------------------------
 
@@ -298,6 +302,115 @@ def build_macro_latest_query() -> tuple[str, dict[str, Any]]:
     )
 
 
+# --- /api/backups (filesystem, not DB) ---------------------------------
+
+#: Filename pattern for alphard backups. Mirrors the convention used by
+#: ``scripts/backup_database.py`` (``alphard_YYYY-MM-DD_HHMMSS.sql.gz``).
+#: Loose tail keeps corrupt names from breaking the listing — we fall
+#: back to mtime in that case.
+_BACKUP_FILENAME_RE: re.Pattern[str] = re.compile(
+    r"^alphard_(?P<strict>\d{4}-\d{2}-\d{2}_\d{6}|[a-zA-Z]+_[a-zA-Z0-9]+)\.sql\.gz$"
+)
+
+#: Retention policy mirrored from scripts/backup_database.py. Daily
+#: window = newest ``DAILY_KEEP`` files. Among the rest, weekly window
+#: keeps one per ISO week for ``WEEKLY_KEEP`` weeks back from the most
+#: recent backup's week.
+DEFAULT_DAILY_KEEP: int = 7
+DEFAULT_WEEKLY_KEEP: int = 4
+
+#: Default backup directory when ``ALPHARD_BACKUP_DIR`` env var is
+#: unset. Mirrors ``scripts/backup_database.DEFAULT_BACKUP_DIR``.
+DEFAULT_BACKUP_DIR: str = "/mnt/appdata/alphard-backups"
+
+
+def _parse_backup_timestamp(name: str, fallback_path: Path) -> datetime:
+    """Extract a timestamp from the filename; fall back to mtime.
+
+    Mirrors ``scripts/backup_database._parse_filename_timestamp``. Kept
+    private + duplicated here so ``src/web/queries.py`` does not import
+    the script (scripts/ is not on the package import path, and the
+    script has CLI side effects on import).
+    """
+    m = _BACKUP_FILENAME_RE.match(name)
+    if m is not None:
+        raw = m.group("strict")
+        if raw and re.fullmatch(r"\d{4}-\d{2}-\d{2}_\d{6}", raw):
+            try:
+                return datetime.strptime(raw, "%Y-%m-%d_%H%M%S")
+            except ValueError:
+                pass
+    return datetime.fromtimestamp(fallback_path.stat().st_mtime)
+
+
+def list_backup_payloads(
+    backup_dir: str | Path,
+    daily_keep: int = DEFAULT_DAILY_KEEP,
+    weekly_keep: int = DEFAULT_WEEKLY_KEEP,
+) -> list[dict[str, Any]]:
+    """Return backup metadata for the operator UI.
+
+    Each row has ``file``, ``size`` (bytes), ``duration`` (None for now
+    — daily cron job has no span measurement), ``started`` (ISO 8601
+    string), ``kind`` (one of ``"daily"``, ``"weekly"``, or ``"extra"``
+    if outside both retention windows — still listed but marked so the
+    operator knows it will be pruned next run).
+
+    Returns ``[]`` if the directory does not exist.
+    """
+    root = Path(backup_dir)
+    if not root.exists() or not root.is_dir():
+        return []
+
+    indexed: list[tuple[datetime, Path]] = []
+    for p in root.iterdir():
+        if not p.is_file():
+            continue
+        if not _BACKUP_FILENAME_RE.match(p.name):
+            continue
+        indexed.append((_parse_backup_timestamp(p.name, p), p))
+    indexed.sort(key=lambda x: x[0], reverse=True)
+
+    # Retention windows: mark which backups fall inside each policy.
+    daily_set: set[Path] = set()
+    weekly_set: set[Path] = set()
+    if daily_keep > 0:
+        for _, p in indexed[:daily_keep]:
+            daily_set.add(p)
+    if weekly_keep > 0 and len(indexed) > daily_keep:
+        seen_weeks: set[tuple[int, int]] = set()
+        kept = 0
+        for when, p in indexed[daily_keep:]:
+            year, week, _ = when.isocalendar()
+            wk = (year, week)
+            if wk in seen_weeks:
+                continue
+            seen_weeks.add(wk)
+            weekly_set.add(p)
+            kept += 1
+            if kept >= weekly_keep:
+                break
+
+    out: list[dict[str, Any]] = []
+    for when, p in indexed:
+        if p in daily_set:
+            kind = "daily"
+        elif p in weekly_set:
+            kind = "weekly"
+        else:
+            kind = "extra"
+        out.append(
+            {
+                "file": p.name,
+                "size": int(p.stat().st_size),
+                "duration": None,
+                "started": when.isoformat(),
+                "kind": kind,
+            }
+        )
+    return out
+
+
 # --- /api/settings (env-only) -----------------------------------------
 
 
@@ -311,8 +424,6 @@ def build_settings_payload() -> dict[str, Any]:
     normally set these to ``1`` to enable, anything else to disable.
     Token presence is reported as a boolean, not the value.
     """
-    import os
-
     def flag(name: str) -> bool:
         return os.environ.get(name, "0") not in ("", "0", "false", "False")
 
@@ -347,7 +458,10 @@ def _iso_or_none(value: Any) -> str | None:
     if value is None:
         return None
     if hasattr(value, "isoformat"):
-        return value.isoformat()
+        # BUGFIX (issue #397): `value: Any` means `value.isoformat()` has
+        # inferred return type `Any`, which leaks under mypy --strict.
+        # Cast to str since isoformat() returns str on date/datetime.
+        return cast(str, value.isoformat())
     return str(value)
 
 
