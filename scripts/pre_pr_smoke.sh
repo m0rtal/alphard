@@ -68,8 +68,23 @@ if [[ ! -f "$REPO_ROOT/.env" ]]; then
         | grep -E '^[A-Za-z_][A-Za-z0-9_]*=' > "$REPO_ROOT/.env"
 fi
 
+# BUGFIX (cycle148, issue #374): scope every compose invocation to a
+# per-PID project name so the smoke stack gets unique container names
+# (alphard-smoke-<PID>-postgres-1, alphard-smoke-<PID>-alphard-bot-1)
+# and never collides with the operator's running alphard-* stack on
+# the same daemon. Without this, the cleanup trap's `docker compose
+# down -v` reuses the operator's existing alphard-postgres/alphard-bot
+# containers (docker-compose.yaml hardcodes container_name:) and wipes
+# their volumes — a destructive collision when any other process on
+# the host is running the operator stack.
 OVERRIDE_FILE="/tmp/alphard-pre-pr-smoke-$$.yaml"
-COMPOSE=(docker compose -f docker-compose.yaml -f "$OVERRIDE_FILE")
+COMPOSE_PROJECT_NAME="alphard-smoke-$$"
+COMPOSE=(docker compose -p "$COMPOSE_PROJECT_NAME" -f docker-compose.yaml -f "$OVERRIDE_FILE")
+# Convenience aliases that route through compose so container-name
+# hardcoding in docker-compose.yaml does not leak into the script's
+# own docker exec / docker inspect calls.
+SMOKE_BOT="$COMPOSE_PROJECT_NAME-alphard-bot-1"
+SMOKE_PG="$COMPOSE_PROJECT_NAME-postgres-1"
 
 cleanup() {
     "${COMPOSE[@]}" down -v >/dev/null 2>&1 || true
@@ -106,7 +121,7 @@ fi
 echo "[pre-pr-smoke] [2/4] waiting for alphard-bot healthy..."
 healthy=0
 for ((i = 1; i <= HEALTH_ATTEMPTS; i++)); do
-    if docker exec alphard-bot python3 -c "
+    if docker exec "$SMOKE_BOT" python3 -c "
 import urllib.request, sys
 try:
     r = urllib.request.urlopen('http://127.0.0.1:8765/health', timeout=3)
@@ -123,7 +138,7 @@ done
 
 if [[ $healthy -ne 1 ]]; then
     echo "[pre-pr-smoke] FAIL: alphard-bot not healthy in $((HEALTH_ATTEMPTS * HEALTH_INTERVAL_SECONDS))s"
-    docker logs --tail 30 alphard-bot 2>&1 | sed 's/^/  /'
+    docker logs --tail 30 "$SMOKE_BOT" 2>&1 | sed 's/^/  /'
     exit 1
 fi
 
@@ -137,13 +152,13 @@ fi
 # real script against the real schema. This is the step that catches
 # schema/column-order defects invisible to mocked tests.
 echo "[pre-pr-smoke] [4/4] running daily_incremental --dry-run in container..."
-PG_IP="$(docker inspect alphard-postgres --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')"
+PG_IP="$(docker inspect "$SMOKE_PG" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')"
 PG_USER="$(grep -E '^POSTGRES_USER=' "$REPO_ROOT/.env" | cut -d= -f2-)"
 PG_DB="$(grep -E '^POSTGRES_DB=' "$REPO_ROOT/.env" | cut -d= -f2-)"
 PG_PW="$(grep -E '^POSTGRES_PASSWORD=' "$REPO_ROOT/.env" | cut -d= -f2-)"
 SMOKE_DSN="postgresql://${PG_USER}:${PG_PW}@${PG_IP}:5432/${PG_DB}"
 
-if ! docker exec alphard-bot bash -c \
+if ! docker exec "$SMOKE_BOT" bash -c \
     "cd /app && ALPHARD_PG_DSN='${SMOKE_DSN}' python3 scripts/daily_incremental.py --dry-run --max-tickers ${SMOKE_MAX_TICKERS}" 2>&1 | tail -10; then
     echo "[pre-pr-smoke] FAIL: daily_incremental --dry-run failed"
     exit 3

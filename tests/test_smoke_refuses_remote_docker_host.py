@@ -114,13 +114,39 @@ class TestSmokeRemoteGuardRuntime:
     """
 
     def _run_smoke(self, env: dict[str, str], timeout: int = 10) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
+        proc = subprocess.Popen(
             ["bash", str(SMOKE)],
             cwd=str(REPO),
             env={**env, "PATH": "/usr/bin:/bin"},
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
-            timeout=timeout,
+        )
+        try:
+            stdout, _ = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            # BUGFIX (cycle148, issue #374): the smoke script registers a
+            # cleanup() trap that runs `docker compose down -v` on EXIT.
+            # If we let TimeoutExpired drop the child without killing it,
+            # the trap fires later and tears down whatever stack the
+            # operator happens to be running on the same daemon. Kill the
+            # child, drain its stdout, then re-raise so the caller's
+            # except branch decides whether the timeout is acceptable.
+            proc.kill()
+            try:
+                stdout, _ = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                stdout = ""  # best-effort: child ignored SIGKILL, nothing useful to capture
+            # Re-raise with the captured stdout attached so callers can
+            # assert against it. exc.stdout is normally bytes | None on
+            # TimeoutExpired; coerce to whatever we captured.
+            exc.stdout = stdout  # type: ignore[assignment]
+            raise
+        return subprocess.CompletedProcess(
+            args=proc.args,
+            returncode=proc.returncode,
+            stdout=stdout,
+            stderr="",
         )
 
     def test_tcp_docker_host_is_refused(self) -> None:
@@ -214,4 +240,102 @@ class TestSmokeRemoteGuardRuntime:
             return
         assert "REFUSED" not in proc.stdout, (
             f"smoke must NOT print REFUSED with DOCKER_HOST=unix://...; " f"got stdout={proc.stdout!r}"
+        )
+
+
+class TestSmokeProjectIsolation:
+    """Regression for issue #374: scope the smoke stack to a per-PID project name.
+
+    Without `--project-name alphard-smoke-<PID>`, the smoke script's
+    `docker compose down -v` reuses whatever alphard-* containers happen
+    to exist on the daemon (because docker-compose.yaml hardcodes
+    container_name:). On a host where the operator is running their own
+    alphard stack, the smoke's cleanup trap wipes the operator's
+    alphard-postgres-data volume — destructive collision. The fix is to
+    give every smoke run a unique compose project name so the cleanup
+    trap is scoped to the smoke's own resources only.
+    """
+
+    def test_smoke_script_uses_per_pid_project_name(self) -> None:
+        content = _read_smoke()
+        # The compose invocation must include `-p alphard-smoke-...` so
+        # every run gets a unique project name (and therefore unique
+        # container names). A bare `docker compose -f ...` regresses
+        # issue #374.
+        assert re.search(
+            r"COMPOSE=.*-p\s+\"?\$\{?COMPOSE_PROJECT_NAME",
+            content,
+        ) or re.search(
+            r"-p\s+\"?\$\{?COMPOSE_PROJECT_NAME",
+            content,
+        ), (
+            "smoke script must pass `-p $COMPOSE_PROJECT_NAME` (a per-PID "
+            "compose project name) on every compose invocation so the "
+            "cleanup trap's `down -v` is scoped to the smoke's own "
+            "containers and never reuses the operator's alphard-* stack."
+        )
+
+    def test_smoke_script_derives_project_name_from_pid(self) -> None:
+        content = _read_smoke()
+        # The project name must be derived from `$$` (the script's PID)
+        # so concurrent runs don't collide and the operator's stack
+        # (project name `alphard`) is untouched.
+        assert re.search(
+            r"COMPOSE_PROJECT_NAME\s*=\s*[\"']?alphard-smoke-\$\$",
+            content,
+        ), (
+            "smoke script must derive COMPOSE_PROJECT_NAME from $$ so each "
+            "run gets a unique project name; otherwise concurrent smoke "
+            "runs collide on the same alphard-* container names."
+        )
+
+    def test_smoke_script_does_not_hardcode_alphard_bot_in_docker_exec(self) -> None:
+        content = _read_smoke()
+        # After the project-rename fix, `docker exec alphard-bot ...` and
+        # `docker inspect alphard-postgres ...` would target the operator's
+        # stack instead of the smoke's. The script must use the per-PID
+        # project-scoped aliases everywhere it touches a container by name.
+        assert "docker exec alphard-bot" not in content, (
+            "smoke must not hardcode `docker exec alphard-bot`; use "
+            "$SMOKE_BOT (derived from $COMPOSE_PROJECT_NAME) so the exec "
+            "targets the smoke's own container, not the operator's."
+        )
+        assert "docker inspect alphard-postgres" not in content, (
+            "smoke must not hardcode `docker inspect alphard-postgres`; "
+            "use $SMOKE_PG (derived from $COMPOSE_PROJECT_NAME) so the "
+            "inspect targets the smoke's own container."
+        )
+
+    def test_test_helper_kills_orphan_subprocess_on_timeout(self) -> None:
+        """The pytest helper must kill its subprocess on TimeoutExpired.
+
+        Regression for issue #374: when the smoke script's 10s timeout
+        expires during `test_local_docker_host_is_allowed_through`, the
+        `subprocess.run(... timeout=...)` call returns normally without
+        killing the child. The child's EXIT trap then fires `docker
+        compose down -v` ~90s later and tears down the operator's stack.
+        The fix in `_run_smoke` uses `subprocess.Popen` and explicitly
+        `proc.kill()`s the child in the TimeoutExpired branch.
+        """
+        import inspect
+
+        # `_run_smoke` lives on TestSmokeRemoteGuardRuntime, not on this
+        # class — grab it from there. inspect.getsource() works on
+        # unbound methods retrieved via the class attribute.
+        helper = getattr(TestSmokeRemoteGuardRuntime, "_run_smoke", None)
+        assert helper is not None, (
+            "TestSmokeRemoteGuardRuntime must define _run_smoke; the "
+            "test helper that runs the smoke script as a subprocess."
+        )
+        source = inspect.getsource(helper)
+        assert "subprocess.Popen" in source, (
+            "test helper _run_smoke must use subprocess.Popen (not "
+            "subprocess.run(... timeout=...)) so the helper retains a "
+            "handle to the child and can kill it on TimeoutExpired."
+        )
+        assert "proc.kill()" in source, (
+            "test helper _run_smoke must proc.kill() the smoke subprocess "
+            "on TimeoutExpired so the smoke's cleanup trap (which runs "
+            "`docker compose down -v`) cannot fire after the test returns. "
+            "Regression for issue #374."
         )
