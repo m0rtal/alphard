@@ -717,7 +717,9 @@ function renderBackups() {
 function renderSettings() {
   const s = state.settings || {};
   document.getElementById('r-s-env').textContent = s.env || '—';
-  document.getElementById('r-s-token').textContent = s.token_set ? '•••••• (set)' : '— not set —';
+  // BUGFIX: r-s-token is <input type="password">. Setting textContent
+  // is a no-op (inputs don't render text content). Use .value instead.
+  document.getElementById('r-s-token').value = s.token_set ? '(set)' : '(not set)';
   const l = s.loops || {};
   ['heartbeat','daily_sync','delisted_sync','backup','macro_regime'].forEach(name => {
     const t = document.getElementById('r-s-loop-' + name);
