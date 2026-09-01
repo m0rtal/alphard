@@ -1,5 +1,3 @@
-version: "3.9"
-
 # =============================================================================
 # Alphard Phase 1 — docker-compose.yaml
 # =============================================================================
@@ -8,13 +6,9 @@ version: "3.9"
 # /srv/alphard; on .107 this is conventionally overridden to
 # /mnt/appdata/alphard to match the rest of the selfhosted fleet: honcho,
 # forgejo, immich, paperclip, bitmagnet, minecraft, etc.). A single
-# one-shot `chownfix` service (compose refactor 2.0, kanban t_884fec4a)
 # mkdir -p's and chown's all four host-data leaves (postgres, redis,
-# grafana, prometheus) with the correct UID:GID for each in-image user
 # before any data service starts. This replaces the per-service
-# grafana-init pattern from PR #217.
 #
-# chownfix needs `cap_add: [CHOWN, DAC_OVERRIDE]` to bypass the .107
 # PVE LXC userns-mapping bug — root in-container cannot chown across
 # the bind-mount leaf boundary without these caps, even with
 # apparmor=unconfined. The earlier pg-init service (which used psql
@@ -26,7 +20,6 @@ version: "3.9"
 # now baked into the postgres image's pg_hba.conf directly or set via
 # environment-driven initdb. See tests/test_347_pg_init_removal.py.
 #
-# Why tmpfs for /app/logs and /prometheus (PR #119, #147)? Same root
 # cause as the /mnt/appdata userns-mapping bug — Docker 29.1.x on PVE
 # LXC maps bind-mount leaf to nobody:nogroup. tmpfs is the cheapest
 # portable workaround. Data is volatile across container restarts,
@@ -38,11 +31,8 @@ version: "3.9"
 #   - alphard-bot        : heartbeat + cron-launched daily_sync.py
 #   - postgres           : DataStore (ohlcv_daily, ticker_universe, decision_log)
 #   - redis              : cache for risk state, news, portfolio drift
-#   - chownfix           : host-data leaf chown (compose refactor 2.0)
 #
 # Phase 3+ additions (profiles: ["observability"]):
-#   - prometheus : scrape /metrics
-#   - grafana    : dashboards (provisioning + dashboards baked from .env B64)
 # =============================================================================
 services:
   alphard-bot:
@@ -118,15 +108,6 @@ services:
     # otherwise the first store.count_ohlcv() crashes with connection refused.
     depends_on:
       - postgres
-      # chownfix (compose refactor 2.0): not strictly needed for the
-      # bot itself (alphard-bot bind-mounts /root/.env, not APPDATA_DIR),
-      # but adding it here synchronises the bot's start with the rest
-      # of the stack so observability dashboards (which DO depend on
-      # chownfix transitively) come up coherently. Without this the
-      # bot can start before chownfix has chown'd the grafana leaf, and
-      # a Watchtower-triggered recreate of grafana could race the bot's
-      # first metrics scrape. Strictly optional ordering.
-      - chownfix
     healthcheck:
       # Phase 2.8 metrics server (PR #52, #144) exposes GET /health on
       # ALPHARD_METRICS_PORT (default 8765) returning 200 with body "ok".
@@ -179,15 +160,11 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
-    # chownfix (compose refactor 2.0): wait for host-data leaf chown
     # before starting postgres. Currently postgres uses a named
     # volume (alphard-postgres-data, no bind-mount), so this is a
-    # soft ordering — chownfix is essentially a no-op for the
     # postgres leaf. We add the dep so a future PR that switches
     # postgres to a bind-mount (e.g. for backup purposes) doesn't
     # have to also remember to update depends_on. Idempotent.
-    depends_on:
-      - chownfix
     networks:
       - alphard-net
 
@@ -268,295 +245,10 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-    # chownfix (compose refactor 2.0): soft ordering — same rationale
     # as postgres above. Current redis uses a named volume
-    # (alphard-redis-data, no bind-mount) so chownfix is no-op;
     # the dep keeps the contract future-proof.
-    depends_on:
-      - chownfix
     networks:
       - alphard-net
-
-  prometheus:
-    image: prom/prometheus:latest
-    container_name: alphard-prometheus
-    restart: unless-stopped
-    # BUGFIX (2026-08-22 LXC): .107 Docker 29.1.x + PVE LXC bind-mount leaf
-    # gets userns-mapped nobody:nogroup ownership; Prometheus writes its
-    # WAL into /prometheus which becomes unwritable for the in-image 'nobody'
-    # user. Same class of bug as #108 (alphard-bot /app/logs) and #122 (postgres
-    # init.sql). Fix: replace bind-mount with tmpfs (root-owned, always writable).
-    # Cost: TSDB lives in container memory; data is lost on container restart.
-    # Acceptable for Phase 2 — restore bind-mount once we move observability to
-    # a non-LXC Docker host (e.g. .110) or fix leaf ownership via a different
-    # mechanism (PR #46-style perms_fix init container).
-    #
-    # Also: --web.enable-lifecycle so prometheus.yml can be hot-reloaded via
-    # POST /-/reload after the inline startup script writes it on first boot.
-    security_opt:
-      - apparmor=unconfined
-    # BUGFIX (2026-08-22 #149): PROM_YML_B64 must be declared explicitly
-    # in service.environment because Portainer standalone does NOT
-    # propagate stack-level Env vars into services that don't opt in.
-    # Without this declaration the inline entrypoint decodes an empty
-    # string and prometheus refuses to bind. The downstream
-    # `environment:` block below (with the same key) is the actual
-    # contract — this comment is here to anchor the rationale in
-    # the file's first-pass reader.
-    # Inline config write: write prometheus.yml on container startup from an
-    # env-baked base64 blob, then exec prometheus. Avoids the bind-mount leaf
-    # file-vs-directory quirk that .107 has for src=file mounts.
-    # BUGFIX (issue #283): PROM_YML_B64 used to be the source of truth
-    # for the scrape config. Portainer StackUpdate silently truncates env
-    # values >60 chars (Go JSON unmarshal fails on long strings) and
-    # 292-byte base64 blobs were routinely cut off mid-keyword. Now we
-    # bind-mount the config file from the repo (./docker/prometheus/prometheus.yml)
-    # instead — the 60-char limit no longer applies and a config change
-    # is a normal git diff.
-    #
-    # BUGFIX (issue #209): prom/prometheus runs as in-image nobody (uid 65534)
-    # but /prometheus is a Docker-managed named volume owned by root:root.
-    # Without chown, queries.active write fails with EPERM and the container
-    # restart-loops. We chown here in the entrypoint BEFORE exec. The
-    # config file itself (bind-mounted :ro) is not affected — userns-mapping
-    # trap only applies to writable leaves.
-    #
-    # --web.enable-lifecycle stays so prometheus.yml can be hot-reloaded via
-    # POST /-/reload after the config file is updated on the host.
-    entrypoint:
-      - sh
-      - -c
-      - |
-        chown -R nobody:nobody /prometheus
-        exec /bin/prometheus \
-          --config.file=/etc/prometheus/prometheus.yml \
-          --storage.tsdb.path=/prometheus \
-          --storage.tsdb.retention.time=30d \
-          --web.listen-address=0.0.0.0:9090 \
-          --web.enable-lifecycle
-    volumes:
-      # Read-only config mount from the bind-mounted repo leaf. The leaf
-      # file (docker/prometheus/prometheus.yml) has been the source of
-      # truth for the scrape config since Phase 2.8 step 1 — quickstart.sh
-      # used to base64-bake it into PROM_YML_B64 before issue #283 made
-      # that path unreliable due to Portainer's 60-char env limit.
-      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      # TSDB lives in a named volume so /prometheus is root-owned by Docker
-      # itself, not bind-mounted (avoiding the #108 / #122 leaf trap).
-      - alphard-prometheus-data:/prometheus
-    ports:
-      - "9090:9090"
-    # chownfix (compose refactor 2.0): soft ordering — prom uses a
-    # named volume (alphard-prometheus-data), so chownfix is a no-op
-    # for /prometheus on the host side. Kept here for symmetry with
-    # postgres/redis/grafana so all four data services share the same
-    # chownfix contract.
-    depends_on:
-      - chownfix
-    networks:
-      alphard-net:
-        aliases:
-          - prometheus
-          - alphard-prometheus
-    profiles: ["observability"]
-    healthcheck:
-      # Prometheus exposes two lifecycle endpoints:
-      #   GET /-/healthy  → 200 OK once the TSDB is open and web server
-      #                     is serving traffic. Standard liveness probe.
-      #   GET /-/ready    → 200 OK only after the initial WAL replay
-      #                     completes; returns 503 while replaying.
-      # /-/healthy is the right choice here — we want to know "is the
-      # process alive and answering HTTP" not "is the query engine
-      # fully caught up". wget is present in the prom/prometheus image
-      # (used by the upstream Dockerfile for its own HEALTHCHECK).
-      # start_period=60s covers the inline entrypoint which base64-decodes
-      # prometheus.yml and writes /prometheus before exec'ing prometheus
-      # (≈3s on cold TSDB rebuild), plus the initial WAL replay on
-      # restart from the tmpfs-backed /prometheus.
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9090/-/healthy"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
-
-  # CHOWNFIX (compose refactor 2.0, kanban t_884fec4a): one-shot init
-  # service that pre-creates all host-bind-mount leaves with the correct
-  # uid:gid ownership BEFORE any data service starts. Replaces the
-  # per-service grafana-init (PR #217) with a single chownfix that
-  # covers all four leaves (postgres, redis, grafana, prometheus).
-  #
-  # Why one service instead of two (grafana-init + a legacy pg-init):
-  # 1. ONE apk add (no postgresql-client binary — pg-init used psql to
-  #    inject hba_file rules, but that path was removed in issue #347:
-  #    pg-init's single-file bind-mounts render as directories on LXC,
-  #    so the schema-apply path was broken. Schema application now
-  #    happens inside the bot's entrypoint via init_schema(). See
-  #    tests/test_347_pg_init_removal.py for the post-fix contract).
-  # 2. ONE chown pass per leaf instead of one container per leaf —
-  #    faster cold start, less log noise.
-  # 3. Single point of truth for the chown UID:GID mapping table;
-  #    a future leaf add (e.g. alertmanager) is one chown line.
-  #
-  # CAP_CHOWN + DAC_OVERRIDE are REQUIRED to bypass the .107 PVE LXC
-  # userns-mapping bug (issue #108 / #122 / #147 / #209 / #216).
-  # Without these caps the in-container root user still cannot
-  # chown across the bind-mount leaf boundary, even with
-  # `apparmor=unconfined` — verified live 2026-08-22 on .107 stack
-  # 112 with the previous grafana-init (which only had root + no
-  # cap_add). On hosts where the bug does not apply (plain Docker
-  # on a non-LXC VM), the caps are harmless — Docker drops them
-  # back to the default set when the container starts.
-  #
-  # WATCHTOWER LABEL: `com.centurylinklabs.watchtower.enable=false`.
-  # This is the canonical watchtower opt-out label (verified via
-  # containrrr docs and the project's own README pattern). Without
-  # it, watchtower would delete this one-shot container on its
-  # next tick (no upstream image to pull → chownfix has no
-  # permanent "running" state, so watchtower interprets it as
-  # needing removal). With the label, watchtower ignores it and
-  # the next StackUpdate re-creates it idempotently.
-  chownfix:
-    image: alpine:3.20
-    container_name: alphard-chownfix
-    restart: "no"
-    security_opt:
-      - apparmor=unconfined
-    cap_add:
-      - CHOWN
-      - DAC_OVERRIDE
-    labels:
-      - "com.centurylinklabs.watchtower.enable=false"
-    environment:
-      APPDATA_DIR: ${APPDATA_DIR:-/srv/alphard}
-    volumes:
-      - ${APPDATA_DIR:-/srv/alphard}:${APPDATA_DIR:-/srv/alphard}
-    entrypoint:
-      - sh
-      - -c
-      - |
-        set -e
-        APPDATA_DIR="$${APPDATA_DIR:-/srv/alphard}"
-        echo "[chownfix] APPDATA_DIR=$$APPDATA_DIR"
-        # UID:GID mapping (verified against the in-image entrypoint users):
-        #   postgres 999:999     postgres:16-alpine entrypoint
-        #   redis    999:999     redis:7-alpine (same numeric UID)
-        #   grafana  472:472     grafana/grafana in-image 'grafana'
-        #   prom     65534:65534 prom/prometheus runs as in-image 'nobody'
-        mkdir -p "$$APPDATA_DIR/postgres" \
-                 "$$APPDATA_DIR/redis" \
-                 "$$APPDATA_DIR/grafana" \
-                 "$$APPDATA_DIR/prometheus"
-        chown -R 999:999     "$$APPDATA_DIR/postgres"
-        chown -R 999:999     "$$APPDATA_DIR/redis"
-        chown -R 472:472     "$$APPDATA_DIR/grafana"
-        chown -R 65534:65534 "$$APPDATA_DIR/prometheus"
-        echo "[chownfix] OK: 4 leaves chowned"
-    networks:
-      - alphard-net
-
-  # GRAFANA — compose refactor 2.0 (kanban t_884fec4a)
-  #
-  # This is the FINAL fix for the LXC bind-mount saga that started with
-  # issue #108 (alphard-bot /app/logs, PR #119) and issue #147
-  # (prometheus, PR #147 → #209) and #216 (grafana provisioning,
-  # PR #217). PR #217 fixed grafana provisioning via APPDATA_DIR bind-
-  # mount, but that approach still requires the operator's host path
-  # to match exactly the bind source AND for the chown to actually
-  # take effect at the bind-mount boundary — fragile.
-  #
-  # THIS refactor removes ALL bind-mounts to docker/grafana/* config
-  # directories. The provisioning YAMLs and dashboard JSONs are baked
-  # into base64 env vars (PROVISIONING_DATASOURCES_YML_B64,
-  # PROVISIONING_DASHBOARDS_PROVIDER_YML_B64, DASHBOARD_PHASE0_JSON_B64,
-  # DASHBOARD_PHASE28_JSON_B64) and decoded at container start by
-  # docker/entrypoint_grafana.sh into the upstream-default paths
-  # /etc/grafana/provisioning and /var/lib/grafana/dashboards. These
-  # paths are inside the container's writable filesystem — no bind-
-  # mount boundary, no userns-mapping, no host-path dependency.
-  #
-  # The ONLY bind-mount remaining for grafana is /var/lib/grafana (the
-  # sqlite db + plugin store), which still benefits from a named
-  # volume path so the chownfix service can pre-create it with 472:472.
-  # Prom has the same named-volume pattern (PR #209).
-  #
-  # declared env vars (Portainer standalone contract — see issue #149):
-  # every *_B64 must appear in service.environment even though it's
-  # also set at stack level; Portainer standalone strips undeclared
-  # stack-level vars during render, which would leave the entrypoint
-  # with empty values and exit 1 loudly. The empty default
-  # (`${X:-}`) means a misconfigured stack fails loudly, not silently
-  # with a half-loaded provisioning.
-  grafana:
-    image: grafana/grafana:latest
-    container_name: alphard-grafana
-    restart: unless-stopped
-    # BUGFIX (2026-08-20): .107 Docker daemon has broken bridge port mapping
-    # (iptables NAT empty after ContainerStart). Standard HostPort publishing
-    # silently fails — host->container port is unreachable. Workaround: use
-    # network_mode: host. Grafana shares the host network namespace, so its
-    # 0.0.0.0:3000 listener = host's 0.0.0.0:3000. forgejo already lives on
-    # host:3000, so Grafana binds to 3300 via GF_SERVER_HTTP_PORT instead.
-    network_mode: host
-    security_opt:
-      - apparmor=unconfined
-    # Bind-mount provisioning + dashboards directly from the repo. This
-    # replaces the previous env-based approach (PR #246, issue #297) which
-    # relied on PROVISIONING_*_B64 env vars decoded by an in-container
-    # entrypoint wrapper (docker/entrypoint_grafana.sh). That approach
-    # hit the same Portainer 60-char env truncation bug as PROM_YML_B64
-    # (issue #283 / PR #284): after StackUpdate on .107 the *_B64 values
-    # were truncated to ~80 chars, base64 -d produced garbage or empty
-    # bytes, and Grafana started with no datasource and no dashboards
-    # ("No data" on every panel even though prometheus was scraping
-    # alphard-bot correctly).
-    #
-    # Trade-off: dashboards are now read-only (:ro), so Grafana's UI
-    # "save dashboard" button will fail with a permission error. This is
-    # intentional — dashboards are git-versioned (same model as
-    # docker/prometheus/prometheus.yml from PR #284). To edit a dashboard
-    # locally, modify the JSON in docker/grafana/dashboards/, commit,
-    # push, then Portainer StackUpdate on .107.
-    #
-    # Why no chownfix needed: bind-mounts from the repo retain their
-    # on-disk permissions (root:root 0644 in this case). The upstream
-    # Grafana image's /run.sh entrypoint tolerates this because it runs
-    # initial setup as root before dropping to uid 472 via gosu. Same
-    # reasoning as PR #284 for prometheus.yml.
-    volumes:
-      - ${APPDATA_DIR:-/srv/alphard}/grafana:/var/lib/grafana
-      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
-    environment:
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-}
-      GF_SERVER_HTTP_PORT: "3300"
-    # Watchtower label — grafana is a long-running service we DO want
-    # auto-updated on image push. Sister-label to chownfix's opt-out.
-    labels:
-      - "com.centurylinklabs.watchtower.enable=true"
-    depends_on:
-      - prometheus
-      - chownfix
-    healthcheck:
-      # Grafana exposes GET /api/health → 200 OK with body `{"database":"ok"}`
-      # once the server is bound and the internal DB is initialised. The
-      # network_mode: host directive (BUGFIX 2026-08-20) means Grafana
-      # listens on the host's loopback, NOT the compose bridge — so we
-      # must hit the GF_SERVER_HTTP_PORT value (3300), NOT the upstream
-      # default 3000 which would resolve to forgejo on .107. start_period
-      # is 120s on the FIRST deploy (cold Grafana: decode 4 b64 files +
-      # sqlite db create + datasource load + dashboard load) and 60s on
-      # subsequent restarts (sqlite db already exists). We use the
-      # upper bound so a Watchtower recreate right after a StackUpdate
-      # doesn't get marked unhealthy while the b64 decode is still
-      # running (decode of 4 files ≈ 50ms but disk write + chown +
-      # grafana first-boot provisioning can spike to 90s on a slow LXC).
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3300/api/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 120s
-    profiles: ["observability"]
-
 networks:
   alphard-net:
     driver: bridge
@@ -565,6 +257,4 @@ volumes:
   alphard-postgres-data:
     driver: local
   alphard-redis-data:
-    driver: local
-  alphard-prometheus-data:
     driver: local

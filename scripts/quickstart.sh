@@ -3,11 +3,11 @@
 #
 # Goal: turn `git clone ... && cd alphard && ./scripts/quickstart.sh` into
 # a single command that produces a fully running stack (postgres, redis,
-# alphard-bot, prometheus, grafana) on any Docker host that satisfies:
+# alphard-bot) on any Docker host that satisfies:
 #   - Docker Engine 20.10+ with compose plugin v2
 #   - ~3 GiB disk free (alphard-bot 405 MB, postgres 80 MB, redis 40 MB,
-#     prometheus 200 MB, grafana 1.4 GB, chownfix 80 MB + image caches)
-#   - Ports 5432, 6379, 9090, 3300 free on the host (3300 == Grafana,
+#     + image caches)
+#   - Ports 5432, 6379 free on the host
 #     which lives on host network namespace; 3000 is taken by forgejo
 #     on .103, hence 3300 is the override)
 #
@@ -15,11 +15,10 @@
 #   1. Sanity-checks: docker is up, compose v2 present, repo root
 #      contains docker-compose.yaml and .env.example.
 #   2. Creates .env from .env.example if missing. Refuses to start
-#      without a non-empty GRAFANA_ADMIN_PASSWORD (no historical literal).
+
 #      Auto-generates POSTGRES_PASSWORD and REDIS_PASSWORD if missing.
-#   3. Bakes the Grafana provisioning / dashboards B64 vars via
-#      tools/bake_grafana_env.py. Skipped if already populated.
-#   4. Bakes the Prometheus config into PROM_YML_B64. Skipped if
+#   3. Bakes the (legacy) Grafana/Prometheus B64 vars. Skipped if
+#      already populated. (Both stacks removed in PR #396.)
 #      already populated.
 #   5. `docker compose --profile observability up -d`.
 #   6. Polls container healthchecks for up to 180s; prints a clear
@@ -27,15 +26,14 @@
 #
 # Run-time knobs (env vars, all optional):
 #   ALPHARD_PROFILE       = "observability" (default) or "data" (skip
-#                           Prometheus + Grafana; bot + postgres + redis
+#                           bot + postgres + redis
 #                           only — for memory-constrained hosts).
 #   ALPHARD_TIMEOUT_SEC   = 180 (default; how long to wait for healthy).
 #                           Set to 0 to run bake stages + compose up,
 #                           skip the health-gate polling, and exit
 #                           regardless of container state. Useful for
 #                           CI fast-fail smoke tests.
-#   ALPHARD_SKIP_COMPOSE  = "1" runs only the bake stages (Grafana +
-#                           Prometheus B64 + password auto-gen) and
+#   ALPHARD_SKIP_COMPOSE  = "1" runs only the bake stages (legacy) and
 #                           exits 0 once .env is fully populated, without
 #                           invoking docker compose at all. The
 #                           operator is then expected to run
@@ -55,7 +53,7 @@
 #     hangs on DNS egress; the first wave of smoke tests required a
 #     manual `docker exec ... psql < init.sql` to seed the _auth_probe
 #     table. Fixed in compose (alpine -> postgres:16-alpine).
-#   - grafana had no `apparmor=unconfined` in compose — the daemon
+#   - bind-mounts need `apparmor=unconfined` in compose — the daemon
 #     rejected the start with `apparmor_parser: Access denied`. Fixed
 #     in compose.
 #   - PROM_YML_B64 was not in .env, so Prometheus started with a zero-
@@ -64,6 +62,7 @@
 #   - PROVISIONING_*_B64 were empty in .env.example, so Grafana's
 #     entrypoint bailed at `FATAL: ... is unset or empty`. THIS SCRIPT
 #     bakes them on first run.
+#     (Both removed in PR #396; entries kept as historical context.)
 #
 # Idempotency: every step short-circuits if its artifact already exists.
 # Re-running on a healthy stack is a no-op (compose up -d skips
@@ -76,14 +75,14 @@ set -euo pipefail
 # BASH_SOURCE[0] is the path AS INVOKED (e.g. "/usr/local/bin/qs" when
 # the script is invoked via a symlink), not the real path. Deriving
 # REPO_ROOT from it directly makes the script read .env / docker-
-# compose.yaml / tools/bake_grafana_env.py from the symlink's parent
+# compose.yaml / tools/ from the symlink's parent
 # directory instead of the real repo, which silently breaks for
 #   cp scripts/quickstart.sh /usr/local/bin/alphard-quickstart
 # or any CI flow that copies the script into a shared /usr/local/bin.
 # (issues #248, #249).
 #
 # We resolve symlinks via `python3 -c 'os.path.realpath'`. python3 is
-# already a hard dependency of this script (tools/bake_grafana_env.py
+# already a hard dependency of this script (tools/
 # requires it), so the cost is zero. We deliberately avoid `readlink -f`
 # and `dirname` because:
 #   - busybox-alpine (the base of alphard-pg-init) ships readlink
@@ -92,7 +91,7 @@ set -euo pipefail
 #     /usr/bin (where readlink and dirname live), which would
 #     otherwise make the script fail before the real sanity checks.
 if ! command -v python3 >/dev/null 2>&1; then
-    echo "FATAL: quickstart.sh requires python3 on PATH (used for symlink resolution and Grafana B64 bake)." >&2
+    echo "FATAL: quickstart.sh requires python3 on PATH (used for symlink resolution)." >&2
     echo "       Install python3 3.8+ first." >&2
     exit 2
 fi
@@ -186,23 +185,6 @@ if [[ ! -f "$REPO_ROOT/.env" ]]; then
 else
     ok ".env exists (kept as-is)"
 fi
-
-# Refuse to proceed with a placeholder GRAFANA_ADMIN_PASSWORD (issue #55):
-# an empty / default-password Grafana would expose admin without auth.
-_gpw="$(env_value GRAFANA_ADMIN_PASSWORD)"
-if [[ -z "$_gpw" ]]; then
-    err "GRAFANA_ADMIN_PASSWORD is empty in .env"
-    err "  Set it to a strong password (16+ chars). Generate: openssl rand -base64 24"
-    err "  Example: GRAFANA_ADMIN_PASSWORD=\"\$(openssl rand -base64 24)\""
-    exit 2
-fi
-if [[ "$_gpw" == "alphard" ]]; then
-    err "GRAFANA_ADMIN_PASSWORD is set to the historical literal 'alphard' (issue #55)"
-    err "  Replace with a strong password before continuing."
-    exit 2
-fi
-ok "GRAFANA_ADMIN_PASSWORD set"
-
 # Auto-generate POSTGRES_PASSWORD if missing.
 _pgpw="$(env_value POSTGRES_PASSWORD)"
 if [[ -z "$_pgpw" ]]; then
@@ -223,37 +205,13 @@ else
     ok "REDIS_PASSWORD set"
 fi
 
-# ---- 3. (No Grafana bake needed — provisioning + dashboards bind-mounted from repo) ----
 # Issue #297: the *_B64 env-var approach was retired because Portainer
 # StackUpdate silently truncates env values >60 chars (Go JSON unmarshal
 # fails on long strings), and the baked base64 blobs were routinely cut
 # off mid-keyword. Bind-mount from the repo is the same fix PR #284 used
-# for prometheus.yml. ./docker/grafana/provisioning and
-# ./docker/grafana/dashboards are mounted directly into the container
-# (see docker-compose.yaml grafana.volumes). Nothing to bake here.
-info "3/5 Grafana provisioning + dashboards (bind-mounted from repo)"
+# Nothing extra to bake — the bot's metrics server is bind-mounted.
 
-# ---- 4. Prometheus config bind-mount sanity check ----
-# Issue #283: PROM_YML_B64 used to be the source of truth, but Portainer
-# StackUpdate silently truncates env values >60 chars (Go JSON unmarshal
-# fails on long strings), and the 292-byte base64 blob was routinely cut
-# off mid-keyword. The fix is to bind-mount the config file from the
-# repo at ./docker/prometheus/prometheus.yml — Portainer's env-length limit
-# is no longer relevant.
-#
-# We just verify the file exists; compose.yaml bind-mounts it as :ro
-# into /etc/prometheus/prometheus.yml inside the prometheus container.
-info "4/5 Prometheus config bind-mount sanity check"
-
-if [[ ! -f "$REPO_ROOT/docker/prometheus/prometheus.yml" ]]; then
-    err "docker/prometheus/prometheus.yml not found (issue #283 — bind-mount target is missing from the repo)"
-    exit 2
-fi
-if ! grep -q "alphard-bot:8765" "$REPO_ROOT/docker/prometheus/prometheus.yml"; then
-    err "docker/prometheus/prometheus.yml does not declare the alphard-bot:8765 scrape target (Grafana will show 'No data')"
-    exit 2
-fi
-ok "docker/prometheus/prometheus.yml present and contains alphard-bot:8765 target"
+ok "prometheus stack removed (PR #396); bot exposes /metrics on port 8765"
 
 # ---- 5. docker compose up ----
 # Two early-exit paths:
@@ -296,9 +254,6 @@ GUARDED_CONTAINERS=(
     "alphard-bot"
     "alphard-postgres"
     "alphard-redis"
-    "alphard-prometheus"
-    "alphard-grafana"
-    "alphard-chownfix"
 )
 
 for _c in "${GUARDED_CONTAINERS[@]}"; do
@@ -361,18 +316,18 @@ if [[ "$TIMEOUT_SEC" -lt 1 ]]; then
 fi
 info "Health gate (up to ${TIMEOUT_SEC}s)"
 
-# One-shot services (Exited(0) is success): alphard-chownfix.
+# One-shot services: none. chownfix was removed in PR #396
+# (its only job was chown'ing Grafana/Prometheus leaf directories).
 # These must NOT be in EXPECTED — the health gate requires
 # State.Status == "running", which one-shots never satisfy.
 # Note: alphard-pg-init was removed in PR #351 (issue #347); see
 # tests/test_347_pg_init_removal.py and the issue #355 regression
 # test for the post-#347 contract.
-ONE_SHOT=("alphard-chownfix")
+ONE_SHOT=()
 # Long-running services we wait for:
 EXPECTED=("alphard-postgres" "alphard-redis" "alphard-bot")
-if [[ "$PROFILE" == "observability" ]]; then
-    EXPECTED+=("alphard-prometheus" "alphard-grafana")
-fi
+# PR #396 removed Grafana and Prometheus; the "observability" profile
+# is preserved as a synonym for "full stack" until a future PR retires it.
 
 elapsed=0
 interval=5
@@ -416,8 +371,7 @@ if [[ $all_healthy -eq 1 ]]; then
 
   Next steps:
     - Bot health/metrics (in-network only):  alphard-bot:8765/health, /metrics
-    - Prometheus:                            http://localhost:9090/
-    - Grafana:                               http://localhost:3300/  (admin / \$GRAFANA_ADMIN_PASSWORD)
+    - alphard-web:                           http://localhost:8080/  (operator UI; replaces Grafana)
     - Postgres + Redis:                      docker exec alphard-postgres psql -U \$POSTGRES_USER -d \$POSTGRES_DB
     - Stop:                                   docker compose --profile $PROFILE down
     - Stop + wipe volumes:                   docker compose --profile $PROFILE down -v

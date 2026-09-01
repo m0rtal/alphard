@@ -76,8 +76,8 @@ fi
 # operator's running alphard-* stack on the same daemon.
 #
 # Why the override is necessary: docker-compose.yaml hardcodes
-# `container_name: alphard-bot`, `alphard-postgres`, `alphard-redis`,
-# `alphard-prometheus`, `alphard-chownfix`, `alphard-grafana`. Docker
+# `container_name: alphard-bot`, `alphard-postgres`, `alphard-redis`.
+# Docker
 # Compose honours these literal names and does NOT prefix them with
 # the project name — the `-p alphard-smoke-<PID>` flag scopes
 # volumes/networks only, not hardcoded container names. On a host
@@ -141,23 +141,7 @@ services:
           - alphard-postgres
   redis:
     container_name: ${COMPOSE_PROJECT_NAME}-redis-1
-  prometheus:
-    container_name: ${COMPOSE_PROJECT_NAME}-prometheus-1
-  chownfix:
-    container_name: ${COMPOSE_PROJECT_NAME}-chownfix-1
-  grafana:
-    container_name: ${COMPOSE_PROJECT_NAME}-grafana-1
 YAML
-
-# BUGFIX (cycle148, followup to #374): the alphard-chownfix sidecar is
-# declared with restart:"no" in docker-compose.yaml, so its container
-# is left in Exited state after the chown pass. Even with the per-PID
-# container_name override above, if a previous aborted smoke run left
-# an Exited `alphard-chownfix` (under the operator's literal name)
-# lying around, drop it here as belt-and-suspenders. `docker rm` of an
-# exited container is a safe no-op against running ones.
-echo "[pre-pr-smoke] [0/4] clearing stale alphard-chownfix orphan..."
-docker rm alphard-chownfix >/dev/null 2>&1 || true
 
 echo "[pre-pr-smoke] [1/4] bringing up stack..."
 # BUGFIX (issue #347): bring up only postgres + alphard-bot. The previous

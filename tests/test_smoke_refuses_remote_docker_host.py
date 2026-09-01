@@ -390,13 +390,13 @@ class TestSmokeContainerNameOverride:
         # Compose derives project-scoped names from the service key, not
         # the hardcoded container_name, so we override each one to
         # `${COMPOSE_PROJECT_NAME}-<service-key>-1`.
+        # After PR #396, only three services remain in the override
+        # (alphard-bot, postgres, redis). Grafana, Prometheus, and
+        # chownfix were removed from the compose stack.
         services_and_names = {
             "alphard-bot": "alphard-bot",
             "postgres": "postgres",
             "redis": "redis",
-            "prometheus": "prometheus",
-            "chownfix": "chownfix",
-            "grafana": "grafana",
         }
         for service_key, project_scoped_name in services_and_names.items():
             # Each service-key section must set container_name using
@@ -484,27 +484,22 @@ class TestSmokeContainerNameOverride:
             "expanded when the file is written."
         )
 
-    def test_chownfix_orphan_cleanup_still_present(self) -> None:
-        """Issue #379 acceptance criterion #3: the
-        `docker rm alphard-chownfix` orphan cleanup must NOT be
-        removed by this fix — it is still valid belt-and-suspenders
-        defence against a previous aborted smoke run that left an
-        Exited `alphard-chownfix` (under the operator's literal name)
-        lying around.
+    def test_chownfix_orphan_cleanup_removed(self) -> None:
+        """Issue #396: the alphard-chownfix service was removed from
+        compose, so its orphan cleanup is no longer needed.
+
+        The historical `docker rm alphard-chownfix` line was deleted
+        from pre_pr_smoke.sh — a future PR that re-adds it should
+        also re-add chownfix to compose, and this test will fail
+        loudly if those drift apart.
         """
         text = _read_smoke()
-        assert "docker rm alphard-chownfix" in text, (
-            "smoke script must keep `docker rm alphard-chownfix` even "
-            "after the per-PID container_name override is in place — "
-            "issue #379 acceptance criterion #3."
+        assert "docker rm alphard-chownfix" not in text, (
+            "smoke script must NOT contain `docker rm alphard-chownfix` "
+            "after PR #396 — chownfix was removed from compose. If a "
+            "future PR re-adds the cleanup, it must also re-add the "
+            "alphard-chownfix service."
         )
-        # And it must run BEFORE `compose up`.
-        rm_pos = text.find("docker rm alphard-chownfix")
-        up_pos = text.find("bringing up stack")
-        assert rm_pos > 0 and up_pos > 0, (
-            "smoke script must contain both `docker rm alphard-chownfix` " "and `bringing up stack`."
-        )
-        assert rm_pos < up_pos, "alphard-chownfix orphan cleanup must run BEFORE `compose up`."
 
     def test_postgres_service_has_alphard_postgres_network_alias(self) -> None:
         """The override file must re-add `alphard-postgres` as a network

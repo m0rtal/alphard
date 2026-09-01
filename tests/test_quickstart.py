@@ -364,23 +364,36 @@ def test_docker_missing_exits_2(tmp_path: Path) -> None:
     assert "docker not found" in (r.stderr + r.stdout)
 
 
-def test_empty_gpw_exits_2(tmp_path: Path) -> None:
-    """GRAFANA_ADMIN_PASSWORD empty must exit 2 (issue #55 guard)."""
+def test_empty_gpw_no_longer_required(tmp_path: Path) -> None:
+    """GRAFANA_ADMIN_PASSWORD check was removed in PR #396 (Grafana gone).
+
+    The historical literal `alphard` and the empty case are now
+    accepted as benign — the variable is read by neither compose
+    nor any entrypoint. The script should pass through the (now
+    removed) GPW check without erroring.
+    """
     env_dir = _quickstart_skel(tmp_path, with_gpw=False)
     r = _run_with_fake_docker(env_dir, tmp_path)
-    assert r.returncode == 2, f"expected exit 2, got {r.returncode}; stderr: {r.stderr}"
-    assert "GRAFANA_ADMIN_PASSWORD" in (r.stderr + r.stdout)
+    combined = r.stderr + r.stdout
+    # GPW-related errors must NOT appear (the check is gone).
+    assert "GRAFANA_ADMIN_PASSWORD is empty" not in combined
+    assert "GRAFANA_ADMIN_PASSWORD is set to the historical literal" not in combined
 
 
-def test_historical_gpw_exits_2(tmp_path: Path) -> None:
-    """GRAFANA_ADMIN_PASSWORD=alphard (historical literal) must exit 2."""
+def test_historical_gpw_no_longer_required(tmp_path: Path) -> None:
+    """GRAFANA_ADMIN_PASSWORD=alphard (historical literal) is now OK.
+
+    With Grafana gone (PR #396), neither the empty case nor the
+    historical literal triggers an error. The test pins the new
+    contract: the script does not refuse to start because of this
+    variable any more.
+    """
     env_dir = _quickstart_skel(tmp_path, with_gpw=True)
     (env_dir / ".env").write_text("GRAFANA_ADMIN_PASSWORD=alphard\n", encoding="utf-8")
     r = _run_with_fake_docker(env_dir, tmp_path)
-    assert r.returncode == 2, f"expected exit 2, got {r.returncode}; stderr: {r.stderr}"
     combined = r.stderr + r.stdout
-    assert "alphard" in combined
-    assert "GRAFANA_ADMIN_PASSWORD" in combined
+    assert "historical literal" not in combined
+    assert "GRAFANA_ADMIN_PASSWORD is empty" not in combined
 
 
 def test_env_created_from_example(tmp_path: Path) -> None:
