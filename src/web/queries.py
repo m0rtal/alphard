@@ -424,6 +424,7 @@ def build_settings_payload() -> dict[str, Any]:
     normally set these to ``1`` to enable, anything else to disable.
     Token presence is reported as a boolean, not the value.
     """
+
     def flag(name: str) -> bool:
         return os.environ.get(name, "0") not in ("", "0", "false", "False")
 
