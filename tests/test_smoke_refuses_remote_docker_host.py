@@ -339,3 +339,48 @@ class TestSmokeProjectIsolation:
             "`docker compose down -v`) cannot fire after the test returns. "
             "Regression for issue #374."
         )
+
+
+class TestSmokeOrphanCleanup:
+    """Cycle148 follow-up to #374: alphard-chownfix orphan cleanup.
+
+    `alphard-chownfix` is declared with ``restart: \"no\"`` in
+    docker-compose.yaml, so its container remains in Exited state
+    after the one-shot chown pass. Docker refuses to reuse the
+    hardcoded ``container_name: alphard-chownfix`` until that Exited
+    instance is removed. Without explicit cleanup, the next smoke run
+    fails at step [1/4] with "container name ... already in use".
+
+    The fix: drop the orphan in pre_pr_smoke.sh before any compose
+    invocation. The contract is that this is safe — ``docker rm`` of
+    an already-Exited container is a no-op against running ones.
+    """
+
+    def test_smoke_drops_alphard_chownfix_orphan(self) -> None:
+        """The pre-pr smoke script removes an existing alphard-chownfix
+        container (Exited or otherwise) before invoking `compose up`.
+
+        We verify this by static inspection rather than a full live
+        smoke run: docker is not available in the test environment.
+        """
+        from pathlib import Path
+
+        smoke = Path(SMOKE)
+        assert smoke.is_file(), "scripts/pre_pr_smoke.sh must exist for the smoke gate to run."
+        text = smoke.read_text()
+        # Find the alphard-chownfix cleanup block. Accept either a
+        # generic `docker rm alphard-chownfix` call (cycle148 fix) or
+        # any explicit cleanup of that specific container_name.
+        assert "alphard-chownfix" in text, "pre_pr_smoke.sh must reference alphard-chownfix cleanup."
+        # The cleanup must run BEFORE the `compose up` block, not
+        # after, so the smoke gate does not fail at step [1/4].
+        rm_pos = text.find("docker rm alphard-chownfix")
+        up_pos = text.find("bringing up stack")
+        assert rm_pos > 0 and up_pos > 0, (
+            "pre_pr_smoke.sh must contain both an alphard-chownfix " "cleanup and a `bringing up stack` step."
+        )
+        assert rm_pos < up_pos, (
+            "alphard-chownfix cleanup must run BEFORE `compose up`, "
+            "otherwise smoke gate step [1/4] still fails on the "
+            "orphaned hardcoded container_name."
+        )

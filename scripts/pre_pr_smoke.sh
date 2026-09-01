@@ -103,6 +103,18 @@ services:
       - ./scripts:/app/scripts:ro
 YAML
 
+# BUGFIX (cycle148, followup to #374): the alphard-chownfix sidecar is
+# declared with restart:"no" in docker-compose.yaml, so its container
+# is left in Exited state after the chown pass. Docker refuses to
+# reuse the hardcoded container_name "alphard-chownfix" until the
+# Exited instance is removed — even though our compose project now
+# scopes other containers. Drop the orphan here, before any compose
+# invocation, so the next `up` doesn't fail with "container name ...
+# already in use". `docker rm` of an exited container is a safe no-op
+# against running ones.
+echo "[pre-pr-smoke] [0/4] clearing stale alphard-chownfix orphan..."
+docker rm alphard-chownfix >/dev/null 2>&1 || true
+
 echo "[pre-pr-smoke] [1/4] bringing up stack..."
 # BUGFIX (issue #347): bring up only postgres + alphard-bot. The previous
 # pg-init sidecar was dropped from docker-compose.yaml because its
