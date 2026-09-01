@@ -488,6 +488,97 @@ class TestUniverse:
         tickers = {m.ticker for m in metas}
         assert tickers == {"SBER", "RU000A0ZZZ", "FXUS"}
 
+    def test_list_tickers_excludes_us_share_isin(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Cycle146 scope change (issue #375): exclude SPBXM-foreign tickers.
+
+        Tinkoff account m0rtal returns LoaderNotFoundError for US-share
+        FIGIs (no broker-side grant), and MOEX ISS returns 0 rows for
+        the same set (these tickers trade on SPB Exchange, not MOEX).
+        The supervisor was spending ~5 seconds per US-share ticker on
+        two HTTP calls that both yield zero bars — 88 minutes wasted
+        per supervisor pass for 1411 zero-yield tickers.
+
+        Filter contract: any ticker with ``isin`` starting with ``US``
+        must be dropped at universe-construction time, before the
+        result enters the cache.
+        """
+        monkeypatch.setenv("TINKOFF_SANDBOX_TOKEN", "fake-token-1234567890")
+        from src.data.token_bucket import TokenBucket
+
+        loader = TinkoffInvestMDDataLoader(bucket=TokenBucket(rate=1000.0, window_seconds=1.0))
+
+        fake_share_russia = [
+            TickerMeta(ticker="SBER", figi="BBG004730N88", class_code="TQBR", name="Sber", lot=1, source="tkf"),
+            TickerMeta(
+                ticker="GAZP",
+                figi="BBG004730RP0",
+                class_code="TQBR",
+                name="Gazprom",
+                lot=10,
+                source="tkf",
+            ),
+        ]
+        fake_share_us = [
+            TickerMeta(
+                ticker="AAPL",
+                figi="BBG000B9XRY4",
+                class_code="SPBXM",
+                name="Apple",
+                lot=1,
+                source="tkf",
+                isin="US0378331005",
+            ),
+            TickerMeta(
+                ticker="MSFT",
+                figi="BBG000BPH459",
+                class_code="SPBXM",
+                name="Microsoft",
+                lot=1,
+                source="tkf",
+                isin="US5949181045",
+            ),
+        ]
+        with patch("src.data.tinkoff_loader.TinkoffInvestDataLoader") as mock_grpc:
+            mock_grpc.return_value.list_shares_all.side_effect = [fake_share_russia, fake_share_us, [], [], [], [], []]
+            mock_grpc.return_value.list_bonds.return_value = []
+            mock_grpc.return_value.list_etfs.return_value = []
+            metas = loader.list_tickers_with_figi()
+        tickers = {m.ticker for m in metas}
+        assert tickers == {"SBER", "GAZP"}, f"US-share tickers should be excluded, got {tickers}"
+
+    def test_list_tickers_keeps_us_share_without_isin(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Tickers missing ISIN must NOT be excluded by the US-prefix filter.
+
+        The filter only catches documented US-share ISINs; unknown or
+        missing ISINs pass through unchanged to avoid silently dropping
+        anything we cannot positively identify as SPBXM-foreign.
+        """
+        monkeypatch.setenv("TINKOFF_SANDBOX_TOKEN", "fake-token-1234567890")
+        from src.data.token_bucket import TokenBucket
+
+        loader = TinkoffInvestMDDataLoader(bucket=TokenBucket(rate=1000.0, window_seconds=1.0))
+
+        # Ticker with no ISIN at all — must be kept.
+        fake_share = [
+            TickerMeta(ticker="SBER", figi="BBG004730N88", class_code="TQBR", name="Sber", lot=1, source="tkf"),
+            TickerMeta(
+                ticker="WEIRD",
+                figi="BBG000WEIRD0",
+                class_code="SPBXM",
+                name="Mystery",
+                lot=1,
+                source="tkf",
+                isin=None,
+            ),
+        ]
+        with patch("src.data.tinkoff_loader.TinkoffInvestDataLoader") as mock_grpc:
+            mock_grpc.return_value.list_shares_all.side_effect = [fake_share, [], [], [], [], [], []]
+            mock_grpc.return_value.list_bonds.return_value = []
+            mock_grpc.return_value.list_etfs.return_value = []
+            metas = loader.list_tickers_with_figi()
+        tickers = {m.ticker for m in metas}
+        assert "WEIRD" in tickers, "Tickers without ISIN must pass through unchanged"
+
     def test_list_tickers_continues_when_bonds_or_etfs_fail(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """If list_bonds() / list_etfs() raise, shares must still come through."""
         monkeypatch.setenv("TINKOFF_SANDBOX_TOKEN", "fake-token-1234567890")

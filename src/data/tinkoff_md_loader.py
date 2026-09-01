@@ -346,6 +346,19 @@ class TinkoffInvestMDDataLoader(DataLoader):
                 logger.warning("list_shares_all(%s) failed: %s", cls, e)
                 continue
             for m in metas:
+                # Cycle146 scope change (issue #375): SPBXM-foreign tickers
+                # have ISINs starting with "US" (e.g. AAPL=US0378331005).
+                # Tinkoff account m0rtal returns LoaderNotFoundError for
+                # these FIGIs (no broker-side grant), MOEX ISS returns 0
+                # rows (these tickers trade on SPB Exchange, not MOEX).
+                # Drop them at universe-construction time so the
+                # supervisor does not spend ~5 s/ticker on two
+                # HTTP calls that both yield zero bars — ~88 min wasted
+                # per pass for 1411 zero-yield tickers. Tickers with
+                # missing ISIN pass through unchanged; we only filter on
+                # a positively-identified US prefix.
+                if m.isin and m.isin.startswith("US"):
+                    continue
                 if m.figi and m.ticker not in seen:
                     seen[m.ticker] = m
         # 2) Bonds (TQOB OFZ + TQCB corporate/muni).
