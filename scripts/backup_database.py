@@ -48,6 +48,19 @@ DEFAULT_DB_USER = os.environ.get("ALPHARD_POSTGRES_USER", "alphard")
 DEFAULT_DAILY_KEEP = 7
 DEFAULT_WEEKLY_KEEP = 4
 
+# Dump sanity gate (issue #387). pg_dump can exit 0 while emitting an
+# empty or truncated dump — a wrong -d target on a freshly-created
+# database, or a stream cut short at the protocol level. Writing such a
+# dump as the newest daily backup pushes a genuinely-valid older file out
+# of the retention window, so seven broken cron runs destroy every real
+# backup. pg_dump --format=plain always terminates a complete dump with
+# this trailer, so its absence means the dump is not usable.
+PG_DUMP_TRAILER = b"PostgreSQL database dump complete"
+
+# rc for "pg_dump exited 0 but the dump is unusable". Distinct from
+# pg_dump's own exit codes and from 124 (timeout).
+RC_DUMP_REJECTED = 3
+
 # Filename pattern: alphard_YYYY-MM-DD_HHMMSS.sql.gz
 # Strict match requires date+time in name; the date_time portion is
 # captured as group(1) so _parse_filename_timestamp can extract it.
@@ -137,6 +150,22 @@ def _run_pg_dump(container: str, db_name: str, db_user: str) -> bytes:
 
 def _compress(data: bytes) -> bytes:
     return gzip.compress(data, compresslevel=6)
+
+
+def _dump_rejection_reason(sql: bytes) -> str | None:
+    """Return why a pg_dump payload is unusable, or None if it is sound.
+
+    Guards the data-loss path in issue #387: a dump that pg_dump exited 0
+    on but that is empty or cut short must never be written, because
+    writing it prunes a valid older backup out of the retention window.
+    """
+    if not sql:
+        return "pg_dump exited 0 but produced no output"
+
+    if PG_DUMP_TRAILER not in sql:
+        return f"pg_dump output is missing the completion trailer ({PG_DUMP_TRAILER.decode()}) — dump is truncated"
+
+    return None
 
 
 def _backup_path(backup_dir: Path, when: datetime) -> Path:
@@ -275,6 +304,12 @@ def run_backup(args: argparse.Namespace) -> int:
     except subprocess.TimeoutExpired:
         logger.error("pg_dump timeout after 600s — container %s may be hung", args.container)
         return 124
+
+    rejection = _dump_rejection_reason(sql)
+    if rejection:
+        logger.error("REFUSING to write backup: %s", rejection)
+        logger.error("existing backups in %s left untouched (not pruned)", backup_dir)
+        return RC_DUMP_REJECTED
 
     compressed = _compress(sql)
     out_path.write_bytes(compressed)
