@@ -102,6 +102,18 @@ services:
           size: 100M
       # BUGFIX (#122): bind-mount host /root/.env so entrypoint.sh can source ALPHARD_PG_DSN
       - /root/.env:/root/.env:ro
+      # BUGFIX (2026-09-02): Russian .ru endpoints (invest-public-api.tinkoff.ru,
+      # iss.moex.com) use Russian Trusted Root CA + Sub CA (GOST crypto)
+      # which is NOT in the standard certifi bundle. Without this CA bundle
+      # every HTTPS request returns ssl.SSLCertVerificationError after the
+      # TCP handshake completes — surfaces as 30-second TCP timeouts
+      # when `requests` retries. Run scripts/fetch_tinkoff_gost_ca.py
+      # once before `compose up`; the bundle file is committed to git
+      # so production pulls it from the repo, no extra CI step needed.
+      # docker/entrypoint.sh rebuilds /etc/ssl/certs/ca-certificates.crt
+      # from certifi + this bundle on every container start (handles
+      # Tinkoff/MOEX chain rotation without rebuilding the image).
+      - ./docker/certs/tinkoff-gost-ca-bundle.pem:/etc/ssl/certs/tinkoff-gost-ca-bundle.pem:ro
     networks:
       - alphard-net
     # BUGFIX (H-7): wait for postgres to be healthy before starting the bot,

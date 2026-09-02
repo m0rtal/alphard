@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/pre_pr_smoke.sh — mandatory pre-PR local stack smoke gate.
+# scripts/pre_pr_smoke.sh - mandatory pre-PR local stack smoke gate.
 #
 # Contract: run this after writing code, before `gh pr create`. The
 # companion hook (scripts/hooks/pre-push, install via
@@ -8,7 +8,7 @@
 #
 # Why this exists: CI alone cannot catch defects that only appear when
 # the code runs against a real Postgres schema inside the container
-# (e.g. a SELECT whose column order disagrees with schema.sql — that
+# (e.g. a SELECT whose column order disagrees with schema.sql - that
 # class of bug passes every mocked unit test). This gate exercises the
 # branch's src/ and scripts/ inside a live container.
 #
@@ -33,7 +33,7 @@ HEALTH_INTERVAL_SECONDS=3
 SMOKE_MAX_TICKERS=3
 
 # BUGFIX (cycle146, issue #371): REFUSE to run `docker compose down -v` against
-# any non-local Docker daemon — not just tcp://. The original cycle145 guard
+# any non-local Docker daemon - not just tcp://. The original cycle145 guard
 # (issue #363 follow-up) only matched DOCKER_HOST=tcp://...; an SSH Docker
 # context (DOCKER_HOST=ssh://user@host) bypassed it and would still wipe the
 # remote volume. Invert to deny-by-default: only DOCKER_HOST=unix://... is
@@ -48,12 +48,22 @@ if [[ -n "${DOCKER_HOST:-}" ]] && [[ ! "${DOCKER_HOST:-}" =~ ^unix:// ]]; then
         echo "[pre-pr-smoke] to exercise the gate against a remote stack."
         exit 9
     fi
-    echo "[pre-pr-smoke] WARNING: DOCKER_HOST=${DOCKER_HOST} (non-local) — proceeding because ALLOW_NONLOCAL_SMOKE=1"
+    echo "[pre-pr-smoke] WARNING: DOCKER_HOST=${DOCKER_HOST} (non-local) - proceeding because ALLOW_NONLOCAL_SMOKE=1"
 fi
 
 echo "[pre-pr-smoke] === alphard pre-PR smoke gate ==="
 echo "[pre-pr-smoke] branch: $(git rev-parse --abbrev-ref HEAD)"
 echo "[pre-pr-smoke] commit: $(git rev-parse --short HEAD)"
+
+# BUGFIX (2026-09-02): refresh Russian GOST CA bundle before stack up.
+# Tinkoff / MOEX chains can rotate (CA expiries, intermediate replacements).
+# Auto-refresh here so the smoke gate catches SSL handshake failures
+# *before* push, not after.
+if [ -f "$REPO_ROOT/scripts/fetch_tinkoff_gost_ca.py" ]; then
+    echo "[pre-pr-smoke] refreshing Russian GOST CA bundle"
+    python3 "$REPO_ROOT/scripts/fetch_tinkoff_gost_ca.py" \
+        --out "$REPO_ROOT/docker/certs/tinkoff-gost-ca-bundle.pem" || true
+fi
 
 # Compose reads .env from the repo root. /root/.env uses `export FOO=bar`
 # shell syntax, which compose does not parse, so normalise it if the
@@ -79,7 +89,7 @@ fi
 # `container_name: alphard-bot`, `alphard-postgres`, `alphard-redis`.
 # Docker
 # Compose honours these literal names and does NOT prefix them with
-# the project name — the `-p alphard-smoke-<PID>` flag scopes
+# the project name - the `-p alphard-smoke-<PID>` flag scopes
 # volumes/networks only, not hardcoded container names. On a host
 # where the operator's stack is already running, `compose up` fails at
 # step [1/4] with "Conflict. The container name '/alphard-bot' is
@@ -93,7 +103,7 @@ fi
 # We also re-add `alphard-postgres` as a network alias for the
 # postgres service. Without `container_name: alphard-postgres`,
 # Compose only adds the service key (`postgres`) as a DNS alias on
-# the alphard-net network — the bot's entrypoint hardcodes the
+# the alphard-net network - the bot's entrypoint hardcodes the
 # hostname `alphard-postgres` (docker/entrypoint.sh:106), so the bot
 # would fail to resolve postgres. The smoke's alphard-net is a
 # separate Docker network (named `alphard-smoke-<PID>_alphard-net`),
@@ -101,7 +111,7 @@ fi
 # into the operator's stack.
 #
 # `!reset null` would be cleaner but is not supported by Compose v2.40
-# on this host — verified via `docker compose ... config` that `!reset`
+# on this host - verified via `docker compose ... config` that `!reset`
 # is silently ignored. We redefine explicitly instead.
 OVERRIDE_FILE="/tmp/alphard-pre-pr-smoke-$$.yaml"
 COMPOSE_PROJECT_NAME="alphard-smoke-$$"
@@ -154,7 +164,7 @@ echo "[pre-pr-smoke] [1/4] bringing up stack..."
 # single-file bind-mounts render as directories on LXC, so the schema
 # never applied and _auth_probe was missing. Schema application is now
 # handled by the bot's entrypoint via init_schema() before auth_probe()
-# — see tests/test_347_pg_init_removal.py.
+# - see tests/test_347_pg_init_removal.py.
 #
 # alphard-web (issue #393, PR #394) is also brought up so the wire-up
 # is exercised in smoke. It bind-mounts ./src:ro via the override above.
@@ -195,7 +205,7 @@ echo "[pre-pr-smoke] [2.5/4] lint+format gate (CI parity: flake8 + black on src/
 # only lints src/ tests/, which let the PR #388 style() commit slip
 # through and cost an extra round trip. Mirror CI exactly here so a
 # flake8/black violation on any script/ file fails the smoke the same
-# way CI would — before we waste a PR cycle on it.
+# way CI would - before we waste a PR cycle on it.
 if ! python3 -m flake8 src/ tests/ scripts/ \
         --max-line-length=120 --extend-ignore=E203,W503; then
     echo "[pre-pr-smoke] FAIL: flake8 reported issues"
@@ -209,7 +219,7 @@ fi
 # alphard-web (issue #393, PR #394): also probe the dashboard service so
 # the wire-up is verified in smoke. start_period=30s in compose; we give
 # the same grace window. If /api/health 5xx's (DSN missing, server
-# crashed), dump logs and fail the gate — there's no point shipping a
+# crashed), dump logs and fail the gate - there's no point shipping a
 # PR that green-lights while the dashboard is dead.
 echo "[pre-pr-smoke] [2.5/4] waiting for alphard-web healthy..."
 web_healthy=0
@@ -238,7 +248,7 @@ fi
 # Smoke a few representative endpoints so a future wire-up regression
 # (e.g. typo in a route name) is caught here, not in production. The
 # HTML root, /api/summary, and /api/health are all probed from inside
-# the alphard-net. Failures are non-fatal at this gate — we only
+# the alphard-net. Failures are non-fatal at this gate - we only
 # block merge if the server itself is unhealthy. The point is to
 # surface the wire-up in `docker logs alphard-web` for the next QA pass.
 echo "[pre-pr-smoke] [2.75/4] probing wire-up endpoints..."

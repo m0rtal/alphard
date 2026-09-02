@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/quickstart.sh — first-shot-friendly Alphard stack bootstrap.
+# scripts/quickstart.sh - first-shot-friendly Alphard stack bootstrap.
 #
 # Goal: turn `git clone ... && cd alphard && ./scripts/quickstart.sh` into
 # a single command that produces a fully running stack (postgres, redis,
@@ -9,7 +9,7 @@
 #     + image caches)
 #   - Ports 5432, 6379 free on the host
 #
-# What it does (idempotent — re-running is safe):
+# What it does (idempotent - re-running is safe):
 #   1. Sanity-checks: docker is up, compose v2 present, repo root
 #      contains docker-compose.yaml and .env.example.
 #   2. Creates .env from .env.example if missing.
@@ -44,7 +44,7 @@
 #     hangs on DNS egress; the first wave of smoke tests required a
 #     manual `docker exec ... psql < init.sql` to seed the _auth_probe
 #     table. Fixed in compose (alpine -> postgres:16-alpine).
-#   - bind-mounts need `apparmor=unconfined` in compose — the daemon
+#   - bind-mounts need `apparmor=unconfined` in compose - the daemon
 #     rejected the start with `apparmor_parser: Access denied`. Fixed
 #     in compose.
 #   - PROM_YML_B64 was not in .env, so Prometheus started with a zero-
@@ -202,7 +202,7 @@ fi
 # StackUpdate silently truncates env values >60 chars (Go JSON unmarshal
 # fails on long strings), and the baked base64 blobs were routinely cut
 # off mid-keyword. Bind-mount from the repo is the same fix PR #284 used
-# Nothing extra to bake — the bot's metrics server is bind-mounted.
+# Nothing extra to bake - the bot's metrics server is bind-mounted.
 
 ok "prometheus stack removed (PR #399); bot exposes /metrics on port 8765"
 
@@ -216,7 +216,7 @@ ok "prometheus stack removed (PR #399); bot exposes /metrics on port 8765"
 # The remaining TIMEOUT_SEC=0 fast-fail path is checked AFTER compose
 # runs but BEFORE the health-gate polling loop.
 if [[ "$SKIP_COMPOSE" == "1" ]]; then
-    info "5/5 docker compose up — skipped (ALPHARD_SKIP_COMPOSE=1)"
+    info "5/5 docker compose up - skipped (ALPHARD_SKIP_COMPOSE=1)"
     info "  Bakes written; docker compose not invoked. Run \`docker compose up -d\` yourself."
     if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
         docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' --filter "name=alphard-" 2>/dev/null || true
@@ -239,7 +239,7 @@ info "5/5 docker compose up -d"
 # and the teardown command instead. Same opt-in shape as
 # ALLOW_NONLOCAL_SMOKE=1 in scripts/pre_pr_smoke.sh: warn loudly, proceed.
 #
-# A container owned by QUICKSTART_PROJECT is this script's own stack — that
+# A container owned by QUICKSTART_PROJECT is this script's own stack - that
 # is a re-run, which is documented as idempotent, so compose reconciles it.
 QUICKSTART_PROJECT="$(basename "$REPO_ROOT")"
 CONFLICT_EXIT_CODE=9
@@ -256,12 +256,12 @@ for _c in "${GUARDED_CONTAINERS[@]}"; do
     _owner="${_owner:-<unknown>}"
 
     if [[ "$_owner" == "$QUICKSTART_PROJECT" ]]; then
-        log "  $_c already up (project $_owner) — re-run, compose will reconcile"
+        log "  $_c already up (project $_owner) - re-run, compose will reconcile"
         continue
     fi
 
     if [[ "${ALLOW_QUICKSTART_OVERWRITE:-0}" == "1" ]]; then
-        warn "$_c is already up under compose project '$_owner' — proceeding because ALLOW_QUICKSTART_OVERWRITE=1"
+        warn "$_c is already up under compose project '$_owner' - proceeding because ALLOW_QUICKSTART_OVERWRITE=1"
         continue
     fi
 
@@ -311,7 +311,7 @@ info "Health gate (up to ${TIMEOUT_SEC}s)"
 
 # One-shot services: none. chownfix was removed in PR #399
 # (its only job was chown'ing Grafana/Prometheus leaf directories).
-# These must NOT be in EXPECTED — the health gate requires
+# These must NOT be in EXPECTED - the health gate requires
 # State.Status == "running", which one-shots never satisfy.
 # Note: alphard-pg-init was removed in PR #351 (issue #347); see
 # tests/test_347_pg_init_removal.py and the issue #355 regression
@@ -320,7 +320,7 @@ ONE_SHOT=()
 # Long-running services we wait for:
 EXPECTED=("alphard-postgres" "alphard-redis" "alphard-bot")
 # PR #399 removed Grafana and Prometheus, and with them the only
-# services that declared a profile — so there is no profile left to
+# services that declared a profile - so there is no profile left to
 # filter on (#402).
 
 elapsed=0

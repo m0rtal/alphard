@@ -1,5 +1,5 @@
 #!/bin/sh
-# init_postgres.sh — apply pg_hba.conf trust line for our private subnet.
+# init_postgres.sh - apply pg_hba.conf trust line for our private subnet.
 #
 # Run this AFTER postgres first starts (i.e., after docker stack deploy).
 # Why? The default pg_hba.conf from postgres:16-alpine uses scram-sha-256
@@ -10,13 +10,13 @@
 # the FIRST rule so that any connection from 172.16.0.0/12 (the RFC1918
 # range Docker uses for default and user-defined bridges) is accepted
 # without password. The legacy 192.168.0.0/16 rule covered ~65k LAN
-# addresses — narrowed in issue #97 to keep defence-in-depth intact
+# addresses - narrowed in issue #97 to keep defence-in-depth intact
 # (LAN peers should NOT reach Postgres without credentials).
 #
 # Override the trust range with POSTGRES_TRUST_SUBNET (e.g.
 # POSTGRES_TRUST_SUBNET=172.18.0.0/16 if you know the bridge subnet).
 # Set it to an unreachable value like 127.0.0.0/32 to disable trust
-# entirely — make sure password auth works first, then remove.
+# entirely - make sure password auth works first, then remove.
 #
 # Idempotent: only adds the line if it isn't already present.
 #
@@ -26,7 +26,7 @@
 # This is the LEGACY manual bootstrap path. For normal container
 # deploys, the bot's own `init_schema()` (called from
 # `docker/entrypoint.sh` BEFORE `auth_probe()`, see issue #347 /
-# PR #351 — `pg-init` was dropped because its single-file
+# PR #351 - `pg-init` was dropped because its single-file
 # bind-mounts rendered as directories on PVE LXC, breaking
 # schema application) is the active path. Use this script only
 # when running postgres outside compose or recovering from a
@@ -75,7 +75,7 @@ echo "Trust line added (${TRUST_CIDR})"
 # Issue #73: the trust line above makes password irrelevant on localhost
 # (psql will succeed with ANY password or none). Drop the literal
 # `PGPASSWORD=alphard` so the script does not pin the historical credential
-# — `docker-compose.yaml` sources ${POSTGRES_PASSWORD:?...required} from
+# - `docker-compose.yaml` sources ${POSTGRES_PASSWORD:?...required} from
 # .env and this script should mirror that posture instead of hardcoding a
 # value that contradicts the compose path.
 psql -h localhost -U "${POSTGRES_USER:-alphard}" -d "${POSTGRES_DB:-alphard}" -w \

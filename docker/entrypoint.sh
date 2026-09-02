@@ -47,6 +47,41 @@ done
 # as if it had been sourced.
 unset ENV_FILE_CANDIDATE
 
+# BUGFIX (2026-09-02): Russian .ru endpoints (invest-public-api.tinkoff.ru,
+# iss.moex.com) use Russian Trusted Root CA + Sub CA (GOST crypto) which
+# is NOT in the standard certifi bundle. Without our GOST bundle every
+# HTTPS request returns ssl.SSLCertVerificationError after the TCP
+# handshake completes — surfaces as 30-second TCP timeouts when `requests`
+# retries. We rebuild the system trust store from certifi + our bundle
+# before any Python `requests` call fires.
+GOST_BUNDLE="/etc/ssl/certs/tinkoff-gost-ca-bundle.pem"
+COMBINED_BUNDLE="/etc/ssl/certs/ca-certificates.crt"
+if [ -f "${GOST_BUNDLE}" ]; then
+    python3 - <<PYEOF
+import os, sys
+gost = "${GOST_BUNDLE}"
+combined = "${COMBINED_BUNDLE}"
+certifi = os.environ.get("REQUESTS_CA_BUNDLE") or ""
+if not certifi:
+    try:
+        import certifi
+        certifi = certifi.where()
+    except ImportError:
+        certifi = ""
+parts = []
+for p in (certifi, gost):
+    if p and os.path.exists(p):
+        with open(p) as f:
+            parts.append(f.read())
+os.makedirs(os.path.dirname(combined), exist_ok=True)
+with open(combined, "w") as f:
+    f.write("".join(parts))
+print(f"[entrypoint] rebuilt {combined} ({sum(len(p) for p in parts)} bytes, {parts.count('-----BEGIN CERTIFICATE-----')} CAs)")
+PYEOF
+    export REQUESTS_CA_BUNDLE="${COMBINED_BUNDLE}"
+    export SSL_CERT_FILE="${COMBINED_BUNDLE}"
+fi
+
 echo "Starting Alphard..."
 # S-H5: do NOT echo $ENV value into docker logs (it may carry secrets in
 # misconfigured deployments). Print only the name of the active profile.

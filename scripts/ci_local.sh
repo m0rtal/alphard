@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Local Phase 1.2 gate runner — replaces GitHub Actions for environments
+# Local Phase 1.2 gate runner - replaces GitHub Actions for environments
 # where Actions infrastructure is unavailable. Runs:
 #   1. pytest with coverage threshold 80% (integration tests skipped without DSN)
 #   2. black format check
