@@ -61,7 +61,7 @@ CLOSES_PR_PAIR = re.compile(r"Closes\s+#(\d+),\s*PR\s+#(\d+)")
 # #394 was allowlisted forever because `_merged_pr_numbers()` only read squash
 # suffixes and could not see its `--no-ff` merge subject; #419 was allowlisted
 # because nothing proved an in-flight number was a PR rather than an issue.
-INFLIGHT_PRS = frozenset({"452"})
+INFLIGHT_PRS = frozenset()
 
 # Entries written before this guard existed that say "PR #NNN" for a number
 # that is an issue (#290, #349) or a closed-unmerged PR (#378, superseded by
@@ -228,6 +228,50 @@ def test_inflight_prs_are_not_closed_issues() -> None:
         f"these INFLIGHT_PRS numbers are below the newest merged PR (#{newest_merged}), "
         f"so they cannot be in flight — they are issues or stale entries: "
         f"{', '.join('#' + pr for pr in spent)}"
+    )
+
+
+def test_latest_changelog_commit_does_not_self_assert_inflight() -> None:
+    """A CHANGELOG-touching squash-merge must not keep itself in INFLIGHT_PRS.
+
+    The recursion that #433 / #438 / #447 / #449 / #453 each had to ship a
+    one-line workaround for: an author adds their own PR number to
+    `INFLIGHT_PRS` to make the CHANGELOG entry resolve on branch tip, then
+    forgets to drop the entry on squash-merge. The drift-window guard from
+    PR #451 covers the symmetric half (latest CHANGELOG commit's PR exempt
+    from the window), but INFLIGHT_PRS pruning has no equivalent — every
+    author-asserted self-insert has to be hand-pruned by the next person who
+    notices main CI red.
+
+    This test pins the contract that the latest CHANGELOG-touching commit's
+    PR is never author-asserted in INFLIGHT_PRS. If a future PR sneaks one
+    past the manual prune, this test fires before the recursive damage
+    reaches `_drift_window_prs`.
+    """
+    # Find the latest commit that actually touched CHANGELOG.md. The bug class
+    # is a CHANGELOG-touching squash-merge leaving its own number asserted; a
+    # non-changelog commit can sit on top and the bug is still latent.
+    latest_subject = _git(
+        "log",
+        f"-{MERGE_SCAN_DEPTH}",
+        "--format=%H %s",
+        "--",
+        "CHANGELOG.md",
+    )
+    if not latest_subject:
+        pytest.skip("no commit touches CHANGELOG.md in the scan window")
+
+    first_line = latest_subject.splitlines()[0]
+    sha, _, subject = first_line.partition(" ")
+    m = MERGE_PR_SUFFIX.search(subject) or NO_FF_MERGE_SUBJECT.match(subject)
+    if not m:
+        pytest.skip("latest CHANGELOG-touching commit is not a merge — nothing to check")
+
+    latest_pr = m.group(1)
+    assert latest_pr not in INFLIGHT_PRS, (
+        f"the latest CHANGELOG-touching commit {sha[:7]} is PR #{latest_pr}, "
+        f"but its number is still asserted in INFLIGHT_PRS — prune it in "
+        f"{Path(__file__).name}:64 (issue #453)"
     )
 
 
