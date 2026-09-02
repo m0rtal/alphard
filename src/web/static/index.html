@@ -515,8 +515,30 @@ const state = {
 };
 
 // ─── helpers ──────────────────────────────────────────────
+// Issue #411 — bearer token: read once from sessionStorage, prompt on
+// first load, store for the duration of the tab. sessionStorage (not
+// localStorage) so the token clears when the operator closes the
+// browser. The server-side gate lives in src/web/server.py:check_auth;
+// the HTML root path is auth-open so this prompt can render.
+const TOKEN_STORAGE_KEY = 'alphard_web_token';
+function getToken() {
+  let t = sessionStorage.getItem(TOKEN_STORAGE_KEY);
+  if (!t) {
+    t = window.prompt('alphard-web bearer token:') || '';
+    if (t) sessionStorage.setItem(TOKEN_STORAGE_KEY, t);
+  }
+  return t;
+}
+
 async function api(path) {
-  const r = await fetch(path);
+  const headers = getToken() ? {Authorization: 'Bearer ' + getToken()} : {};
+  const r = await fetch(path, {headers});
+  // Issue #411: 401 → clear stored token so a wrong / rotated token
+  // surfaces a re-prompt instead of silently throwing.
+  if (r.status === 401) {
+    sessionStorage.removeItem(TOKEN_STORAGE_KEY);
+    throw new Error(`auth required: ${path} → 401`);
+  }
   if (!r.ok) throw new Error(`${path} → ${r.status}`);
   return r.json();
 }

@@ -781,13 +781,21 @@ def test_check_auth_open_paths_skip_gate(
     assert server_mod.check_auth("/api/health", "Bearer wrong") is True
 
 
-def test_check_auth_html_root_is_protected(
+def test_check_auth_html_root_is_open(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Issue #406: HTML root path requires auth (the page itself leaks)."""
+    """Issue #411: HTML root must be auth-open so the JS token-prompt can render.
+
+    The Grafana login-page model: public page, gated data. Without this,
+    the dashboard is dead in any deployment with ALPHARD_WEB_TOKEN set.
+    The fix moved ``/`` into ``_AUTH_OPEN_PATHS`` (see server.py L75).
+    """
     monkeypatch.setenv("ALPHARD_WEB_TOKEN", "secret-token-abc")
-    assert server_mod.check_auth("/", None) is False
-    assert server_mod.check_auth("/", "Bearer secret-token-abc") is True
+    assert server_mod.check_auth("/", None) is True
+    # Even without the header, the page loads so the token prompt can render.
+    assert server_mod.check_auth("/", "Bearer wrong") is True
+    # /api/* is still gated.
+    assert server_mod.check_auth("/api/summary", None) is False
 
 
 def test_check_auth_matching_bearer_passes(

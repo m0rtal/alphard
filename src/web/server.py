@@ -14,11 +14,14 @@ Layering (per SOUL.md):
   for the psycopg connection helper. It does NOT call into the loader
   chain, supervisor, or coordinator.
 
-Issue #406 — auth gate: every /api/* endpoint (except /api/health) and
-the HTML root require ``Authorization: Bearer <ALPHARD_WEB_TOKEN>`` when
-``ALPHARD_WEB_TOKEN`` is set in the environment. If unset, the gate
-fails open so local dev still works; the compose file MUST inject the
-env in production (see ``tests/test_compose_structure.py``).
+Issue #406/#411 — auth gate: every /api/* endpoint (except /api/health)
+requires ``Authorization: Bearer <ALPHA...N>`` when ``ALPHARD_WEB_TOKEN``
+is set in the environment. The HTML root path ``/`` is intentionally
+auth-open so the JS client can render a token-prompt before fetching
+data — the same model as Grafana's login page (public page, gated
+data). If ``ALPHARD_WEB_TOKEN`` is unset the gate fails open so local
+dev still works; the compose file MUST inject the env in production
+(see ``tests/test_compose_structure.py``).
 """
 
 from __future__ import annotations
@@ -71,7 +74,10 @@ _AUTH_TOKEN_ENV: str = "ALPHARD_WEB_TOKEN"
 #: Paths that stay open even when ``_AUTH_TOKEN_ENV`` is set.
 #: /api/health is required by the container healthcheck; the LAN-side
 #: operator dashboard scrape should not depend on injecting the header.
-_AUTH_OPEN_PATHS: frozenset[str] = frozenset({"/api/health"})
+#: ``/`` is the HTML root — it must be auth-open so the JS client can
+#: render a token-prompt before fetching data (issue #411). The Grafana
+#: login-page model: public page, gated data behind it.
+_AUTH_OPEN_PATHS: frozenset[str] = frozenset({"/api/health", "/"})
 
 
 def execute_query(dsn: str, sql: str, params: dict[str, Any]) -> list[dict[str, Any]]:
