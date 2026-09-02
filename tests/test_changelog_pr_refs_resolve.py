@@ -54,7 +54,7 @@ PR_NUMBER = re.compile(r"#(\d+)")
 # the next no-ff merge will be detected via the test, and a follow-up PR
 # drops the entry. #399 is the prior example of an entry that needed
 # pruning — see cycle165 QA review (issue #407).
-INFLIGHT_PRS = frozenset({"394"})
+INFLIGHT_PRS = frozenset({"394", "420"})
 
 # Entries written before this guard existed that say "PR #NNN" for a number
 # that is an issue (#290, #349) or a closed-unmerged PR (#378, superseded by
