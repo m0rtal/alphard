@@ -160,9 +160,89 @@ _BACKFILL_SCRIPT_ARGS: tuple[str, ...] = (
 _BACKFILL_RESPAWN_BACKOFF_SECONDS = 30
 _BACKFILL_MAX_RESPAWNS_PER_HOUR = 10  # >10 deaths/hour = fatal: stop the loop
 
+# Circuit breaker (issue #430): when broker egress (Tinkoff 178.130.128.33:443,
+# MOEX iss.moex.com:443) is persistently unreachable, the child exits rc=1
+# on every spawn. Constant 30s respawn thrashes the supervisor and trips
+# the >10/hour fatal cap, causing Docker to restart the bot — a sawtooth
+# pattern. Detect persistent UNAVAILABLE and back off exponentially:
+# after _CB_UNAVAILABLE_THRESHOLD consecutive network-only failures, sleep
+# _CB_BACKOFF_SECONDS instead of 30s. After _CB_RECOVERY_SECONDS of backoff,
+# half-open: try one respawn; on success close the breaker, on failure reopen.
+_CB_UNAVAILABLE_THRESHOLD = 3  # consecutive UNAVAILABLE child exits → open
+_CB_BACKOFF_SECONDS = 300  # 5 min between respawns while open
+_CB_RECOVERY_SECONDS = 900  # 15 min of backoff before half-open probe
+
 # Module-level logger so _spawn_backfill can log without depending on
 # main() having called logging.basicConfig() yet.
 _supervisor_logger = logging.getLogger("alphard.backfill_supervisor")
+
+
+_DEFAULT_NETWORK_LOG_PATH = "/app/logs/backfill_history_md.log"
+
+
+def _child_exit_was_network_outage(
+    child_pid: int = 0,
+    log_path: str = _DEFAULT_NETWORK_LOG_PATH,
+) -> bool:
+    """Return True iff the most recent backfill_history_md log lines for this
+    child pid are dominated by gRPC UNAVAILABLE / TCP TimeoutError.
+
+    Reads ``log_path`` (defaults to ``/app/logs/backfill_history_md.log``,
+    the RotatingFileHandler 10MiB x3 segment). The child writes its own
+    FileHandler so it never holds the file open with exclusive lock — we
+    can read line-by-line safely.
+
+    Heuristic: count lines in the last 50 containing one of the network
+    error patterns (UNAVAILABLE, TimeoutError, connect() timed out, tcp
+    handshaker shutdown, Max retries exceeded). If ≥3 such lines appear,
+    call it a network outage. Returns False on read failure (conservative:
+    don't trip the breaker on transient fs errors).
+    """
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            tail = f.readlines()[-50:]
+    except OSError:
+        return False
+    network_signature_count = sum(
+        1
+        for line in tail
+        if (
+            "UNAVAILABLE" in line
+            or "TimeoutError" in line
+            or "connect() timed out" in line
+            or "tcp handshaker shutdown" in line
+            or "Max retries exceeded" in line
+        )
+    )
+    # Threshold: at least 3 network-pattern lines in last 50 → call it a
+    # network outage (NOT an OOM, code bug, or auth_probe). This ratio
+    # tolerates the occasional non-network WARN that shares the log.
+    return network_signature_count >= 3
+
+
+def _read_unavail_streak(path: str) -> int:
+    """Read circuit-breaker streak counter from disk (survives bot restart)."""
+    try:
+        import json as _json
+
+        with open(path, "r", encoding="utf-8") as f:
+            return int(_json.load(f).get("unavail_streak", 0))
+    except (OSError, ValueError):
+        return 0
+
+
+def _write_unavail_streak(path: str, value: int, log) -> None:
+    """Persist circuit-breaker streak counter. Failures are non-fatal —
+    on persistent storage failure we just lose the streak count, which
+    degrades back to the original sawtooth-loop behaviour but does not
+    break correctness."""
+    try:
+        import json as _json
+
+        with open(path, "w", encoding="utf-8") as f:
+            _json.dump({"unavail_streak": value, "updated": time.time()}, f)
+    except OSError as e:
+        log.warning(f"_write_unavail_streak: persist failed: {e}; continuing without breaker state")
 
 
 def _spawn_backfill() -> int:
@@ -259,7 +339,29 @@ def _backfill_supervisor_loop() -> None:
                 pass
             break
         # Backoff before respawn.
-        _sleep_interruptible(_BACKFILL_RESPAWN_BACKOFF_SECONDS)
+        # Issue #430: if the last N child exits were network-only (Tinkoff/MOEX
+        # TCP TimeoutError / UNAVAILABLE), open the circuit breaker — back
+        # off _CB_BACKOFF_SECONDS instead of 30s to avoid the sawtooth
+        # restart-loop. After _CB_RECOVERY_SECONDS of cumulative backoff,
+        # half-open: try one respawn; if the child survives past the
+        # early-network-probe window (30s), close the breaker.
+        backoff = _BACKFILL_RESPAWN_BACKOFF_SECONDS
+        cb_state_path = "/tmp/alphard-cb-state.json"
+        if rc != 0 and _child_exit_was_network_outage(pid):
+            _unavail_streak = _read_unavail_streak(cb_state_path) + 1
+            _write_unavail_streak(cb_state_path, _unavail_streak, _supervisor_logger)
+            if _unavail_streak >= _CB_UNAVAILABLE_THRESHOLD:
+                backoff = _CB_BACKOFF_SECONDS
+                _supervisor_logger.warning(
+                    f"_backfill_supervisor_loop: circuit OPEN after {_unavail_streak} "
+                    f"consecutive network-outage exits; backing off {_CB_BACKOFF_SECONDS}s"
+                )
+        else:
+            # Clean run (rc==0) or non-network failure (rare: OOM, bug). Reset streak.
+            if _read_unavail_streak(cb_state_path) > 0:
+                _supervisor_logger.info("_backfill_supervisor_loop: circuit CLOSED (non-network exit or clean exit)")
+                _write_unavail_streak(cb_state_path, 0, _supervisor_logger)
+        _sleep_interruptible(backoff)
         # Prune `death_timestamps` on EVERY iteration (cheap when empty,
         # bounded when not) so the list cannot grow unbounded on long
         # stretches of clean exits. Only APPEND on crashes — clean exits
