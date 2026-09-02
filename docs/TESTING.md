@@ -314,7 +314,7 @@ volume, etc.). Runtime-skip маскирует регрессии: тест мо
 | Job | Что проверяет |
 |---|---|
 | `Lint + Format` | flake8, black |
-| `Ops policy` | нет literal Grafana password, нет anonymous auth (legacy Grafana checks; PR #399 dropped the gate) |
+| `Ops policy` | нет literal Grafana password, нет anonymous auth (regression guard: PR #399 dropped Grafana/Prometheus services, но CI gate оставлен на случай ре-интродукции). Live metrics: `alphard-web` на .107:8081 (PR #394), читает Postgres напрямую. |
 | `SCA (pip-audit)` | known CVEs в зависимостях |
 | `Secrets scan (gitleaks)` | нет секретов в diff |
 | `Build + push` | docker image собирается |

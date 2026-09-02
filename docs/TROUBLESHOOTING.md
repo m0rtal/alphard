@@ -406,19 +406,27 @@ import → удалить или использовать; E711 = `== None` → 
 
 ### 8.6 `Grafana secrets guard` failed
 
-**Cause:** literal Grafana admin password или anonymous auth
-re-enabled. CI ripgrep'ом ищет `admin_password:` без `${...}`
-interpolation.
+**Cause:** literal `GF_SECURITY_ADMIN_PASSWORD=...` или
+`GF_AUTH_ANONYMOUS_ENABLED=true` найдены в `scripts/`,
+`docker-compose.yaml`, или `docker/`. Gate существовал для
+Grafana-стека (PR #399 его снёс) и сохранён как **regression
+guard**: если будущий PR случайно вернёт Grafana/Prometheus и
+хардкоднет пароль — CI заорёт. CI ripgrep'ом ищет assignments
+без `${...}` interpolation.
 
 **Fix:** все Grafana secrets через `${GRAFANA_ADMIN_PASSWORD}`,
-`${GRAFANA_SECRET_KEY}` env vars. Подробнее см. `docs/SECURITY.md`
-и issue #55.
+`${GRAFANA_SECRET_KEY}` env vars. Если этот guard сработал
+после #399 — почти наверняка ваш PR ре-интродуцит Grafana
+либо случайно вставил `GF_*` в compose-окружение; пересмотрите
+дифф. Подробнее см. `docs/SECURITY.md` и issue #55.
 
 ### 8.7 `Ops policy` failed
 
-Найден literal Grafana password, anonymous auth, или `0.0.0.0/0`
-trust в Postgres. См. `tests/test_init_postgres_sh.py` для
-ожидаемого формата.
+Найден literal `GF_SECURITY_ADMIN_PASSWORD`, anonymous auth,
+или `0.0.0.0/0` trust в Postgres. После #399 первые две группы
+срабатывают только если кто-то ре-интродуцит Grafana — это
+regression guard, как 8.6. См. `tests/test_init_postgres_sh.py`
+для ожидаемого формата Postgres-grant'а.
 
 ### 8.8 Test fails only on CI
 
@@ -503,8 +511,10 @@ docker exec alphard-bot curl -s http://127.0.0.1:8765/metrics > /tmp/metrics.txt
 docker compose stop alphard-bot
 ```
 
-Read-only mode не трогает Postgres, Prometheus, Grafana — мониторинг
-продолжает работать.
+Read-only mode не трогает Postgres и не публикует никаких
+наблюдательных сервисов (Grafana/Prometheus снесены в PR #399;
+операторский UI — `alphard-web` на :8081, читает Postgres
+напрямую через SQL) — мониторинг продолжает работать.
 
 ---
 
