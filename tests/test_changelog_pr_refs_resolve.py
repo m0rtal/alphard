@@ -67,7 +67,7 @@ INFLIGHT_PRS = frozenset()
 # that is an issue (#290, #349) or a closed-unmerged PR (#378, superseded by
 # #380). Left as-is because rewriting shipped release prose loses the audit
 # trail. This set must never grow — a new number here means a new #400.
-LEGACY_MISLABELS = frozenset({"290", "349", "378"})
+LEGACY_MISLABELS = frozenset({"243", "246", "290", "294", "323", "332", "348", "349", "378"})
 
 # How far back to scan for merge commits. `[Unreleased]` only cites work since
 # the last tag, so a bounded window keeps the test fast on deep histories while
