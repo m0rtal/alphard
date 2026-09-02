@@ -1,0 +1,43 @@
+name: Changelog allowlist guard
+
+# Regression guard for issue #407: PR #399 left `INFLIGHT_PRS` with self-reference
+# after merge, causing `test_inflight_allowlist_is_pruned` to fail on main HEAD.
+# The full ci.yml workflow runs the entire pytest suite on push to main, but if
+# a different test flakes or hangs, the changelog gate can get masked. This
+# dedicated workflow runs ONLY the two changelog-drift guards so any future
+# regression in `INFLIGHT_PRS`, `LEGACY_MISLABELS`, or the drift window is caught
+# in under a minute and surfaces in the GitHub UI as its own red check.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  changelog-allowlist:
+    name: Changelog drift + allowlist gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need git history for `_merged_pr_numbers()` to work.
+          fetch-depth: 500
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install pytest
+        run: pip install pytest
+      # Regression guard: PR #399's squash-merge commit was reachable from
+      # main but the inflight allowlist wasn't pruned, so this guard fired
+      # on the post-merge push. Keep this command focused on the two gates
+      # that protect against the regression class.
+      - name: Run changelog drift + allowlist guards
+        run: |
+          pytest \
+            tests/test_changelog_pr_refs_resolve.py \
+            tests/test_changelog_drift_window.py \
+            -v --no-cov

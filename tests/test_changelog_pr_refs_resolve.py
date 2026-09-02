@@ -47,7 +47,9 @@ PR_NUMBER = re.compile(r"#(\d+)")
 
 # Open at the time their entry lands, so git cannot confirm them yet.
 # #394 ships alphard-web and is a stated prerequisite of the #399 entry.
-INFLIGHT_PRS = frozenset({"394", "399"})
+# Post-#399 (issue #407): #399 is merged on main (cfa7b9b), so it was dropped
+# from this allowlist. #394 is still in-flight.
+INFLIGHT_PRS = frozenset({"394"})
 
 # Entries written before this guard existed that say "PR #NNN" for a number
 # that is an issue (#290, #349) or a closed-unmerged PR (#378, superseded by
