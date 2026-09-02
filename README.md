@@ -152,7 +152,7 @@ alphard/
 ├── tests/                            # 1621+ tests, ~95% coverage
 ├── .dockerignore
 ├── .env.example                # Шаблон секретов (TINKOFF_SANDBOX_TOKEN/REAL_TOKEN, POSTGRES_PASSWORD)
-├── docker-compose.yaml         # alphard-bot, postgres, redis, alphard-web
+├── docker-compose.yaml         # alphard-bot, postgres, alphard-web
 ├── pyproject.toml              # Poetry (Phase 2+ deps)
 ├── requirements.txt            # Pinned CI deps
 ├── LICENSE                     # Apache-2.0 (canonical, 11.3 KB)
@@ -218,7 +218,7 @@ Branch protection на `main`:
 - `gitleaks` pre-commit + GitHub Actions CI блокируют утечки секретов
 - Контейнер работает от non-root user (UID 1000)
 - Risk Agent — `RiskLimits` frozen=True, любая мутация post-construction → reject
-- Сеть изолирована (postgres/redis только внутри `alphard-net`)
+- Сеть изолирована (postgres только внутри `alphard-net`)
 - Все credentials через `.env`, шаблон в `.env.example`
 - `LIVE_TRADING=false` hardlock в `src/broker/tinkoff_account.py` — бот НЕ
   размещает real orders даже при подмене credentials

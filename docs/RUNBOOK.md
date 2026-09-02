@@ -32,7 +32,7 @@
 | Switch | Где живёт | Что делает | Как активировать |
 |---|---|---|---|
 | **`alphard-bot.pause`** | `.env` (`BOT_PAUSED=true`) | Risk Agent отклоняет все orders, бот продолжает мониторинг | `docker compose stop alphard-bot` или set `BOT_PAUSED=true` + restart |
-| **`alphard-net.isolate`** | docker network `alphard-net` | Отрезает бот от postgres + redis; оставляет только healthcheck | `docker network disconnect alphard-net alphard-bot` |
+| **`alphard-net.isolate`** | docker network `alphard-net` | Отрезает бот от postgres; оставляет только healthcheck | `docker network disconnect alphard-net alphard-bot` |
 | **`alphard-token.rotate`** | Tinkoff UI + `.env` | Принудительная смена broker token + рестарт стека | Tinkoff Invest → Settings → Token → Revoke → вписать новый в `.env` → `docker compose up -d` |
 | **`alphard-portainer.lockdown`** | Portainer .107 → RBAC | Временно блокирует все изменения в stack кроме read-only ops | Portainer UI → Settings → Disable API key для текущего пользователя |
 | **`alphard-llm.cooloff`** | Coordinator config | Запрещает любые LLM-driven решения на N часов | `LLM_COOLOFF_HOURS=24` + restart |

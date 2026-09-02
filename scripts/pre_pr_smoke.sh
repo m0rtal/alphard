@@ -86,7 +86,7 @@ fi
 # surface on hosts already running the operator's alphard-web stack.
 #
 # Why the override is necessary: docker-compose.yaml hardcodes
-# `container_name: alphard-bot`, `alphard-postgres`, `alphard-redis`.
+# `container_name: alphard-bot`, `alphard-postgres`.
 # Docker
 # Compose honours these literal names and does NOT prefix them with
 # the project name — the `-p alphard-smoke-<PID>` flag scopes
@@ -161,8 +161,6 @@ services:
       alphard-net:
         aliases:
           - alphard-postgres
-  redis:
-    container_name: ${COMPOSE_PROJECT_NAME}-redis-1
 YAML
 
 # BUGFIX (issue #469 + #479): pre-fetch the Russian GOST CA bundle

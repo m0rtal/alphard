@@ -390,13 +390,12 @@ class TestSmokeContainerNameOverride:
         # Compose derives project-scoped names from the service key, not
         # the hardcoded container_name, so we override each one to
         # `${COMPOSE_PROJECT_NAME}-<service-key>-1`.
-        # After PR #396, only three services remain in the override
-        # (alphard-bot, postgres, redis). Grafana, Prometheus, and
+        # After PR #396, only two services remain in the override
+        # (alphard-bot, postgres). Grafana, Prometheus, redis, and
         # chownfix were removed from the compose stack.
         services_and_names = {
             "alphard-bot": "alphard-bot",
             "postgres": "postgres",
-            "redis": "redis",
         }
         for service_key, project_scoped_name in services_and_names.items():
             # Each service-key section must set container_name using
