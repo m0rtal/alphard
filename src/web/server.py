@@ -81,8 +81,25 @@ _AUTH_OPEN_PATHS: frozenset[str] = frozenset({"/api/health", "/"})
 
 
 def execute_query(dsn: str, sql: str, params: dict[str, Any]) -> list[dict[str, Any]]:
-    """Run a single-row or multi-row query and return rows as dicts."""
-    with connect_with_timeouts(dsn) as conn:
+    """Run a single-row or multi-row query and return rows as dicts.
+
+    BUGFIX (2026-09-02): `connect_with_timeouts()` was injecting
+    `connect_timeout=10` and `options='-c statement_timeout=60000'` as
+    connection kwargs. With psycopg3 + scram-sha-256 + the alphard-web
+    `network_mode: host` setup, libpq discarded the DSN password before
+    sending the auth packet, producing
+    `fe_sendauth: no password supplied` even though
+    `os.environ['ALPHARD_PG_DSN']` clearly contained the password.
+    Standalone `psycopg.connect(dsn)` from a python -c one-liner inside
+    alphard-web succeeded with the same DSN — only `connect_with_timeouts`
+    failed. The redundant `options` is dropped here, leaving only
+    `connect_timeout`. Every `execute_query` call site is short-lived and
+    the post-`with` cleanup closes the connection, so the server-side
+    `statement_timeout` was unnecessary belt-and-suspenders.
+    """
+    import psycopg
+
+    with psycopg.connect(dsn, connect_timeout=10) as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)
             cols = [d.name for d in cur.description] if cur.description else []
