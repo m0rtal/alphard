@@ -35,7 +35,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from src.data.pg_store import connect_with_timeouts
+from src.data.pg_store import (  # noqa: F401  -- kept for downstream callers
+    connect_with_timeouts,
+)
 from src.web.queries import (
     DEFAULT_BACKUP_DIR,
     DEFAULT_SPARKLINE_DAYS,
