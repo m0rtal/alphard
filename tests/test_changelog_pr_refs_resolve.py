@@ -61,7 +61,7 @@ CLOSES_PR_PAIR = re.compile(r"Closes\s+#(\d+),\s*PR\s+#(\d+)")
 # #394 was allowlisted forever because `_merged_pr_numbers()` only read squash
 # suffixes and could not see its `--no-ff` merge subject; #419 was allowlisted
 # because nothing proved an in-flight number was a PR rather than an issue.
-INFLIGHT_PRS = frozenset({"450"})
+INFLIGHT_PRS = frozenset({"452"})
 
 # Entries written before this guard existed that say "PR #NNN" for a number
 # that is an issue (#290, #349) or a closed-unmerged PR (#378, superseded by
