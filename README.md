@@ -36,7 +36,8 @@ Alphard — автономный multi-agent trading system:
 ## Архитектура
 
 Краткий обзор: 8 агентов + Coordinator, один контейнер `alphard-bot`,
-состояние в Postgres, метрики в Prometheus + Grafana. Полная архитектура,
+состояние в Postgres, метрики в `alphard-web` на .107:8081 (PR #394)
+через прямой SQL к Postgres. Полная архитектура,
 конвейер Coordinator (FETCH → VALIDATE → RISK → EXECUTE → AUDIT),
 политики fail-open/fail-closed и failure modes — в
 [`ARCHITECTURE.md`](ARCHITECTURE.md). Для публичного API контракта —
@@ -139,7 +140,7 @@ alphard/
 │   │   ├── token_bucket.py     # Tinkoff rate-limit guard (capacity ≥ 1.0)
 │   │   ├── quality/            # 3-tier quality gate
 │   │   └── models.py           # TickerMeta, OHLCVRow, CorporateAction, SourceType
-│   ├── metrics_server.py       # Prometheus /health + /metrics (PR #52/#53)
+│   ├── metrics_server.py       # /health + /metrics on alphard-bot:8765 (PR #52/#53; observability surface — read by alphard-web directly since PR #399 dropped Prometheus)
 │   ├── coordinator.py          # Data→Quality→Risk→Broker pipeline + decision log
 │   └── _types.py
 ├── scripts/
@@ -242,7 +243,7 @@ Branch protection на `main`:
 | 1 | Network stall .107 | 3-layer: PR #47 tuple index, PR #50 token bucket, PR #46 statement_timeout + SIGUSR1 |
 | 2 | ~250 no-data tickers | `mark_terminally_failed.py` (commit 9d34663) |
 | 3 | Schema bootstrap on fresh volume | `init_schema()` in `docker/entrypoint.sh` (issue #347, runs BEFORE `auth_probe()`) |
-| 4 | Observability | Phase 2.8 — PR #52 metrics + PR #53 Grafana provisioning (✅ MERGED) |
+| 4 | Observability | Phase 2.8 — PR #52 metrics + PR #53 Grafana provisioning (✅ MERGED; PR #399 dropped Grafana/Prometheus; PR #394 alphard-web reads metrics directly from Postgres) |
 | 5 | Broker stub | Phase 1.3 TinkoffAccount + sandbox switch |
 | 6 | Coordinator | Phase 1.5 + PR #30 coordinator smoke + PR #33 drawdown tracker |
 | 7 | delisted_at sync | PR #37 (Phase 2.7) — merged |
