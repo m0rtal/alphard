@@ -79,11 +79,13 @@ def test_postmerge_inflight_allowlist_is_pruned() -> None:
     causing CI to fail on the post-merge push.
     """
     # Parse the INFLIGHT_PRS frozenset literal from the source file so we
-    # always reflect the live config, not a copy.
+    # always reflect the live config, not a copy. Accept both frozenset()
+    # (empty allowlist, the ideal state) and frozenset({"NNN", ...}).
     src = INFLIGHT_PRS_FILE.read_text(encoding="utf-8")
-    m = re.search(r"INFLIGHT_PRS\s*=\s*frozenset\(\{([^}]*)\}\)", src)
+    m = re.search(r"INFLIGHT_PRS\s*=\s*frozenset\((.*?)\)\s*$", src, re.MULTILINE)
     assert m is not None, f"Could not parse INFLIGHT_PRS frozenset literal from {INFLIGHT_PRS_FILE}"
-    inflight = frozenset(re.findall(r'"(\d+)"', m.group(1)))
+    body = m.group(1).strip()
+    inflight = frozenset(re.findall(r'"(\d+)"', body))
 
     merged = _merged_pr_numbers()
     if not merged:
