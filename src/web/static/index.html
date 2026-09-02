@@ -530,10 +530,15 @@ function isoLocal(s) {
   return d.toLocaleString('ru-RU', {timeZone: 'Europe/Moscow'});
 }
 function el(tag, props, ...children) {
+  // Issue #413: el() does NOT accept on* event-handler props. The DOM
+  // property setter coerces string values into functions (Function
+  // constructor semantics), so a server-row object like
+  // {onclick: 'alert(1)'} would execute arbitrary JS on click.
+  // Callers attach handlers after el() returns — the handler is then
+  // a function literal, not a string. See test_413_el_helper_on_handler_sink.
   const e = document.createElement(tag);
   if (props) for (const k in props) {
     if (k === 'class') e.className = props[k];
-    else if (k.startsWith('on')) e[k] = props[k];
     else e.setAttribute(k, props[k]);
   }
   for (const c of children) if (c != null) e.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
