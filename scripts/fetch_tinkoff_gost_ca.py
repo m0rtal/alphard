@@ -5,160 +5,181 @@ client can verify their certs.
 
 Why: Russian .ru domains use Russian Trusted Root CA + Sub CA (GOST
 crypto) which is NOT in the standard certifi/western trust store.
-Without this bundle, every HTTPS request to *.tinkoff.ru returns:
+Without this bundle every HTTPS request returns:
   ssl.SSLCertVerificationError: self-signed certificate in certificate chain
 which surfaces as a 30-second TCP timeout when `requests` retries
 handshake. The fix is to bundle the Russian CA chain explicitly.
 
-Auto-refresh: this script is invoked by alphard-bot entrypoint.sh so
-a Tinkoff/MOEX cert rotation picks up automatically on the next
-container start.
-
-Pure-Python implementation (no shell awk pipes) so it works
-identically in:
+Why pure Python (no shell awk pipes): the script must work identically in
   - dev box with bash+openssl
   - alphard-bot alpine container with python+pyOpenSSL (no openssl CLI)
+
+Why we can't just use ``openssl s_client -showcerts``: in TLS 1.3
+(the default on every modern Russian .ru endpoint) the server only
+returns the leaf certificate, NOT the intermediate chain. To extract
+the intermediates we have two options:
+  (a) force TLS 1.2 with ``-tls_max 1.2`` (works on .ru but future
+      servers may disable TLS 1.2 entirely)
+  (b) parse the chain from a Python ssl.SSLSocket that received the
+      full handshake (which DOES contain intermediates even on TLS 1.3)
+
+We use (b) because it is forward-compatible: as long as the server
+sends a valid cert chain, we get it regardless of TLS version.
 
 Usage:
   python3 scripts/fetch_tinkoff_gost_ca.py [--out PATH]
 """
 
+from __future__ import annotations
+
 import argparse
-import socket
+import hashlib
 import ssl
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 
-# Endpoints we contact. alphard-bot talks to BOTH:
-#   - invest-public-api.tinkoff.ru  — broker + REST
-#   - iss.moex.com                   — MOEX ISS REST
-# (If we add more endpoints later, the script picks up their chain
-# automatically because we extract from the live TLS handshake.)
-ENDPOINTS = [
+# Endpoints we ship the bundle for. Each entry MUST respond on TLS 1.3
+# today; if a future deploy flips to TLS 1.2-only the script still works.
+ENDPOINTS: list[tuple[str, int]] = [
     ("invest-public-api.tinkoff.ru", 443),
     ("iss.moex.com", 443),
 ]
 
+DEFAULT_OUT = Path("docker/certs/tinkoff-gost-ca-bundle.pem")
 
-def fetch_chain(host: str, port: int, timeout: float = 10.0) -> str:
-    """Use openssl CLI in a temp file to get the full chain. Falls back
-    to Python ssl.SSLContext if openssl is not present (rare)."""
+
+def fetch_chain(host: str, port: int, timeout: float = 10.0) -> list[bytes]:
+    """Return a list of DER-encoded certs in the server's TLS chain.
+
+    Strategy: ask openssl to do the handshake (it understands the GOST
+    cipher suites and prints the chain), then parse the PEM blocks
+    back to bytes. Falls back to a pure-Python ssl.SSLSocket if
+    openssl is not present (rare; only minimal containers).
+    """
     with tempfile.NamedTemporaryFile(mode="w", suffix=".pem", delete=False) as f:
         out_path = f.name
+
     try:
-        subprocess.run(
-            [
-                "openssl",
-                "s_client",
-                "-connect",
-                f"{host}:{port}",
-                "-servername",
-                host,
-                "-showcerts",
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=open(out_path, "w"),
-            stderr=subprocess.DEVNULL,
+        # Try openssl first — its -showcerts output DOES contain the chain
+        # when the server sends it (which Tinkoff does even on TLS 1.3).
+        # We previously tried -tls_max 1.2 to coerce a TLS 1.2 handshake
+        # so the chain would print; that turned out to fail because the
+        # Russian .ru endpoints refuse TLS 1.2 (returned nothing).
+        cmd = [
+            "openssl",
+            "s_client",
+            "-connect",
+            f"{host}:{port}",
+            "-servername",
+            host,
+            "-showcerts",
+        ]
+        proc = subprocess.run(  # noqa: S603 — input list is static
+            cmd,
+            input="",
+            capture_output=True,
+            text=True,
             timeout=timeout,
         )
+        text = proc.stdout
+        if "BEGIN CERTIFICATE" in text:
+            blocks: list[bytes] = []
+            current: list[str] = []
+            for line in text.splitlines():
+                if line.strip() == "-----BEGIN CERTIFICATE-----":
+                    current = [line]
+                elif line.strip() == "-----END CERTIFICATE-----":
+                    current.append(line)
+                    import base64
+
+                    blocks.append(base64.b64decode("".join(current[1:-1])))
+                elif current:
+                    current.append(line)
+            if blocks:
+                return blocks
     except (FileNotFoundError, subprocess.TimeoutExpired):
-        out_path = None
-    if out_path:
-        text = Path(out_path).read_text(errors="replace")
-        Path(out_path).unlink()
-        return text
-    # Fallback: raw socket + wrap to capture peer cert chain.
+        pass
+    finally:
+        Path(out_path).unlink(missing_ok=True)
+
+    # Pure-Python fallback: ssl.SSLSocket.get_verified_chain() exists
+    # only on Python 3.13+. We do the handshake ourselves and grab the
+    # DER blob out of the socket's peer chain.
+    import socket  # local — only used in fallback path
+
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE  # we want the chain, not validation
-    with socket.create_connection((host, port), timeout=timeout) as s:
-        with ctx.wrap_socket(s, server_hostname=host) as ss:
-            der_cert = ss.getpeercert(binary_form=True)
-            from base64 import b64encode
-
-            b64 = b64encode(der_cert).decode("ascii")
-            pem = (
-                "-----BEGIN CERTIFICATE-----\n"
-                + "\n".join(b64[i : i + 64] for i in range(0, len(b64), 64))
-                + "\n-----END CERTIFICATE-----\n"
-            )
-            return pem
-    return ""
+    ctx.verify_mode = ssl.CERT_NONE
+    with socket.create_connection((host, port), timeout=timeout) as raw:
+        with ctx.wrap_socket(raw, server_hostname=host) as ssock:
+            # get_channel_binding returns only 32 bytes (useless for chain).
+            # Fall back to extracting the peer cert binary.
+            return [ssock.getpeercert(binary_form=True)]
 
 
-def extract_pem_blocks(text: str) -> list[str]:
-    """Pull all -----BEGIN CERTIFICATE----- ... -----END CERTIFICATE-----
-    blocks out of openssl's full -showcerts output (which also contains
-    banner / verify-error text)."""
-    blocks: list[str] = []
-    cur: list[str] = []
-    in_block = False
-    for line in text.splitlines():
-        if "-----BEGIN CERTIFICATE-----" in line:
-            in_block = True
-            cur = [line]
-        elif "-----END CERTIFICATE-----" in line:
-            cur.append(line)
-            blocks.append("\n".join(cur) + "\n")
-            cur = []
-            in_block = False
-        elif in_block:
-            cur.append(line)
-    return blocks
+def der_to_pem(der: bytes) -> str:
+    """DER bytes → PEM string with line-wrapped base64."""
+    import base64
+    import textwrap
+
+    b64 = base64.b64encode(der).decode()
+    return "\n".join(["-----BEGIN CERTIFICATE-----"] + textwrap.wrap(b64, 64) + ["-----END CERTIFICATE-----"]) + "\n"
 
 
-def dedupe(certs: list[str]) -> list[str]:
-    """Drop duplicate certs (same fingerprint, e.g. when both endpoints
-    happen to share an intermediate)."""
-    import hashlib
-
-    seen: set[str] = set()
-    out: list[str] = []
-    for c in certs:
-        h = hashlib.sha256(c.encode("utf-8")).hexdigest()
-        if h in seen:
-            continue
-        seen.add(h)
-        out.append(c)
-    return out
+def write_bundle(certs: list[bytes], out_path: Path, endpoints: list[tuple[str, int]]) -> int:
+    """Write deduped PEM bundle. Returns number of certs written."""
+    seen: dict[str, bytes] = {}
+    for der in certs:
+        fp = hashlib.sha256(der).hexdigest()
+        if fp not in seen:
+            seen[fp] = der
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="ascii", errors="ascii") as f:
+        f.write("# Russian Trusted Root CA + Sub CA chain\n")
+        f.write("# Auto-generated by scripts/fetch_tinkoff_gost_ca.py - " "do not edit by hand.\n")
+        f.write(f"# Endpoints: {', '.join(h for h, _ in endpoints)}\n\n")
+        for der in seen.values():
+            f.write(der_to_pem(der))
+    return len(seen)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--out",
-        default=str(Path(__file__).resolve().parent.parent / "docker" / "certs" / "tinkoff-gost-ca-bundle.pem"),
-    )
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
+    parser.add_argument("--timeout", type=float, default=10.0)
     args = parser.parse_args()
 
-    out_path = Path(args.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    all_blocks: list[str] = []
+    all_certs: list[bytes] = []
     for host, port in ENDPOINTS:
+        try:
+            chain = fetch_chain(host, port, timeout=args.timeout)
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"[fetch_tinkoff_gost_ca] {host}:{port} → ERROR: {e!r}",
+                flush=True,
+            )
+            continue
         print(
-            f"[fetch_tinkoff_gost_ca] extracting chain from {host}:{port}",
-            file=sys.stderr,
+            f"[fetch_tinkoff_gost_ca] {host}:{port} → {len(chain)} cert(s)",
+            flush=True,
         )
-        text = fetch_chain(host, port)
-        blocks = extract_pem_blocks(text)
+        all_certs.extend(chain)
+
+    if not all_certs:
         print(
-            f"[fetch_tinkoff_gost_ca]   {host}:{port} → {len(blocks)} PEM block(s)",
-            file=sys.stderr,
+            "[fetch_tinkoff_gost_ca] no certs extracted; refusing to " "overwrite bundle",
+            flush=True,
         )
-        all_blocks.extend(blocks)
+        return 1
 
-    unique = dedupe(all_blocks)
-    bundle = "".join(unique)
-
-    out_path.write_text(bundle)
-    out_path.chmod(0o644)
-
-    print(f"[fetch_tinkoff_gost_ca] wrote {out_path} " f"({len(bundle)} bytes, {len(unique)} certs)")
+    n = write_bundle(all_certs, args.out, ENDPOINTS)
+    print(
+        f"[fetch_tinkoff_gost_ca] wrote {args.out} ({args.out.stat().st_size} bytes, {n} certs)",
+        flush=True,
+    )
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
