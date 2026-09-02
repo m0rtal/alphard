@@ -25,7 +25,10 @@ occur after a chain of fail-safe gates that all return "allow".
 
 > Eight cooperating agents orchestrated by a single `Coordinator`,
 > running as supervised threads inside one container, exchanging data
-> through Postgres and emitting Prometheus metrics on `:8765`.
+> through Postgres and emitting metrics on `:8765` (text-format
+> endpoint at `alphard-bot:8765/metrics`; primary reader is
+> `alphard-web`, PR #394, on `:8081`). _(Prometheus scraper removed
+> in PR #399.)_
 
 ### 1.2 Why one container
 
@@ -200,10 +203,10 @@ must declare its failure policy so a degraded mode is **predictable**.
 | Tinkoff gRPC outage | connection error | **fail-OPEN within layer** (retry with backoff, 3-attempt budget) | supervisor logs |
 | MOEX ISS outage | connection error | **fail-OPEN within layer** (skip source, fall back to Tinkoff MD) | `cross_source` smoke |
 | Postgres outage | `psycopg.Error` | **fail-CLOSED** (gauges stop updating, supervisor keeps trying) | `alphard_uptime_seconds` stale > 5 min |
-| Prometheus scrape failure | — | **fail-OPEN** (Grafana panel shows "No data") | dashboard alert |
+| Prometheus scrape failure _(removed, PR #399)_ | — | fail-OPEN (formerly: Grafana panel shows "No data") | dashboard alert _(superseded by `alphard-web` tile, PR #394)_ |
 | `_daily_sync_loop` exception | — | **fail-OPEN** (log + sleep, retry next tick) | `alphard_daily_sync_total{result="error"}` |
 | `_backfill_supervisor_loop` exception | — | **fail-OPEN with resume** (writes checkpoint, restarts on next tick) | `alphard_backfill_total{result="error"}` |
-| `_universe_metrics_loop` exception | — | **fail-OPEN** (gauges stay at last value, Prometheus sees stale) | `alphard_*_total` no delta |
+| `_universe_metrics_loop` exception | — | **fail-OPEN** (gauges stay at last value; reader sees stale) _(Prometheus scraper removed, PR #399; current reader is `alphard-web`, PR #394)_ | `alphard_*_total` no delta |
 | RiskGate limits object mutation post-construction | `object.__setattr__` blocked | **fail-CLOSED** (`FrozenInstanceError`) | unit test |
 
 Rule of thumb: anything that could move money is fail-CLOSED.
@@ -256,35 +259,41 @@ graph TB
         PG[("postgres:16-alpine<br/>:5432<br/>volume: /mnt/appdata/alphard/postgres")]
         RD[("redis:7-alpine<br/>:6379<br/>volume: /mnt/appdata/alphard/redis")]
         BOT["alphard-bot<br/>:8765 (metrics)"]
-        PROM["prometheus<br/>:9090"]
-        GF["grafana<br/>:3300"]
+        WEB["alphard-web<br/>:8081 (operator UI)"]
         BACKUP["/mnt/appdata/alphard-backups/<br/>(daily pg_dump)"]
     end
 
     PG --- BOT
     RD --- BOT
-    BOT -.scrapes.- PROM
-    PROM -.feeds.- GF
+    PG --- WEB
+    WEB -.reads /metrics.- BOT
     PG -.pg_dump cron.- BACKUP
 ```
+
+_(Post-#399: the Prometheus and Grafana nodes were removed; the
+metrics read path is `alphard-web` (PR #394) on `:8081` reading from
+`alphard-bot:8765/metrics` and from the Postgres-resident state.)_
 
 ### 7.2 Port map
 
 | Port | Service | Notes |
 |---|---|---|
 | 8080 | alphard-bot health | legacy, may be removed in Phase 3 |
-| 8765 | alphard-bot /metrics | Prometheus scrape target |
-| 9090 | Prometheus | scraped metrics |
-| 3300 | Grafana | Phase 2.8 dashboard |
+| 8081 | `alphard-web` | operator UI (PR #394); bearer-token gated per PR #406 / #411 |
+| 8765 | alphard-bot /metrics | reader endpoint (text-format; `alphard-web` is the active consumer post-#399) |
+
+_(Ports 9090 (Prometheus) and 3300 (Grafana) removed in PR #399; see
+§7.1 for the post-removal layout.)_
 
 ### 7.3 Bind-mounts (repo-controlled)
 
 | Source | Container path | Service | Notes |
 |---|---|---|---|
-| `./docker/grafana/provisioning/` | `/etc/grafana/provisioning/` | grafana | bind-mounted (PR #300, fixes Portainer B64 truncation) |
-| `./docker/grafana/dashboards/` | `/var/lib/grafana/dashboards/` | grafana | bind-mounted (PR #300) |
-| `./docker/prometheus/prometheus.yml` | `/etc/prometheus/prometheus.yml` | prometheus | bind-mounted (PR #284, fixes Portainer B64 truncation) |
 | `./backups/` | `/var/backups/` | alphard-bot | bind-mounted for backup staging |
+
+_(The two bind-mount rows from the deleted Grafana / Prometheus
+directories are dropped — see git history pre-PR #399 for the
+original rows; the directories themselves were removed in PR #399.)_
 
 ### 7.4 Env sources
 

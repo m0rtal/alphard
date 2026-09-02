@@ -155,7 +155,7 @@
 **Частично реализовано:**
 - ✅ `src/data/quality/audit.py` — `PostgresAuditLog` + `InMemoryAuditLog` (audit_log table в Postgres)
 - ✅ `src/main.py:81 _daily_sync_loop()` — daily 20:00 MSK watchdog thread
-- ❌ Prometheus metrics endpoint — нет в compose, Phase 3+
+- ❌ Prometheus metrics endpoint _(replaced by `alphard-web` (PR #394) reader; Prometheus scraper removed, PR #399)_
 - ❌ Decision lineage в Postgres — частично (audit_log есть, но не structured_jsonb lineage)
 - 📅 Phase 2+: anomaly detection, loss alerts, daily volume cap alerts
 
@@ -168,60 +168,128 @@
 - 📅 Token usage anomaly > N API/min — Phase 2+
 - 📅 Unusual hours (вне MOEX) → CRITICAL — Phase 2+
 
-#### Level 4.1 — Monitoring profile (Prometheus + Grafana) LAN exposure (issue #55)
+#### Level 4.1 — Monitoring profile (Prometheus + Grafana) — REMOVED, PR #399 (issue #55)
 
-**Surface:**
-- Grafana binds host port 3300 via `network_mode: host` (compose workaround
-  for the broken bridge-NAT on the .107 Docker daemon — see
-  `docker-compose.yaml:190-194`).
-- Prometheus binds host port 9090 via standard bridge port-mapping.
-- Both containers live on the .107 host's LAN via the Portainer Stack
+> **Archaeology banner:** the Prometheus + Grafana stack described
+> below was **removed** in PR #399 (2026-08-31). `alphard-web`
+> (PR #394) on `.107:8081` is the replacement observability surface;
+> it requires `ALPHARD_WEB_TOKEN` for `/api/*` endpoints (PR #406 /
+> #411). This section is retained as a historical threat-model record
+> for the removed stack — see §4.2 for the current `alphard-web`
+> threat model. _(All bullet points below reference services removed
+> in PR #399; they are pinned here for the regression guard and the
+> git-history audit trail.)_
+
+**Surface (historical, removed in PR #399):**
+- Grafana bound host port 3300 via `network_mode: host` (compose
+  workaround for the broken bridge-NAT on the .107 Docker daemon —
+  see `docker-compose.yaml:190-194`). _(Removed, PR #399.)_
+- Prometheus bound host port 9090 via standard bridge port-mapping.
+  _(Removed, PR #399.)_
+- Both containers lived on the .107 host's LAN via the Portainer Stack
   defined in `docker-compose.yaml` (issue #228 / PR #228, 2026-08-25).
+  _(Removed, PR #399; the Portainer Stack itself was reorganized
+  post-#399 to omit these services.)_
 
-**Threats:**
-1. **Anonymous Grafana access** — any LAN peer that reaches `:3300` would
-   see every provisioned dashboard (`alphard_heartbeats_total`,
-   `alphard_open_positions`, etc.) without authentication. Status:
-   **mitigated** in issue #55 — `GF_AUTH_ANONYMOUS_ENABLED` removed and
-   forbidden by the `ops-policy` CI guard. `/api/search` returns 401
-   without auth.
-2. **Literal admin password in git** — the original `deploy_monitoring.sh`
-   hardcoded `GF_SECURITY_ADMIN_PASSWORD=alphard` (committed 2026-08-19).
-   Status: **mitigated** in issue #55 — the script was rewritten to source
-   `GRAFANA_ADMIN_PASSWORD` from `$ALPHARD_ENV_FILE` (default `./.env`)
-   and refused to run if the variable was missing or set to the historical
-   literal. The literal is **still in git history** but the script
-   itself is now deleted (B3 cleanup, 2026-08-26) because the .107-specific
-   deploy workaround it implemented is no longer needed: PR #228 moved
-   observability under the standard `docker compose` flow (which
-   configures port mapping correctly even on the .107 daemon) and
-   Portainer StackUpdate is the production deploy path. The literal in
-   git history is reachable by the same git-filter-repo procedure used
-   for other historical leaks.
-   tracked in issue #55 acceptance criteria).
-3. **Cross-stack secret drift** — pre-fix `scripts/deploy_monitoring.sh`
-   and `docker-compose.yaml` had different Grafana security postures
-   (anonymous+literal vs. .env+auth-only). Status: **resolved** — both
-   now require .env-sourced authentication. No more drift.
+**Threats (historical, removed in PR #399):**
+1. **Anonymous Grafana access** _(removed, PR #399)_ — any LAN peer
+   that reached `:3300` would see every provisioned dashboard
+   (`alphard_heartbeats_total`, `alphard_open_positions`, etc.) without
+   authentication. Status: **mitigated** in issue #55 —
+   `GF_AUTH_ANONYMOUS_ENABLED` removed and forbidden by the
+   `ops-policy` CI guard. `/api/search` returned 401 without auth.
+2. **Literal admin password in git** _(removed, PR #399; literal
+   remains in git history, reachable via git-filter-repo)_ — the
+   original `deploy_monitoring.sh` hardcoded
+   `GF_SECURITY_ADMIN_PASSWORD=alphard` (committed 2026-08-19).
+   Status: **mitigated** in issue #55 — the script was rewritten to
+   source `GRAFANA_ADMIN_PASSWORD` from `$ALPHARD_ENV_FILE` (default
+   `./.env`) and refused to run if the variable was missing or set to
+   the historical literal. The literal is **still in git history**
+   but the script itself is now deleted (B3 cleanup, 2026-08-26)
+   because the .107-specific deploy workaround it implemented is no
+   longer needed: PR #228 moved observability under the standard
+   `docker compose` flow (which configured port mapping correctly
+   even on the .107 daemon) and Portainer StackUpdate is the
+   production deploy path. The literal in git history is reachable
+   by the same git-filter-repo procedure used for other historical
+   leaks (tracked in issue #55 acceptance criteria).
+3. **Cross-stack secret drift** _(resolved, services removed in
+   PR #399)_ — pre-fix `scripts/deploy_monitoring.sh` and
+   `docker-compose.yaml` had different Grafana security postures
+   (anonymous+literal vs. .env+auth-only). Status: **resolved** —
+   both required .env-sourced authentication. No more drift.
 
-**Defenses:**
-- `scripts/deploy_monitoring.sh` reads `$GRAFANA_ADMIN_PASSWORD` from
-  `$ALPHARD_ENV_FILE` (default `./.env`) and refuses to run if missing
-  or set to the historical literal `alphard`.
+**Defenses (historical, removed in PR #399):**
+- `scripts/deploy_monitoring.sh` _(removed, PR #399)_ read
+  `$GRAFANA_ADMIN_PASSWORD` from `$ALPHARD_ENV_FILE` (default
+  `./.env`) and refused to run if missing or set to the historical
+  literal `alphard`.
 - `.github/workflows/ci.yml` `ops-policy` job fails the build if
-  `scripts/` contains a literal `GF_SECURITY_ADMIN_PASSWORD=<value>` or
-  `GF_AUTH_ANONYMOUS_ENABLED=true`.
+  `scripts/` contains a literal `GF_SECURITY_ADMIN_PASSWORD=<value>`
+  or `GF_AUTH_ANONYMOUS_ENABLED=true`. _(Regression guard: the gate
+  is still live post-#399 to catch any future PR that accidentally
+  re-introduces a monitoring script with the historical defaults.)_
 - `docs/SECURITY.md` (this file) records the threat model so future
   maintainers know which knobs are forbidden and why.
 
+**Operator actions (out of band for code PRs, historical):**
+- **Rotate the live Grafana admin password on .107** _(no longer
+  applicable; service removed, PR #399)_. The historical literal
+  `alphard` is permanently in the public git history; rotation is
+  the only way to invalidate it. _(Action recommended at the time
+  of removal; no ongoing operator action required post-#399.)_
+- **Restrict host:3300 + host:9090 at the LAN firewall** _(no
+  longer applicable; ports no longer bound, PR #399)_. The current
+  setup exposes Prometheus query API and Grafana UI to anyone on
+  the same subnet. A firewall rule limiting access to the Hermes
+  host's IP (`192.168.1.103`) and an operator workstation was
+  recommended for defense in depth, but was not enforced in code.
+  _(Superseded by §4.2 `alphard-web` threat model — the LAN-exposed
+  surface is now `:8081` behind `ALPHARD_WEB_TOKEN`.)_
+
+#### Level 4.2 — `alphard-web` operator UI LAN exposure (PR #394, PR #406, PR #411)
+
+**Surface (current, post-#399):**
+- `alphard-web` binds host port `8081` on `.107` and serves the
+  operator dashboard (PR #394). HTML root path is auth-open so the
+  login prompt can render; `/api/*` endpoints require a valid bearer
+  token (PR #406 / #411).
+
+**Threats (current):**
+1. **Anonymous `/api/*` access** — any LAN peer that reaches `:8081`
+   would see live positions, decision lineage, and audit-log entries
+   if the bearer-token gate were bypassed. Status: **mitigated** in
+   PR #406 / #411 — every `/api/*` route runs `check_auth()` which
+   returns 401 without a valid `Authorization: Bearer <token>`
+   header. The HTML root path returns the login prompt, not the
+   dashboard; the dashboard is loaded via `/api/dashboard` after
+   the JS helper stores the token (PR #414, `src/web/static/index.html`
+   `api()` helper).
+
+**Defenses (current):**
+- `src/web/server.py:check_auth()` short-circuits `/api/*` requests
+  without a valid `ALPHARD_WEB_TOKEN` to a `401` response (PR #406).
+- The HTML root path is exempt from `check_auth()` so the login
+  prompt can render; once the operator supplies a token, it is
+  stored in `sessionStorage` and sent as `Authorization: Bearer <token>`
+  on every subsequent fetch (PR #414).
+- A 401 from any fetch clears the stored token so a wrong or
+  rotated token surfaces a re-prompt instead of silently throwing.
+- `tests/test_411_auth_gate_js_wiring.py` pins the wire-up:
+  `api()` helper must read from `sessionStorage` and attach the
+  header; `test_token_prompt_on_first_load` confirms the prompt
+  fires once on first load.
+
 **Operator actions (out of band for code PRs):**
-- **Rotate the live Grafana admin password on .107.** The historical
-  literal `alphard` is permanently in the public git history; rotation
-  is the only way to invalidate it.
-- **Restrict host:3300 + host:9090 at the LAN firewall.** The current
-  setup exposes Prometheus query API and Grafana UI to anyone on the
-  same subnet. A firewall rule limiting access to the Hermes host's
-  IP (`192.168.1.103`) and an operator workstation is recommended for
+- **Set `ALPHARD_WEB_TOKEN` to a strong random value** in
+  `/root/.env` on `.107`. The default value (if any) is rejected
+  by `check_auth()`; rotation is the only way to invalidate a
+  leaked token.
+- **Restrict host:8081 at the LAN firewall.** The current setup
+  exposes the `alphard-web` UI to anyone on the same subnet. A
+  firewall rule limiting access to the Hermes host's IP
+  (`192.168.1.103`) and operator workstations is recommended for
   defense in depth, but is not enforced in code.
 
 ### Level 5: Recovery & incident response
@@ -256,7 +324,7 @@
 
 | # | Мера | Где |
 |---|---|---|
-| 11 | Anomaly detection alerts | Prometheus + AlertManager | TODO Phase 3 |
+| 11 | Anomaly detection alerts | `alphard-web` tile-level alerts (PR #394) — _(was: Prometheus + AlertManager, removed PR #399)_ | TODO Phase 3 |
 | 12 | Loss alerts (telegram/SMS) | Phase 4 |
 | 13 | Failed trades spike detector | Phase 4 |
 | 14 | Token usage anomaly | Tinkoff wrapper |

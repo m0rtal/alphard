@@ -1,11 +1,16 @@
-# Phase 2.8 step 1 — Prometheus metrics + Grafana
+# Phase 2.8 step 1 — Metrics endpoint + `alphard-web` reader
 
 ## What
 
 A lightweight stdlib-only HTTP server in `src/metrics_server.py` exposes
-`/metrics` (Prometheus text exposition format) and `/health` on
-`alphard-bot:8765`. A Prometheus + Grafana stack runs under the
-`observability` profile in `docker-compose.yaml` and scrapes the bot.
+`/metrics` (text-format exposition, historically called "Prometheus
+text exposition format") and `/health` on `alphard-bot:8765`.
+
+_(Post-PR #399, the historical scraper was removed. The
+primary reader is `alphard-web` (PR #394) on `.107:8081`, which pulls
+counters and gauges from the same `/metrics` endpoint via SQL on the
+Postgres-resident state. The `/metrics` route stays — the wire format
+is unchanged so any future scraper can consume it.)_
 
 ## Why this exists
 
@@ -19,7 +24,8 @@ coverage on `src/metrics_server.py`.
 
 - `GET /health` — returns `200 ok\n`. Cheap liveness probe.
 - `GET /metrics` — Prometheus text format. Stdlib `ThreadingHTTPServer`,
-  no `prometheus_client` dependency.
+  no `prometheus_client` dependency. _(Retained post-PR #399; format
+  unchanged for compatibility with `alphard-web` reader.)_
 - `GET /anything-else` — `404 not found`.
 
 ## Metrics exposed
@@ -35,8 +41,9 @@ Counters:
 Gauges:
 - `alphard_uptime_seconds` — process uptime.
 - `alphard_heartbeat_last_tick_timestamp` — unix epoch of last tick.
-  Pair with `time() - alphard_heartbeat_last_tick_timestamp` in Prometheus
-  for stale-heartbeat alerts (> 60s).
+  Pair with `time() - alphard_heartbeat_last_tick_timestamp` for
+  stale-heartbeat alerts (> 60s). _(Served via the same endpoint; the
+  consumer is `alphard-web` post-PR #399.)_
 - `alphard_backfill_progress_{tickers_done,tickers_total,bars_written}`
   — declared; emitted by `_backfill_supervisor_loop`.
 - `alphard_daily_sync_last_run_timestamp` + `..._status{status}` —
@@ -44,49 +51,34 @@ Gauges:
 
 ## Deploy
 
-Stack file already declares the profile (no change to `docker-compose.yaml`
-besides the env var addition):
+The metrics endpoint is part of `alphard-bot`; no separate service to
+bring up. Post-PR #399 there is no `observability` profile in
+`docker-compose.yaml`. To surface the metrics visually, run
+`alphard-web` (PR #394) on `.107:8081`:
 
-```yaml
-prometheus:
-  image: prom/prometheus:latest
-  profiles: ["observability"]
-  volumes:
-    - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-    - /mnt/appdata/alphard/prometheus:/prometheus
-
-grafana:
-  image: grafana/grafana:latest
-  profiles: ["observability"]
-  volumes:
-    - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
-    - ./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
+```sh
+docker compose -f /root/projects/alphard/docker-compose.yaml up -d alphard-web
 ```
 
-Bring up:
-
-```bash
-# 1. Ensure ALPHARD_METRICS_PORT=8765 in /root/projects/alphard/.env (default ok)
-# 2. Redeploy alphard-bot to pick up src/metrics_server.py
-docker compose -f /root/projects/alphard/docker-compose.yaml up -d alphard-bot
-# 3. Bring up Prometheus + Grafana
-docker compose -f /root/projects/alphard/docker-compose.yaml --profile observability up -d
-# 4. Open Grafana at http://192.168.1.107:3000 (admin / $GRAFANA_ADMIN_PASSWORD)
-```
+The `alphard-web` reader pulls `/metrics` on each render and shows
+the same counters / gauges that a scraper would. _(Historical: pre-#399
+a Prometheus + Grafana stack ran under the `observability` profile.
+Both services were removed in PR #399 because they duplicated the
+read-path that `alphard-web` now serves directly.)_
 
 ## Verification
 
-After step 2, scrape from `.107`:
+After deploy, scrape from `.107`:
 
-```bash
-curl -s http://alphard-bot:8765/health      # → ok
-curl -s http://alphard-bot:8765/metrics    # → Prometheus exposition format
+```sh
+curl -s http://192.168.1.107:8765/health      # → ok
+curl -s http://192.168.1.107:8765/metrics     # → exposition format
 ```
 
-Prometheus should pick up the `alphard-bot` job within 15s
-(`scrape_interval`). Grafana auto-loads the dashboard from
-`docker/grafana/dashboards/alphard-phase28.json` (the provider reads
-`/etc/grafana/provisioning/dashboards`).
+Then open <http://192.168.1.107:8081/> (after auth-prompt with your
+`ALPHARD_WEB_TOKEN`); the dashboard renders the same metrics from
+`alphard-web`'s SQL-backed reader. _(Historical: pre-#399 the dashboard
+served from Grafana at `:3300`; that service no longer exists.)_
 
 ## Risks
 
@@ -94,12 +86,17 @@ Prometheus should pick up the `alphard-bot` job within 15s
   the `try/except OSError` wrapper in `src/main.py` — the bot continues
   without metrics if the bind fails (logged at WARNING).
 - Observability is not a hard dependency for trading. The bot must
-  remain operational even if Prometheus is down. The `inc_counter` /
+  remain operational even if the reader is down. The `inc_counter` /
   `set_gauge` calls in the heartbeat loop are guarded by a None-check on
   the registry.
+- `alphard-web` on `:8081` is LAN-exposed. Mitigated by bearer-token
+  gate (PR #406 / #411) — see `docs/SECURITY.md` §4.2 for the current
+  threat model.
 
 ## Out of scope (Phase 2.8 step 2+)
 
 - Per-stage Prometheus histograms (backfill latency, daily_sync duration).
 - Decision-pipeline counters (orders placed, RISK rejections).
-- Alertmanager + Telegram alerts.
+- Alertmanager + Telegram alerts. _(Post-#399 alert delivery routes
+  through `alphard-web`'s tile-level alerts; Alertmanager service is
+  not on the roadmap.)_

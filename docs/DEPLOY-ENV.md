@@ -144,8 +144,11 @@ After a redeploy:
    ```
    Should print a non-empty value.
 
-4. **Grafana heartbeat rate > 0 within 5 minutes.** Check the
-   `alphard_heartbeats_total` panel.
+4. **`alphard-web` reachable at `:8081` and renders the dashboard.**
+   Open <http://192.168.1.107:8081/> in a browser; the auth-prompt
+   should accept your `ALPHARD_WEB_TOKEN` (PR #394, gated by
+   PR #406 / #411). _(Grafana heartbeat panel removed, PR #399 —
+   the replacement observability surface is `alphard-web`.)_
 
 ## What entrypoint.sh does (source-level reference)
 

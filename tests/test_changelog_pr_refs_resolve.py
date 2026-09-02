@@ -41,20 +41,27 @@ UNRELEASED_HEADING = "## [Unreleased]"
 # Squash-merge subjects end with the PR number GitHub appends: "... (#399)".
 MERGE_PR_SUFFIX = re.compile(r"\(#(\d+)\)$")
 
+# `--no-ff` merges (alphard convention for long-lived feature branches) carry
+# the number in the subject instead: "Merge pull request #394 from ...".
+NO_FF_MERGE_SUBJECT = re.compile(r"^Merge pull request #(\d+)\b")
+
 # "PR #399", "PRs #385, #388" and "(PR #399, Closes #395.)" all cite PRs.
 PR_CITATION = re.compile(r"\bPRs?\s+((?:#\d+(?:\s*,\s*)?)+)")
 PR_NUMBER = re.compile(r"#(\d+)")
 
-# Open at the time their entry lands, so git cannot confirm them yet.
-# #394 just merged via `--no-ff` (alphard convention) which does not append
-# `(#394)` to the merge subject, so the suffix-driven `_merged_pr_numbers()`
-# cannot prove the merge from git history alone. The Changelog allowlist
-# guard workflow (.github/workflows/changelog-allowlist-guard.yml) plus
-# `tests/test_407_postmerge_inflight_allowlist.py` keep this list honest:
-# the next no-ff merge will be detected via the test, and a follow-up PR
-# drops the entry. #399 is the prior example of an entry that needed
-# pruning — see cycle165 QA review (issue #407).
-INFLIGHT_PRS = frozenset({"394"})
+# "Closes #411, PR #414" — the issue the entry closes, and the PR that did it.
+CLOSES_PR_PAIR = re.compile(r"Closes\s+#(\d+),\s*PR\s+#(\d+)")
+
+# Open at the time their entry lands, so git cannot confirm them yet. An entry
+# here is an author assertion, so two guards keep it honest:
+# `test_inflight_allowlist_is_pruned` forces removal once a merge commit proves
+# the number, and `test_inflight_prs_are_not_closed_issues` rejects a number at
+# or below the newest merged PR — such a number is spent (an issue, or a long
+# ago merge) and cannot be in flight. That second guard is what #422 needed:
+# #394 was allowlisted forever because `_merged_pr_numbers()` only read squash
+# suffixes and could not see its `--no-ff` merge subject; #419 was allowlisted
+# because nothing proved an in-flight number was a PR rather than an issue.
+INFLIGHT_PRS = frozenset({"423"})
 
 # Entries written before this guard existed that say "PR #NNN" for a number
 # that is an issue (#290, #349) or a closed-unmerged PR (#378, superseded by
@@ -88,14 +95,21 @@ def _git(*args: str) -> str:
 
 
 def _merged_pr_numbers() -> frozenset[str]:
-    """PR numbers with a squash-merge commit reachable from HEAD."""
+    """PR numbers with a merge commit reachable from HEAD.
+
+    Covers both merge styles the repo uses: GitHub squash-merge (number in a
+    trailing `(#NNN)` suffix) and `--no-ff` merges of long-lived feature
+    branches (number in a `Merge pull request #NNN` subject). Missing the
+    second style is what forced #394 into `INFLIGHT_PRS` as a permanent
+    unprunable entry.
+    """
     out = _git("log", f"-{MERGE_SCAN_DEPTH}", "--format=%s")
     if not out:
         pytest.skip("no commits in this checkout (shallow clone?)")
 
     found = set()
     for subject in out.splitlines():
-        m = MERGE_PR_SUFFIX.search(subject)
+        m = MERGE_PR_SUFFIX.search(subject) or NO_FF_MERGE_SUBJECT.match(subject)
         if not m:
             continue
 
@@ -163,6 +177,57 @@ def test_inflight_allowlist_is_pruned() -> None:
     assert not stale, (
         "these PRs are merged — remove them from INFLIGHT_PRS in "
         f"{Path(__file__).name}: {', '.join('#' + pr for pr in stale)}"
+    )
+
+
+def test_no_entry_cites_its_own_issue_as_its_pr() -> None:
+    """`Closes #N, PR #N` is always wrong — a PR cannot close itself.
+
+    #400 and #422 are the same defect: the author wrote the CHANGELOG entry
+    before GitHub assigned the PR number, guessed, and guessed a number that
+    was already taken by the issue the entry closes. `INFLIGHT_PRS` then hides
+    it from `test_unreleased_pr_citations_resolve`, because that allowlist is
+    author-asserted and nothing proves an in-flight number is a PR at all.
+
+    This check needs no network and no merge commit: the collision is visible
+    in the prose itself. Every legitimate historical pair has distinct
+    numbers (`Closes #395, PR #399`; `Closes #411, PR #414`).
+    """
+    lines = CHANGELOG.read_text(encoding="utf-8").splitlines()
+
+    collisions = []
+    for offset, line in enumerate(lines):
+        for closed, cited in CLOSES_PR_PAIR.findall(line):
+            if closed != cited:
+                continue
+
+            collisions.append(
+                f"CHANGELOG.md:{offset + 1} says 'Closes #{closed}, PR #{cited}' — a PR cannot close itself"
+            )
+
+    assert not collisions, "self-closing PR citations in CHANGELOG.md:\n" + "\n".join(collisions)
+
+
+def test_inflight_prs_are_not_closed_issues() -> None:
+    """An in-flight number must exceed every merged PR number.
+
+    PR and issue numbers share one counter. A number at or below the newest
+    merged PR is already spent — it is an issue, or a PR that merged long ago
+    and should have been pruned. Either way it is not a PR still in flight,
+    so admitting it turns `INFLIGHT_PRS` into a permanent bypass (#422).
+    """
+    merged = _merged_pr_numbers()
+    if not merged:
+        pytest.skip("no squash-merge commits reachable from HEAD")
+
+    newest_merged = max(int(pr) for pr in merged)
+
+    spent = sorted((pr for pr in INFLIGHT_PRS if int(pr) < newest_merged), key=int)
+
+    assert not spent, (
+        f"these INFLIGHT_PRS numbers are below the newest merged PR (#{newest_merged}), "
+        f"so they cannot be in flight — they are issues or stale entries: "
+        f"{', '.join('#' + pr for pr in spent)}"
     )
 
 

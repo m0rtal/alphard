@@ -232,8 +232,9 @@ class MyAgent:
 - Agents MUST NOT bypass `RiskGate.evaluate()`.
 - Agents MUST NOT write to `audit_log` directly; route through
   `Coordinator._audit()`.
-- Agents SHOULD emit Prometheus counters via `_metrics_registry` (see
-  `src/main.py`).
+- Agents SHOULD emit counters via `_metrics_registry` (see `src/main.py`);
+  primary reader is `alphard-web` (PR #394) on `.107:8081` post-PR #399.
+  _(Prometheus scraper removed, PR #399.)_
 
 ---
 
@@ -308,8 +309,10 @@ if a pipeline ran, it was recorded.
 ### 5.3 Who reads it
 
 - `replay_sizing.py` — for position-size backtesting.
-- Grafana panels (planned) — `decided=true` count, `risk_violations`
-  histogram.
+- _(Grafana panels were planned readers, removed, PR #399.)_ The
+  active reader is `alphard-web` (PR #394): it pulls `decided=true`
+  counts and `risk_violations` histograms directly from the
+  Postgres-resident state.
 - Incident-response scripts in `docs/RUNBOOK.md`.
 
 ---

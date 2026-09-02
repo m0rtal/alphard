@@ -30,7 +30,7 @@
 | [`docs/SECURITY.md`](docs/SECURITY.md) | threat model + defense layers + runbook triggers | 🟢 |
 | [`docs/DEPLOY-ENV.md`](docs/DEPLOY-ENV.md) | production .107 deployment variables | 🟢 |
 | [`docs/POSITION-SIZING.md`](docs/POSITION-SIZING.md) | position sizing policy (Phase 2.2) | 🟢 |
-| [`docs/PHASE2-8-METRICS.md`](docs/PHASE2-8-METRICS.md) | Prometheus metrics + Grafana panels | 🟢 |
+| [`docs/PHASE2-8-METRICS.md`](docs/PHASE2-8-METRICS.md) | `alphard-web` metrics emission + UI (PR #394, post-PR #399) | 🟢 |
 | [`docs/PHASE2-ROADMAP.md`](docs/PHASE2-ROADMAP.md) | Phase 2 roadmap (live, актуально на 2026-08-27) | 🟢 |
 
 ## 🏛 Архитектурные решения (ADR)
@@ -109,7 +109,7 @@ fixture-only.
 | Incident response (security) | [`docs/SECURITY.md`](docs/SECURITY.md) + [`docs/RUNBOOK.md`](docs/RUNBOOK.md) |
 | Threat model | [`docs/SECURITY.md`](docs/SECURITY.md) |
 | Position sizing | [`docs/POSITION-SIZING.md`](docs/POSITION-SIZING.md) |
-| Prometheus / Grafana | [`docs/PHASE2-8-METRICS.md`](docs/PHASE2-8-METRICS.md) |
+| Metrics surface (`alphard-web`, PR #394) | [`docs/PHASE2-8-METRICS.md`](docs/PHASE2-8-METRICS.md) |
 | Roadmap / Phase status | [`docs/PHASE2-ROADMAP.md`](docs/PHASE2-ROADMAP.md) |
 | .107 deployment variables | [`docs/DEPLOY-ENV.md`](docs/DEPLOY-ENV.md) |
 | Архитектурное решение | [`docs/decisions/`](docs/decisions/) |
