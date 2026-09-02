@@ -29,8 +29,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install pytest + pytest-cov
-        run: pip install pytest pytest-cov
+      - name: Install runtime + test deps
+        # Mirrors the dependency install in .github/workflows/ci.yml's 'Tests
+        # + Coverage' job. The conftest.py autouse fixture imports
+        # scripts.apply_corporate_actions, which depends on the runtime
+        # requirements (notably `requests`); without them, the fixture errors
+        # out at setup and masks the actual changelog-gate verdict.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-cov
       # Regression guard: PR #399's squash-merge commit was reachable from
       # main but the inflight allowlist wasn't pruned, so this guard fired
       # on the post-merge push. Keep this command focused on the two gates
