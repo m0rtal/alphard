@@ -2,18 +2,18 @@
 # scripts/quickstart.sh — first-shot-friendly Alphard stack bootstrap.
 #
 # Goal: turn `git clone ... && cd alphard && ./scripts/quickstart.sh` into
-# a single command that produces a fully running stack (postgres, redis,
+# a single command that produces a fully running stack (postgres,
 # alphard-bot) on any Docker host that satisfies:
 #   - Docker Engine 20.10+ with compose plugin v2
-#   - ~3 GiB disk free (alphard-bot 405 MB, postgres 80 MB, redis 40 MB,
+#   - ~3 GiB disk free (alphard-bot 405 MB, postgres 80 MB,
 #     + image caches)
-#   - Ports 5432, 6379 free on the host
+#   - Ports 5432 free on the host
 #
 # What it does (idempotent — re-running is safe):
 #   1. Sanity-checks: docker is up, compose v2 present, repo root
 #      contains docker-compose.yaml and .env.example.
 #   2. Creates .env from .env.example if missing.
-#      Auto-generates POSTGRES_PASSWORD and REDIS_PASSWORD if missing.
+#      Auto-generates POSTGRES_PASSWORD if missing.
 #   3. `docker compose up -d` (no --profile filter; see #402).
 #   4. Polls container healthchecks for up to 180s; prints a clear
 #      status table (or a failure table with `docker logs <svc>` hints).
@@ -188,16 +188,6 @@ else
     ok "POSTGRES_PASSWORD set"
 fi
 
-# Same for REDIS_PASSWORD.
-_rpw="$(env_value REDIS_PASSWORD)"
-if [[ -z "$_rpw" ]]; then
-    _new_rpw="$(openssl rand -base64 24)"
-    sed -i "s|^REDIS_PASSWORD=$|REDIS_PASSWORD=\"${_new_rpw}\"|" "$REPO_ROOT/.env"
-    ok "REDIS_PASSWORD auto-generated (24 random bytes)"
-else
-    ok "REDIS_PASSWORD set"
-fi
-
 # Issue #297: the *_B64 env-var approach was retired because Portainer
 # StackUpdate silently truncates env values >60 chars (Go JSON unmarshal
 # fails on long strings), and the baked base64 blobs were routinely cut
@@ -246,7 +236,6 @@ CONFLICT_EXIT_CODE=9
 GUARDED_CONTAINERS=(
     "alphard-bot"
     "alphard-postgres"
-    "alphard-redis"
 )
 
 for _c in "${GUARDED_CONTAINERS[@]}"; do
@@ -318,7 +307,7 @@ info "Health gate (up to ${TIMEOUT_SEC}s)"
 # test for the post-#347 contract.
 ONE_SHOT=()
 # Long-running services we wait for:
-EXPECTED=("alphard-postgres" "alphard-redis" "alphard-bot")
+EXPECTED=("alphard-postgres" "alphard-bot")
 # PR #399 removed Grafana and Prometheus, and with them the only
 # services that declared a profile — so there is no profile left to
 # filter on (#402).

@@ -76,7 +76,7 @@ fi
 # operator's running alphard-* stack on the same daemon.
 #
 # Why the override is necessary: docker-compose.yaml hardcodes
-# `container_name: alphard-bot`, `alphard-postgres`, `alphard-redis`.
+# `container_name: alphard-bot`, `alphard-postgres`.
 # Docker
 # Compose honours these literal names and does NOT prefix them with
 # the project name — the `-p alphard-smoke-<PID>` flag scopes
@@ -144,8 +144,6 @@ services:
       alphard-net:
         aliases:
           - alphard-postgres
-  redis:
-    container_name: ${COMPOSE_PROJECT_NAME}-redis-1
 YAML
 
 echo "[pre-pr-smoke] [1/4] bringing up stack..."

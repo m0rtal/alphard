@@ -1,8 +1,8 @@
 # Alphard — Quickstart
 
 | **Goal**: take a clean Docker host and a fresh `git clone`, run one
-command, and have a fully functional `alphard` stack (postgres,
-redis, alphard-bot, alphard-web) on `localhost`.
+|command, and have a fully functional `alphard` stack (postgres,
+|alphard-bot, alphard-web) on `localhost`.
 
 This document covers the **single-command first-shot path**. For
 day-2 operations (re-deploy, scale, custom domains, multi-host,
@@ -16,12 +16,12 @@ production tuning), see [RUNBOOK.md](RUNBOOK.md) and the ADRs under
 | Linux host (kernel ≥4.x) | `uname -r` |
 | Docker Engine 20.10+ | `docker version` |
 | Docker Compose plugin v2 | `docker compose version` |
-| ~3 GiB free disk | `df -h /` (alphard-bot 405 MB, postgres 80 MB, redis 40 MB, alphard-web 120 MB) |
-| Ports 5432, 6379, 8081 free on host | `ss -ltn '( sport = :5432 or :6379 or :8081 )'` |
+| ~3 GiB free disk | `df -h /` (alphard-bot 405 MB, postgres 80 MB, alphard-web 120 MB) |
+| Ports 5432, 8081 free on host | `ss -ltn '( sport = :5432 or :8081 )'` |
 | git | `git --version` |
 
 **Minimum smoke**: 1 vCPU, 2 GiB RAM works; 4 GiB recommended.
-**Memory profile**: bot ~200 MiB, postgres ~100 MiB, redis ~20 MiB,
+**Memory profile**: bot ~200 MiB, postgres ~100 MiB,
 alphard-web ~80 MiB.
 
 ## The one-command path
@@ -36,8 +36,8 @@ That is **all**. The script:
 
 1. Sanity-checks Docker and Compose.
 2. Creates `.env` from `.env.example` (if missing).
-3. Auto-generates a 24-byte random `POSTGRES_PASSWORD` /
-   `REDIS_PASSWORD` (if missing).
+3. Auto-generates a 24-byte random `POSTGRES_PASSWORD`
+   (if missing).
 4. Runs `docker compose up -d`.
 5. Waits up to 180 s for every long-running service to report
    `healthy`.
@@ -49,10 +49,9 @@ That is **all**. The script:
 ```
 === Final state ===
 NAMES                STATUS                    PORTS
-alphard-bot          Up 41 seconds (healthy)
-alphard-postgres     Up 41 seconds (healthy)   5432/tcp
-alphard-redis        Up 41 seconds (healthy)   6379/tcp
-alphard-web          Up 41 seconds (healthy)   0.0.0.0:8081->8080/tcp
+|alphard-bot          Up 41 seconds (healthy)
+|alphard-postgres     Up 41 seconds (healthy)   5432/tcp
+|alphard-web          Up 41 seconds (healthy)   0.0.0.0:8081->8080/tcp
 ok: stack is up
 ```
 
@@ -60,7 +59,7 @@ ok: stack is up
 |---------|------------------|
 | Bot `/health`, `/metrics` | in-network only — `docker exec alphard-bot curl localhost:8765/health` |
 | alphard-web (operator dashboard) | http://localhost:8081/ |
-| Postgres + Redis | `docker exec alphard-postgres psql -U $POSTGRES_USER -d $POSTGRES_DB` |
+| Postgres | `docker exec alphard-postgres psql -U $POSTGRES_USER -d $POSTGRES_DB` |
 
 ## Failure modes the script catches
 
@@ -91,8 +90,8 @@ All are optional env vars.
 - Configure alphard-web TLS. Plain HTTP, internal-only by default.
   Production must front this with a reverse proxy that terminates
   TLS and pins the dashboard behind an auth provider.
-- Create the `alphard-postgres-data` and `alphard-redis-data` named
-  volumes ahead of time. Compose creates them on first run.
+- Create the `alphard-postgres-data` named volume ahead of time.
+  Compose creates it on first run.
 - Set up reverse-proxy / DNS / port forwarding. The default ports
   listen on `0.0.0.0` for 8081 (alphard-web operator dashboard).
   No host-network services anymore — see compose for the

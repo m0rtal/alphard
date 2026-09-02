@@ -11,7 +11,7 @@ rows that reference code paths that no longer exist.
 These tests pin the post-#399 doc contract:
 
 1. **README.md and docs/QUICKSTART.md** describe a 3-container stack
-   (alphard-bot, postgres, redis) plus ``alphard-web`` (PR #394) as
+   (alphard-bot, postgres) plus ``alphard-web`` (PR #394) as
    the operator UI.
 2. **docs/TROUBLESHOOTING.md and docs/TESTING.md** no longer describe
    Grafana/Prometheus services as an active observability path. The
@@ -183,7 +183,7 @@ def test_quickstart_no_active_grafana_prometheus() -> None:
     assert not offenders, (
         "Issue #401: docs/QUICKSTART.md has active-prose references to the "
         "removed services. Post-#399 onboarding describes a 3-container "
-        "stack (alphard-bot, postgres, redis) plus alphard-web.\n"
+        "stack (alphard-bot, postgres) plus alphard-web.\n"
         "Offenders:\n" + "\n".join(f"  L{ln}: {s}" for ln, s in offenders)
     )
 
