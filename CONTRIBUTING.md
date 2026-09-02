@@ -41,7 +41,10 @@ Coordinator-интеграции. Ключевые ограничения:
 - Агент НЕ ДОЛЖЕН вызывать `Coordinator._execute()` напрямую.
 - Агент НЕ ДОЛЖЕН обходить `RiskGate.evaluate()`.
 - Агент НЕ ДОЛЖЕН писать в `audit_log` напрямую — только через `Coordinator._audit()`.
-- Агент ДОЛЖЕН эмитить Prometheus counters через `_metrics_registry` (см. `src/main.py`).
+- Агент ДОЛЖЕН эмитить counters через `_metrics_registry` (см. `src/main.py`).
+  Primary reader — `alphard-web` (PR #394) на `:8081`. _(Исторический
+  scraper снесён в PR #399; wire-format остаётся text exposition
+  для совместимости.)_
 
 ## 2. Workflow
 

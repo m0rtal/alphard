@@ -8,11 +8,13 @@
 
 Live PR-by-PR tracking for Phase 2 deliverables (sub-step granularity).
 Each row carries the exact metric names + the PR that landed it so an
-operator can correlate a Grafana panel with the code commit that emits it.
+operator can correlate an `alphard-web` tile (PR #394) with the code
+commit that emits its underlying counter. _(Historical: pre-#399 a
+Grafana panel served the same correlation; that surface is removed.)_
 
 | Sub-step | Deliverable | Status | PR |
 |---|---|---|---|
-| 2.8 step 1 | Prometheus metrics HTTP server (`alphard_uptime_seconds`, `alphard_heartbeat_last_tick_timestamp`, `alphard_heartbeats_total`) + heartbeat dashboard | ✅ MERGEABLE | PR #34 |
+| 2.8 step 1 | Metrics HTTP server (`alphard_uptime_seconds`, `alphard_heartbeat_last_tick_timestamp`, `alphard_heartbeats_total`) + `alphard-web` heartbeat tile (PR #394) _(Prometheus scraper removed, PR #399; current reader is `alphard-web`)_ | ✅ MERGEABLE | PR #34 |
 | 2.8 step 2 | Universe coverage gauges (`alphard_tickers_in_universe_total`, `alphard_tickers_with_full_history_total`) | ✅ MERGEABLE | PR #243 |
 | 2.7 step 1 | Weekly delisted_at cron (`_delisted_sync_loop`) | ✅ merged | (see history) |
 | 2.6 step 1 | Cross-source validation cron + schema | ✅ merged | (see history) |
@@ -34,7 +36,7 @@ operator can correlate a Grafana panel with the code commit that emits it.
 | 1.5 | Coordinator stub | ✅ done (5/21 components, real wiring Phase 5.2) |
 | 1.6 | Daily sync + in-process watchdog | ✅ done (commit `0dcf55b`, redeployed `sha-bc867a2`) |
 | 2.x | (this document) | ⏳ pending |
-| 3.x | (Portfolio, Prometheus, full audit) | ⏳ punted |
+| 3.x | (Portfolio, full audit) — Prometheus + AlertManager _(removed, PR #399; alerts now flow through `alphard-web` tiles, PR #394)_ | ⏳ punted |
 
 ## Phase 1.4 — Real order placement (NEXT)
 
@@ -212,9 +214,15 @@ filters (negative amounts, malformed dates).
 **Today:** script exists (202 lines, gRPC 1-year chunks), `sync_universe_delisted` in pg_store.py, but no schedule.
 **Adjacent:** `mark_terminally_failed.py` (sha-`9d34663`) covers the no-data heuristic; this complements it for tickers that DID trade but are delisted.
 
-### 2.7 — Prometheus + Grafana observability
+### 2.7 — Metrics observability (removed, PR #399)
 
-**What:** Deploy `alphard-prometheus` + `alphard-grafana` (skeleton configs already in `docker/prometheus/` + `docker/grafana/dashboards/alphard-phase0.json`).
+_(Removed in PR #399; replaced by `alphard-web` (PR #394) which reads
+metrics directly from Postgres. Row retained for archaeology; the
+operator UI is `alphard-web` on `.107:8081`.)_
+
+**What (historical):** Deploy `alphard-prometheus` + `alphard-grafana`
+(skeleton configs already in `docker/prometheus/` +
+`docker/grafana/dashboards/alphard-phase0.json`).
 **Metrics:** backfill bars/sec, daily_sync duration, auth_probe success rate, ohlcv_daily count, broker reconnect count.
 **Why Phase 2:** Need 4 weeks of operation before metrics are stable; Phase 2 is the natural deploy window.
 
@@ -270,7 +278,7 @@ When Phase 2.1-2.3 land, these unblock and graduate from "deferred" to "in scope
 |---|---|
 | Portfolio Agent | Needs real-money PnL to validate allocation algorithm |
 | Off-host backup (S3/B2) | Premature until Phase 2.8 proves daily backup is reliable |
-| Prometheus alert escalation (PagerDuty) | Single-operator (me); Telegram alerts suffice |
+| Alert escalation (PagerDuty-equivalent) _(was: Prometheus alert escalation; removed, PR #399 — current surface is `alphard-web` tile-level alerts, PR #394)_ | Single-operator (me); Telegram alerts suffice |
 | LSTM / transformer models | Walk-forward XGBoost first; deep nets only if SOTA justifies cost |
 
 ---
