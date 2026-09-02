@@ -191,6 +191,8 @@ def test_no_docker_compose_version_key() -> None:
     with open(COMPOSE_PATH) as f:
         raw = yaml.safe_load(f)
     assert "version" not in raw, "docker-compose.yaml still has the obsolete top-level " "'version' key; remove it."
+
+
 class TestAlphardWebSecurity:
     """Issue #406 — security contract for the alphard-web service.
 
@@ -264,11 +266,5 @@ class TestAlphardWebSecurity:
                 f"(issue #406: 0.0.0.0 exposes dashboard to LAN); "
                 f"got: {host_ip!r} (full mapping: {port_mapping!r})"
             )
-            assert str(published) == "8081", (
-                f"alphard-web port mapping published MUST be 8081; "
-                f"got: {published!r}"
-            )
-            assert str(target) == "8080", (
-                f"alphard-web port mapping target MUST be 8080; "
-                f"got: {target!r}"
-            )
+            assert str(published) == "8081", f"alphard-web port mapping published MUST be 8081; " f"got: {published!r}"
+            assert str(target) == "8080", f"alphard-web port mapping target MUST be 8080; " f"got: {target!r}"
