@@ -29,8 +29,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install pytest
-        run: pip install pytest
+      - name: Install pytest + pytest-cov
+        run: pip install pytest pytest-cov
       # Regression guard: PR #399's squash-merge commit was reachable from
       # main but the inflight allowlist wasn't pruned, so this guard fired
       # on the post-merge push. Keep this command focused on the two gates
