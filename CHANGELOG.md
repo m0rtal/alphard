@@ -22,7 +22,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
-- **Restore post-merge changelog citation guards** (PR #443, Related to #433). Expanded `LEGACY_MISLABELS` for the six pre-existing `[Unreleased]` PR citations without rewriting shipped release prose, and recorded the merged PR #432 so the drift-window guard no longer rejects `main`. The follow-up at #447 cites this PR's own number in the entry it ships, so the drift window from #423 onwards now passes on `main` HEAD `af69616` and forward.
+- **Restore post-merge changelog citation guards** (PR #443, Related to #433). Expanded `LEGACY_MISLABELS` for the six pre-existing `[Unreleased]` PR citations without rewriting shipped release prose, and recorded the merged PR #432 so the drift-window guard no longer rejects `main`. The follow-up at #447 cites this PR's own number in the entry it ships, so the drift window from #423 onwards now passes on `main` HEAD `af69616` and forward. The next iteration at #448 (PR #448) added the self-citation to the same paragraph so the drift window from #423 onwards stays closed.
 
 > Entries below are landed on `main` since `0.1.0` but not yet tagged.
 > Open PRs not yet on `main` are tracked on the [Kanban board](#) and
