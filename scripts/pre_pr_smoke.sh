@@ -113,6 +113,7 @@ COMPOSE=(docker compose -p "$COMPOSE_PROJECT_NAME" -f docker-compose.yaml -f "$O
 # own docker invocations.
 SMOKE_BOT="$COMPOSE_PROJECT_NAME-alphard-bot-1"
 SMOKE_PG="$COMPOSE_PROJECT_NAME-postgres-1"
+SMOKE_WEB="$COMPOSE_PROJECT_NAME-alphard-web-1"
 
 cleanup() {
     "${COMPOSE[@]}" down -v >/dev/null 2>&1 || true
@@ -133,6 +134,10 @@ services:
     volumes:
       - ./src:/app/src:ro
       - ./scripts:/app/scripts:ro
+  alphard-web:
+    container_name: ${COMPOSE_PROJECT_NAME}-alphard-web-1
+    volumes:
+      - ./src:/app/src:ro
   postgres:
     container_name: ${COMPOSE_PROJECT_NAME}-postgres-1
     networks:
@@ -150,7 +155,10 @@ echo "[pre-pr-smoke] [1/4] bringing up stack..."
 # never applied and _auth_probe was missing. Schema application is now
 # handled by the bot's entrypoint via init_schema() before auth_probe()
 # — see tests/test_347_pg_init_removal.py.
-if ! "${COMPOSE[@]}" up -d postgres alphard-bot >/dev/null 2>&1; then
+#
+# alphard-web (issue #393, PR #394) is also brought up so the wire-up
+# is exercised in smoke. It bind-mounts ./src:ro via the override above.
+if ! "${COMPOSE[@]}" up -d postgres alphard-bot alphard-web >/dev/null 2>&1; then
     echo "[pre-pr-smoke] FAIL: docker compose up failed"
     exit 1
 fi
@@ -198,6 +206,55 @@ if ! python3 -m black --check src/ tests/ scripts/; then
     exit 2
 fi
 
+# alphard-web (issue #393, PR #394): also probe the dashboard service so
+# the wire-up is verified in smoke. start_period=30s in compose; we give
+# the same grace window. If /api/health 5xx's (DSN missing, server
+# crashed), dump logs and fail the gate — there's no point shipping a
+# PR that green-lights while the dashboard is dead.
+echo "[pre-pr-smoke] [2.5/4] waiting for alphard-web healthy..."
+web_healthy=0
+for ((i = 1; i <= HEALTH_ATTEMPTS; i++)); do
+    if docker exec "$SMOKE_WEB" python3 -c "
+import urllib.request, sys
+try:
+    r = urllib.request.urlopen('http://127.0.0.1:8080/api/health', timeout=3)
+    sys.exit(0 if r.status == 200 else 1)
+except Exception:
+    sys.exit(1)
+" 2>/dev/null; then
+        echo "[pre-pr-smoke]   web healthy after $((i * HEALTH_INTERVAL_SECONDS))s"
+        web_healthy=1
+        break
+    fi
+    sleep "$HEALTH_INTERVAL_SECONDS"
+done
+
+if [[ $web_healthy -ne 1 ]]; then
+    echo "[pre-pr-smoke] FAIL: alphard-web not healthy in $((HEALTH_ATTEMPTS * HEALTH_INTERVAL_SECONDS))s"
+    docker logs --tail 30 "$SMOKE_WEB" 2>&1 | sed 's/^/  /'
+    exit 1
+fi
+
+# Smoke a few representative endpoints so a future wire-up regression
+# (e.g. typo in a route name) is caught here, not in production. The
+# HTML root, /api/summary, and /api/health are all probed from inside
+# the alphard-net. Failures are non-fatal at this gate — we only
+# block merge if the server itself is unhealthy. The point is to
+# surface the wire-up in `docker logs alphard-web` for the next QA pass.
+echo "[pre-pr-smoke] [2.75/4] probing wire-up endpoints..."
+for probe_path in /api/summary "/api/tickers?limit=1" /api/backfill /api/settings /api/backups; do
+    if ! docker exec "$SMOKE_WEB" python3 -c "
+import urllib.request, sys
+try:
+    r = urllib.request.urlopen('http://127.0.0.1:8080${probe_path}', timeout=3)
+    sys.exit(0 if r.status == 200 else 1)
+except Exception as e:
+    print(f'probe ${probe_path} failed: {e}', file=sys.stderr)
+    sys.exit(1)
+" 2>&1 | sed 's/^/  /'; then
+        echo "[pre-pr-smoke] WARN: ${probe_path} not 200 (continuing; see logs above)"
+    fi
+done
 echo "[pre-pr-smoke] [3/4] running pytest..."
 if ! python3 -m pytest tests/ --no-cov -p no:cacheprovider -q 2>&1 | tail -15; then
     echo "[pre-pr-smoke] FAIL: pytest failed"

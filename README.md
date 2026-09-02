@@ -10,8 +10,9 @@
 > (2.6 step 1 cross-source, 2.7 delisted cron, 2.8 metrics, 2.9 step 1 backup,
 > 2.5 step 1 split adjust, 2.1 sandbox-token redeploy in flight).
 > Backfill resume-safe via `_backfill_supervisor_loop` (PR #47/#50,
-> 3-layer deadlock fix). Health monitoring live (Grafana :3300, Prometheus :9090,
-> alphard-bot /metrics :8765). Daily Postgres backup at /mnt/appdata/alphard-backups/.
+> 3-layer deadlock fix). Health monitoring live (alphard-web operator
+> dashboard on port 8081, alphard-bot /metrics :8765). Daily Postgres
+> backup at /mnt/appdata/alphard-backups/.
 > **Бот НЕ торгует на реальные деньги** — `LIVE_TRADING=false` hardlock
 > в `src/broker/tinkoff_account.py`. Active phase: **2.3 Macro Agent** + **2.6 step 2
 > multi-source schema** + **2.5 step 2b corporate-actions wiring**.
@@ -89,8 +90,7 @@ docker compose ps
 docker compose logs -f alphard-bot
 # Health: curl http://192.168.1.107:8765/health → 200
 # Metrics: curl http://192.168.1.107:8765/metrics
-# Grafana: http://192.168.1.107:3300/ (admin/alphard, network_mode: host)
-# Prometheus: http://192.168.1.107:9090/
+# Operator dashboard: http://192.168.1.107:8081/
 ```
 
 ```bash
@@ -150,15 +150,10 @@ alphard/
 │   ├── cross_source_smoke.py          # 3-scenario validation harness (PR #27)
 │   ├── fetch_moex_corporate_actions.py # MOEX ISS splits+dividends fetcher
 │   └── mark_terminally_failed.py      # Skip known no-data tickers
-├── tests/                            # 716+ tests, ~93% coverage
-├── observability/
-│   ├── prometheus.yml
-│   └── grafana/
-│       ├── provisioning/
-│       └── dashboards/alphard-phase2.json
+├── tests/                            # 1621+ tests, ~95% coverage
 ├── .dockerignore
 ├── .env.example                # Шаблон секретов (TINKOFF_SANDBOX_TOKEN/REAL_TOKEN, POSTGRES_PASSWORD)
-├── docker-compose.yaml         # Single compose file + observability stack
+├── docker-compose.yaml         # alphard-bot, postgres, redis, alphard-web
 ├── pyproject.toml              # Poetry (Phase 2+ deps)
 ├── requirements.txt            # Pinned CI deps
 ├── LICENSE                     # Apache-2.0 (canonical, 11.3 KB)
@@ -209,9 +204,10 @@ Branch protection на `main`:
 ## Мониторинг
 
 - **alphard-bot** на .107 — `python3 -m src.main`, экспортирует metrics на :8765
-- **Prometheus** — `prom/prometheus:latest`, scrape interval 15s
-- **Grafana** — `grafana/grafana:latest`, dashboard "Alphard — Phase 2.8 baseline"
-  с панелями heartbeat rate, uptime, restart count, backfill exit codes
+- **alphard-web** — операторская панель на :8081 (PR #394), читает
+  напрямую из `alphard-postgres` через SQL, отображает те же метрики,
+  что и Grafana phase28 dashboard. Заменяет Grafana + Prometheus
+  (PR #399).
 - **alphard-postgres** — данные OHLCV + decision_log, отдельный bind-mount на
   `/mnt/appdata/alphard-postgres`
 - **Backup** — `/mnt/appdata/alphard-backups/`, daily pg_dump gzip-6, retention
@@ -265,7 +261,7 @@ Branch protection на `main`:
 | 2.5 Adjusted prices | ✅ step 1 (PR #45) + step 2b (PR #74) + step 2c (this PR) | apply_adjustment (splits+dividends) + MOEX fetcher + orchestrator |
 | 2.6 Cross-source | ✅ step 1 (PR #27), 🟡 step 2 (t_5596e3ba) | multi-source schema migration |
 | 2.7 Delisted cron | ✅ merged (PR #37) | |
-| 2.8 Metrics /metrics + /health | ✅ merged (PR #52, #53) | Grafana live on .107:3300 |
+| 2.8 Metrics /metrics + /health | ✅ merged (PR #52, #53); operator dashboard PR #394 | alphard-web live on .107:8081 |
 | 2.9 Daily backup | ✅ step 1 (PR #38), ⏸ step 2 S3 sync | ждёт S3 bucket target |
 | 2.10 Coordinator event loop | ⏳ not started | open-ended design |
 

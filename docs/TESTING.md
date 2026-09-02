@@ -314,10 +314,9 @@ volume, etc.). Runtime-skip маскирует регрессии: тест мо
 | Job | Что проверяет |
 |---|---|
 | `Lint + Format` | flake8, black |
-| `Ops policy` | нет literal Grafana password, нет anonymous auth |
+| `Ops policy` | нет literal Grafana password, нет anonymous auth (legacy Grafana checks; PR #399 dropped the gate) |
 | `SCA (pip-audit)` | known CVEs в зависимостях |
 | `Secrets scan (gitleaks)` | нет секретов в diff |
-| `Grafana secrets guard` | дополнительный gate на grafana-секреты |
 | `Build + push` | docker image собирается |
 
 Если **любой** job красный — PR не мёрджится. Ветка `main` защищена

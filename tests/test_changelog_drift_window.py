@@ -38,6 +38,7 @@ CHANGELOG_EXEMPT_PRS = frozenset(
         "360",  # docs(changelog): backfill cycle146 PRs #368 #369
         "383",  # 381: docs(changelog): backfill cycle147-150
         "386",  # 384: docs(changelog): backfill #373 #367 + drift guard (this PR)
+        "404",  # docs(changelog): backfill cycle159 PRs #385 #388 #391 (#404)
     }
 )
 

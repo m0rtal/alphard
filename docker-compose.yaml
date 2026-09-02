@@ -126,6 +126,80 @@ services:
       retries: 3
       start_period: 60s
 
+  # alphard-web (issue #393, PR #394) — internal single-purpose dashboard.
+  # Reuses the alphard-bot image (no separate build pipeline). Overrides
+  # the bot's entrypoint to run ``python3 -m src.web.server`` directly,
+  # bypassing the bot's init_schema/faulthandler/auth_probe chain which is
+  # not needed for a read-only dashboard. Internal-only (no host port
+  # published) — only reachable from inside alphard-net.
+  #
+  # Watchtower is OFF so accidental alphard-bot image updates do not
+  # silently switch the dashboard to a half-broken newer build. Manual
+  # Portainer StackUpdate is the only path.
+  alphard-web:
+    image: ghcr.io/m0rtal/alphard:latest
+    container_name: alphard-web
+    # Operator UI — bound to host port 8081 (8080 is taken by
+    # watchtower + qbittorrent on .107). Issue #395 / PR #394.
+    # Issue #406: bind to loopback only so the dashboard cannot be
+    # reached from the LAN without going through a reverse proxy that
+    # injects the bearer token. The auth gate in src/web/server.py
+    # enforces ALPHARD_WEB_TOKEN; this binding is defence-in-depth.
+    ports:
+      - "127.0.0.1:8081:8080"
+    restart: unless-stopped
+    user: root
+    security_opt:
+      - apparmor=unconfined
+    labels:
+      - "com.centurylinklabs.watchtower.enable=false"
+    entrypoint:
+      - python3
+      - -m
+      - src.web.server
+      - "8080"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-alphard}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+      POSTGRES_DB: ${POSTGRES_DB:-alphard}
+      # DSN is built inline from POSTGRES_* above (same convention as
+      # alphard-bot's entrypoint.sh, minus the bot-only faulthandler).
+      # If a future PR adds an alphard_web role, switch to those creds.
+      ALPHARD_PG_DSN: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@alphard-postgres:5432/${POSTGRES_DB}
+      # /api/backups reads ALPHARD_BACKUP_DIR (default /mnt/appdata/alphard-backups).
+      # Bind-mount that path into the container so the operator's backups
+      # directory is visible. Same convention as the alphard-bot backup
+      # loop (scripts/backup_database.py writes there).
+      ALPHARD_BACKUP_DIR: ${ALPHARD_BACKUP_DIR:-/mnt/appdata/alphard-backups}
+      # Issue #406: bearer-token auth gate. Operator must set
+      # ALPHARD_WEB_TOKEN in .env to a long random string;
+      # src/web/server.py::check_auth compares it against the
+      # Authorization: Bearer header on every protected request.
+      # tests/test_compose_structure.py::TestAlphardWebSecurity pins
+      # the presence of this env var so it cannot be silently removed.
+      ALPHARD_WEB_TOKEN: ${ALPHARD_WEB_TOKEN:-}
+    volumes:
+      # NOTE: a regression guard in tests/test_compose_structure.py
+      # (TestGrafanaPortability::test_no_hardcoded_mnt_appdata_volumes)
+      # forbids ANY service from bind-mounting from /mnt/... directly.
+      # Routed through ${APPDATA_DIR:-...} so the stack root is portable
+      # (see commit history for issue #297 / PR #298 background).
+      - ${APPDATA_DIR:-/mnt/appdata/alphard-backups}:${ALPHARD_BACKUP_DIR:-/mnt/appdata/alphard-backups}:ro
+    depends_on:
+      - postgres
+      - alphard-bot
+    networks:
+      - alphard-net
+    healthcheck:
+      # alphard-web exposes GET /api/health on 8080. Probe from inside
+      # the container. start_period=30s covers the slow first-boot path:
+      # Python3 startup + http.server bind (typically 1-2s, generous).
+      test: ["CMD-SHELL", "python3 -c 'import urllib.request; r=urllib.request.urlopen(\"http://127.0.0.1:8080/api/health\", timeout=2); assert r.status==200'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
   postgres:
     image: postgres:16-alpine
     container_name: alphard-postgres

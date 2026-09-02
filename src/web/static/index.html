@@ -1,0 +1,849 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>alphard-bot · control</title>
+<style>
+  :root{
+    --bg:#0b0e14; --panel:#12161f; --panel2:#171c27; --line:#222936;
+    --fg:#e6edf3; --muted:#8b95a7; --dim:#5a6678;
+    --ok:#3fb950; --warn:#d29922; --err:#f85149; --acc:#58a6ff;
+    --mono:'JetBrains Mono','SF Mono',Menlo,Consolas,monospace;
+    --sans:Inter,-apple-system,'Segoe UI',Roboto,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.4 var(--sans)}
+  a{color:var(--acc);text-decoration:none}
+  button{font:inherit;color:inherit;background:transparent;border:1px solid var(--line);padding:5px 10px;border-radius:5px;cursor:pointer}
+  button:hover{background:var(--panel2)}
+  button.primary{background:var(--acc);border-color:var(--acc);color:#0b0e14;font-weight:600}
+  button.danger{border-color:var(--err);color:var(--err)}
+  input,select{font:inherit;color:inherit;background:var(--bg);border:1px solid var(--line);padding:5px 8px;border-radius:5px}
+
+  /* topbar */
+  .topbar{display:flex;align-items:center;gap:14px;padding:8px 16px;background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:10}
+  .brand{font-weight:700;font-size:14px;letter-spacing:.5px}
+  .brand .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 6px var(--ok);margin-right:6px;vertical-align:middle}
+  .pill{font:11px var(--mono);padding:2px 8px;border-radius:10px;background:var(--panel2);border:1px solid var(--line);color:var(--muted)}
+  .pill.sandbox{color:var(--warn);border-color:#5a4a17}
+  .pill.prod{color:var(--err);border-color:#5a2226}
+  .pill.up{color:var(--ok);border-color:#1d3a23}
+  .pill.down{color:var(--err);border-color:#5a2226}
+  .topbar .spacer{flex:1}
+  .topbar .meta{font:11px var(--mono);color:var(--dim)}
+  .topbar .meta b{color:var(--fg);font-weight:600}
+
+  /* nav */
+  nav.tabs{display:flex;background:var(--panel);border-bottom:1px solid var(--line);padding:0 16px;gap:2px}
+  nav.tabs button{background:transparent;border:none;border-bottom:2px solid transparent;padding:10px 14px;border-radius:0;color:var(--muted)}
+  nav.tabs button.active{color:var(--fg);border-bottom-color:var(--acc)}
+  nav.tabs button:hover{background:transparent;color:var(--fg)}
+
+  main{padding:16px;max-width:1400px;margin:0 auto}
+  .view{display:none}
+  .view.active{display:block}
+
+  /* cards */
+  .grid{display:grid;gap:12px}
+  .g-4{grid-template-columns:repeat(4,1fr)}
+  .g-6{grid-template-columns:repeat(6,1fr)}
+  .g-3{grid-template-columns:repeat(3,1fr)}
+  @media(max-width:1100px){.g-6,.g-4{grid-template-columns:repeat(3,1fr)}}
+  @media(max-width:700px){.g-6,.g-4,.g-3{grid-template-columns:1fr 1fr}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px}
+  .card h3{margin:0 0 8px;font:11px var(--mono);color:var(--dim);text-transform:uppercase;letter-spacing:.5px;font-weight:600}
+  .metric{font:24px/1.1 var(--mono);font-weight:600}
+  .metric small{font-size:13px;color:var(--muted);font-weight:400;margin-left:4px}
+  .delta{font:11px var(--mono);margin-top:4px}
+  .delta.up{color:var(--ok)}
+  .delta.down{color:var(--err)}
+  .delta.flat{color:var(--dim)}
+  .spark{margin-top:8px;height:32px}
+  .spark path{fill:none;stroke:var(--acc);stroke-width:1.5}
+
+  /* table */
+  table{width:100%;border-collapse:collapse;font:12px var(--mono)}
+  th,td{text-align:left;padding:6px 10px;border-bottom:1px solid var(--line)}
+  th{background:var(--panel2);color:var(--dim);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.5px;position:sticky;top:0}
+  tr:hover td{background:var(--panel2)}
+  td.num{text-align:right}
+  td .badge{display:inline-block;padding:1px 7px;border-radius:8px;font-size:10px;font-weight:600;letter-spacing:.3px}
+  .badge.ok{background:#1d3a23;color:var(--ok)}
+  .badge.run{background:#1a2a40;color:var(--acc)}
+  .badge.warn{background:#3a2f12;color:var(--warn)}
+  .badge.err{background:#3a1818;color:var(--err)}
+  .badge.dim{background:#222a36;color:var(--dim)}
+
+  /* toolbar */
+  .toolbar{display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap}
+  .toolbar .grow{flex:1}
+  .toolbar input{min-width:240px}
+
+  /* progress */
+  .bar{height:6px;background:var(--panel2);border-radius:3px;overflow:hidden}
+  .bar > div{height:100%;background:var(--acc);transition:width .3s}
+  .bar.warn > div{background:var(--warn)}
+  .bar.err > div{background:var(--err)}
+
+  /* log */
+  .log{font:11px var(--mono);background:#07090d;border:1px solid var(--line);border-radius:6px;padding:10px;height:260px;overflow:auto;white-space:pre;color:var(--muted)}
+  .log .ok{color:var(--ok)}
+  .log .err{color:var(--err)}
+  .log .warn{color:var(--warn)}
+  .log .info{color:var(--acc)}
+
+  /* regime */
+  .regime{font:18px var(--mono);font-weight:700;padding:10px 14px;border-radius:6px;display:inline-block}
+  .regime.risk_off{background:#3a1818;color:#ff8585;border:1px solid #5a2226}
+  .regime.risk_on_reduced{background:#3a2f12;color:#ffd76b;border:1px solid #5a4a17}
+  .regime.neutral{background:#1a2a40;color:#79b8ff;border:1px solid #2c4769}
+
+  /* settings */
+  .row{display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--line)}
+  .row:last-child{border-bottom:none}
+  .row label{flex:0 0 240px;color:var(--muted)}
+  .row .desc{flex:1;color:var(--dim);font-size:12px}
+  .toggle{position:relative;display:inline-block;width:38px;height:20px;background:var(--panel2);border-radius:10px;cursor:pointer;border:1px solid var(--line)}
+  .toggle::after{content:"";position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;background:var(--dim);transition:.2s}
+  .toggle.on{background:#1a2a40;border-color:var(--acc)}
+  .toggle.on::after{left:20px;background:var(--acc)}
+
+  /* modal */
+  .modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:100}
+  .modal-bg.open{display:flex}
+  .modal{background:var(--panel);border:1px solid var(--line);border-radius:8px;width:520px;max-width:90vw;max-height:80vh;overflow:auto}
+  .modal .head{padding:12px 16px;border-bottom:1px solid var(--line);font-weight:600;display:flex;justify-content:space-between;align-items:center}
+  .modal .body{padding:16px;font:12px var(--mono)}
+  .modal .body table th{background:transparent}
+
+  /* drawer */
+  .drawer-bg{position:fixed;inset:0;background:rgba(0,0,0,.4);display:none;z-index:50}
+  .drawer-bg.open{display:block}
+  .drawer{position:fixed;top:0;right:0;bottom:0;width:480px;background:var(--panel);border-left:1px solid var(--line);overflow:auto;transform:translateX(100%);transition:.2s}
+  .drawer-bg.open .drawer{transform:translateX(0)}
+  .drawer .head{padding:14px 16px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center}
+  .drawer .body{padding:16px;font:12px var(--mono)}
+  .kv{display:grid;grid-template-columns:130px 1fr;gap:4px 12px}
+  .kv dt{color:var(--dim)}
+  .kv dd{margin:0}
+
+  /* footer */
+  footer{padding:20px 16px;color:var(--dim);font:11px var(--mono);text-align:center;border-top:1px solid var(--line);margin-top:30px}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="brand"><span class="dot"></span>alphard-bot</div>
+  <span class="pill sandbox">SANDBOX</span>
+  <span class="pill up">● UP</span>
+  <span class="pill" style="color:var(--acc);border-color:#1a2a40">sha-82907a5</span>
+  <span class="meta">uptime <b>40d 14h</b></span>
+  <span class="meta">heartbeat <b>14s ago</b></span>
+  <div class="spacer"></div>
+  <span class="meta">.107:8000 · last daily_sync <b>02.09 20:00 MSK</b></span>
+  <button>🔄 refresh</button>
+</div>
+
+<nav class="tabs">
+  <button class="active" data-view="dash">Дашборд</button>
+  <button data-view="universe">Тикеры</button>
+  <button data-view="backfill">Backfill</button>
+  <button data-view="macro">Режим рынка</button>
+  <button data-view="backups">Бэкапы</button>
+  <button data-view="settings">Настройки</button>
+</nav>
+
+<main>
+
+<!-- DASHBOARD -->
+<section class="view active" id="view-dash">
+  <div class="grid g-6">
+    <div class="card">
+      <h3>Режим рынка</h3>
+      <div class="regime neutral" id="r-regime">—</div>
+      <div class="delta" id="r-budget">—</div>
+    </div>
+    <div class="card">
+      <h3>Тикеров всего</h3>
+      <div class="metric" id="r-universe">—</div>
+      <div class="delta flat">universe · MOEX ISS</div>
+    </div>
+    <div class="card">
+      <h3>Backfill done</h3>
+      <div class="metric" id="r-backfill">— <small>/ —</small></div>
+      <div class="bar" style="margin-top:6px"><div id="r-backfill-pct" style="width:0%"></div></div>
+      <div class="delta flat" id="r-backfill-meta">—</div>
+    </div>
+    <div class="card">
+      <h3>Daily sync</h3>
+      <div class="metric" id="r-daily">— <small>баров</small></div>
+      <div class="delta flat" id="r-daily-at">—</div>
+    </div>
+    <div class="card">
+      <h3>Drawdown</h3>
+      <div class="metric" id="r-drawdown">— <small>%</small></div>
+      <div class="delta flat" id="r-drawdown-meta">no peak tracking yet</div>
+    </div>
+    <div class="card">
+      <h3>Backup</h3>
+      <div class="metric" id="r-backup-files">— <small>files</small></div>
+      <div class="delta flat" id="r-backup-at">—</div>
+    </div>
+  </div>
+
+  <div class="grid g-3" style="margin-top:12px">
+    <div class="card">
+      <h3>Backfill прогресс · 7d</h3>
+      <svg class="spark" viewBox="0 0 200 32" preserveAspectRatio="none">
+        <path d="M0,28 L20,26 L40,22 L60,20 L80,16 L100,14 L120,10 L140,8 L160,6 L180,4 L200,2"/>
+      </svg>
+      <div class="delta up">+412 тикеров за неделю</div>
+    </div>
+    <div class="card">
+      <h3>Heartbeat · 24h</h3>
+      <svg class="spark" viewBox="0 0 200 32" preserveAspectRatio="none">
+        <path d="M0,16 L10,15 L20,17 L30,16 L40,18 L50,16 L60,15 L70,17 L80,16 L90,18 L100,16 L110,15 L120,17 L130,16 L140,18 L150,16 L160,15 L170,17 L180,16 L190,18 L200,16" stroke="#3fb950"/>
+      </svg>
+      <div class="delta flat">1440 / 1440 (100%)</div>
+    </div>
+    <div class="card">
+      <h3>Daily sync bars · 7d</h3>
+      <svg class="spark" viewBox="0 0 200 32" preserveAspectRatio="none">
+        <path d="M0,18 L30,16 L60,17 L90,14 L120,15 L150,12 L180,13 L200,10"/>
+      </svg>
+      <div class="delta up">+12 840 за неделю</div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:12px">
+    <h3>Последние события</h3>
+    <table>
+      <thead><tr><th>when</th><th>loop</th><th>status</th><th>msg</th></tr></thead>
+      <tbody id="r-events"></tbody>
+    </table>
+  </div>
+</section>
+
+<!-- UNIVERSE -->
+<section class="view" id="view-universe">
+  <div class="toolbar">
+    <input id="universe-search" placeholder="тикер или FIGI">
+    <select><option>все статусы</option><option>done</option><option>running</option><option>no-data</option><option>failed</option><option>delisted</option></select>
+    <select><option>все сектора</option><option>нефть/газ</option><option>финансы</option><option>металлы</option><option>ритейл</option><option>IT</option><option>телеком</option></select>
+    <div class="grow"></div>
+    <span id="r-universe-count" style="color:var(--dim);font:12px var(--mono)">—</span>
+    <button class="primary">+ добавить FIGI</button>
+  </div>
+  <div class="card" style="padding:0;overflow:auto;max-height:65vh">
+    <table id="universe-table">
+      <thead><tr>
+        <th>тикер</th><th>FIGI</th><th>статус</th><th class="num">баров</th><th>listed</th><th>delisted</th><th class="num">last sync</th><th class="num">retries</th><th></th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</section>
+
+<!-- BACKFILL -->
+<section class="view" id="view-backfill">
+  <div class="grid g-4">
+    <div class="card">
+      <h3>Прогресс</h3>
+      <div class="metric" id="r-bf-pct">—</div>
+      <div class="bar" style="margin-top:6px"><div id="r-bf-bar" style="width:0%"></div></div>
+      <div class="delta flat" id="r-bf-count">—</div>
+    </div>
+    <div class="card">
+      <h3>Текущий тикер</h3>
+      <div class="metric" style="font-size:18px" id="r-bf-cur-ticker">—</div>
+      <div class="delta flat" id="r-bf-cur-figi">—</div>
+    </div>
+    <div class="card">
+      <h3>Скорость</h3>
+      <div class="metric">~16<small>min/тикер</small></div>
+      <div class="delta flat">token-bucket 0.5/60s</div>
+    </div>
+    <div class="card">
+      <h3>ETA</h3>
+      <div class="metric">~38<small>d</small></div>
+      <div class="delta flat">~1 625 тикеров осталось</div>
+    </div>
+  </div>
+
+  <div class="grid g-3" style="margin-top:12px">
+    <div class="card">
+      <h3>Статусы тикеров</h3>
+      <table>
+        <tbody>
+          <tr><td><span class="badge ok">done</span></td><td class="num">1 628</td><td class="num">50.0%</td></tr>
+          <tr><td><span class="badge run">running</span></td><td class="num">1</td><td class="num">0.0%</td></tr>
+          <tr><td><span class="badge dim">pending</span></td><td class="num">1 176</td><td class="num">36.1%</td></tr>
+          <tr><td><span class="badge warn">no-data</span></td><td class="num">252</td><td class="num">7.7%</td></tr>
+          <tr><td><span class="badge err">failed</span></td><td class="num">196</td><td class="num">6.0%</td></tr>
+          <tr><td><span class="badge dim">delisted</span></td><td class="num">1</td><td class="num">0.0%</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="card">
+      <h3>Контроль</h3>
+      <div class="row" style="border:none;padding:6px 0">
+        <button class="danger">⏸  pause</button>
+        <button class="primary">▶  resume</button>
+      </div>
+      <div class="row" style="border:none;padding:6px 0">
+        <label style="flex:0 0 110px">--limit</label>
+        <input value="5500" style="width:100px">
+      </div>
+      <div class="row" style="border:none;padding:6px 0">
+        <label style="flex:0 0 110px">--start-year</label>
+        <input value="2018" style="width:100px">
+      </div>
+      <div class="row" style="border:none;padding:6px 0">
+        <label style="flex:0 0 110px">--min-bars</label>
+        <input value="1300" style="width:100px">
+      </div>
+      <div class="row" style="border:none;padding:6px 0">
+        <label style="flex:0 0 110px">--skip-known-bad</label>
+        <div class="toggle on" data-on="true"></div>
+      </div>
+      <div class="row" style="border:none;padding:6px 0">
+        <button>↻  restart supervisor</button>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Логи · tail</h3>
+      <div class="log" id="backfill-log"></div>
+    </div>
+  </div>
+</section>
+
+<!-- MACRO / REGIME -->
+<section class="view" id="view-macro">
+  <div class="grid g-4">
+    <div class="card">
+      <h3>Режим</h3>
+      <div class="regime neutral" id="r-macro-regime">—</div>
+      <div class="delta flat" style="margin-top:6px" id="r-macro-budget">—</div>
+    </div>
+    <div class="card">
+      <h3>CBR ставка</h3>
+      <div class="metric" id="r-macro-cbr">— <small>%</small></div>
+      <div class="delta flat" id="r-macro-cbr-meta">—</div>
+    </div>
+    <div class="card">
+      <h3>USD/RUB</h3>
+      <div class="metric" id="r-macro-usdrub">—</div>
+      <div class="delta flat" id="r-macro-usdrub-meta">—</div>
+    </div>
+    <div class="card">
+      <h3>IMOEX</h3>
+      <div class="metric" id="r-macro-imoex">—</div>
+      <div class="delta flat" id="r-macro-imoex-meta">—</div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:12px">
+    <h3>Правила классификатора</h3>
+    <table>
+      <thead><tr><th>условие</th><th>режим</th><th>budget</th><th>сейчас</th></tr></thead>
+      <tbody>
+        <tr><td>CBR &gt; 15% ИЛИ IMOEX dd &gt; 20% / 60d</td><td><span class="badge err">risk_off</span></td><td>×0.5</td><td><span class="badge ok">match</span></td></tr>
+        <tr><td>USD/RUB Δ &gt; 5% / 5d (без risk_off)</td><td><span class="badge warn">risk_on_reduced</span></td><td>×0.7</td><td><span class="badge dim">—</span></td></tr>
+        <tr><td>иначе</td><td><span class="badge run">neutral</span></td><td>×1.0</td><td><span class="badge dim">—</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card" style="margin-top:12px">
+    <h3>Источники данных</h3>
+    <table>
+      <thead><tr><th>feature</th><th>источник</th><th>обновление</th><th>last</th><th></th></tr></thead>
+      <tbody>
+        <tr><td>CBR</td><td>MOEX ISS · cbr_key_rate</td><td>manual</td><td>01.09 09:00</td><td><span class="badge ok">ok</span></td></tr>
+        <tr><td>USD/RUB</td><td>MOEX ISS · USD000UTSTOM</td><td>daily 20:00</td><td>02.09 20:00</td><td><span class="badge ok">ok</span></td></tr>
+        <tr><td>IMOEX</td><td>MOEX ISS · IMOEX</td><td>daily 20:00</td><td>02.09 20:00</td><td><span class="badge ok">ok</span></td></tr>
+        <tr><td>Brent</td><td>—</td><td>deferred</td><td>—</td><td><span class="badge dim">off</span></td></tr>
+        <tr><td>CPI / GDP</td><td>—</td><td>deferred</td><td>—</td><td><span class="badge dim">off</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- BACKUPS -->
+<section class="view" id="view-backups">
+  <div class="toolbar">
+    <div class="grow"></div>
+    <button>↻  сейчас</button>
+    <button class="primary">⬇  pull latest</button>
+  </div>
+  <div class="card" style="padding:0;overflow:auto">
+    <table>
+      <thead><tr><th>file</th><th class="num">size</th><th class="num">duration</th><th>started</th><th>retention</th><th></th></tr></thead>
+      <tbody id="backups-body"></tbody>
+    </table>
+  </div>
+  <div class="card" style="margin-top:12px">
+    <h3>Retention policy</h3>
+    <table>
+      <tbody>
+        <tr><td>daily keep</td><td class="num">7</td><td>последние 7 дней</td></tr>
+        <tr><td>weekly keep</td><td class="num">4</td><td>по одному за ISO-неделю</td></tr>
+        <tr><td>target dir</td><td colspan="2"><code>/mnt/appdata/alphard-backups/</code></td></tr>
+        <tr><td>compression</td><td colspan="2">gzip -6 · --format=plain</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- SETTINGS -->
+<section class="view" id="view-settings">
+  <div class="card">
+    <h3>Режим</h3>
+    <div class="row">
+      <label>Среда</label>
+      <select id="r-s-env" style="min-width:200px">
+        <option>sandbox</option><option>prod</option>
+      </select>
+      <div class="desc">sandbox — Tinkoff demo-token, без реальных денег. prod — токен с реального счёта, нужны права <code>trade:write</code>.</div>
+    </div>
+    <div class="row">
+      <label>Token</label>
+      <input id="r-s-token" type="password" value="••••••••••••••••••••" style="width:300px" readonly>
+      <div class="desc">хранится в <code>/root/.env</code> → <code>TINKOFF_INVEST_TOKEN</code>, bind-mount в контейнер</div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:12px">
+    <h3>Backfill</h3>
+    <div class="row">
+      <label>token-bucket rate</label>
+      <input value="0.5" style="width:80px"> <span style="color:var(--dim)">/ 60s</span>
+      <div class="desc">0.5 запросов в минуту — лимит Tinkoff MD archive. Не поднимать, иначе 429.</div>
+    </div>
+    <div class="row">
+      <label>--start-year</label>
+      <input value="2018" style="width:80px">
+      <div class="desc">глубина истории для OHLCV</div>
+    </div>
+    <div class="row">
+      <label>--min-bars</label>
+      <input value="1300" style="width:80px">
+      <div class="desc">меньше — тикер помечается no-data и пропускается</div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:12px">
+    <h3>Risk</h3>
+    <div class="row">
+      <label>max DD</label>
+      <input value="10" style="width:60px"> <span style="color:var(--dim)">%</span>
+      <div class="desc">halt при drawdown ≥ N%</div>
+    </div>
+    <div class="row">
+      <label>max position</label>
+      <input value="5" style="width:60px"> <span style="color:var(--dim)">%</span>
+      <div class="desc">доля портфеля на одну позицию</div>
+    </div>
+    <div class="row">
+      <label>max sector</label>
+      <input value="30" style="width:60px"> <span style="color:var(--dim)">%</span>
+      <div class="desc">концентрация на сектор</div>
+    </div>
+    <div class="row">
+      <label>cash floor</label>
+      <input value="5" style="width:60px"> <span style="color:var(--dim)">%</span>
+      <div class="desc">минимальный кэш в портфеле</div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:12px">
+    <h3>Loops</h3>
+    <div class="row"><label>heartbeat</label><div class="toggle" id="r-s-loop-heartbeat"></div><div class="desc">60s tick · метрика <code>alphard_heartbeats_total</code></div></div>
+    <div class="row"><label>daily_sync</label><div class="toggle" id="r-s-loop-daily_sync"></div><div class="desc">20:00 MSK · incremental OHLCV</div></div>
+    <div class="row"><label>delisted_sync</label><div class="toggle" id="r-s-loop-delisted_sync"></div><div class="desc">weekly · 7d cadence</div></div>
+    <div class="row"><label>backup</label><div class="toggle" id="r-s-loop-backup"></div><div class="desc">03:00 MSK · pg_dump + gzip</div></div>
+    <div class="row"><label>macro_regime</label><div class="toggle" id="r-s-loop-macro_regime"></div><div class="desc">после daily_sync · CBR + USD/RUB + IMOEX</div></div>
+  </div>
+</section>
+
+</main>
+
+<!-- ticker drawer -->
+<div class="drawer-bg" id="drawer">
+  <div class="drawer">
+    <div class="head">
+      <span id="drawer-title">—</span>
+      <button onclick="closeDrawer()">✕</button>
+    </div>
+    <div class="body" id="drawer-body"></div>
+  </div>
+</div>
+
+<!-- backup confirm modal -->
+<div class="modal-bg" id="modal">
+  <div class="modal">
+    <div class="head">
+      <span id="modal-title">—</span>
+      <button onclick="closeModal()">✕</button>
+    </div>
+    <div class="body" id="modal-body"></div>
+  </div>
+</div>
+
+<footer>
+alphard-bot · sha-82907a5 · .107:8000 · Hermes Kanban orchestrator · mock data, не live
+</footer>
+
+<script>
+// ─── state ────────────────────────────────────────────────
+const state = {
+  active: 'dash',
+  summary: null,
+  sparklineTickers: [],
+  sparklineBars: [],
+  events: [],
+  tickers: [],
+  tickersTotal: 0,
+  tickersFilter: {q:'', status:'', offset:0},
+  tickerDetail: null,
+  backfill: null,
+  macro: null,
+  backups: [],
+  settings: null,
+};
+
+// ─── helpers ──────────────────────────────────────────────
+async function api(path) {
+  const r = await fetch(path);
+  if (!r.ok) throw new Error(`${path} → ${r.status}`);
+  return r.json();
+}
+
+function fmt(n) { return (n ?? 0).toLocaleString('ru-RU'); }
+function fmtPct(n) { return (n ?? 0).toFixed(1) + '%'; }
+function isoLocal(s) {
+  if (!s) return '—';
+  const d = new Date(s);
+  if (isNaN(d)) return s;
+  return d.toLocaleString('ru-RU', {timeZone: 'Europe/Moscow'});
+}
+function el(tag, props, ...children) {
+  const e = document.createElement(tag);
+  if (props) for (const k in props) {
+    if (k === 'class') e.className = props[k];
+    else if (k.startsWith('on')) e[k] = props[k];
+    else e.setAttribute(k, props[k]);
+  }
+  for (const c of children) if (c != null) e.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+  return e;
+}
+
+// ─── view loaders ─────────────────────────────────────────
+async function loadSummary() {
+  const [summary, ticks, bars, events] = await Promise.all([
+    api('/api/summary'),
+    api('/api/sparkline?metric=tickers&days=7').catch(() => []),
+    api('/api/sparkline?metric=bars&days=7').catch(() => []),
+    api('/api/events?limit=10').catch(() => []),
+  ]);
+  state.summary = summary;
+  state.sparklineTickers = ticks;
+  state.sparklineBars = bars;
+  state.events = events;
+}
+
+async function loadTickers() {
+  const f = state.tickersFilter;
+  const q = new URLSearchParams();
+  if (f.q) q.set('q', f.q);
+  if (f.status) q.set('status', f.status);
+  q.set('limit', '50');
+  q.set('offset', String(f.offset));
+  const [list, total] = await Promise.all([
+    api('/api/tickers?' + q.toString()),
+    api('/api/tickers/count?' + q.toString()).catch(() => ({count: 0})),
+  ]);
+  state.tickers = list;
+  state.tickersTotal = total.count || 0;
+}
+
+async function loadBackfill() {
+  state.backfill = await api('/api/backfill').catch(() => null);
+}
+async function loadMacro() {
+  state.macro = await api('/api/macro').catch(() => null);
+}
+async function loadBackups() {
+  state.backups = await api('/api/backups').catch(() => []);
+}
+async function loadSettings() {
+  state.settings = await api('/api/settings').catch(() => null);
+}
+
+// ─── tab nav ──────────────────────────────────────────────
+document.querySelectorAll('nav.tabs button').forEach(b => {
+  b.onclick = async () => {
+    document.querySelectorAll('nav.tabs button').forEach(x => x.classList.remove('active'));
+    document.querySelectorAll('.view').forEach(x => x.classList.remove('active'));
+    b.classList.add('active');
+    const v = b.dataset.view;
+    state.active = v;
+    await refreshActive();
+  };
+});
+
+async function refreshActive() {
+  if (state.active === 'dash') await loadSummary();
+  if (state.active === 'universe') await loadTickers();
+  if (state.active === 'backfill') await loadBackfill();
+  if (state.active === 'macro') await loadMacro();
+  if (state.active === 'backups') await loadBackups();
+  if (state.active === 'settings') await loadSettings();
+  renderActive();
+}
+
+function renderActive() {
+  if (state.active === 'dash') renderDash();
+  if (state.active === 'universe') renderUniverse();
+  if (state.active === 'backfill') renderBackfill();
+  if (state.active === 'macro') renderMacro();
+  if (state.active === 'backups') renderBackups();
+  if (state.active === 'settings') renderSettings();
+}
+
+// ─── render: dashboard ────────────────────────────────────
+function renderDash() {
+  const s = state.summary || {};
+  document.getElementById('r-regime').textContent = s.regime || '—';
+  document.getElementById('r-regime').className = 'regime ' + (s.regime === 'risk_off' ? 'risk_off' : s.regime === 'risk_on_reduced' ? 'risk_on_reduced' : 'neutral');
+  document.getElementById('r-budget').textContent = s.regime ? ('budget ×' + (s.regime_multiplier ?? '?')) : '—';
+  document.getElementById('r-universe').textContent = fmt(s.universe_size);
+  // Issue #405: r-backfill, r-daily, r-drawdown, r-backup-files
+  // previously used innerHTML with template literals. The values
+  // come from server JSON and are NOT sanitised server-side, so any
+  // user-editable broker metadata (figi, listed_at, delisted_at, msg)
+  // could carry a payload like ``<img src=x onerror=alert(1)>``. Build
+  // DOM nodes with createElement + textContent so the browser never
+  // parses values as HTML.
+  const bfEl = document.getElementById('r-backfill');
+  bfEl.replaceChildren(fmt(s.backfill_done), el('small', {}, '/ ' + fmt(s.universe_size)));
+  document.getElementById('r-backfill-pct').style.width = (s.backfill_pct || 0) + '%';
+  document.getElementById('r-backfill-meta').textContent = fmtPct(s.backfill_pct) + ' done';
+  const dailyEl = document.getElementById('r-daily');
+  dailyEl.replaceChildren(fmt(s.daily_sync_bars), el('small', {}, 'баров'));
+  document.getElementById('r-daily-at').textContent = s.daily_sync_at ? isoLocal(s.daily_sync_at) : '—';
+  const drawdownEl = document.getElementById('r-drawdown');
+  drawdownEl.replaceChildren('—', el('small', {}, '%'));
+  const backupFilesEl = document.getElementById('r-backup-files');
+  backupFilesEl.replaceChildren('—', el('small', {}, 'files'));
+  document.getElementById('r-backup-at').textContent = '—';
+
+  // Recent events table
+  const evTbody = document.getElementById('r-events');
+  evTbody.replaceChildren();
+  if (!state.events.length) {
+    evTbody.appendChild(
+      el('tr', {}, el('td', {colspan: '4', style: 'color:var(--dim);text-align:center'}, 'no events yet'))
+    );
+  } else {
+    state.events.forEach(e => {
+      evTbody.appendChild(
+        el('tr', {},
+          el('td', {}, isoLocal(e.at)),
+          el('td', {}, e.kind),
+          el('td', {}, el('span', {class: 'badge ' + (e.status === 'ok' ? 'ok' : 'warn')}, e.status || '?')),
+          el('td', {}, e.msg || '')
+        )
+      );
+    });
+  }
+}
+
+// ─── render: universe ─────────────────────────────────────
+function renderUniverse() {
+  const tb = document.getElementById('universe-table').querySelector('tbody');
+  tb.replaceChildren();
+  if (!state.tickers.length) {
+    tb.appendChild(
+      el('tr', {}, el('td', {colspan: '9', style: 'color:var(--dim);text-align:center'}, 'no tickers match the current filter'))
+    );
+  } else {
+    state.tickers.forEach(t => {
+      const status = t.backfill_complete ? 'done' : (t.bar_count === 0 ? 'no-data' : 'pending');
+      const sBadge = {done:'ok', running:'run', 'no-data':'warn', failed:'err', delisted:'dim', pending:'dim'}[status];
+      const btn = el('button', {'data-ticker': t.ticker}, '···');
+      btn.onclick = (ev) => { ev.stopPropagation(); openDrawer(t.ticker); };
+      const tr = el('tr', {},
+        el('td', {}, el('b', {}, t.ticker)),
+        el('td', {style: 'color:var(--dim)'}, t.figi || '—'),
+        el('td', {}, el('span', {class: 'badge ' + sBadge}, status)),
+        el('td', {class: 'num'}, fmt(t.bar_count)),
+        el('td', {}, t.listed_at || '—'),
+        el('td', {}, t.delisted_at || '—'),
+        el('td', {class: 'num'}, t.last_bar_at || '—'),
+        el('td', {class: 'num'}, '—'),
+        el('td', {}, btn)
+      );
+      tb.appendChild(tr);
+    });
+  }
+  document.getElementById('r-universe-count').textContent = `показано ${state.tickers.length} из ${fmt(state.tickersTotal)}`;
+}
+
+document.getElementById('universe-search').oninput = (e) => {
+  state.tickersFilter.q = e.target.value;
+  state.tickersFilter.offset = 0;
+  loadTickers().then(renderUniverse);
+};
+
+// ─── render: backfill ─────────────────────────────────────
+function renderBackfill() {
+  const b = state.backfill || {};
+  const total = b.total || 0;
+  const done = b.done || 0;
+  const pct = total ? Math.round(1000 * done / total) / 10 : 0;
+  document.getElementById('r-bf-pct').textContent = fmtPct(pct);
+  document.getElementById('r-bf-bar').style.width = pct + '%';
+  document.getElementById('r-bf-count').textContent = `${fmt(done)} / ${fmt(total)}`;
+  document.getElementById('r-bf-cur-ticker').textContent = b.current_ticker || '—';
+  document.getElementById('r-bf-cur-figi').textContent = b.current_figi || '';
+}
+
+// ─── render: macro ────────────────────────────────────────
+function renderMacro() {
+  const m = state.macro || {};
+  if (!m.regime) {
+    document.getElementById('r-macro-regime').textContent = '—';
+    const cbrEmpty = document.getElementById('r-macro-cbr');
+    cbrEmpty.replaceChildren('—', el('small', {}, '%'));
+    document.getElementById('r-macro-usdrub').textContent = '—';
+    document.getElementById('r-macro-imoex').textContent = '—';
+    return;
+  }
+  document.getElementById('r-macro-regime').textContent = m.regime.toUpperCase();
+  const cbrEl = document.getElementById('r-macro-cbr');
+  cbrEl.replaceChildren(String(m.cbr_key_rate ?? '—'), el('small', {}, '%'));
+  document.getElementById('r-macro-usdrub').textContent = m.usdrub_close ?? '—';
+  document.getElementById('r-macro-imoex').textContent = m.imoex_close ?? '—';
+}
+
+// ─── render: backups ──────────────────────────────────────
+function renderBackups() {
+  const tb = document.getElementById('backups-body');
+  tb.replaceChildren();
+  if (!state.backups.length) {
+    tb.appendChild(
+      el('tr', {}, el('td', {colspan: '6', style: 'color:var(--dim);text-align:center'}, 'no backups found'))
+    );
+    return;
+  }
+  state.backups.forEach(b => {
+    tb.appendChild(
+      el('tr', {},
+        el('td', {}, el('code', {}, b.file)),
+        el('td', {class: 'num'}, b.size),
+        el('td', {class: 'num'}, b.duration || '—'),
+        el('td', {}, b.started),
+        el('td', {}, b.kind || '—'),
+        el('td', {}, el('button', {}, '⬇'), el('button', {class: 'danger'}, '↺ restore'))
+      )
+    );
+  });
+}
+
+// ─── render: settings ─────────────────────────────────────
+function renderSettings() {
+  const s = state.settings || {};
+  document.getElementById('r-s-env').textContent = s.env || '—';
+  // BUGFIX: r-s-token is <input type="password">. Setting textContent
+  // is a no-op (inputs don't render text content). Use .value instead.
+  document.getElementById('r-s-token').value = s.token_set ? '(set)' : '(not set)';
+  const l = s.loops || {};
+  ['heartbeat','daily_sync','delisted_sync','backup','macro_regime'].forEach(name => {
+    const t = document.getElementById('r-s-loop-' + name);
+    if (t) t.classList.toggle('on', !!l[name]);
+  });
+}
+
+// ─── toggles (client-only, no backend write in MVP) ───────
+document.querySelectorAll('.toggle').forEach(t => {
+  t.onclick = () => t.classList.toggle('on');
+});
+
+// ─── ticker drawer ───────────────────────────────────────
+async function openDrawer(ticker) {
+  try {
+    const detail = await api('/api/ticker/' + encodeURIComponent(ticker));
+    state.tickerDetail = detail;
+    document.getElementById('drawer-title').textContent = ticker + ' · ' + (detail.figi || '');
+    // Issue #405: every value below is server-controlled JSON
+    // (figi, listed_at, delisted_at, status, bar values). Pre-fix
+    // this whole block was a template literal assigned to innerHTML;
+    // any of those fields carrying ``<img src=x onerror=alert(1)>``
+    // would execute in the operator's browser. Build DOM nodes with
+    // textContent so the browser treats values as text.
+    const body = document.getElementById('drawer-body');
+    body.replaceChildren(
+      el('dl', {class: 'kv'},
+        el('dt', {}, 'FIGI'),
+        el('dd', {}, detail.figi || '—'),
+        el('dt', {}, 'Status'),
+        el('dd', {}, detail.backfill_complete ? 'done' : 'pending'),
+        el('dt', {}, 'Bars in DB'),
+        el('dd', {}, fmt(detail.bar_count)),
+        el('dt', {}, 'Listed'),
+        el('dd', {}, detail.listed_at || '—'),
+        el('dt', {}, 'Delisted'),
+        el('dd', {}, detail.delisted_at || '—')
+      )
+    );
+    if (detail.recent_bars && detail.recent_bars.length) {
+      const tbl = el('table', {},
+        el('thead', {}, el('tr', {},
+          el('th', {}, 'ts'),
+          el('th', {class: 'num'}, 'o'),
+          el('th', {class: 'num'}, 'h'),
+          el('th', {class: 'num'}, 'l'),
+          el('th', {class: 'num'}, 'c'),
+          el('th', {class: 'num'}, 'v')
+        )),
+        el('tbody')
+      );
+      const tb = tbl.querySelector('tbody');
+      detail.recent_bars.forEach(b => {
+        tb.appendChild(
+          el('tr', {},
+            el('td', {}, String(b.ts)),
+            el('td', {class: 'num'}, String(b.open)),
+            el('td', {class: 'num'}, String(b.high)),
+            el('td', {class: 'num'}, String(b.low)),
+            el('td', {class: 'num'}, String(b.close)),
+            el('td', {class: 'num'}, fmt(b.volume))
+          )
+        );
+      });
+      body.appendChild(el('h3', {style: 'margin-top:20px'}, 'Свежие бары'));
+      body.appendChild(tbl);
+    }
+    document.getElementById('drawer').classList.add('open');
+  } catch (e) {
+    console.error('openDrawer failed', e);
+  }
+}
+function closeDrawer() { document.getElementById('drawer').classList.remove('open'); }
+
+// ─── modal ────────────────────────────────────────────────
+function closeModal() { document.getElementById('modal').classList.remove('open'); }
+
+// ─── bootstrap ───────────────────────────────────────────
+async function tick() {
+  await refreshActive();
+}
+
+tick();
+setInterval(tick, 30_000);
+</script>
+</body>
+</html>
