@@ -231,7 +231,7 @@ def _read_unavail_streak(path: str) -> int:
         return 0
 
 
-def _write_unavail_streak(path: str, value: int, log) -> None:
+def _write_unavail_streak(path: str, value: int, log: logging.Logger) -> None:
     """Persist circuit-breaker streak counter. Failures are non-fatal —
     on persistent storage failure we just lose the streak count, which
     degrades back to the original sawtooth-loop behaviour but does not
