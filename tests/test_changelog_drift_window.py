@@ -126,11 +126,7 @@ def test_drift_window_prs_are_all_in_changelog() -> None:
     """
     text = CHANGELOG.read_text(encoding="utf-8")
 
-    missing = [
-        f"PR #{pr} — {subject}"
-        for pr, subject in _drift_window_prs()
-        if f"#{pr}" not in text
-    ]
+    missing = [f"PR #{pr} — {subject}" for pr, subject in _drift_window_prs() if f"#{pr}" not in text]
 
     assert not missing, "merged to main but absent from CHANGELOG.md:\n" + "\n".join(missing)
 
@@ -153,9 +149,7 @@ def test_latest_changelog_commit_is_self_cite_exempt() -> None:
     latest_pr = latest_pr_match.group(1)
 
     window_prs = [pr for pr, _subject in _drift_window_prs()]
-    assert (
-        latest_pr not in window_prs
-    ), (
+    assert latest_pr not in window_prs, (
         f"latest CHANGELOG commit (PR #{latest_pr}) leaked into the drift "
         f"window — self-cite recursion is back (#449 regression)"
     )
