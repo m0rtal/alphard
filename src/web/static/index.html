@@ -520,18 +520,28 @@ const state = {
 // localStorage) so the token clears when the operator closes the
 // browser. The server-side gate lives in src/web/server.py:check_auth;
 // the HTML root path is auth-open so this prompt can render.
+//
+// Issue #421 — the prompt must use `<input type="password">` via the
+// #modal element, NOT `window.prompt()`, which renders the input in
+// plaintext (shoulder-surfing / screen-recording exposure for a
+// production financial UI on the .107 LAN).
 const TOKEN_STORAGE_KEY = 'alphard_web_token';
-function getToken() {
+async function getToken() {
   let t = sessionStorage.getItem(TOKEN_STORAGE_KEY);
   if (!t) {
-    t = window.prompt('alphard-web bearer token:') || '';
+    t = await promptPassword({
+      title: 'alphard-web auth',
+      label: 'Bearer token',
+      placeholder: 'paste ALPHARD_WEB_TOKEN here'
+    });
     if (t) sessionStorage.setItem(TOKEN_STORAGE_KEY, t);
   }
   return t;
 }
 
 async function api(path) {
-  const headers = getToken() ? {Authorization: 'Bearer ' + getToken()} : {};
+  const token = await getToken();
+  const headers = token ? {Authorization: 'Bearer ' + token} : {};
   const r = await fetch(path, {headers});
   // Issue #411: 401 → clear stored token so a wrong / rotated token
   // surfaces a re-prompt instead of silently throwing.
@@ -862,9 +872,61 @@ async function openDrawer(ticker) {
 function closeDrawer() { document.getElementById('drawer').classList.remove('open'); }
 
 // ─── modal ────────────────────────────────────────────────
+// Issue #421 — bearer token must NOT be entered via `window.prompt()`
+// because that primitive renders the input in plaintext (shoulder-
+// surfing, screen-recording leakage, VNC exposure). The auth modal
+// uses `<input type="password">` so the browser masks every character.
+//
+// `promptPassword({title, label})` returns a Promise<string> that
+// resolves to the entered token (or empty string on cancel). It reuses
+// the existing #modal element so styling matches the rest of the UI.
+function openModal(title, bodyHtml) {
+  document.getElementById('modal-title').textContent = title;
+  document.getElementById('modal-body').innerHTML = bodyHtml;
+  document.getElementById('modal').classList.add('open');
+}
 function closeModal() { document.getElementById('modal').classList.remove('open'); }
 
-// ─── bootstrap ───────────────────────────────────────────
+function promptPassword({title, label, placeholder}) {
+  return new Promise((resolve) => {
+    const safePlaceholder = (placeholder || '').replace(/[<>"&]/g, '');
+    const safeLabel = (label || '').replace(/[<>"&]/g, '');
+    openModal(
+      title,
+      '<div class="auth-form">' +
+        '<label>' + safeLabel + '</label>' +
+        '<input type="password" id="auth-token-input" autocomplete="off" ' +
+              'spellcheck="false" autofocus placeholder="' + safePlaceholder + '">' +
+        '<div class="auth-actions">' +
+          '<button id="auth-cancel">Cancel</button>' +
+          '<button id="auth-ok">Save</button>' +
+        '</div>' +
+      '</div>'
+    );
+    const input = document.getElementById('auth-token-input');
+    const okBtn = document.getElementById('auth-ok');
+    const cancelBtn = document.getElementById('auth-cancel');
+
+    function done(value) {
+      closeModal();
+      input.removeEventListener('keydown', onKey);
+      okBtn.removeEventListener('click', onOk);
+      cancelBtn.removeEventListener('click', onCancel);
+      resolve(value);
+    }
+    function onOk() { done(input.value || ''); }
+    function onCancel() { done(''); }
+    function onKey(ev) {
+      if (ev.key === 'Enter') { ev.preventDefault(); onOk(); }
+      else if (ev.key === 'Escape') { ev.preventDefault(); onCancel(); }
+    }
+    input.addEventListener('keydown', onKey);
+    okBtn.addEventListener('click', onOk);
+    cancelBtn.addEventListener('click', onCancel);
+  });
+}
+
+// ─── bootstrap ────────────────────────────────────────────
 async function tick() {
   await refreshActive();
 }

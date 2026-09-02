@@ -212,23 +212,33 @@ class TestApiHelperSendsAuthorization:
         )
 
     def test_token_prompt_on_first_load(self) -> None:
-        """When no token in sessionStorage, prompt the operator once."""
+        """When no token in sessionStorage, prompt the operator once.
+
+        Issue #421 replaces the legacy ``window.prompt(...)`` call with
+        a Promise-based ``promptPassword(...)`` helper that opens a
+        styled modal containing ``<input type=\"password\">`` (so the
+        browser masks the token against shoulder-surfing). Both
+        mechanisms satisfy this regression — the contract is "the page
+        acquires the bearer token on first load before any api() call",
+        not the specific JS primitive used.
+        """
         text = _load_index_html()
-        # The page should call window.prompt (or similar) to acquire the token.
-        # This is a one-shot UX layer so we don't require it to be inside
-        # api() itself — anywhere in the file before the first fetch is fine.
-        # Look for prompt() with a token-related string. The reference is
-        # the canonical key 'alphard_web_token' (storage) and the operator
-        # hint "bearer token" (UX). Either must appear in the prompt arg.
         prompt_patterns = (
+            # Legacy mechanism (issue #411, closed by PR #414).
             r"prompt\s*\(\s*['\"][^'\"]*alphard[_-]?web[_-]?token[^'\"]*['\"]",
             r"prompt\s*\(\s*['\"][^'\"]*bearer\s+token[^'\"]*['\"]",
+            # Modern mechanism (issue #421, fixed by this branch):
+            # getToken() awaits promptPassword({title, label, ...})
+            # and the label is the operator-visible UX string.
+            r"promptPassword\s*\(\s*\{[^}]*label\s*:\s*['\"][^'\"]*bearer\s+token[^'\"]*['\"]",
         )
         prompt_match = any(re.search(p, text, re.IGNORECASE) for p in prompt_patterns)
         assert prompt_match, (
             "Issue #411: index.html must prompt the operator for the bearer "
-            "token on first load. Searched for prompt(...alphard_web_token...) "
-            "and prompt(...bearer token...) in the page source."
+            "token on first load. Searched for the legacy prompt(...) call "
+            "and the issue #421 promptPassword({label: 'Bearer token', ...}) "
+            "form in the page source. Neither matched — the operator will "
+            "never be prompted and api() will fire with no Authorization."
         )
 
 
