@@ -40,6 +40,11 @@ def _render_compose() -> dict:
     return yaml.safe_load(text)
 
 
+# Alias: tests merged from feature/alphard-web-v2 (PR #394) use the
+# `_load_compose` name; keep both working without renaming all call-sites.
+_load_compose = _render_compose
+
+
 def _render_compose_text() -> str:
     r = subprocess.run(
         ["docker", "compose", "-f", str(COMPOSE_PATH), "config"],
@@ -226,11 +231,13 @@ class TestAlphardWebSecurity:
     def test_alphard_web_port_is_loopback_only(self) -> None:
         """Issue #406: published port MUST bind to 127.0.0.1 (loopback).
 
-        The compose port mapping for alphard-web must be the long
-        ``HOST_IP:HOST_PORT:CONTAINER_PORT`` form with ``127.0.0.1``
-        as the host IP. Short form (``"8081:8080"``) or
-        ``"0.0.0.0:8081:8080"`` would expose the dashboard on every
-        interface the container sees.
+        The compose port mapping for alphard-web must resolve to a host
+        IP of ``127.0.0.1`` (loopback) so the dashboard is reachable
+        only via a reverse proxy that injects the bearer header. Docker
+        Compose v2 renders long-form ``HOST_IP:HOST_PORT:CONTAINER_PORT``
+        entries as a dict with ``host_ip``, ``published``, ``target``;
+        the source YAML still uses the string form ``127.0.0.1:8081:8080``
+        for readability.
         """
         data = _load_compose()
         web = data["services"]["alphard-web"]
@@ -238,10 +245,30 @@ class TestAlphardWebSecurity:
         web_ports = [p for p in ports if "8081" in str(p)]
         assert web_ports, f"alphard-web MUST publish port 8081; got: {ports}"
         for port_mapping in web_ports:
-            s = str(port_mapping)
-            # Long form must start with 127.0.0.1:
-            assert "127.0.0.1:8081:8080" in s, (
-                f"alphard-web port mapping must bind 127.0.0.1:8081:8080 "
-                f"(issue #406: 0.0.0.0/short form exposes dashboard to LAN); "
-                f"got: {s}"
+            # Normalize: long-form string OR Compose v2 dict both appear
+            if isinstance(port_mapping, dict):
+                host_ip = port_mapping.get("host_ip", "")
+                published = port_mapping.get("published", "")
+                target = port_mapping.get("target", "")
+            else:
+                s = str(port_mapping)
+                # Long form must start with 127.0.0.1:
+                assert "127.0.0.1:8081:8080" in s, (
+                    f"alphard-web port mapping must bind 127.0.0.1:8081:8080 "
+                    f"(issue #406: 0.0.0.0/short form exposes dashboard to LAN); "
+                    f"got: {s}"
+                )
+                continue
+            assert host_ip == "127.0.0.1", (
+                f"alphard-web port mapping host_ip MUST be 127.0.0.1 "
+                f"(issue #406: 0.0.0.0 exposes dashboard to LAN); "
+                f"got: {host_ip!r} (full mapping: {port_mapping!r})"
+            )
+            assert str(published) == "8081", (
+                f"alphard-web port mapping published MUST be 8081; "
+                f"got: {published!r}"
+            )
+            assert str(target) == "8080", (
+                f"alphard-web port mapping target MUST be 8080; "
+                f"got: {target!r}"
             )

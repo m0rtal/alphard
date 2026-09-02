@@ -46,8 +46,15 @@ PR_CITATION = re.compile(r"\bPRs?\s+((?:#\d+(?:\s*,\s*)?)+)")
 PR_NUMBER = re.compile(r"#(\d+)")
 
 # Open at the time their entry lands, so git cannot confirm them yet.
-# #394 ships alphard-web and is a stated prerequisite of the #399 entry.
-INFLIGHT_PRS = frozenset({"394", "399"})
+# #394 just merged via `--no-ff` (alphard convention) which does not append
+# `(#394)` to the merge subject, so the suffix-driven `_merged_pr_numbers()`
+# cannot prove the merge from git history alone. The Changelog allowlist
+# guard workflow (.github/workflows/changelog-allowlist-guard.yml) plus
+# `tests/test_407_postmerge_inflight_allowlist.py` keep this list honest:
+# the next no-ff merge will be detected via the test, and a follow-up PR
+# drops the entry. #399 is the prior example of an entry that needed
+# pruning — see cycle165 QA review (issue #407).
+INFLIGHT_PRS = frozenset({"394"})
 
 # Entries written before this guard existed that say "PR #NNN" for a number
 # that is an issue (#290, #349) or a closed-unmerged PR (#378, superseded by
