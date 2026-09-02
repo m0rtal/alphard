@@ -74,12 +74,29 @@ def _drift_window_prs() -> list[tuple[str, str]]:
     PREVIOUS CHANGELOG commit rather than the latest one, because the latest
     is normally the backfill under review — its own additions must be inside
     the window it claims to close.
+
+    The LATEST CHANGELOG commit is also exempted dynamically: its own
+    `(#NNN)` suffix is appended only at squash-merge time, so the branch-tip
+    CI cannot see it. Once on `main`, the drift-window check would reject
+    the backfill for missing its own citation — even when the entry on the
+    line above explicitly references it. This is the recursion that #447 /
+    #448 / #450 / #449 surfaced. Fix: parse the latest CHANGELOG commit's
+    squash-merge subject and add its PR number to a per-run exemption set.
+    See issue #449 option 2 for the rationale.
     """
-    history = _git("log", "-2", "--format=%H", "--", "CHANGELOG.md").splitlines()
+    history = _git("log", "-2", "--format=%H%x00%s", "--", "CHANGELOG.md").splitlines()
     if len(history) < 2:
         pytest.skip("fewer than 2 CHANGELOG commits in this checkout (shallow clone?)")
 
-    window_start = history[-1]
+    latest_line = history[0]
+    _latest_sha, _, latest_subject = latest_line.partition("\x00")
+    latest_pr_match = MERGE_PR_SUFFIX.search(latest_subject)
+
+    runtime_exempt: frozenset[str] = CHANGELOG_EXEMPT_PRS | (
+        frozenset({latest_pr_match.group(1)}) if latest_pr_match else frozenset()
+    )
+
+    window_start = history[-1].split("\x00", 1)[0]
 
     out = _git("log", "--format=%H%x00%s", f"{window_start}..HEAD")
     if not out:
@@ -94,7 +111,7 @@ def _drift_window_prs() -> list[tuple[str, str]]:
 
         found.append((m.group(1), subject))
 
-    return found
+    return [(pr, subject) for pr, subject in found if pr not in runtime_exempt]
 
 
 def test_drift_window_prs_are_all_in_changelog() -> None:
@@ -103,16 +120,39 @@ def test_drift_window_prs_are_all_in_changelog() -> None:
     This is the gate that #384 says was missing: it derives the window from
     git, so a backfill cannot pass by logging only the PRs a human happened
     to name in an issue title.
+
+    The recursion guard for self-citing PRs is implemented in
+    `_drift_window_prs` (see issue #449).
     """
     text = CHANGELOG.read_text(encoding="utf-8")
 
-    missing = [
-        f"PR #{pr} — {subject}"
-        for pr, subject in _drift_window_prs()
-        if pr not in CHANGELOG_EXEMPT_PRS and f"#{pr}" not in text
-    ]
+    missing = [f"PR #{pr} — {subject}" for pr, subject in _drift_window_prs() if f"#{pr}" not in text]
 
     assert not missing, "merged to main but absent from CHANGELOG.md:\n" + "\n".join(missing)
+
+
+def test_latest_changelog_commit_is_self_cite_exempt() -> None:
+    """Regression test for issue #449 — recursion guard.
+
+    The latest CHANGELOG-touching commit's own `(#NNN)` suffix is appended
+    only at squash-merge time. Branch-tip CI cannot see it, so the test
+    would falsely flag the backfill for missing its own citation once it
+    lands on `main`. `_drift_window_prs` must dynamically exempt that PR.
+    """
+    history = _git("log", "-1", "--format=%s", "--", "CHANGELOG.md").splitlines()
+    if not history:
+        pytest.skip("no CHANGELOG.md commit reachable from HEAD")
+    latest_subject = history[0]
+    latest_pr_match = MERGE_PR_SUFFIX.search(latest_subject)
+    if not latest_pr_match:
+        pytest.skip("latest CHANGELOG commit is not a squash-merge (#NNN suffix)")
+    latest_pr = latest_pr_match.group(1)
+
+    window_prs = [pr for pr, _subject in _drift_window_prs()]
+    assert latest_pr not in window_prs, (
+        f"latest CHANGELOG commit (PR #{latest_pr}) leaked into the drift "
+        f"window — self-cite recursion is back (#449 regression)"
+    )
 
 
 @pytest.mark.parametrize("pr", PINNED_PRS)
