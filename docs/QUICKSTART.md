@@ -38,10 +38,15 @@ That is **all**. The script:
 2. Creates `.env` from `.env.example` (if missing).
 3. Auto-generates a 24-byte random `POSTGRES_PASSWORD` /
    `REDIS_PASSWORD` (if missing).
-4. Runs `docker compose up -d`.
-5. Waits up to 180 s for every long-running service to report
+4. Fetches the Russian Trusted Root CA + Sub CA bundle from
+   `invest-public-api.tinkoff.ru` / `iss.moex.com` and writes it to
+   `docker/certs/tinkoff-gost-ca-bundle.pem` so the bot can verify
+   their TLS chains. Idempotent — re-running skips the fetch if the
+   bundle is <30 days old. (Issue #455.)
+5. Runs `docker compose up -d`.
+6. Waits up to 180 s for every long-running service to report
    `healthy`.
-6. Prints the per-container status table and the URL of each
+7. Prints the per-container status table and the URL of each
    service.
 
 ## What you should see on success

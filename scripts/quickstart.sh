@@ -206,6 +206,64 @@ fi
 
 ok "prometheus stack removed (PR #399); bot exposes /metrics on port 8765"
 
+# ---- 3. Russian GOST CA bundle (Issue #455) ----
+# docker-compose.yaml bind-mounts ./docker/certs/tinkoff-gost-ca-bundle.pem
+# into the alphard-bot container so its ssl/requests clients trust
+# invest-public-api.tinkoff.ru + iss.moex.com (which sit behind the Russian
+# Trusted Root CA, not in certifi). Without this bundle every HTTPS call
+# to those endpoints fails with CERTIFICATE_VERIFY_FAILED.
+#
+# scripts/fetch_tinkoff_gost_ca.py (PR #444 + #454) writes the bundle
+# to docker/certs/tinkoff-gost-ca-bundle.pem. We invoke it here so a
+# fresh clone has the file before `compose up` runs — otherwise the
+# bind-mount in docker-compose.yaml errors with "Bind source path
+# does not exist" and the whole stack fails to start.
+#
+# Idempotency: if the file already exists and is less than 30 days
+# old, we skip the fetch. 30 days matches the Russian Trusted Root
+# CA rotation cadence (they rotate ~quarterly; 30d is conservative
+# for the typical operator who doesn't touch the bundle between
+# code drops). An operator who suspects stale certs can `rm` the
+# file and re-run quickstart to force a fresh fetch.
+info "3/5 Russian GOST CA bundle"
+
+GOST_BUNDLE="$REPO_ROOT/docker/certs/tinkoff-gost-ca-bundle.pem"
+GOST_BUNDLE_DIR="$(dirname "$GOST_BUNDLE")"
+GOST_FETCH_MAX_AGE_DAYS="${GOST_FETCH_MAX_AGE_DAYS:-30}"
+
+needs_gost_fetch=1
+if [[ -f "$GOST_BUNDLE" ]]; then
+    # `find -mtime -30` returns 0 if any file in the tree was modified
+    # within the window. The bundle is a single file, so a direct mtime
+    # check is enough; `find` here is a defensive belt-and-braces against
+    # a future change where the script writes multiple files into
+    # docker/certs/.
+    if find "$GOST_BUNDLE" -mtime -"$GOST_FETCH_MAX_AGE_DAYS" -print -quit 2>/dev/null | grep -q .; then
+        log "  $GOST_BUNDLE is fresh (<$GOST_FETCH_MAX_AGE_DAYS days); skipping fetch"
+        needs_gost_fetch=0
+    else
+        log "  $GOST_BUNDLE is older than $GOST_FETCH_MAX_AGE_DAYS days; refetching"
+    fi
+fi
+
+if [[ "$needs_gost_fetch" == "1" ]]; then
+    mkdir -p "$GOST_BUNDLE_DIR"
+    # `|| true` swallows non-zero exit so the script doesn't abort on
+    # a fetch failure (network down, Russian endpoints unreachable
+    # from a CI host, etc). We log the failure and continue — the
+    # compose step below will then fail loudly with the actual
+    # bind-mount error, which is more diagnostic than a silent
+    # quickstart exit. The pre-pr_smoke.sh gate covers the
+    # success-path contract (it requires the script to exit 0).
+    if ! python3 "$REPO_ROOT/scripts/fetch_tinkoff_gost_ca.py" --out "$GOST_BUNDLE" 2>&1 | sed 's/^/    /'; then
+        warn "fetch_tinkoff_gost_ca.py failed; compose up will likely fail with bind-mount error"
+        warn "  Re-run once Russian endpoints are reachable, or remove the bundle file"
+        warn "  and re-run quickstart."
+    else
+        ok "GOST CA bundle written to $GOST_BUNDLE"
+    fi
+fi
+
 # ---- 5. docker compose up ----
 # Two early-exit paths:
 #   - ALPHARD_SKIP_COMPOSE=1: bake-only mode. Operator wants a fully-
@@ -224,7 +282,7 @@ if [[ "$SKIP_COMPOSE" == "1" ]]; then
     ok "bakes complete; compose not invoked"
     exit 0
 fi
-info "5/5 docker compose up -d"
+info "4/5 docker compose up -d"
 
 # ---- Container-name conflict precheck (issue #382) ----
 # docker-compose.yaml hardcodes `container_name:` for the six long-running
