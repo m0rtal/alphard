@@ -78,9 +78,7 @@ def _drop_leaf(certs: list[bytes]) -> list[bytes]:
     that has zero usable CAs (issue #482).
     """
     if not certs:
-        raise RuntimeError(
-            "chain is empty; refusing to ship a leaf-only bundle (issue #482)"
-        )
+        raise RuntimeError("chain is empty; refusing to ship a leaf-only bundle (issue #482)")
     # Walk the chain from the front; collect indices that are leaves.
     leaf_count = 0
     for der in certs:
@@ -96,37 +94,48 @@ def _drop_leaf(certs: list[bytes]) -> list[bytes]:
 
 
 def _is_ca_cert(der: bytes) -> bool:
-    """Return True iff the DER cert carries `basicConstraints CA:TRUE`.
+    """Return True iff the DER cert carries ``basicConstraints CA:TRUE``.
 
-    Cheap parse via `openssl x509 -ext basicConstraints` on a temp file.
-    Returns False on any decode error (treating undecodable bytes as
-    non-CA so the caller strips them — safer than keeping unknowns).
+    Pure-Python parse via ``cryptography.x509`` (already a project dep
+    used by ``_fetch_chain_python`` for the bytes-shaped-chain fix in
+    #464). Returns False on any decode error (treating undecodable
+    bytes as non-CA so the caller strips them — safer than keeping
+    unknowns).
+
+    Why no ``openssl x509 -ext basicConstraints`` subprocess: the openssl
+    CLI is not guaranteed to exist on the alphard-bot alpine container
+    (per the module docstring: ``python+pyOpenSSL (no openssl CLI)``).
+    Shell-out based CA detection would mark every cert as a leaf on
+    openssl-less hosts, causing ``_drop_leaf`` to raise
+    ``RuntimeError("chain has N cert(s) and none is a CA...")`` and
+    refuse to write the bundle. Issue #488.
     """
-    import tempfile
-
-    with tempfile.NamedTemporaryFile(suffix=".pem", delete=False) as f:
-        f.write(der_to_pem(der).encode("ascii"))
-        path = f.name
     try:
-        r = subprocess.run(  # noqa: S603 — path is a controlled tempfile
-            [
-                "openssl",
-                "x509",
-                "-in",
-                path,
-                "-noout",
-                "-ext",
-                "basicConstraints",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if r.returncode != 0:
-            return False
-        return "CA:TRUE" in r.stdout
-    finally:
-        Path(path).unlink(missing_ok=True)
+        from cryptography import x509
+        from cryptography.x509.oid import ExtensionOID
+    except ImportError:
+        # cryptography is a hard dep of the project (requirements.txt);
+        # this branch only fires on a manually-stripped install. Treat
+        # the cert as a leaf (caller strips it) so the script fails
+        # loudly on a missing dep rather than silently shipping a
+        # leaf-only bundle.
+        return False
+
+    try:
+        cert = x509.load_der_x509_certificate(der)
+    except Exception:  # noqa: BLE001 — DER parse error → not a CA
+        return False
+
+    try:
+        bc = cert.extensions.get_extension_for_oid(ExtensionOID.BASIC_CONSTRAINTS).value
+    except x509.ExtensionNotFound:
+        # RFC 5280 §4.2.1.9: a cert without basicConstraints is a leaf.
+        return False
+
+    # `bc` is `cryptography.x509.BasicConstraints` at runtime; the type
+    # is reported as `ExtensionType` upstream, so we read the attribute
+    # through ``getattr`` to keep the type checker happy.
+    return bool(getattr(bc, "ca", False))
 
 
 def _parse_pem_blocks(text: str) -> list[bytes]:

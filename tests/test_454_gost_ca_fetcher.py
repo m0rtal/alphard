@@ -168,8 +168,8 @@ def test_fetch_chain_python_strips_leaf_cert(gost_module) -> None:
     """
     chain = [
         b"\x30\x82\x01\x00" + b"\x00" * 100,  # leaf (index 0)
-        b"\x30\x82\x01\x01" + b"\x00" * 80,   # intermediate CA
-        b"\x30\x82\x01\x02" + b"\x00" * 60,   # root CA
+        b"\x30\x82\x01\x01" + b"\x00" * 80,  # intermediate CA
+        b"\x30\x82\x01\x02" + b"\x00" * 60,  # root CA
     ]
     fake_ctx, _ = _fake_chain_ctx(chain)
 
@@ -189,8 +189,133 @@ def test_fetch_chain_python_strips_leaf_cert(gost_module) -> None:
         f"(expected 2 after leaf-strip). Issue #482."
     )
     # The returned list must contain the 2 trailing CA certs, not the leaf.
-    assert out == chain[1:], (
-        f"_fetch_chain_python must return [intermediate, root] (chain[1:]); got {out!r}"
+    assert out == chain[1:], f"_fetch_chain_python must return [intermediate, root] (chain[1:]); got {out!r}"
+
+
+def test_is_ca_cert_uses_stdlib_not_openssl_cli(gost_module) -> None:
+    """Defect (#488): ``_is_ca_cert`` must not shell out to ``openssl``.
+
+    On the alphard-bot alpine container the ``openssl`` CLI is absent
+    (per the module docstring: ``python+pyOpenSSL (no openssl CLI)``),
+    so any CA-detection that depends on ``openssl x509 -ext
+    basicConstraints`` would mark every cert as a leaf and cause
+    ``_drop_leaf`` to raise ``RuntimeError("chain has N cert(s) and none
+    is a CA...")``. The fix parses ``basicConstraints`` via
+    ``cryptography.x509`` (a project dep).
+
+    Pin two contracts:
+    1. ``subprocess.run`` is NEVER called by ``_is_ca_cert``.
+    2. A real self-signed CA cert (built with ``cryptography`` in this
+       test) returns ``True``; a real leaf cert returns ``False``.
+    """
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    def _make_cert(*, ca: bool) -> bytes:
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "test-cert")])
+        builder = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(issuer)
+            .public_key(key.public_key())
+            .serial_number(1)
+            .not_valid_before(__import__("datetime").datetime(2026, 1, 1))
+            .not_valid_after(__import__("datetime").datetime(2030, 1, 1))
+        )
+        builder = builder.add_extension(x509.BasicConstraints(ca=ca, path_length=None), critical=True)
+        cert = builder.sign(key, hashes.SHA256())
+        return cert.public_bytes(serialization.Encoding.DER)
+
+    ca_der = _make_cert(ca=True)
+    leaf_der = _make_cert(ca=False)
+
+    # 1) subprocess.run must NOT be invoked from _is_ca_cert.
+    with patch.object(subprocess, "run") as mock_run:
+        assert gost_module._is_ca_cert(ca_der) is True
+        assert gost_module._is_ca_cert(leaf_der) is False
+        assert mock_run.call_count == 0, (
+            f"_is_ca_cert must not call subprocess.run (got {mock_run.call_count} "
+            f"calls). Issue #488 — openssl-less alpine contract."
+        )
+
+    # 2) A cert without basicConstraints at all must return False.
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "no-bc")])
+    cert_no_bc = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(2)
+        .not_valid_before(__import__("datetime").datetime(2026, 1, 1))
+        .not_valid_after(__import__("datetime").datetime(2030, 1, 1))
+        .sign(key, hashes.SHA256())
+    )
+    der_no_bc = cert_no_bc.public_bytes(serialization.Encoding.DER)
+    assert (
+        gost_module._is_ca_cert(der_no_bc) is False
+    ), "RFC 5280 §4.2.1.9: certs without basicConstraints are leaves, not CAs"
+
+
+def test_fetch_chain_python_does_not_require_openssl_for_leaf_filter(
+    gost_module,
+) -> None:
+    """Issue #488 acceptance test: openssl-less alpine contract.
+
+    End-to-end check: on a host without the ``openssl`` CLI,
+    ``_fetch_chain_python`` + ``_drop_leaf`` returns the CAs unchanged
+    (i.e. does NOT raise ``RuntimeError("none is a CA")``). Verified by
+    making ``subprocess.run`` raise ``FileNotFoundError`` (the exact
+    behaviour the OS shows when ``openssl`` is missing from ``$PATH``)
+    and confirming the chain still flows through the leaf filter via
+    the stdlib ``cryptography`` path.
+    """
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    def _make_cert(*, ca: bool) -> bytes:
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "test-cert")])
+        return (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(issuer)
+            .public_key(key.public_key())
+            .serial_number(1)
+            .not_valid_before(__import__("datetime").datetime(2026, 1, 1))
+            .not_valid_after(__import__("datetime").datetime(2030, 1, 1))
+            .add_extension(x509.BasicConstraints(ca=ca, path_length=None), critical=True)
+            .sign(key, hashes.SHA256())
+        ).public_bytes(serialization.Encoding.DER)
+
+    leaf_der = _make_cert(ca=False)
+    ca_der = _make_cert(ca=True)
+    chain = [leaf_der, ca_der]
+
+    fake_ctx, _ = _fake_chain_ctx(chain)
+
+    def openssl_missing(*_args, **_kwargs):
+        raise FileNotFoundError("[Errno 2] No such file or directory: 'openssl': " "simulated openssl-less alpine host")
+
+    with patch.object(_socket, "create_connection", return_value=MagicMock()):
+        with patch.object(gost_module.ssl, "create_default_context", return_value=fake_ctx):
+            with patch.object(subprocess, "run", side_effect=openssl_missing):
+                # If _is_ca_cert shells out, this raises RuntimeError.
+                # After the cryptography refactor, it returns the CAs unchanged.
+                out = gost_module._fetch_chain_python(
+                    "example.com", 443, timeout=1.0, reason="openssl not found: simulated"
+                )
+
+    assert out == [ca_der], (
+        f"_fetch_chain_python must drop the leaf and return [ca_der] on an "
+        f"openssl-less host; got {len(out)} cert(s). Issue #488 — the "
+        f"alpine-deployment contract requires the leaf filter to work "
+        f"without the openssl CLI."
     )
 
 
@@ -198,7 +323,7 @@ def test_fetch_chain_rejects_openssl_returncode_nonzero(gost_module) -> None:
     """Defect 1 (#454): openssl returncode was ignored; partial output parsed.
 
     `openssl s_client` against a closed port returns 1 and writes
-    `CONNECTED(...)` to stderr before any PEM. The script must not parse
+    `CONNECTED(00000005)` to stderr before any PEM. The script must not parse
     stdout and silently return an empty chain.
     """
     fake_proc = MagicMock()
