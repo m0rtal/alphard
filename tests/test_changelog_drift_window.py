@@ -75,26 +75,39 @@ def _drift_window_prs() -> list[tuple[str, str]]:
     is normally the backfill under review — its own additions must be inside
     the window it claims to close.
 
-    The LATEST CHANGELOG commit is also exempted dynamically: its own
-    `(#NNN)` suffix is appended only at squash-merge time, so the branch-tip
-    CI cannot see it. Once on `main`, the drift-window check would reject
-    the backfill for missing its own citation — even when the entry on the
-    line above explicitly references it. This is the recursion that #447 /
-    #448 / #450 / #449 surfaced. Fix: parse the latest CHANGELOG commit's
-    squash-merge subject and add its PR number to a per-run exemption set.
-    See issue #449 option 2 for the rationale.
+    The recursion guard exempts EVERY CHANGELOG-touching commit's PR number
+    in the bounded scan window, not just the latest. The original PR #451
+    logic exempted only the latest, which was sufficient when the latest
+    CHANGELOG commit was always the squash-merge — the squash-merge commit
+    always carries `(#NNN)` in its subject (GitHub appends it) and the
+    CHANGELOG diff it includes already references every PR it should. But
+    when a follow-up CHANGELOG edit lands after the backfill squash, the
+    squash-merge commit is no longer the latest, its `(#NNN)` is no longer
+    exempt, and the test falsely fails demanding the backfill self-cite.
+    Issue #462 extends the exemption to every CHANGELOG-touching commit in
+    the window so the recursion guard holds even when multiple recent
+    CHANGELOG commits sit inside the bounded `-2` scan.
+
+    The window itself stays `-2` (the previous CHANGELOG commit opens it) —
+    only the exemption set widened. Widening the window itself would drag
+    in PRs merged many cycles ago that the current backfill is not
+    responsible for and that older backfills already covered.
     """
     history = _git("log", "-2", "--format=%H%x00%s", "--", "CHANGELOG.md").splitlines()
     if len(history) < 2:
         pytest.skip("fewer than 2 CHANGELOG commits in this checkout (shallow clone?)")
 
-    latest_line = history[0]
-    _latest_sha, _, latest_subject = latest_line.partition("\x00")
-    latest_pr_match = MERGE_PR_SUFFIX.search(latest_subject)
-
-    runtime_exempt: frozenset[str] = CHANGELOG_EXEMPT_PRS | (
-        frozenset({latest_pr_match.group(1)}) if latest_pr_match else frozenset()
-    )
+    # Every CHANGELOG-touching commit in the bounded scan window contributes
+    # its PR number to the exemption set when its subject carries `(#NNN)`.
+    # Branch commits lack the suffix, so they contribute nothing; the
+    # exemption set is exactly the set of CHANGELOG commits whose squash
+    # merge landed on main between the previous CHANGELOG commit and HEAD.
+    runtime_exempt: frozenset[str] = CHANGELOG_EXEMPT_PRS
+    for line in history:
+        _sha, _, subject = line.partition("\x00")
+        m = MERGE_PR_SUFFIX.search(subject)
+        if m:
+            runtime_exempt = runtime_exempt | frozenset({m.group(1)})
 
     window_start = history[-1].split("\x00", 1)[0]
 
@@ -153,6 +166,136 @@ def test_latest_changelog_commit_is_self_cite_exempt() -> None:
         f"latest CHANGELOG commit (PR #{latest_pr}) leaked into the drift "
         f"window — self-cite recursion is back (#449 regression)"
     )
+
+
+def test_every_changelog_commit_in_window_is_exempt() -> None:
+    """Regression test for issue #462 — every CHANGELOG-touching squash-merge
+    in the bounded scan window must be exempt from the drift-window check.
+
+    PR #451's recursion guard only exempted the LATEST CHANGELOG commit,
+    which was sufficient when the latest was always the squash-merge under
+    review. A follow-up CHANGELOG edit (typo fix, doc cleanup) lands after
+    the backfill squash and pushes the squash-merge commit out of the
+    "latest" slot — its `(#NNN)` is then no longer exempt and the test
+    falsely fires demanding the backfill self-cite.
+
+    This test asserts the recursion guard covers every CHANGELOG commit in
+    the bounded `-2` window, not just the latest. The bounded window stays
+    at `-2` because the drift-window check itself is bounded to the
+    previous CHANGELOG commit; only the exemption set widened.
+    """
+    history = _git("log", "-2", "--format=%s", "--", "CHANGELOG.md").splitlines()
+    if len(history) < 2:
+        pytest.skip("fewer than 2 CHANGELOG commits in this checkout (shallow clone?)")
+
+    prs_in_window = []
+    for subject in history:
+        m = MERGE_PR_SUFFIX.search(subject)
+        if m:
+            prs_in_window.append(m.group(1))
+
+    drift_prs = {pr for pr, _ in _drift_window_prs()}
+
+    leaked = sorted(set(prs_in_window) & drift_prs, key=int)
+    assert not leaked, (
+        "these CHANGELOG-touching PRs leaked into the drift window — "
+        "_drift_window_prs must exempt every CHANGELOG commit in the bounded "
+        f"scan window, not just the latest (issue #462): {', '.join('#' + p for p in leaked)}"
+    )
+
+
+@pytest.mark.parametrize(
+    "history_lines, window_commits, expected_drift_prs",
+    [
+        # Single-commit case: only the newest CHANGELOG commit is in the
+        # window, and it carries `(#NNN)`. Exemption works (no offenders).
+        (
+            ["aaa1111 docs(changelog): backfill stuff (#500)"],
+            ["aaa1111 docs(changelog): backfill stuff (#500)"],
+            [],
+        ),
+        # Multi-commit gap from issue #462: the second-newest CHANGELOG
+        # commit is a backfill with `(#NNN)`, and the newest is a follow-up
+        # typo fix with no suffix. The old latest-only exemption would skip
+        # (latest has no `(#NNN)`); the new full-window exemption must
+        # remove the backfill from the drift set.
+        (
+            [
+                "bbb2222 docs: typo fix in CHANGELOG",
+                "ccc3333 docs(changelog): backfill stuff (#501)",
+            ],
+            ["ccc3333 docs(changelog): backfill stuff (#501)"],
+            [],
+        ),
+        # Two CHANGELOG commits in the window, both squash-merges with
+        # `(#NNN)`. Both must be exempt from the drift set.
+        (
+            [
+                "ddd4444 docs(changelog): backfill #496 #497 (#500)",
+                "eee5555 fix(other): also touches CHANGELOG (#501)",
+            ],
+            [
+                "ddd4444 docs(changelog): backfill #496 #497 (#500)",
+                "eee5555 fix(other): also touches CHANGELOG (#501)",
+            ],
+            [],
+        ),
+        # PR #502 has NO `(#NNN)` (it is the typo fix), so it is not in the
+        # window set; the squash-merge #501 IS the latest and IS exempt.
+        # A separate PR #502 in the window would still be flagged.
+        (
+            [
+                "fff6666 docs: typo fix in CHANGELOG",
+                "ggg7777 docs(changelog): backfill #501 (#502)",
+            ],
+            ["ggg7777 docs(changelog): backfill #501 (#502)"],
+            [],
+        ),
+    ],
+)
+def test_drift_window_exempts_every_changelog_commit_in_window(
+    monkeypatch: pytest.MonkeyPatch,
+    history_lines: list[str],
+    window_commits: list[str],
+    expected_drift_prs: list[str],
+) -> None:
+    """Regression test for issue #462 — the recursion guard must cover
+    every CHANGELOG-touching squash-merge in the bounded window, not just
+    the latest.
+
+    Each case mocks the two `_git` calls `_drift_window_prs` makes:
+      * `git log -2 ... CHANGELOG.md` (history of CHANGELOG-touching commits)
+      * `git log <window_start>..HEAD` (commits inside the drift window)
+
+    The exemption logic is exercised directly so the test does not depend
+    on the live git history. PR #462's multi-commit gap is the second case
+    below: a backfill squash-merge followed by a follow-up typo fix on
+    CHANGELOG — the old latest-only exemption silently skipped the backfill
+    when the typo fix became the latest.
+    """
+    history_output = "\n".join(history_lines)
+    window_output = "\n".join(window_commits)
+
+    history_log_args = ("log", "-2", "--format=%H%x00%s", "--", "CHANGELOG.md")
+    window_log_args = ("log", "--format=%H%x00%s")
+
+    def fake_git(*args: str, **_kwargs: object) -> str:
+        if args[:5] == history_log_args[:5]:
+            return history_output
+        if args[:1] == window_log_args[:1]:
+            return window_output
+        # Branch-tip or unrelated queries return empty.
+        return ""
+
+    monkeypatch.setattr(
+        "tests.test_changelog_drift_window._git",
+        fake_git,
+    )
+
+    drift = _drift_window_prs()
+    assert sorted(pr for pr, _ in drift) == sorted(
+        expected_drift_prs
+    ), f"expected drift PRs {expected_drift_prs!r}, got {[pr for pr, _ in drift]!r}"
 
 
 @pytest.mark.parametrize("pr", PINNED_PRS)
