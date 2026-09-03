@@ -79,6 +79,23 @@ services:
       # Phase 2.8 step 1: Prometheus metrics HTTP server port.
       # Defaults to 8765; exposed at alphard-bot:8765/metrics inside the network.
       ALPHARD_METRICS_PORT: ${ALPHARD_METRICS_PORT:-8765}
+      # Issue #455 (Closes via this PR): tell Python's `requests`
+      # library to verify TLS chains against the Russian GOST CA bundle
+      # bind-mounted at /etc/ssl/certs/tinkoff-gost-ca-bundle.pem.
+      #
+      # Without this env var the bind-mount is dead weight — `requests`
+      # uses the `certifi` package's hardcoded bundle by default, which
+      # does NOT include the Russian Trusted Root CA. The env var is
+      # honored by `requests.adapters.HTTPAdapter.cert_verify` and
+      # causes every HTTPS call to invest-public-api.tinkoff.ru and
+      # iss.moex.com to verify against the bind-mounted bundle.
+      #
+      # SSL_CERT_FILE is intentionally NOT set: it would shadow the
+      # system trust store rather than augment it, so subprocess calls
+      # to openssl / curl lose trust for non-Russian endpoints. REQUESTS_CA_BUNDLE
+      # is the narrowest correct fix for the Python TLS clients in
+      # src/data/ (the only callers of the .ru endpoints).
+      REQUESTS_CA_BUNDLE: /etc/ssl/certs/tinkoff-gost-ca-bundle.pem
     volumes:
       # BUGFIX (alphard#108): bind-mount on .107 PVE LXC leaves the
       # leaf owned by userns-mapped nobody (uid 65534), which neither
@@ -102,16 +119,26 @@ services:
           size: 100M
       # BUGFIX (#122): bind-mount host /root/.env so entrypoint.sh can source ALPHARD_PG_DSN
       - /root/.env:/root/.env:ro
-      # Issue #455 (Closes via this PR): bind-mount the Russian GOST CA bundle
-      # produced by scripts/fetch_tinkoff_gost_ca.py so the bot's
-      # `requests`/`ssl` clients trust invest-public-api.tinkoff.ru +
-      # iss.moex.com TLS chains. scripts/quickstart.sh runs the fetch
-      # script before `compose up`, so the file always exists on a
-      # first-shot-friendly bootstrap. Re-running compose against an
-      # existing repo is a no-op (the file is already there). The `:ro`
-      # flag protects the file from accidental in-container writes —
-      # only the fetch script (running on the host) is allowed to
-      # regenerate it.
+      # Issue #455 (Closes via this PR): bind-mount the Russian GOST CA
+      # bundle produced by scripts/fetch_tinkoff_gost_ca.py so the
+      # `REQUESTS_CA_BUNDLE` env var (set in the environment: block
+      # above) points at a real file inside the container.
+      #
+      # The env var is what makes Python's `requests` trust the bundle
+      # — without it, this bind-mount is dead weight. The combination
+      # (bind-mount + REQUESTS_CA_BUNDLE) means the file is sourced
+      # from the host (no image rebuild on CA rotation) but verified
+      # against the bind-mounted path inside the container.
+      #
+      # scripts/quickstart.sh runs the fetch script before `compose up`
+      # so the file always exists on a first-shot-friendly bootstrap.
+      # scripts/pre_pr_smoke.sh does the same pre-flight check (issue
+      # #469) so a fresh-clone smoke run also has the file before
+      # compose reads the bind-mount source. Re-running compose
+      # against an existing repo is a no-op (the file is already
+      # there). The `:ro` flag protects the file from accidental
+      # in-container writes — only the fetch script (running on the
+      # host) is allowed to regenerate it.
       - ./docker/certs/tinkoff-gost-ca-bundle.pem:/etc/ssl/certs/tinkoff-gost-ca-bundle.pem:ro
     networks:
       - alphard-net
