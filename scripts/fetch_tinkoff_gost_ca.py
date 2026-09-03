@@ -32,7 +32,7 @@ deliberately used to comply with the project's ``.gitignore`` rule
 blocking ``*.pem``). Python's ``ssl.SSLContext.load_verify_locations``
 parses the file by content (``-----BEGIN CERTIFICATE-----`` markers),
 not by extension — verified by
-``tests/test_454_gost_ca_fetcher.py::test_pem_ext_not_required``.
+``tests/test_455_gost_wiring.py::test_gost_bundle_file_contains_valid_pem``.
 """
 
 from __future__ import annotations
