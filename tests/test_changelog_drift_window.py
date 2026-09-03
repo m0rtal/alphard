@@ -292,6 +292,20 @@ def test_drift_window_exempts_every_changelog_commit_in_window(
         fake_git,
     )
 
+    # Force-rebind `_git` on the actual module that owns
+    # `_drift_window_prs.__globals__` — pytest sometimes imports the
+    # same file under both `tests.test_changelog_drift_window` (the
+    # package-style name in __main__.py imports) and
+    # `test_changelog_drift_window` (the path-style name that
+    # pytest's collector uses for the test file's own globals), so
+    # `monkeypatch.setattr` on the package-style target string does
+    # NOT update the module referenced by `_drift_window_prs`.
+    # `sys.modules` keys for both spellings must point at the same
+    # module so that every name resolves to the same `_git` binding.
+    import sys as _sys
+
+    _abc_mod = _drift_window_prs.__globals__["__name__"]
+    _sys.modules[_abc_mod]._git = fake_git  # type: ignore[attr-defined]
     drift = _drift_window_prs()
     assert sorted(pr for pr, _ in drift) == sorted(
         expected_drift_prs
