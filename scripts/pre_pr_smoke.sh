@@ -165,6 +165,39 @@ services:
     container_name: ${COMPOSE_PROJECT_NAME}-redis-1
 YAML
 
+# BUGFIX (issue #469): pre-fetch the Russian GOST CA bundle BEFORE
+# `compose up` so the alphard-bot bind-mount source path
+# (./docker/certs/tinkoff-gost-ca-bundle.pem) exists as a regular file.
+# Without this, compose's `create_host_path: true` default silently
+# creates a DIRECTORY at the source path, which ssl/requests cannot
+# use as a CA bundle, and the bot's REQUESTS_CA_BUNDLE env var points
+# at an unreadable directory.
+#
+# This mirrors scripts/quickstart.sh step 3/5 so smoke gate works on
+# a fresh checkout that has never run quickstart.sh. We refuse to
+# auto-create a directory-shaped bundle (a known footgun from issue
+# #469): if the source path exists as a directory, we rm -rf it and
+# fetch fresh.
+GOST_BUNDLE_PATH="./docker/certs/tinkoff-gost-ca-bundle.pem"
+if [[ -d "$GOST_BUNDLE_PATH" ]]; then
+    echo "[pre-pr-smoke] [0/4] removing directory-shaped GOST bundle at $GOST_BUNDLE_PATH"
+    echo "[pre-pr-smoke]       (compose auto-created it on a prior run; ssl/requests need a file)"
+    rm -rf "$GOST_BUNDLE_PATH"
+fi
+if [[ ! -f "$GOST_BUNDLE_PATH" ]]; then
+    echo "[pre-pr-smoke] [0/4] pre-fetching GOST CA bundle to $GOST_BUNDLE_PATH"
+    mkdir -p "$(dirname "$GOST_BUNDLE_PATH")"
+    if ! python3 scripts/fetch_tinkoff_gost_ca.py --out "$GOST_BUNDLE_PATH" 2>&1 | sed 's/^/  /'; then
+        echo "[pre-pr-smoke] FAIL: GOST CA bundle fetch failed"
+        echo "[pre-pr-smoke]       (Russian endpoints unreachable? Network policy?)"
+        exit 1
+    fi
+    if [[ ! -f "$GOST_BUNDLE_PATH" ]]; then
+        echo "[pre-pr-smoke] FAIL: $GOST_BUNDLE_PATH still missing after fetch"
+        exit 1
+    fi
+fi
+
 echo "[pre-pr-smoke] [1/4] bringing up stack..."
 # BUGFIX (issue #347): bring up only postgres + alphard-bot. The previous
 # pg-init sidecar was dropped from docker-compose.yaml because its
