@@ -20,7 +20,7 @@
 |---|---|---|
 | **Tinkoff API token** | Доступ к деньгам | КРИТИЧНО |
 | **Postgres credentials** | Portfolio state, trade history | HIGH |
-| **Redis password** | Caching, rate limits | MEDIUM |
+| **Rate-limit secrets** (none — token bucket is in-process after PR #426) | Caching, rate limits | MEDIUM |
 | **LLM API keys** (routerai) | Operational, ~$50/mo | LOW |
 | **GitHub repo** | Public, IP exposure | LOW |
 | **Server credentials** (.107, .110) | Infrastructure access | HIGH |
@@ -81,7 +81,7 @@
 - ✅ Tinkoff API calls — ТОЛЬКО HTTPS через `requests` library, default cert verification ON (`src/broker/tinkoff_account.py`)
 - ✅ Postgres — bound в compose, internal network only (не exposed наружу)
 - ❌ Dedicated bridge `alphard-net` — нет отдельного network, всё в default bridge
-- 📅 Phase 2+: dedicated bridge, separate redis net, outbound allowlist (нет файрвола в compose)
+- 📅 Phase 2+: dedicated bridge, in-process rate-limit channel per shard, outbound allowlist (нет файрвола в compose)
 
 #### Level 2.1 — Postgres pg_hba.conf trust posture (issue #97)
 
@@ -315,7 +315,7 @@
 | 4 | `.env` permissions (chmod 600) | Makefile init | TODO |
 | 5 | Tinkoff token rotate monthly | config + reminder | TODO |
 | 6 | Postgres password > 16 chars | .env.example | TODO |
-| 7 | Redis password > 16 chars | .env.example | TODO |
+| 7 | Redis password > 16 chars (n/a after PR #426) | n/a | REMOVED |
 | 8 | NO direct ports to outside | docker-compose ports | ✅ Phase 0 |
 | 9 | HTTPS only для Tinkoff | code | TODO |
 | 10 | Decision lineage в Postgres | code + schema | TODO Phase 1 |

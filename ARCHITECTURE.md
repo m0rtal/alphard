@@ -16,7 +16,8 @@ Phase 1.6 view, see [`docs/PHASE1-6-SERVICE-DIAGRAM.md`](docs/PHASE1-6-SERVICE-D
 
 Alphard is an autonomous, event-driven multi-agent trading system for MOEX
 (Tinkoff Invest API). It runs as a single Docker container
-(`alphard-bot`) backed by Postgres (state) and Redis (cache). The
+(`alphard-bot`) backed by Postgres (state); rate limiting uses an
+in-process token bucket (Redis was removed in PR #426). The
 system is **read-heavy by default, write-light by design**: most threads
 fetch market data, validate it, and emit metrics; trading actions only
 occur after a chain of fail-safe gates that all return "allow".
@@ -232,12 +233,12 @@ sharding needed; VACUUM ANALYZE every 7 days is sufficient.
 | `macro_state` | Macro Agent | CBR key rate, USD/RUB, IMOEX time-series |
 | `delisted_universe` | `_delisted_sync_loop` | MOEX ISS delisted tickers |
 
-### 6.2 Redis
+### 6.2 Rate limiting (in-process token bucket)
 
-Used for token-bucket rate limiting on Tinkoff API calls (per-token,
-per-second). On Redis outage the Data Agent falls back to in-process
-token bucket (`src/data/token_bucket.py`); correctness preserved,
-throughput degraded.
+Token-bucket rate limiting on Tinkoff API calls (per-token, per-second)
+runs entirely in-process via `src/data/token_bucket.py`. The earlier
+external-Redis implementation was removed in PR #426 — correctness
+preserved, throughput is per-process rather than cluster-wide.
 
 ### 6.3 Tinkoff MD archive (read-only)
 
@@ -257,14 +258,12 @@ backfill completion is checked via `_is_complete()` in
 graph TB
     subgraph HOST["Host (192.168.1.107)"]
         PG[("postgres:16-alpine<br/>:5432<br/>volume: /mnt/appdata/alphard/postgres")]
-        RD[("redis:7-alpine<br/>:6379<br/>volume: /mnt/appdata/alphard/redis")]
         BOT["alphard-bot<br/>:8765 (metrics)"]
         WEB["alphard-web<br/>:8081 (operator UI)"]
         BACKUP["/mnt/appdata/alphard-backups/<br/>(daily pg_dump)"]
     end
 
     PG --- BOT
-    RD --- BOT
     PG --- WEB
     WEB -.reads /metrics.- BOT
     PG -.pg_dump cron.- BACKUP

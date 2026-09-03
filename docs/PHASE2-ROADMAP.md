@@ -253,7 +253,7 @@ The OHLCV backfill took hours of Tinkoff MD downloads; if `.107` dies, that hist
 ### 2.10 — Event-driven decision loop
 
 **What:** Replace 1h heartbeat with event-driven triggers (broker fill, news wire, macro release).
-**Stack:** Redis Streams + in-process subscribers.
+**Stack:** In-process pub/sub + cron-driven loops (external Redis was removed in PR #426).
 **Why Phase 2:** Needs Phase 2.1-2.3 agents active — without them there's nothing to react to.
 
 ### Phase 2 — items deferred to Phase 3+ (cross-ref README "Honest gaps")

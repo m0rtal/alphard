@@ -247,8 +247,8 @@ Any variable not listed here may change without notice.
 
 | Var | Type | Purpose | Failure mode |
 |---|---|---|---|
-| `ALPHARD_PG_DSN` | `str` | Postgres DSN, `postgresql://user:pass@host:5432/db` | unset → most loops no-op (with logged warning) |
-| `ALPHARD_REDIS_URL` | `str` | Redis URL, `redis://host:6379/0` | unset → token bucket falls back to in-process |
+| `ALPHARD_PG_DSN` | `str` | Postgres DSN, `postgresql://user:***@host:5432/db` | unset → most loops no-op (with logged warning) |
+| _Removed after PR #426:_ `ALPHARD_REDIS_URL` | `str` | Redis URL | unset → token bucket falls back to in-process |
 
 ### 4.2 Safety locks
 
