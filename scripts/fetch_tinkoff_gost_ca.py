@@ -98,9 +98,10 @@ def _is_ca_cert(der: bytes) -> bool:
 
     Pure-Python parse via ``cryptography.x509`` (already a project dep
     used by ``_fetch_chain_python`` for the bytes-shaped-chain fix in
-    #464). Returns False on any decode error (treating undecodable
-    bytes as non-CA so the caller strips them — safer than keeping
-    unknowns).
+    #464; listed explicitly in ``requirements.txt`` and
+    ``requirements-ci.txt`` since PR #486 closes #488). Returns False on
+    any decode error (treating undecodable bytes as non-CA so the
+    caller strips them — safer than keeping unknowns).
 
     Why no ``openssl x509 -ext basicConstraints`` subprocess: the openssl
     CLI is not guaranteed to exist on the alphard-bot alpine container

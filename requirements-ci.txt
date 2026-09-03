@@ -32,6 +32,16 @@ psycopg[binary]>=3.1,<4.0  # Phase 1.2 — Postgres integration test
 # mypy stubs (Phase 1.2)
 types-requests>=2.31,<3.0
 
+# Issue #488: PR #486 rewrites `_is_ca_cert` to parse `basicConstraints`
+# via `cryptography.x509` (replacing the openssl-CLI subprocess that
+# broke the openssl-less alpine contract — see #454/#464). The
+# production alphard-bot image gets `cryptography` transitively via
+# `t-tech-investments`, but CI excludes `t-tech-investments` (Tinkoff
+# SDK not on PyPI), so `cryptography` must be installed explicitly
+# here for the regression tests in `test_454_gost_ca_fetcher.py` to
+# run. Pin to a major version that ships with Python 3.11 wheels.
+cryptography>=42.0,<52.0
+
 # Tinkoff Invest SDK (Phase 1.1) — Apache-2.0
 # Install: pip install t-tech-investments --index-url https://opensource.tbank.ru/api/v4/projects/238/packages/pypi/simple
 
