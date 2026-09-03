@@ -45,6 +45,25 @@ PRE_PR_SMOKE = REPO_ROOT / "scripts" / "pre_pr_smoke.sh"
 COMPOSE = REPO_ROOT / "docker-compose.yaml"
 
 
+def _exists_readable(path: str) -> bool:
+    """True iff ``path`` exists and the current process can read it.
+
+    ``Path.exists()`` returns True even when the file is unreadable (e.g.
+    owned by root in a CI container running as a non-root user). The
+    subprocess invocation in ``test_script_smoke_gate_runs_locally``
+    fails with ``PermissionError`` in that case — so callers must check
+    readability, not just existence.
+    """
+    p = Path(path)
+    if not p.exists():
+        return False
+    try:
+        with p.open():
+            return True
+    except (PermissionError, OSError):
+        return False
+
+
 def _run_override_writer() -> str:
     """Run scripts/pre_pr_smoke.sh up to the point it writes the override,
     then return the override file contents.
@@ -258,7 +277,7 @@ def test_script_smoke_gate_runs_locally() -> None:
     """
     import os
 
-    if not (REPO_ROOT / ".env").exists() and not Path("/root/.env").exists():
+    if not (REPO_ROOT / ".env").exists() and not _exists_readable("/root/.env"):
         # Skip if we can't even produce .env — the test is about the
         # override writer, not the full daemon dance.
         return
