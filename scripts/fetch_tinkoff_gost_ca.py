@@ -60,6 +60,75 @@ _PEM_BEGIN = "-----BEGIN CERTIFICATE-----"
 _PEM_END = "-----END CERTIFICATE-----"
 
 
+def _drop_leaf(certs: list[bytes]) -> list[bytes]:
+    """Drop leaf cert(s) from the front of a TLS chain.
+
+    `openssl s_client -showcerts` and `SSLSocket.get_verified_chain()`
+    return `[leaf, intermediate_1, intermediate_2, ..., root]`. Some
+    servers (verified against `iss.moex.com` on 2026-09-03) repeat the
+    leaf cert at index 0 AND index 1 — likely a TLS-extension quirk
+    where the server includes the leaf twice in its handshake message.
+    A CA bundle is supposed to contain only CA certs (intermediates +
+    root), so we strip ALL leading leaf certs by walking the front of
+    the chain until we hit a CA (`basicConstraints CA:TRUE`).
+
+    If every cert in the chain is a leaf (broken upstream CA chain —
+    server sending only its own cert with no intermediate), raise so
+    the caller fails the write instead of shipping a leaf-only bundle
+    that has zero usable CAs (issue #482).
+    """
+    if not certs:
+        raise RuntimeError(
+            "chain is empty; refusing to ship a leaf-only bundle (issue #482)"
+        )
+    # Walk the chain from the front; collect indices that are leaves.
+    leaf_count = 0
+    for der in certs:
+        if _is_ca_cert(der):
+            break
+        leaf_count += 1
+    if leaf_count == len(certs):
+        raise RuntimeError(
+            f"chain has {len(certs)} cert(s) and none is a CA (basicConstraints CA:TRUE); "
+            f"refusing to ship a leaf-only bundle (issue #482)"
+        )
+    return certs[leaf_count:]
+
+
+def _is_ca_cert(der: bytes) -> bool:
+    """Return True iff the DER cert carries `basicConstraints CA:TRUE`.
+
+    Cheap parse via `openssl x509 -ext basicConstraints` on a temp file.
+    Returns False on any decode error (treating undecodable bytes as
+    non-CA so the caller strips them — safer than keeping unknowns).
+    """
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(suffix=".pem", delete=False) as f:
+        f.write(der_to_pem(der).encode("ascii"))
+        path = f.name
+    try:
+        r = subprocess.run(  # noqa: S603 — path is a controlled tempfile
+            [
+                "openssl",
+                "x509",
+                "-in",
+                path,
+                "-noout",
+                "-ext",
+                "basicConstraints",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if r.returncode != 0:
+            return False
+        return "CA:TRUE" in r.stdout
+    finally:
+        Path(path).unlink(missing_ok=True)
+
+
 def _parse_pem_blocks(text: str) -> list[bytes]:
     """Parse `BEGIN CERTIFICATE ... END CERTIFICATE` blocks out of `text`.
 
@@ -155,7 +224,9 @@ def fetch_chain(host: str, port: int, timeout: float = 10.0) -> list[bytes]:
             f"(stdout first 200 chars: {proc.stdout[:200]!r})"
         )
 
-    return blocks
+    # Issue #482: openssl `-showcerts` returns [leaf, intermediate, root];
+    # strip the leaf so the bundle contains only CA certs.
+    return _drop_leaf(blocks)
 
 
 def _fetch_chain_python(host: str, port: int, timeout: float, reason: str) -> list[bytes]:
@@ -219,7 +290,9 @@ def _fetch_chain_python(host: str, port: int, timeout: float, reason: str) -> li
                             f"{exc!r}"
                         ) from exc
                     out.append(c.public_bytes(serialization.Encoding.DER))
-                return out
+                # Issue #482: `get_verified_chain()` returns [leaf, ...CA];
+                # strip the leaf so the bundle contains only CA certs.
+                return _drop_leaf(out)
             raise RuntimeError(
                 f"openssl CLI missing and Python <3.13 on {host}:{port}: "
                 f"stdlib ssl module cannot extract the certificate chain (only the leaf "

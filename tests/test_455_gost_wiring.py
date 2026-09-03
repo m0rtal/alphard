@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -621,5 +622,85 @@ def test_gost_bundle_file_contains_valid_pem() -> None:
         f"{bundle_path} parsed cleanly but zero X509 CA certs were "
         f"loaded into the trust store. ssl.context.cert_store_stats()={stats}. "
         f"Regenerate the bundle via scripts/fetch_tinkoff_gost_ca.py "
+        f"and recommit."
+    )
+
+
+def test_gost_bundle_every_entry_is_a_ca_cert() -> None:
+    """Issue #482 widening: every cert in the bundle MUST be a CA.
+
+    The prior assertion (above) only checked that *at least one* CA
+    loaded. Issue #482 found 2 leaf server certs (`*.tinkoff.ru`,
+    `iss.moex.com`) commingled with the 5 CAs in the committed bundle —
+    `load_verify_locations` silently swallowed them as non-CA X.509
+    entries but `openssl x509 -in <cert> -noout -dates` against the
+    file showed two `CA:FALSE` entries with 4-11 week expiry.
+
+    Pin: every cert in the bundle has `basicConstraints CA:TRUE`.
+    This is the X.509 spec discriminator: a CA cert MUST carry the
+    CA-true basicConstraints extension; a leaf server cert carries
+    CA:FALSE (or omits it entirely, which also means non-CA per
+    RFC 5280 §4.2.1.9).
+
+    Implementation: split the bundle into individual PEM blocks and
+    invoke `openssl x509 -noout -ext basicConstraints` on each block
+    via a temp file. We don't ship pyOpenSSL just for this assertion
+    — openssl is in the runtime image (see Dockerfile) and the
+    invocation is portable across openssl 1.1.1+ / 3.x.
+    """
+    bundle_path = REPO_ROOT / BUNDLE_RELPATH
+    if not bundle_path.is_file():
+        pytest.skip(f"{bundle_path} missing — covered by test_gost_bundle_path_exists_in_repo_tree")
+    text = bundle_path.read_text()
+    # Split PEM blocks — `re.findall` is cleaner than line-walking and
+    # correctly handles blocks separated by varying whitespace.
+    pem_blocks: list[str] = re.findall(
+        r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----\n?",
+        text,
+        flags=re.DOTALL,
+    )
+    assert pem_blocks, f"{bundle_path} contains zero PEM blocks (file is empty?)"
+    leaf_subjects: list[str] = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for i, pem in enumerate(pem_blocks):
+            tmp_pem = Path(tmpdir) / f"cert_{i}.pem"
+            tmp_pem.write_text(pem)
+            # `openssl x509 -ext basicConstraints -noout` outputs
+            # `X509v3 Basic Constraints: CA:FALSE` (leaf) or
+            # `X509v3 Basic Constraints: critical\n    CA:TRUE` (CA).
+            # We treat any line containing `CA:TRUE` as a CA, anything
+            # else (CA:FALSE, or no basicConstraints section at all) as
+            # a leaf.
+            r = subprocess.run(
+                [
+                    "openssl",
+                    "x509",
+                    "-in",
+                    str(tmp_pem),
+                    "-noout",
+                    "-ext",
+                    "basicConstraints",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if r.returncode != 0:
+                pytest.skip(f"openssl x509 -ext basicConstraints failed: {r.stderr[:200]!r}")
+            # Subject line via a separate cheap invocation.
+            r_subj = subprocess.run(
+                ["openssl", "x509", "-in", str(tmp_pem), "-noout", "-subject"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            subject = r_subj.stdout.strip()
+            if "CA:TRUE" in r.stdout:
+                continue  # this cert is a CA
+            leaf_subjects.append(subject)
+    assert not leaf_subjects, (
+        f"{bundle_path} contains {len(leaf_subjects)} leaf (non-CA) cert(s) "
+        f"alongside the CAs — issue #482 regression. Leaf subjects: "
+        f"{leaf_subjects}. Regenerate via scripts/fetch_tinkoff_gost_ca.py "
         f"and recommit."
     )

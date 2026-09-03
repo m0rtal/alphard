@@ -104,6 +104,96 @@ def test_parse_pem_blocks_skips_text_outside_blocks(gost_module) -> None:
     assert len(blocks) == 1
 
 
+def test_fetch_chain_strips_all_leading_leaves(gost_module) -> None:
+    """Defect (#482): openssl `-showcerts` returns `[leaf, intermediate, root]`.
+
+    Some servers (verified against `iss.moex.com` on 2026-09-03) repeat
+    the leaf cert at index 0 AND index 1. The leaf-strip must walk the
+    front of the chain until it hits a CA cert, not blindly drop only
+    index 0 — otherwise leaf #2 leaks into the bundle.
+
+    A CA bundle is supposed to contain only CA certs (intermediates +
+    root). Leaf certs (server certs) expire in weeks and confuse any
+    operator running `openssl x509 -in <cert> -noout -dates` against
+    the committed bundle.
+
+    The test stubs `_is_ca_cert` so we don't need a real DER-encoded
+    CA cert fixture — index 0 and 1 are leaves, indices 2-4 are CAs.
+    """
+    fake_proc = MagicMock()
+    fake_proc.returncode = 0
+    # 5 PEM blocks: 2 leaves (duplicated iss.moex.com-style) + 3 CAs.
+    pem = _wrap_pem(VALID_B64_BODY)
+    fake_proc.stdout = pem * 5
+    fake_proc.stderr = ""
+
+    def fake_is_ca(_der: bytes) -> bool:
+        # First 2 calls (leaves) return False; subsequent calls return True.
+        fake_is_ca.call_count = getattr(fake_is_ca, "call_count", 0) + 1
+        return fake_is_ca.call_count > 2
+
+    with patch.object(subprocess, "run", return_value=fake_proc):
+        with patch.object(gost_module, "_is_ca_cert", side_effect=fake_is_ca):
+            blocks = gost_module.fetch_chain("example.com", 443)
+    # 5 input blocks - 2 leaves = 3 CAs returned.
+    assert len(blocks) == 3, (
+        f"fetch_chain must strip ALL leading leaves; got {len(blocks)} blocks "
+        f"(expected 3 after leaf-strip of 2-duplicate-leaf chain). Issue #482."
+    )
+
+
+def test_fetch_chain_raises_when_no_ca_in_chain(gost_module) -> None:
+    """Edge case (#482): if every cert in the openssl handshake is a leaf
+    (broken upstream — server sends only its own cert with no intermediate),
+    `fetch_chain` must refuse. A leaf-only bundle has zero usable CAs and
+    breaks `REQUESTS_CA_BUNDLE` consumers.
+    """
+    fake_proc = MagicMock()
+    fake_proc.returncode = 0
+    fake_proc.stdout = _wrap_pem(VALID_B64_BODY) * 2  # 2 leaves, no CAs
+    fake_proc.stderr = ""
+
+    with patch.object(subprocess, "run", return_value=fake_proc):
+        with patch.object(gost_module, "_is_ca_cert", return_value=False):
+            with pytest.raises(RuntimeError, match="leaf-only"):
+                gost_module.fetch_chain("example.com", 443)
+
+
+def test_fetch_chain_python_strips_leaf_cert(gost_module) -> None:
+    """Defect (#482): `ssock.get_verified_chain()` returns `[leaf, ...CA]`.
+
+    Both `openssl s_client -showcerts` and `SSLSocket.get_verified_chain()`
+    return the leaf at index 0. The pure-Python fallback must also strip
+    it so the openssl-less deploy path ships a leaf-free bundle.
+    """
+    chain = [
+        b"\x30\x82\x01\x00" + b"\x00" * 100,  # leaf (index 0)
+        b"\x30\x82\x01\x01" + b"\x00" * 80,   # intermediate CA
+        b"\x30\x82\x01\x02" + b"\x00" * 60,   # root CA
+    ]
+    fake_ctx, _ = _fake_chain_ctx(chain)
+
+    def fake_is_ca(_der: bytes) -> bool:
+        fake_is_ca.call_count = getattr(fake_is_ca, "call_count", 0) + 1
+        return fake_is_ca.call_count > 1  # 1st is leaf, 2nd-3rd are CAs
+
+    with patch.object(_socket, "create_connection", return_value=MagicMock()):
+        with patch.object(gost_module.ssl, "create_default_context", return_value=fake_ctx):
+            with patch.object(gost_module, "_is_ca_cert", side_effect=fake_is_ca):
+                out = gost_module._fetch_chain_python(
+                    "example.com", 443, timeout=1.0, reason="openssl not found: simulated"
+                )
+
+    assert len(out) == 2, (
+        f"_fetch_chain_python must drop the leaf cert (index 0); got {len(out)} certs "
+        f"(expected 2 after leaf-strip). Issue #482."
+    )
+    # The returned list must contain the 2 trailing CA certs, not the leaf.
+    assert out == chain[1:], (
+        f"_fetch_chain_python must return [intermediate, root] (chain[1:]); got {out!r}"
+    )
+
+
 def test_fetch_chain_rejects_openssl_returncode_nonzero(gost_module) -> None:
     """Defect 1 (#454): openssl returncode was ignored; partial output parsed.
 
@@ -124,12 +214,19 @@ def test_fetch_chain_rejects_openssl_returncode_nonzero(gost_module) -> None:
 def test_fetch_chain_returns_blocks_on_success(gost_module) -> None:
     fake_proc = MagicMock()
     fake_proc.returncode = 0
-    fake_proc.stdout = _wrap_pem(VALID_B64_BODY) + _wrap_pem(VALID_B64_BODY)
+    # Issue #482: openssl -showcerts returns [leaf, ...CA]. 3 PEM blocks
+    # → first 1 is a leaf → 2 CAs returned after leaf-strip.
+    fake_proc.stdout = _wrap_pem(VALID_B64_BODY) + _wrap_pem(VALID_B64_BODY) + _wrap_pem(VALID_B64_BODY)
     fake_proc.stderr = ""
 
+    def fake_is_ca(_der: bytes) -> bool:
+        fake_is_ca.call_count = getattr(fake_is_ca, "call_count", 0) + 1
+        return fake_is_ca.call_count > 1  # 1st is leaf, 2nd-3rd are CAs
+
     with patch.object(subprocess, "run", return_value=fake_proc):
-        blocks = gost_module.fetch_chain("example.com", 443)
-    assert len(blocks) == 2
+        with patch.object(gost_module, "_is_ca_cert", side_effect=fake_is_ca):
+            blocks = gost_module.fetch_chain("example.com", 443)
+    assert len(blocks) == 2  # leaf stripped, 2 CAs returned
 
 
 def test_fetch_chain_rejects_malformed_openssl_output(gost_module) -> None:
@@ -184,16 +281,23 @@ def test_main_writes_bundle_on_success(gost_module, tmp_path) -> None:
     out = tmp_path / "bundle.pem"
     fake_proc = MagicMock()
     fake_proc.returncode = 0
-    fake_proc.stdout = _wrap_pem(VALID_B64_BODY)
+    # Issue #482: openssl -showcerts returns [leaf, ...CA]. 2 PEM blocks
+    # → first is leaf → 1 CA returned → write_bundle ships a 1-cert bundle.
+    fake_proc.stdout = _wrap_pem(VALID_B64_BODY) + _wrap_pem(VALID_B64_BODY)
     fake_proc.stderr = ""
 
+    def fake_is_ca(_der: bytes) -> bool:
+        fake_is_ca.call_count = getattr(fake_is_ca, "call_count", 0) + 1
+        return fake_is_ca.call_count > 1  # 1st is leaf, 2nd is CA
+
     with patch.object(subprocess, "run", return_value=fake_proc):
-        with patch.object(
-            sys,
-            "argv",
-            ["fetch_tinkoff_gost_ca.py", "--out", str(out), "--timeout", "5"],
-        ):
-            rc = gost_module.main()
+        with patch.object(gost_module, "_is_ca_cert", side_effect=fake_is_ca):
+            with patch.object(
+                sys,
+                "argv",
+                ["fetch_tinkoff_gost_ca.py", "--out", str(out), "--timeout", "5"],
+            ):
+                rc = gost_module.main()
 
     assert rc == 0
     assert out.exists()
@@ -238,17 +342,34 @@ def test_write_bundle_dedupes_by_sha256(gost_module, tmp_path) -> None:
     assert text.count("-----BEGIN CERTIFICATE-----") == 1
 
 
-def test_script_does_not_use_tempfile(tmp_path) -> None:
+def test_script_does_not_use_tempfile_in_fetch_chain(tmp_path) -> None:
     """Defect 4 (#454): the dead tempfile branch was removed.
 
-    `tempfile.NamedTemporaryFile` is no longer imported or referenced in
-    `fetch_chain`. A regression that re-adds it (e.g. for `-out` wiring)
-    will fail this grep before reaching CI.
+    `tempfile.NamedTemporaryFile` is no longer used in `fetch_chain`.
+    A regression that re-adds it (e.g. for `-out` wiring) will fail
+    this grep before reaching CI.
+
+    Issue #482 widens the check: `_is_ca_cert` legitimately uses
+    `tempfile.NamedTemporaryFile` for the openssl subprocess call,
+    but it lives outside `fetch_chain` — only re-introducing it
+    INSIDE `fetch_chain` is a regression.
     """
+    import re
+
     src = SCRIPT_PATH.read_text(encoding="utf-8")
-    assert "NamedTemporaryFile" not in src, (
-        "fetch_tinkoff_gost_ca.py must not allocate a tempfile in fetch_chain — "
-        "if you are wiring openssl's `-out`, do it as an explicit subprocess arg"
+    # Locate the `def fetch_chain` block and assert no tempfile usage
+    # within it.
+    fetch_chain_match = re.search(
+        r"def fetch_chain\(.*?(?=\ndef |\Z)",
+        src,
+        flags=re.DOTALL,
+    )
+    assert fetch_chain_match, "could not locate `def fetch_chain` in script"
+    fetch_chain_body = fetch_chain_match.group(0)
+    assert "NamedTemporaryFile" not in fetch_chain_body, (
+        "fetch_chain must not allocate a tempfile — the openssl output "
+        "is captured via subprocess.run(capture_output=True). If you are "
+        "wiring openssl's `-out`, do it as an explicit subprocess arg."
     )
 
 
@@ -288,19 +409,28 @@ def test_fetch_chain_python_handles_bytes_chain(gost_module) -> None:
     This test pins the contract on whatever the running interpreter
     exposes; it does not require Python 3.13+ specifically because the
     fix should be polyglot across interpreter versions.
+
+    # Issue #482: chain shape is [leaf, ...CA]. With 2 chain entries
+    # (1 leaf + 1 CA), _fetch_chain_python returns 1 after leaf-strip.
     """
     chain = [b"\x30\x82\x01\x00" + b"\x00" * 100, b"\x30\x82\x01\x01" + b"\x00" * 80]
     fake_ctx, fake_sock = _fake_chain_ctx(chain)
 
+    def fake_is_ca(_der: bytes) -> bool:
+        fake_is_ca.call_count = getattr(fake_is_ca, "call_count", 0) + 1
+        return fake_is_ca.call_count > 1  # 1st is leaf, 2nd is CA
+
     with patch.object(_socket, "create_connection", return_value=MagicMock()):
         with patch.object(gost_module.ssl, "create_default_context", return_value=fake_ctx):
-            out = gost_module._fetch_chain_python(
-                "example.com", 443, timeout=1.0, reason="openssl not found: simulated"
-            )
+            with patch.object(gost_module, "_is_ca_cert", side_effect=fake_is_ca):
+                out = gost_module._fetch_chain_python(
+                    "example.com", 443, timeout=1.0, reason="openssl not found: simulated"
+                )
 
     assert isinstance(out, list)
-    assert len(out) == len(chain)
-    for cert, expected in zip(out, chain):
+    # Issue #482: leaf stripped, so 2-input chain → 1-output list.
+    assert len(out) == len(chain) - 1
+    for cert, expected in zip(out, chain[1:]):  # chain[1:] = the CAs only
         assert isinstance(cert, bytes), f"cert must be bytes, got {type(cert).__name__}"
         # Either identity-preserving (already bytes) or DER-encoded via
         # cryptography — both are valid. Just assert non-empty.
