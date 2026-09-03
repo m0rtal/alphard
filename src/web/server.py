@@ -94,15 +94,21 @@ def execute_query(dsn: str, sql: str, params: dict[str, Any]) -> list[dict[str, 
     `os.environ['ALPHARD_PG_DSN']` clearly contained the password.
     Standalone `psycopg.connect(dsn)` from a python -c one-liner inside
     alphard-web succeeded with the same DSN — only `connect_with_timeouts`
-    failed. The redundant `options` is dropped here, leaving only
-    `connect_timeout`. Every `execute_query` call site is short-lived and
-    the post-`with` cleanup closes the connection, so the server-side
-    `statement_timeout` was unnecessary belt-and-suspenders.
+    failed.
+
+    RE-FIX (2026-09-03, issue #428): the original commit dropped the
+    `statement_timeout=60000` because DSN-options path was broken. The
+    60 s safety is still needed for runaway queries — applied here via
+    `SET LOCAL statement_timeout` inside the same transaction so it
+    does NOT touch the DSN (libpq won't re-parse options) and only
+    affects this call's session, not the underlying pool. Per-statement
+    overhead is one extra round-trip (~0.5 ms on local network).
     """
     import psycopg
 
     with psycopg.connect(dsn, connect_timeout=10) as conn:
         with conn.cursor() as cur:
+            cur.execute("SET LOCAL statement_timeout = 60000")
             cur.execute(sql, params)
             cols = [d.name for d in cur.description] if cur.description else []
             rows = cur.fetchall()
