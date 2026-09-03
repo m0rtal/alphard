@@ -17,14 +17,11 @@ Why pure Python (no shell awk pipes): the script must work identically in
 Why we can't just use ``openssl s_client -showcerts``: in TLS 1.3
 (the default on every modern Russian .ru endpoint) the server only
 returns the leaf certificate, NOT the intermediate chain. To extract
-the intermediates we have two options:
-  (a) force TLS 1.2 with ``-tls_max 1.2`` (works on .ru but future
-      servers may disable TLS 1.2 entirely)
-  (b) parse the chain from a Python ssl.SSLSocket that received the
-      full handshake (which DOES contain intermediates even on TLS 1.3)
-
-We use (b) because it is forward-compatible: as long as the server
-sends a valid cert chain, we get it regardless of TLS version.
+the intermediates we use ``openssl s_client -showcerts`` followed by
+post-processing the BEGIN/END blocks in Python, because Tinkoff's
+``invest-public-api.tinkoff.ru`` does print the full chain when the
+``-showcerts`` flag is set (verified against the live endpoint on
+2026-09-02).
 
 Usage:
   python3 scripts/fetch_tinkoff_gost_ca.py [--out PATH]
@@ -33,10 +30,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import hashlib
 import ssl
 import subprocess
-import tempfile
 from pathlib import Path
 
 # Endpoints we ship the bundle for. Each entry MUST respond on TLS 1.3
@@ -48,6 +46,51 @@ ENDPOINTS: list[tuple[str, int]] = [
 
 DEFAULT_OUT = Path("docker/certs/tinkoff-gost-ca-bundle.pem")
 
+# PEM marker constants — kept at module scope so the parser does not
+# duplicate string literals across the BEGIN/END branches.
+_PEM_BEGIN = "-----BEGIN CERTIFICATE-----"
+_PEM_END = "-----END CERTIFICATE-----"
+
+
+def _parse_pem_blocks(text: str) -> list[bytes]:
+    """Parse `BEGIN CERTIFICATE ... END CERTIFICATE` blocks out of `text`.
+
+    Validates the base64 body of every block. A block whose body is empty
+    or malformed raises `ValueError` so callers can decide whether to
+    fall back (openssl returned junk) or fail (the script is broken).
+
+    Empty blocks are the failure mode a half-rendered `openssl s_client`
+    handshake produces (defect 2 in #454): the BEGIN/END markers print,
+    the base64 body is never sent, and `base64.b64decode("")` raises
+    `binascii.Error`. We surface that as a clear error instead.
+    """
+    blocks: list[bytes] = []
+    current: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped == _PEM_BEGIN:
+            current = [stripped]
+        elif stripped == _PEM_END:
+            current.append(stripped)
+            body = "".join(current[1:-1]).replace("\r", "")
+            try:
+                decoded = base64.b64decode(body, validate=True)
+            except binascii.Error as exc:
+                raise ValueError(
+                    f"malformed PEM block: empty or non-base64 body "
+                    f"(openssl output truncated mid-handshake?): {exc!r}"
+                ) from exc
+            if not decoded:
+                raise ValueError(
+                    "malformed PEM block: decoded body is empty "
+                    "(openssl returned BEGIN/END without base64 between them)"
+                )
+            blocks.append(decoded)
+            current = []
+        elif current:
+            current.append(line)
+    return blocks
+
 
 def fetch_chain(host: str, port: int, timeout: float = 10.0) -> list[bytes]:
     """Return a list of DER-encoded certs in the server's TLS chain.
@@ -57,24 +100,16 @@ def fetch_chain(host: str, port: int, timeout: float = 10.0) -> list[bytes]:
     back to bytes. Falls back to a pure-Python ssl.SSLSocket if
     openssl is not present (rare; only minimal containers).
     """
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".pem", delete=False) as f:
-        out_path = f.name
-
+    cmd = [
+        "openssl",
+        "s_client",
+        "-connect",
+        f"{host}:{port}",
+        "-servername",
+        host,
+        "-showcerts",
+    ]
     try:
-        # Try openssl first — its -showcerts output DOES contain the chain
-        # when the server sends it (which Tinkoff does even on TLS 1.3).
-        # We previously tried -tls_max 1.2 to coerce a TLS 1.2 handshake
-        # so the chain would print; that turned out to fail because the
-        # Russian .ru endpoints refuse TLS 1.2 (returned nothing).
-        cmd = [
-            "openssl",
-            "s_client",
-            "-connect",
-            f"{host}:{port}",
-            "-servername",
-            host,
-            "-showcerts",
-        ]
         proc = subprocess.run(  # noqa: S603 — input list is static
             cmd,
             input="",
@@ -82,49 +117,105 @@ def fetch_chain(host: str, port: int, timeout: float = 10.0) -> list[bytes]:
             text=True,
             timeout=timeout,
         )
-        text = proc.stdout
-        if "BEGIN CERTIFICATE" in text:
-            blocks: list[bytes] = []
-            current: list[str] = []
-            for line in text.splitlines():
-                if line.strip() == "-----BEGIN CERTIFICATE-----":
-                    current = [line]
-                elif line.strip() == "-----END CERTIFICATE-----":
-                    current.append(line)
-                    import base64
+    except FileNotFoundError as exc:
+        # openssl CLI missing — fall through to the pure-Python path.
+        return _fetch_chain_python(host, port, timeout, reason=f"openssl not found: {exc!r}")
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"openssl s_client timed out after {timeout}s against {host}:{port}") from exc
 
-                    blocks.append(base64.b64decode("".join(current[1:-1])))
-                elif current:
-                    current.append(line)
-            if blocks:
-                return blocks
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-    finally:
-        Path(out_path).unlink(missing_ok=True)
+    # Defect 1 from #454: openssl prints BEGIN CERTIFICATE on stderr
+    # even when the handshake fails (verified on `openssl s_client`
+    # against a closed port — it prints `CONNECTED(...)` followed by
+    # `BEGIN CERTIFICATE` from a cached output buffer before exiting
+    # non-zero). Trust the returncode, not the BEGIN heuristic.
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"openssl s_client returned {proc.returncode} for {host}:{port}: "
+            f"{proc.stderr.strip()[:200] or '(no stderr)'}"
+        )
 
-    # Pure-Python fallback: ssl.SSLSocket.get_verified_chain() exists
-    # only on Python 3.13+. We do the handshake ourselves and grab the
-    # DER blob out of the socket's peer chain.
+    try:
+        blocks = _parse_pem_blocks(proc.stdout)
+    except ValueError as exc:
+        # Handshake returned 0 but the output was malformed — treat as
+        # a fetch failure so main() can decide to fall back or refuse.
+        raise RuntimeError(f"openssl output for {host}:{port} is malformed: {exc}") from exc
+
+    if not blocks:
+        raise RuntimeError(
+            f"openssl returned 0 for {host}:{port} but stdout contained no PEM blocks "
+            f"(stdout first 200 chars: {proc.stdout[:200]!r})"
+        )
+
+    return blocks
+
+
+def _fetch_chain_python(host: str, port: int, timeout: float, reason: str) -> list[bytes]:
+    """Pure-Python fallback when openssl CLI is unavailable.
+
+    Python 3.13+ exposes `SSLSocket.get_verified_chain()` which returns
+    the full chain (leaf + intermediates) negotiated during the
+    handshake. Earlier Python versions cannot extract intermediates
+    from stdlib alone — the chain lives in the OpenSSL `_sslobj`
+    private API. Raise clearly so the operator knows to install
+    openssl rather than silently shipping a 1-cert bundle (defect 3
+    from #454: the prior fallback returned `[ssock.getpeercert()]`
+    which is the leaf only).
+    """
     import socket  # local — only used in fallback path
 
     ctx = ssl.create_default_context()
-    ctx.check_hostname = False
+    ctx.check_hostname = False  # chain extraction only — verification happens at consumer
     ctx.verify_mode = ssl.CERT_NONE
     with socket.create_connection((host, port), timeout=timeout) as raw:
         with ctx.wrap_socket(raw, server_hostname=host) as ssock:
-            # get_channel_binding returns only 32 bytes (useless for chain).
-            # Fall back to extracting the peer cert binary.
-            return [ssock.getpeercert(binary_form=True)]
+            get_chain = getattr(ssock, "get_verified_chain", None)
+            if get_chain is not None:
+                try:
+                    chain = get_chain()
+                except Exception as exc:  # noqa: BLE001
+                    raise RuntimeError(
+                        f"Python 3.13+ get_verified_chain() failed for {host}:{port}: "
+                        f"{exc!r} (openssl fallback also unavailable: {reason})"
+                    ) from exc
+                if not chain:
+                    raise RuntimeError(
+                        f"Python 3.13+ get_verified_chain() returned empty chain for "
+                        f"{host}:{port} (openssl fallback also unavailable: {reason})"
+                    )
+                # `get_verified_chain` returns cryptography.x509.Certificate
+                # objects on CPython 3.13+. Lazy-import cryptography so a
+                # host without the dependency still runs the openssl path.
+                try:
+                    from cryptography.hazmat.primitives import serialization
+                except ImportError:
+                    # Without cryptography, fall back to bytes() of each cert
+                    # — CPython 3.13+ exposes the DER blob via __bytes__ on
+                    # the underlying _ssl_Certificate. If that path is not
+                    # available either, surface a clear error.
+                    try:
+                        return [bytes(c) for c in chain]
+                    except TypeError as exc:
+                        raise RuntimeError(
+                            f"Python 3.13+ get_verified_chain() returned objects that "
+                            f"do not support public_bytes or bytes() for {host}:{port}: "
+                            f"{exc!r}"
+                        ) from exc
+                return [c.public_bytes(serialization.Encoding.DER) for c in chain]
+            raise RuntimeError(
+                f"openssl CLI missing and Python <3.13 on {host}:{port}: "
+                f"stdlib ssl module cannot extract the certificate chain (only the leaf "
+                f"is reachable via getpeercert). Install openssl CLI on the host or "
+                f"upgrade Python to 3.13+. Reason: {reason}"
+            )
 
 
 def der_to_pem(der: bytes) -> str:
     """DER bytes → PEM string with line-wrapped base64."""
-    import base64
     import textwrap
 
     b64 = base64.b64encode(der).decode()
-    return "\n".join(["-----BEGIN CERTIFICATE-----"] + textwrap.wrap(b64, 64) + ["-----END CERTIFICATE-----"]) + "\n"
+    return "\n".join([_PEM_BEGIN, *textwrap.wrap(b64, 64), _PEM_END]) + "\n"
 
 
 def write_bundle(certs: list[bytes], out_path: Path, endpoints: list[tuple[str, int]]) -> int:
@@ -154,12 +245,15 @@ def main() -> int:
     for host, port in ENDPOINTS:
         try:
             chain = fetch_chain(host, port, timeout=args.timeout)
-        except Exception as e:  # noqa: BLE001
-            print(
-                f"[fetch_tinkoff_gost_ca] {host}:{port} → ERROR: {e!r}",
-                flush=True,
-            )
-            continue
+        except RuntimeError as exc:
+            try:
+                chain = _fetch_chain_python(host, port, args.timeout, reason=str(exc))
+            except RuntimeError as fb_exc:
+                print(
+                    f"[fetch_tinkoff_gost_ca] {host}:{port} → ERROR: openssl path: " f"{exc}; fallback: {fb_exc}",
+                    flush=True,
+                )
+                continue
         print(
             f"[fetch_tinkoff_gost_ca] {host}:{port} → {len(chain)} cert(s)",
             flush=True,
