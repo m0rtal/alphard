@@ -54,6 +54,7 @@ QUICKSTART_MD_PATH = REPO_ROOT / "docs" / "QUICKSTART.md"
 
 BUNDLE_RELPATH = "docker/certs/tinkoff-gost-ca-bundle.pem"
 BUNDLE_CONTAINER_PATH = "/etc/ssl/certs/tinkoff-gost-ca-bundle.pem"
+REQUEST_CA_BUNDLE_ENV = "REQUESTS_CA_BUNDLE"
 
 
 # --- contract 1: docker-compose.yaml bind-mount -------------------------
@@ -152,6 +153,163 @@ def test_compose_bind_mount_targets_only_alphard_bot() -> None:
             f"{svc} MUST NOT bind-mount the GOST bundle; "
             f"only alphard-bot talks to tinkoff.ru / iss.moex.com. "
             f"Block:\n{block}"
+        )
+
+
+# --- contract 1b: REQUESTS_CA_BUNDLE env var (issue #468) ----------------
+
+
+def test_compose_sets_requests_ca_bundle_env_var() -> None:
+    """The bind-mount alone is NOT enough to make Python's `requests`
+    library trust the GOST CA bundle. `requests.adapters.HTTPAdapter`
+    uses the `certifi` bundle by default and only honors the
+    `REQUESTS_CA_BUNDLE` env var as an override.
+
+    Pin: `docker-compose.yaml` alphard-bot `environment:` block MUST
+    contain `REQUESTS_CA_BUNDLE: /etc/ssl/certs/tinkoff-gost-ca-bundle.pem`
+    so the bind-mounted file is actually consulted by the TLS client.
+
+    We assert on the raw yaml text rather than `docker compose config`
+    output because env vars survive normalization unchanged but
+    `docker compose config` returns them as a nested list whose
+    formatting varies across Compose v2 minor versions.
+    """
+    text = COMPOSE_PATH.read_text()
+    expected = f"{REQUEST_CA_BUNDLE_ENV}: {BUNDLE_CONTAINER_PATH}"
+    assert expected in text, (
+        f"alphard-bot environment: block MUST contain `{expected}` "
+        f"so Python's requests library trusts the bind-mounted GOST "
+        f"bundle (issue #468). docker-compose.yaml excerpt around the "
+        f"environment block:\n{text[text.find('environment:'):text.find('environment:')+1500]}"
+    )
+
+
+def test_compose_does_not_set_ssl_cert_file() -> None:
+    """`SSL_CERT_FILE`, if set, REPLACES the default system trust
+    store rather than augmenting it. Setting it would shadow
+    `certifi`'s bundle (which includes the Russian Trusted Root CA
+    baked in by t-tech-investments — see Dockerfile) for any
+    subprocess that uses openssl / curl.
+
+    Pin: REQUESTS_CA_BUNDLE is the narrowest correct fix. SSL_CERT_FILE
+    is intentionally NOT set. A future refactor that adds
+    SSL_CERT_FILE must justify the trade-off in a comment.
+    """
+    text = COMPOSE_PATH.read_text()
+    # Note: assert the LITERAL is NOT present, ignoring comments.
+    # Compose-valid env entries are `KEY: value` lines inside
+    # `environment:` blocks. Comments start with `#`.
+    env_block_match = re.search(
+        r"environment:\s*\n(?P<body>(?:[ \t]+#[^\n]*\n|[ \t]+[^#\n][^\n]*\n)+)",
+        text,
+        flags=re.MULTILINE,
+    )
+    assert env_block_match, "alphard-bot environment: block not found"
+    env_lines = [
+        ln
+        for ln in env_block_match.group("body").splitlines()
+        if ln.strip() and not ln.strip().startswith("#")
+    ]
+    env_keys = [
+        re.match(r"\s*([A-Z_][A-Z0-9_]*)\s*:", ln).group(1)
+        for ln in env_lines
+        if re.match(r"\s*([A-Z_][A-Z0-9_]*)\s*:", ln)
+    ]
+    assert "SSL_CERT_FILE" not in env_keys, (
+        f"SSL_CERT_FILE is set in alphard-bot environment: — this "
+        f"SHADOWS the default trust store. Remove it; REQUESTS_CA_BUNDLE "
+        f"is the narrowest correct fix for the .ru TLS clients. "
+        f"env keys found: {env_keys}"
+    )
+
+
+def test_compose_requests_ca_bundle_only_on_alphard_bot() -> None:
+    """REQUESTS_CA_BUNDLE must be set on alphard-bot only — postgres
+    and redis don't talk to .ru endpoints and a global env would
+    leak the bundle path into other containers.
+
+    Pin: the alphard-bot service block (alphard-bot: ... volumes:)
+    contains the env var; postgres / redis blocks do NOT.
+    """
+    text = COMPOSE_PATH.read_text()
+    # Locate the alphard-bot service by top-level key under services:.
+    bot_match = re.search(
+        r"^  alphard-bot:\s*\n(?P<body>(?:[ \t]+[^\n]*\n)+)",
+        text,
+        flags=re.MULTILINE,
+    )
+    assert bot_match, "alphard-bot service block not found"
+    bot_body = bot_match.group("body")
+    expected = f"{REQUEST_CA_BUNDLE_ENV}: {BUNDLE_CONTAINER_PATH}"
+    assert expected in bot_body, (
+        f"REQUESTS_CA_BUNDLE env var MUST be set on alphard-bot "
+        f"so its `requests` client trusts the GOST bundle. Bot block "
+        f"excerpt:\n{bot_body[:2000]}"
+    )
+
+
+# --- contract 1c: scripts/pre_pr_smoke.sh pre-fetches the bundle (issue #469) --
+
+
+def test_pre_pr_smoke_pre_fetches_gost_bundle() -> None:
+    """`scripts/pre_pr_smoke.sh` runs `docker compose up` directly
+    (without scripts/quickstart.sh), so it MUST pre-fetch the GOST
+    bundle on a fresh checkout — otherwise compose's
+    `create_host_path: true` default creates a directory at the
+    bind-mount source, and ssl/requests fail at request time
+    (issue #469).
+
+    Pin: pre_pr_smoke.sh contains `python3 scripts/fetch_tinkoff_gost_ca.py`
+    AND references the GOST_BUNDLE_PATH variable before `compose up`.
+    """
+    smoke_path = REPO_ROOT / "scripts" / "pre_pr_smoke.sh"
+    text = smoke_path.read_text()
+    assert "fetch_tinkoff_gost_ca.py" in text, (
+        f"scripts/pre_pr_smoke.sh MUST pre-fetch the GOST bundle "
+        f"(invoke fetch_tinkoff_gost_ca.py) so a fresh-clone smoke "
+        f"run does not hit the create_host_path directory defect. "
+        f"Current pre_pr_smoke.sh:\n{text}"
+    )
+    # The invocation must happen BEFORE the `compose up` line.
+    fetch_idx = text.find("fetch_tinkoff_gost_ca.py")
+    compose_up_idx = text.find('"${COMPOSE[@]}" up -d')
+    assert compose_up_idx != -1, "compose up line not found in pre_pr_smoke.sh"
+    assert fetch_idx != -1 and fetch_idx < compose_up_idx, (
+        f"fetch_tinkoff_gost_ca.py invocation (idx {fetch_idx}) MUST "
+        f"appear BEFORE compose up (idx {compose_up_idx}) in "
+        f"pre_pr_smoke.sh. Otherwise the bind-mount source path "
+        f"doesn't exist when compose reads it."
+    )
+
+
+def test_pre_pr_smoke_refuses_directory_shaped_bundle() -> None:
+    """If `docker/certs/tinkoff-gost-ca-bundle.pem` already exists as a
+    DIRECTORY (compose's `create_host_path: true` auto-created it on
+    a prior run), pre_pr_smoke.sh MUST detect this and refuse to
+    bring up the stack — otherwise the bot starts with a broken
+    REQUESTS_CA_BUNDLE that points at a directory.
+
+    Pin: pre_pr_smoke.sh contains an `-d` (directory) check on the
+    GOST bundle path with an explicit failure message.
+    """
+    smoke_path = REPO_ROOT / "scripts" / "pre_pr_smoke.sh"
+    text = smoke_path.read_text()
+    # Look for a directory test (e.g. `[[ -d "$VAR" ]]` or `[ -d "$VAR" ]`)
+    # on the GOST bundle path. `if [[ -d "$GOST_BUNDLE_PATH" ]]; then`
+    # is the canonical form, but accept any shell quoting.
+    #
+    # The match must require the `-d` (or `! -d`) flag immediately
+    # before the variable name. We pattern-match `-d "$<var>"` /
+    # `-d $<var>` / `! -d "$<var>"` since shell-quoted forms vary.
+    for var_name in ("GOST_BUNDLE_PATH", "GOST_BUNDLE"):
+        pattern = rf'(?:^|\s)(?:-d|\!-d)\s+"?\${{?{re.escape(var_name)}}}?"?'
+        if re.search(pattern, text):
+            break
+    else:
+        raise AssertionError(
+            f"pre_pr_smoke.sh MUST check for a directory-shaped GOST "
+            f"bundle (`-d ${{GOST_BUNDLE_PATH:-...}}`) and refuse to "
+            f"proceed (issue #469 Fix B). Current pre_pr_smoke.sh:\n{text}"
         )
 
 
