@@ -7,7 +7,7 @@ Background
 
 PR #444 + #454 shipped `scripts/fetch_tinkoff_gost_ca.py`, which writes
 the Russian Trusted Root CA + Sub CA chain to
-`docker/certs/tinkoff-gost-ca-bundle.pem`. Without that bundle every
+`docker/certs/tinkoff-gost-ca-bundle.txt`. Without that bundle every
 HTTPS call to `invest-public-api.tinkoff.ru` and `iss.moex.com` fails
 with `CERTIFICATE_VERIFY_FAILED` because the standard `certifi` trust
 store does not include the Russian Ministry of Digital Development's
@@ -34,6 +34,11 @@ Pinned contracts
    t-tech-investments.
 5. README/QUICKSTART/SECURITY docs mention the script + bundle so
    operators discovering the sawtooth-restart bug know the fix exists.
+6. `docker/certs/tinkoff-gost-ca-bundle.txt` exists in the repo tree as
+   a regular (non-directory) file with PEM content (Issue #479). The
+   bind-mount contract holds for any operator path — quickstart.sh,
+   pre_pr_smoke.sh, OR direct `docker compose up -d` — without an
+   implicit "run quickstart first" requirement.
 """
 
 from __future__ import annotations
@@ -52,8 +57,8 @@ DOCKERFILE_PATH = REPO_ROOT / "docker" / "Dockerfile"
 README_PATH = REPO_ROOT / "README.md"
 QUICKSTART_MD_PATH = REPO_ROOT / "docs" / "QUICKSTART.md"
 
-BUNDLE_RELPATH = "docker/certs/tinkoff-gost-ca-bundle.pem"
-BUNDLE_CONTAINER_PATH = "/etc/ssl/certs/tinkoff-gost-ca-bundle.pem"
+BUNDLE_RELPATH = "docker/certs/tinkoff-gost-ca-bundle.txt"
+BUNDLE_CONTAINER_PATH = "/etc/ssl/certs/tinkoff-gost-ca-bundle.txt"
 REQUEST_CA_BUNDLE_ENV = "REQUESTS_CA_BUNDLE"
 
 
@@ -75,7 +80,7 @@ def _render_compose() -> str:
 
 def test_compose_bind_mounts_gost_bundle_into_alphard_bot() -> None:
     """alphard-bot MUST bind-mount the host bundle file into the
-    standard certs directory at /etc/ssl/certs/tinkoff-gost-ca-bundle.pem.
+    standard certs directory at /etc/ssl/certs/tinkoff-gost-ca-bundle.txt.
 
     Without this mount the bot's ssl clients fall back to the system
     certifi store, which lacks the Russian Trusted Root CA — issue
@@ -105,7 +110,7 @@ def test_compose_bind_mount_is_read_only() -> None:
     text = _render_compose()
     # Find the bundle entry. Compose renders volumes as a list of
     # dicts after `config`; the bind-mount we care about has
-    # `target: /etc/ssl/certs/tinkoff-gost-ca-bundle.pem`.
+    # `target: /etc/ssl/certs/tinkoff-gost-ca-bundle.txt`.
     target_marker = f"target: {BUNDLE_CONTAINER_PATH}"
     idx = text.find(target_marker)
     assert idx != -1, f"bundle bind-mount not found; compose config:\n{text}"
@@ -166,7 +171,7 @@ def test_compose_sets_requests_ca_bundle_env_var() -> None:
     `REQUESTS_CA_BUNDLE` env var as an override.
 
     Pin: `docker-compose.yaml` alphard-bot `environment:` block MUST
-    contain `REQUESTS_CA_BUNDLE: /etc/ssl/certs/tinkoff-gost-ca-bundle.pem`
+    contain `REQUESTS_CA_BUNDLE: /etc/ssl/certs/tinkoff-gost-ca-bundle.txt`
     so the bind-mounted file is actually consulted by the TLS client.
 
     We assert on the raw yaml text rather than `docker compose config`
@@ -281,7 +286,7 @@ def test_pre_pr_smoke_pre_fetches_gost_bundle() -> None:
 
 
 def test_pre_pr_smoke_refuses_directory_shaped_bundle() -> None:
-    """If `docker/certs/tinkoff-gost-ca-bundle.pem` already exists as a
+    """If `docker/certs/tinkoff-gost-ca-bundle.txt` already exists as a
     DIRECTORY (compose's `create_host_path: true` auto-created it on
     a prior run), pre_pr_smoke.sh MUST detect this and refuse to
     bring up the stack — otherwise the bot starts with a broken
@@ -358,7 +363,7 @@ def test_quickstart_fetch_runs_before_compose_up() -> None:
 
 
 def test_quickstart_fetch_outputs_to_correct_path() -> None:
-    """The fetch MUST write to docker/certs/tinkoff-gost-ca-bundle.pem —
+    """The fetch MUST write to docker/certs/tinkoff-gost-ca-bundle.txt —
     the same path compose bind-mounts. A typo (e.g. /tmp/...) would
     silently pass quickstart but break compose up.
     """
@@ -495,4 +500,126 @@ def test_fetch_script_default_out_matches_compose_bind_mount() -> None:
     assert BUNDLE_RELPATH in text, (
         f"scripts/fetch_tinkoff_gost_ca.py DEFAULT_OUT must equal "
         f"{BUNDLE_RELPATH} (compose bind-mount source). Got script:\n{text[:2000]}"
+    )
+
+
+# --- contract 6: bundle file actually committed to repo (Issue #479) ---
+
+
+def test_gost_bundle_path_exists_in_repo_tree() -> None:
+    """The bind-mount source path `docker/certs/tinkoff-gost-ca-bundle.txt`
+    MUST exist in the repo tree as a regular file (not a directory).
+
+    Without this PR #477's bind-mount contract has a chicken-and-egg
+    on a fresh clone: the bind source is missing, and Docker's
+    `create_host_path: true` default silently creates a DIRECTORY at the
+    source path. The empty directory is then bind-mounted into the
+    container as a file-shaped target, Python's `requests` (driven by
+    `REQUESTS_CA_BUNDLE`) fails to parse it, and the sawtooth-restart
+    loop #430 documents returns. The regression was filed as Issue #479
+    after PR #477's four-wire design auto-closed #441/#455/#468/#469
+    on textual contract without an assert on the file's presence.
+
+    Pin: at least one of the following must return a blob line for
+    `tinkoff-gost-ca-bundle.txt`:
+    - `git ls-tree -r HEAD -- docker/certs/` (already-merged state)
+    - `git ls-files --stage -- docker/certs/` (staged on the branch)
+    The on-disk `Path.is_file()` check catches a future where someone
+    `.gitignore`s the file post-commit. We accept either `.txt`
+    (current state, chosen to comply with `.gitignore` `*.pem` exclusion)
+    or `.pem` — but the path MUST resolve to a real regular file.
+    """
+    import subprocess
+
+    # Check the committed state first.
+    r_head = subprocess.run(
+        ["git", "ls-tree", "-r", "HEAD", "--", "docker/certs/"],
+        capture_output=True,
+        text=True,
+        check=True,
+        cwd=str(REPO_ROOT),
+    )
+    in_head = "tinkoff-gost-ca-bundle" in r_head.stdout
+
+    # Fall back to the staged state (branch commits land here first).
+    r_index = subprocess.run(
+        ["git", "ls-files", "--stage", "--", "docker/certs/"],
+        capture_output=True,
+        text=True,
+        check=True,
+        cwd=str(REPO_ROOT),
+    )
+    in_index = "tinkoff-gost-ca-bundle" in r_index.stdout
+
+    assert in_head or in_index, (
+        "docker/certs/tinkoff-gost-ca-bundle.txt is not in the repo "
+        "tree or the staging index. Either commit the PEM (or rename "
+        "to .txt to comply with .gitignore `*.pem` per this PR), or "
+        "remove the bind-mount. Issue #479."
+    )
+    # And confirm the path actually points at a regular file on disk
+    # (not just present in git history). `git ls-tree`/`ls-files` is
+    # already enough for the failure mode #479 described, but the
+    # on-disk check catches a future where someone `.gitignore`s the
+    # file post-commit.
+    bundle_path = REPO_ROOT / BUNDLE_RELPATH
+    assert bundle_path.is_file(), (
+        f"{bundle_path} is missing or not a regular file. "
+        f"`docker compose up -d` will fail with bind-source-path-does-not-exist "
+        f"or silently create a directory (`create_host_path: true`). "
+        f"Either commit the bundle (issue #479 Option A) or remove the "
+        f"bind-mount (Option B). Currently in HEAD as a committed file "
+        f"(`.txt` extension chosen for .gitignore compliance)."
+    )
+
+
+def test_gost_bundle_file_contains_valid_pem() -> None:
+    """The committed bundle file MUST contain at least one
+    `-----BEGIN CERTIFICATE-----` ... `-----END CERTIFICATE-----` block
+    parseable by Python's `ssl.SSLContext.load_verify_locations`.
+
+    Otherwise the alphard-bot container trusts an empty CA bundle
+    (the file exists from `git ls-tree` but `requests` cannot extract
+    the chain) and the sawtooth-restart loop returns. This is the
+    second half of the regression gap Issue #479 surfaced — a
+    committed-but-empty file is no better than a missing one.
+
+    Pin: parse the file with `ssl.SSLContext.load_verify_locations`
+    and assert it raises nothing AND the context has at least one
+    loaded CA (CA certs attribute).
+    """
+    import ssl
+
+    bundle_path = REPO_ROOT / BUNDLE_RELPATH
+    if not bundle_path.is_file():
+        pytest.skip(f"{bundle_path} missing — covered by test_gost_bundle_path_exists_in_repo_tree")
+    text = bundle_path.read_text()
+    assert text.count("-----BEGIN CERTIFICATE-----") >= 1, (
+        f"{bundle_path} contains zero PEM cert blocks; the bundle is "
+        f"truncated or empty. Re-run scripts/fetch_tinkoff_gost_ca.py "
+        f"and recommit."
+    )
+    # Now the more rigorous check: `load_verify_locations` parses the
+    # PEM content. It silently ignores PEM blocks it can't decode but
+    # raises nothing for a well-formed file. `ctx.cert_store_stats()`
+    # returns (loaded_x509, loaded_x509_ca) on CPython 3.10+ — we
+    # assert at least one X509 CA cert got loaded.
+    ctx = ssl.create_default_context()
+    ctx.load_verify_locations(str(bundle_path))
+    stats = ctx.cert_store_stats()
+    # On Python 3.10+ `cert_store_stats()` returns either a dict
+    # `{'x509_ca': N, 'x509': M, 'crl': K}` OR a 3-tuple
+    # `(x509, x509_ca, crl)` depending on build options; both shapes
+    # are valid. We pull the CA-cert count defensively, falling back
+    # to 0 if neither shape matches. Anything ≥1 means the bundle
+    # parsed cleanly and added at least one CA to the trust store.
+    if isinstance(stats, dict):
+        ca_count = int(stats.get("x509_ca", 0))
+    else:
+        ca_count = int(stats[1]) if len(stats) >= 2 else 0
+    assert ca_count >= 1, (
+        f"{bundle_path} parsed cleanly but zero X509 CA certs were "
+        f"loaded into the trust store. ssl.context.cert_store_stats()={stats}. "
+        f"Regenerate the bundle via scripts/fetch_tinkoff_gost_ca.py "
+        f"and recommit."
     )

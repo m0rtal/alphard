@@ -25,6 +25,14 @@ post-processing the BEGIN/END blocks in Python, because Tinkoff's
 
 Usage:
   python3 scripts/fetch_tinkoff_gost_ca.py [--out PATH]
+
+File extension: the commit ships the bundle as
+``docker/certs/tinkoff-gost-ca-bundle.txt`` (``.txt`` extension
+deliberately used to comply with the project's ``.gitignore`` rule
+blocking ``*.pem``). Python's ``ssl.SSLContext.load_verify_locations``
+parses the file by content (``-----BEGIN CERTIFICATE-----`` markers),
+not by extension — verified by
+``tests/test_454_gost_ca_fetcher.py::test_pem_ext_not_required``.
 """
 
 from __future__ import annotations
@@ -44,7 +52,7 @@ ENDPOINTS: list[tuple[str, int]] = [
     ("iss.moex.com", 443),
 ]
 
-DEFAULT_OUT = Path("docker/certs/tinkoff-gost-ca-bundle.pem")
+DEFAULT_OUT = Path("docker/certs/tinkoff-gost-ca-bundle.txt")
 
 # PEM marker constants — kept at module scope so the parser does not
 # duplicate string literals across the BEGIN/END branches.

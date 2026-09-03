@@ -40,7 +40,7 @@ That is **all**. The script:
    `REDIS_PASSWORD` (if missing).
 4. Fetches the Russian Trusted Root CA + Sub CA bundle from
    `invest-public-api.tinkoff.ru` / `iss.moex.com` and writes it to
-   `docker/certs/tinkoff-gost-ca-bundle.pem` so the bot can verify
+   `docker/certs/tinkoff-gost-ca-bundle.txt` so the bot can verify
    their TLS chains. Idempotent — re-running skips the fetch if the
    bundle is <30 days old. (Issue #455.)
 5. Runs `docker compose up -d`.
