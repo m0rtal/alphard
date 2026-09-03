@@ -12,6 +12,14 @@ Covers the three logic defects in issue #454:
 The fourth defect (dead `tempfile.NamedTemporaryFile`) is structural and
 verified by inspection — no test needed because the cleanup is unconditional.
 
+Defect 5 (#464): `_fetch_chain_python` calls `c.public_bytes(...)` on each
+member of `ssock.get_verified_chain()`. On CPython 3.13+ that method already
+returns `bytes` objects (CPython issue #118658), so `c.public_bytes(...)`
+raises an uncaught `AttributeError` and the script's only openssl-less
+fallback crashes. The fix branch (test_fetch_chain_python_handles_bytes_chain)
+exercises the real function body with bytes-shaped chain entries so a
+regression where `public_bytes` is reached again fails this test.
+
 We mock `subprocess.run` to drive `fetch_chain` through the openssl path
 without touching the network, and exercise the parser on synthetic PEM
 text so the unit tests run in any CI sandbox.
@@ -19,6 +27,7 @@ text so the unit tests run in any CI sandbox.
 
 from __future__ import annotations
 
+import socket as _socket
 import subprocess
 import sys
 from pathlib import Path
@@ -192,7 +201,12 @@ def test_main_writes_bundle_on_success(gost_module, tmp_path) -> None:
 
 
 def test_main_returns_one_when_no_certs_extracted(gost_module, tmp_path) -> None:
-    """main() must not overwrite the bundle file when all endpoints fail."""
+    """main() must not overwrite the bundle file when all endpoints fail.
+
+    With defect 5 (#464) fixed, `_fetch_chain_python` is reachable from
+    main()'s outer RuntimeError handler — so this test now also has to
+    stub the fallback to keep the unit test hermetic.
+    """
     out = tmp_path / "bundle.pem"
 
     fake_proc = MagicMock()
@@ -200,13 +214,15 @@ def test_main_returns_one_when_no_certs_extracted(gost_module, tmp_path) -> None
     fake_proc.stdout = "no certs"
     fake_proc.stderr = "fail"
 
+    fallback_err = RuntimeError("fallback also failed: simulated for test")
     with patch.object(subprocess, "run", return_value=fake_proc):
-        with patch.object(
-            sys,
-            "argv",
-            ["fetch_tinkoff_gost_ca.py", "--out", str(out), "--timeout", "1"],
-        ):
-            rc = gost_module.main()
+        with patch.object(gost_module, "_fetch_chain_python", side_effect=fallback_err):
+            with patch.object(
+                sys,
+                "argv",
+                ["fetch_tinkoff_gost_ca.py", "--out", str(out), "--timeout", "1"],
+            ):
+                rc = gost_module.main()
 
     assert rc == 1
     assert not out.exists()
@@ -234,3 +250,85 @@ def test_script_does_not_use_tempfile(tmp_path) -> None:
         "fetch_tinkoff_gost_ca.py must not allocate a tempfile in fetch_chain — "
         "if you are wiring openssl's `-out`, do it as an explicit subprocess arg"
     )
+
+
+def _fake_chain_ctx(chain):
+    """Build a mock ssl context whose wrap_socket returns a stub chain source.
+
+    The stub chain source pretends to be `ssl.SSLSocket.get_verified_chain()`.
+    The class also implements the context-manager protocol so the
+    `with ctx.wrap_socket(...) as ssock` block inside `_fetch_chain_python`
+    unwinds cleanly without touching the network.
+    """
+    fake_sock = MagicMock()
+    fake_sock.__enter__ = lambda self: fake_sock
+    fake_sock.__exit__ = lambda self, *a: False
+    fake_sock.get_verified_chain = lambda: chain
+
+    fake_ctx = MagicMock()
+    fake_ctx.check_hostname = False
+    fake_ctx.verify_mode = 0
+    fake_ctx.wrap_socket.return_value = fake_sock
+    return fake_ctx, fake_sock
+
+
+def test_fetch_chain_python_handles_bytes_chain(gost_module) -> None:
+    """Defect 5 (#464): CPython 3.13+ returns bytes from get_verified_chain.
+
+    On 3.13+ the `ssl.SSLSocket.get_verified_chain()` method already
+    returns `bytes` objects (raw DER) per CPython issue #118658. The
+    fallback previously called `c.public_bytes(...)` on each member,
+    which raises `AttributeError: 'bytes' object has no attribute
+    'public_bytes'` and propagates out of `main()` uncaught — breaking
+    the openssl-less deployment contract. The fix must accept both
+    bytes-shaped chains (3.13+ default) and `cryptography.x509.Certificate`
+    objects (older / non-CPython builds) and emit a `list[bytes]` in
+    either case.
+
+    This test pins the contract on whatever the running interpreter
+    exposes; it does not require Python 3.13+ specifically because the
+    fix should be polyglot across interpreter versions.
+    """
+    chain = [b"\x30\x82\x01\x00" + b"\x00" * 100, b"\x30\x82\x01\x01" + b"\x00" * 80]
+    fake_ctx, fake_sock = _fake_chain_ctx(chain)
+
+    with patch.object(_socket, "create_connection", return_value=MagicMock()):
+        with patch.object(gost_module.ssl, "create_default_context", return_value=fake_ctx):
+            out = gost_module._fetch_chain_python(
+                "example.com", 443, timeout=1.0, reason="openssl not found: simulated"
+            )
+
+    assert isinstance(out, list)
+    assert len(out) == len(chain)
+    for cert, expected in zip(out, chain):
+        assert isinstance(cert, bytes), f"cert must be bytes, got {type(cert).__name__}"
+        # Either identity-preserving (already bytes) or DER-encoded via
+        # cryptography — both are valid. Just assert non-empty.
+        assert len(cert) > 0
+
+
+def test_fetch_chain_python_attributeerror_no_longer_uncaught(gost_module) -> None:
+    """Regression guard: an AttributeError must NEVER propagate out of fetch_chain.
+
+    Before the #464 fix, `c.public_bytes(...)` on a bytes-shaped chain
+    raised `AttributeError` which the `except ImportError:` clause did
+    not catch. The error surfaced as a Python traceback in production
+    logs instead of the `[fetch_tinkoff_gost_ca] host:port → ERROR: ...`
+    message that supervisors grep on. This test calls the real
+    `_fetch_chain_python` (no mocking of the function itself) with
+    bytes-shaped chain entries and asserts only `RuntimeError` (or
+    success) can escape — never `AttributeError`.
+    """
+    chain = [b"\x30\x82\x01\x00" + b"\x00" * 64]
+    fake_ctx, _ = _fake_chain_ctx(chain)
+
+    with patch.object(_socket, "create_connection", return_value=MagicMock()):
+        with patch.object(gost_module.ssl, "create_default_context", return_value=fake_ctx):
+            try:
+                gost_module._fetch_chain_python("example.com", 443, timeout=1.0, reason="openssl not found: simulated")
+            except RuntimeError:
+                # Acceptable: the fallback may surface a structured error
+                # (e.g. on exotic builds where bytes(c) is also unsupported).
+                pass
+            except AttributeError as exc:  # pragma: no cover — covered by assertion below
+                pytest.fail(f"AttributeError escaped _fetch_chain_python — #464 regression: {exc!r}")
