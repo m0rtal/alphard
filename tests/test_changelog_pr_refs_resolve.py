@@ -231,8 +231,8 @@ def test_inflight_prs_are_not_closed_issues() -> None:
     )
 
 
-def test_latest_changelog_commit_does_not_self_assert_inflight() -> None:
-    """A CHANGELOG-touching squash-merge must not keep itself in INFLIGHT_PRS.
+def test_no_changelog_commit_self_asserts_inflight() -> None:
+    """No CHANGELOG-touching merge in the scan window may keep itself in INFLIGHT_PRS.
 
     The recursion that #433 / #438 / #447 / #449 / #453 each had to ship a
     one-line workaround for: an author adds their own PR number to
@@ -243,36 +243,141 @@ def test_latest_changelog_commit_does_not_self_assert_inflight() -> None:
     author-asserted self-insert has to be hand-pruned by the next person who
     notices main CI red.
 
-    This test pins the contract that the latest CHANGELOG-touching commit's
-    PR is never author-asserted in INFLIGHT_PRS. If a future PR sneaks one
-    past the manual prune, this test fires before the recursive damage
-    reaches `_drift_window_prs`.
+    This test scans every CHANGELOG-touching commit in the scan window, not
+    just the latest. A single-commit squash-merge is the common case (the
+    latest-only variant handled this), but a multi-commit CHANGELOG fix that
+    self-inserts via an earlier commit and then has a follow-up CHANGELOG
+    edit land on main afterwards would escape a latest-only scan: the
+    follow-up becomes the latest CHANGELOG commit and lacks the merge
+    suffix, so the test would skip; meanwhile the earlier self-insert still
+    asserts in INFLIGHT_PRS. Issue #462.
+
+    Branch-tip CI is still safe: branch commits lack the `(#NNN)` suffix
+    (GitHub appends it on squash-merge), so they match nothing and the test
+    passes vacuously until the squash lands.
     """
-    # Find the latest commit that actually touched CHANGELOG.md. The bug class
-    # is a CHANGELOG-touching squash-merge leaving its own number asserted; a
-    # non-changelog commit can sit on top and the bug is still latent.
-    latest_subject = _git(
+    history = _git(
         "log",
         f"-{MERGE_SCAN_DEPTH}",
         "--format=%H %s",
         "--",
         "CHANGELOG.md",
     )
-    if not latest_subject:
+    if not history:
         pytest.skip("no commit touches CHANGELOG.md in the scan window")
 
-    first_line = latest_subject.splitlines()[0]
-    sha, _, subject = first_line.partition(" ")
-    m = MERGE_PR_SUFFIX.search(subject) or NO_FF_MERGE_SUBJECT.match(subject)
-    if not m:
-        pytest.skip("latest CHANGELOG-touching commit is not a merge — nothing to check")
+    offenders: list[str] = []
+    for line in history.splitlines():
+        sha, _, subject = line.partition(" ")
+        m = MERGE_PR_SUFFIX.search(subject) or NO_FF_MERGE_SUBJECT.match(subject)
+        if not m:
+            continue
+        pr = m.group(1)
+        if pr in INFLIGHT_PRS:
+            offenders.append(f"{sha[:7]} (PR #{pr}, subject: {subject[:80]!r})")
 
-    latest_pr = m.group(1)
-    assert latest_pr not in INFLIGHT_PRS, (
-        f"the latest CHANGELOG-touching commit {sha[:7]} is PR #{latest_pr}, "
-        f"but its number is still asserted in INFLIGHT_PRS — prune it in "
-        f"{Path(__file__).name}:64 (issue #453)"
+    assert not offenders, (
+        "these CHANGELOG-touching merges still assert their own PR in INFLIGHT_PRS — "
+        f"prune them in {Path(__file__).name}:64 (issues #433, #447, #449, #453, #462):\n" + "\n".join(offenders)
     )
+
+
+@pytest.mark.parametrize(
+    "history_lines, inflight, expected_offender_substrings",
+    [
+        # Multi-commit gap scenario from issue #462: an earlier commit's
+        # `(#NNN)` self-insert survives while the latest CHANGELOG commit
+        # is a follow-up with no suffix. The latest-only check would skip;
+        # the full-window check must fire on the earlier commit.
+        (
+            [
+                "aaa1111 docs: typo fix in CHANGELOG",
+                "bbb2222 docs(changelog): backfill stuff (Closes #500) (#500)",
+            ],
+            frozenset({"500"}),
+            ["bbb2222 (PR #500"],
+        ),
+        # Latest-only case: the squash-merge is the latest and self-asserts.
+        # Must still be caught by the full-window scan.
+        (
+            ["ccc3333 fix(changelog): backfill cycle200 (#501)"],
+            frozenset({"501"}),
+            ["ccc3333 (PR #501"],
+        ),
+        # Both a backfill and a follow-up squash-merge self-assert. The
+        # follow-up's PR is the latest (exempted in the old code) but the
+        # backfill's PR must also be caught.
+        (
+            [
+                "ddd4444 docs(changelog): backfill #496 #497 (#500)",
+                "eee5555 fix(other): also touches CHANGELOG (#501)",
+            ],
+            frozenset({"500", "501"}),
+            ["ddd4444 (PR #500", "eee5555 (PR #501"],
+        ),
+        # No offenders: neither commit's PR is in INFLIGHT_PRS. Passes.
+        (
+            [
+                "fff6666 docs: typo fix in CHANGELOG",
+                "ggg7777 docs(changelog): backfill cycle200 (#600)",
+            ],
+            frozenset({"601"}),  # unrelated, not in window
+            [],
+        ),
+        # --no-ff merge subject must also be caught by the full scan.
+        (
+            ["hhh8888 Merge pull request #700 from feature/x"],
+            frozenset({"700"}),
+            ["hhh8888 (PR #700"],
+        ),
+    ],
+)
+def test_no_changelog_commit_self_asserts_inflight_full_window(
+    monkeypatch: pytest.MonkeyPatch,
+    history_lines: list[str],
+    inflight: frozenset[str],
+    expected_offender_substrings: list[str],
+) -> None:
+    """Regression test for issue #462 — covers the multi-commit gap.
+
+    Each parametrized case mocks the `_git` helper to return a controlled
+    CHANGELOG commit history. The cases enumerate:
+
+    * Earlier-commit self-insert (multi-commit gap from #462's proof).
+    * Latest-commit self-insert (single-commit squash, the case the old
+      test handled).
+    * Two self-inserts across a backfill and a follow-up.
+    * Negative case: no self-inserts present.
+    * `--no-ff` merge subject (the `_drift_window_prs` guard skips this
+      style, but the INFLIGHT_PRS recursion guard catches it).
+
+    Asserts the new full-window scan fires on every offender in
+    `expected_offender_substrings` and reports none when the list is empty.
+    """
+    fake_history = "\n".join(history_lines)
+    monkeypatch.setattr(
+        "tests.test_changelog_pr_refs_resolve._git",
+        lambda *args, **_kwargs: fake_history,
+    )
+    monkeypatch.setattr(
+        "tests.test_changelog_pr_refs_resolve.INFLIGHT_PRS",
+        inflight,
+    )
+
+    import tests.test_changelog_pr_refs_resolve as _module
+
+    try:
+        _module.test_no_changelog_commit_self_asserts_inflight()
+    except AssertionError as exc:
+        message = str(exc)
+        for needle in expected_offender_substrings:
+            assert needle in message, f"expected offender substring {needle!r} in failure message:\n{message}"
+        if not expected_offender_substrings:
+            raise AssertionError(f"expected test to PASS with no offenders, got:\n{message}") from exc
+    else:
+        assert not expected_offender_substrings, (
+            "expected test to FAIL with offenders " f"{expected_offender_substrings!r}, but it passed"
+        )
 
 
 def test_legacy_mislabels_are_still_cited() -> None:
