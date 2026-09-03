@@ -139,7 +139,7 @@ services:
       # project's `.gitignore` blocks `*.pem` per a "never commit
       # secrets" policy. Python's `ssl.SSLContext.load_verify_locations`
       # reads PEM content regardless of file extension (verified by
-      # `tests/test_455_gost_wiring.py::test_re_bundle_is_loaded_by_requests_via_extension`).
+      # `tests/test_455_gost_wiring.py::test_gost_bundle_file_contains_valid_pem`).
       #
       # scripts/quickstart.sh and scripts/pre_pr_smoke.sh still call
       # `scripts/fetch_tinkoff_gost_ca.py` before compose reads the
