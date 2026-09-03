@@ -183,25 +183,35 @@ def _fetch_chain_python(host: str, port: int, timeout: float, reason: str) -> li
                         f"Python 3.13+ get_verified_chain() returned empty chain for "
                         f"{host}:{port} (openssl fallback also unavailable: {reason})"
                     )
-                # `get_verified_chain` returns cryptography.x509.Certificate
-                # objects on CPython 3.13+. Lazy-import cryptography so a
-                # host without the dependency still runs the openssl path.
-                try:
-                    from cryptography.hazmat.primitives import serialization
-                except ImportError:
-                    # Without cryptography, fall back to bytes() of each cert
-                    # — CPython 3.13+ exposes the DER blob via __bytes__ on
-                    # the underlying _ssl_Certificate. If that path is not
-                    # available either, surface a clear error.
+                # `get_verified_chain` shape varies by build:
+                #  * CPython 3.13+ returns raw `bytes` (DER) per
+                #    https://github.com/python/cpython/issues/118658.
+                #  * Older / non-CPython builds (e.g. PyPy, patched ssl
+                #    modules) may still return `cryptography.x509.Certificate`
+                #    objects that require `public_bytes(Encoding.DER)` to
+                #    serialise.
+                # Defect 5 (#464): the prior code path only handled the
+                # second shape and crashed with `AttributeError` on the
+                # first — breaking the openssl-less deployment contract
+                # on the very Python version it was designed for. Handle
+                # both shapes here so the fallback stays polyglot.
+                out: list[bytes] = []
+                for c in chain:
+                    if isinstance(c, (bytes, bytearray, memoryview)):
+                        out.append(bytes(c))
+                        continue
                     try:
-                        return [bytes(c) for c in chain]
-                    except TypeError as exc:
+                        from cryptography.hazmat.primitives import serialization
+                    except ImportError as exc:
                         raise RuntimeError(
-                            f"Python 3.13+ get_verified_chain() returned objects that "
-                            f"do not support public_bytes or bytes() for {host}:{port}: "
+                            f"Python 3.13+ get_verified_chain() returned a "
+                            f"{type(c).__name__} for {host}:{port} and the "
+                            f"`cryptography` package is not installed (install "
+                            f"`cryptography` or rely on the openssl CLI path): "
                             f"{exc!r}"
                         ) from exc
-                return [c.public_bytes(serialization.Encoding.DER) for c in chain]
+                    out.append(c.public_bytes(serialization.Encoding.DER))
+                return out
             raise RuntimeError(
                 f"openssl CLI missing and Python <3.13 on {host}:{port}: "
                 f"stdlib ssl module cannot extract the certificate chain (only the leaf "
