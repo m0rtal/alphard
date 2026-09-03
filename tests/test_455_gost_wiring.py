@@ -206,9 +206,7 @@ def test_compose_does_not_set_ssl_cert_file() -> None:
     )
     assert env_block_match, "alphard-bot environment: block not found"
     env_lines = [
-        ln
-        for ln in env_block_match.group("body").splitlines()
-        if ln.strip() and not ln.strip().startswith("#")
+        ln for ln in env_block_match.group("body").splitlines() if ln.strip() and not ln.strip().startswith("#")
     ]
     env_keys = [
         re.match(r"\s*([A-Z_][A-Z0-9_]*)\s*:", ln).group(1)
