@@ -325,14 +325,10 @@ def test_fetch_chain_python_attributeerror_no_longer_uncaught(gost_module) -> No
     with patch.object(_socket, "create_connection", return_value=MagicMock()):
         with patch.object(gost_module.ssl, "create_default_context", return_value=fake_ctx):
             try:
-                gost_module._fetch_chain_python(
-                    "example.com", 443, timeout=1.0, reason="openssl not found: simulated"
-                )
+                gost_module._fetch_chain_python("example.com", 443, timeout=1.0, reason="openssl not found: simulated")
             except RuntimeError:
                 # Acceptable: the fallback may surface a structured error
                 # (e.g. on exotic builds where bytes(c) is also unsupported).
                 pass
             except AttributeError as exc:  # pragma: no cover — covered by assertion below
-                pytest.fail(
-                    f"AttributeError escaped _fetch_chain_python — #464 regression: {exc!r}"
-                )
+                pytest.fail(f"AttributeError escaped _fetch_chain_python — #464 regression: {exc!r}")
