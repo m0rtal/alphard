@@ -55,6 +55,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 ### Backfilled drift
 - **PRs #385, #388, #391** — pre-existing changelog drift surfaced by the drift-window guard during preparation of PR #399. These PRs were merged to `main` between the last changelog-touching commit and #399; they were simply not referenced here yet. None of these PRs are part of the Grafana/Prometheus removal work in #399 — this entry is a backfill, not an additional change.
 
+### Fixed
+- *(awaiting merge — backfill supervisor circuit breaker for persistent broker outages, Closes #430)*
+
 ### Removed
 - **Grafana and Prometheus removed from the compose stack** (Closes #395, PR #399). The `docker/grafana/` and `docker/prometheus/` directories are deleted; the `alphard-grafana`, `alphard-prometheus`, and `alphard-chownfix` services are dropped from `docker-compose.yaml`; the obsolete top-level `version: "3.9"` key is removed. With `alphard-web` (PR #394) replacing the Grafana phase28 dashboard as the operator UI, the observability surfaces no longer need a separate Grafana stack — direct SQL to `alphard-postgres` serves every metric the four-panel dashboard showed. The `alphard-chownfix` sidecar is gone because its sole purpose was to set ownership on Grafana/Prometheus leaf directories; with both gone, there is no work left for it. `tests/test_compose_structure.py` is rewritten with **negative assertions** that the three removed services stay removed — so any future PR that re-adds Grafana or Prometheus by accident is caught immediately. `alphard-prometheus-data` named volume is also dropped. The bot, postgres, and redis services are unchanged. Operators should pull `alphard-web` separately (PR #394) before merging #399 so the dashboard is live before the Grafana URL 502s. (PR #399, Closes #395.)
 
