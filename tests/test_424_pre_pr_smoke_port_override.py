@@ -48,19 +48,19 @@ COMPOSE = REPO_ROOT / "docker-compose.yaml"
 def _exists_readable(path: str) -> bool:
     """True iff ``path`` exists and the current process can read it.
 
-    ``Path.exists()`` returns True even when the file is unreadable (e.g.
-    owned by root in a CI container running as a non-root user). The
-    subprocess invocation in ``test_script_smoke_gate_runs_locally``
-    fails with ``PermissionError`` in that case — so callers must check
-    readability, not just existence.
+    ``Path.exists()`` is not safe under all permission regimes: on
+    CPython 3.11/Linux, ``Path('/root/.env').exists()`` raises
+    ``PermissionError`` rather than returning False when the parent
+    directory is readable but the file's permission bits exclude the
+    current user (the GH Actions runner scenario). The subprocess
+    invocation in ``test_script_smoke_gate_runs_locally`` also fails
+    with ``PermissionError`` when ``/root/.env`` is not readable, so
+    callers must check readability, not just existence.
     """
-    p = Path(path)
-    if not p.exists():
-        return False
     try:
-        with p.open():
+        with open(path):
             return True
-    except (PermissionError, OSError):
+    except (FileNotFoundError, PermissionError, OSError):
         return False
 
 
@@ -277,7 +277,7 @@ def test_script_smoke_gate_runs_locally() -> None:
     """
     import os
 
-    if not (REPO_ROOT / ".env").exists() and not _exists_readable("/root/.env"):
+    if not _exists_readable(str(REPO_ROOT / ".env")) and not _exists_readable("/root/.env"):
         # Skip if we can't even produce .env — the test is about the
         # override writer, not the full daemon dance.
         return
