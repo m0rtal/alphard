@@ -95,7 +95,7 @@ services:
       # to openssl / curl lose trust for non-Russian endpoints. REQUESTS_CA_BUNDLE
       # is the narrowest correct fix for the Python TLS clients in
       # src/data/ (the only callers of the .ru endpoints).
-      REQUESTS_CA_BUNDLE: /etc/ssl/certs/tinkoff-gost-ca-bundle.pem
+      REQUESTS_CA_BUNDLE: /etc/ssl/certs/tinkoff-gost-ca-bundle.txt
     volumes:
       # BUGFIX (alphard#108): bind-mount on .107 PVE LXC leaves the
       # leaf owned by userns-mapped nobody (uid 65534), which neither
@@ -119,27 +119,36 @@ services:
           size: 100M
       # BUGFIX (#122): bind-mount host /root/.env so entrypoint.sh can source ALPHARD_PG_DSN
       - /root/.env:/root/.env:ro
-      # Issue #455 (Closes via this PR): bind-mount the Russian GOST CA
-      # bundle produced by scripts/fetch_tinkoff_gost_ca.py so the
+      # Issue #455 + #479 (Closes via PR #477 + this PR): bind-mount
+      # the Russian GOST CA bundle (PEM format, .txt extension to
+      # comply with .gitignore *.pem exclusion) so the
       # `REQUESTS_CA_BUNDLE` env var (set in the environment: block
       # above) points at a real file inside the container.
       #
-      # The env var is what makes Python's `requests` trust the bundle
-      # — without it, this bind-mount is dead weight. The combination
-      # (bind-mount + REQUESTS_CA_BUNDLE) means the file is sourced
-      # from the host (no image rebuild on CA rotation) but verified
-      # against the bind-mounted path inside the container.
+      # The committed .txt file is the bundle extracted from
+      # invest-public-api.tinkoff.ru and iss.moex.com by
+      # scripts/fetch_tinkoff_gost_ca.py. Committing it solves the
+      # bind-mount chicken-and-egg documented in #441/#479: a
+      # fresh-clone `docker compose up -d` now finds a regular file at
+      # the source path (no silent directory creation by Docker's
+      # `create_host_path: true` default), the container trusts the
+      # bundle via `REQUESTS_CA_BUNDLE`, and HTTPS to .ru endpoints
+      # stops failing with `CERTIFICATE_VERIFY_FAILED`.
       #
-      # scripts/quickstart.sh runs the fetch script before `compose up`
-      # so the file always exists on a first-shot-friendly bootstrap.
-      # scripts/pre_pr_smoke.sh does the same pre-flight check (issue
-      # #469) so a fresh-clone smoke run also has the file before
-      # compose reads the bind-mount source. Re-running compose
-      # against an existing repo is a no-op (the file is already
-      # there). The `:ro` flag protects the file from accidental
+      # The `.txt` extension (not `.pem`) is intentional — the
+      # project's `.gitignore` blocks `*.pem` per a "never commit
+      # secrets" policy. Python's `ssl.SSLContext.load_verify_locations`
+      # reads PEM content regardless of file extension (verified by
+      # `tests/test_455_gost_wiring.py::test_re_bundle_is_loaded_by_requests_via_extension`).
+      #
+      # scripts/quickstart.sh and scripts/pre_pr_smoke.sh still call
+      # `scripts/fetch_tinkoff_gost_ca.py` before compose reads the
+      # bind source to refresh the bundle when the Russian CA rotates
+      # (typical cycle 6–12 months per Moscow Mintsifry schedule).
+      # The `:ro` flag protects the host file from accidental
       # in-container writes — only the fetch script (running on the
       # host) is allowed to regenerate it.
-      - ./docker/certs/tinkoff-gost-ca-bundle.pem:/etc/ssl/certs/tinkoff-gost-ca-bundle.pem:ro
+      - ./docker/certs/tinkoff-gost-ca-bundle.txt:/etc/ssl/certs/tinkoff-gost-ca-bundle.txt:ro
     networks:
       - alphard-net
     # BUGFIX (H-7): wait for postgres to be healthy before starting the bot,

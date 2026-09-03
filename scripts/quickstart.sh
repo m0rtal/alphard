@@ -206,18 +206,23 @@ fi
 
 ok "prometheus stack removed (PR #399); bot exposes /metrics on port 8765"
 
-# ---- 3. Russian GOST CA bundle (Issue #455) ----
-# docker-compose.yaml bind-mounts ./docker/certs/tinkoff-gost-ca-bundle.pem
+# ---- 3. Russian GOST CA bundle (Issue #455 + #479) ----
+# docker-compose.yaml bind-mounts ./docker/certs/tinkoff-gost-ca-bundle.txt
 # into the alphard-bot container so its ssl/requests clients trust
 # invest-public-api.tinkoff.ru + iss.moex.com (which sit behind the Russian
 # Trusted Root CA, not in certifi). Without this bundle every HTTPS call
 # to those endpoints fails with CERTIFICATE_VERIFY_FAILED.
 #
 # scripts/fetch_tinkoff_gost_ca.py (PR #444 + #454) writes the bundle
-# to docker/certs/tinkoff-gost-ca-bundle.pem. We invoke it here so a
-# fresh clone has the file before `compose up` runs — otherwise the
-# bind-mount in docker-compose.yaml errors with "Bind source path
-# does not exist" and the whole stack fails to start.
+# to docker/certs/tinkoff-gost-ca-bundle.txt. We invoke it here so a
+# fresh clone has the file before `compose up` runs.
+#
+# Issue #479: as of PR #478 (this section), the bundle file is also
+# committed to the repo at docker/certs/tinkoff-gost-ca-bundle.txt
+# (using `.txt` extension to comply with .gitignore `*.pem` exclusion).
+# This means the bind-mount contract holds for any operator path —
+# `quickstart.sh`, `pre_pr_smoke.sh`, OR direct `docker compose up -d`
+# — without an implicit "run quickstart first" requirement.
 #
 # Idempotency: if the file already exists and is less than 30 days
 # old, we skip the fetch. 30 days matches the Russian Trusted Root
@@ -227,7 +232,7 @@ ok "prometheus stack removed (PR #399); bot exposes /metrics on port 8765"
 # file and re-run quickstart to force a fresh fetch.
 info "3/5 Russian GOST CA bundle"
 
-GOST_BUNDLE="$REPO_ROOT/docker/certs/tinkoff-gost-ca-bundle.pem"
+GOST_BUNDLE="$REPO_ROOT/docker/certs/tinkoff-gost-ca-bundle.txt"
 GOST_BUNDLE_DIR="$(dirname "$GOST_BUNDLE")"
 GOST_FETCH_MAX_AGE_DAYS="${GOST_FETCH_MAX_AGE_DAYS:-30}"
 

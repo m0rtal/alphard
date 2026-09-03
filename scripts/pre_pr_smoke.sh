@@ -165,20 +165,27 @@ services:
     container_name: ${COMPOSE_PROJECT_NAME}-redis-1
 YAML
 
-# BUGFIX (issue #469): pre-fetch the Russian GOST CA bundle BEFORE
-# `compose up` so the alphard-bot bind-mount source path
-# (./docker/certs/tinkoff-gost-ca-bundle.pem) exists as a regular file.
+# BUGFIX (issue #469 + #479): pre-fetch the Russian GOST CA bundle
+# BEFORE `compose up` so the alphard-bot bind-mount source path
+# (./docker/certs/tinkoff-gost-ca-bundle.txt) exists as a regular file.
 # Without this, compose's `create_host_path: true` default silently
 # creates a DIRECTORY at the source path, which ssl/requests cannot
 # use as a CA bundle, and the bot's REQUESTS_CA_BUNDLE env var points
 # at an unreadable directory.
+#
+# As of PR #478 (issue #479), the bundle file is ALSO committed to the
+# repo at docker/certs/tinkoff-gost-ca-bundle.txt — `.txt` extension
+# to comply with `.gitignore` blocking `*.pem`. This means the fetch
+# below usually no-ops: the committed file's mtime is recent enough
+# and is_valid_pem-shaped; the script confirms and only refetches if
+# the file is missing or a directory.
 #
 # This mirrors scripts/quickstart.sh step 3/5 so smoke gate works on
 # a fresh checkout that has never run quickstart.sh. We refuse to
 # auto-create a directory-shaped bundle (a known footgun from issue
 # #469): if the source path exists as a directory, we rm -rf it and
 # fetch fresh.
-GOST_BUNDLE_PATH="./docker/certs/tinkoff-gost-ca-bundle.pem"
+GOST_BUNDLE_PATH="./docker/certs/tinkoff-gost-ca-bundle.txt"
 if [[ -d "$GOST_BUNDLE_PATH" ]]; then
     echo "[pre-pr-smoke] [0/4] removing directory-shaped GOST bundle at $GOST_BUNDLE_PATH"
     echo "[pre-pr-smoke]       (compose auto-created it on a prior run; ssl/requests need a file)"
