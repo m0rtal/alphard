@@ -242,6 +242,36 @@ class TestApiHelperSendsAuthorization:
         )
 
 
+class TestApiHelperCallsGetTokenAtMostOnce:
+    """Issue #418 cosmetic follow-up: api() must call getToken() at most once.
+
+    The pre-fix code had ``getToken() ? {Authorization: 'Bearer ' + getToken()}``
+    which was wasteful (extra sessionStorage read per fetch) and harder to read.
+    PR #452 already hoisted the call into ``const token = await getToken();``
+    — this test pins the contract so a future refactor that re-introduces the
+    double-call pattern is caught pre-merge.
+
+    The double-call does NOT cause a double prompt (the inner ``sessionStorage``
+    write short-circuits the second call), but reducing to one call is cheaper
+    and clearer. The contract is a code-quality one, not a behavioural one.
+    """
+
+    def test_api_helper_calls_getToken_at_most_once(self) -> None:
+        text = _load_index_html()
+        m = re.search(r"(?:async\s+)?function\s+api\s*\([^)]*\)\s*\{([\s\S]*?)\n\}", text)
+        assert m is not None, "api() helper must be a top-level function"
+        body = m.group(1)
+        # Count standalone getToken() invocations in the function body.
+        # The declaration ``function getToken()`` lives outside the api()
+        # body, so the regex above scopes the search correctly.
+        call_count = len(re.findall(r"\bgetToken\s*\(\s*\)", body))
+        assert call_count <= 1, (
+            f"Issue #418 regression: api() helper must call getToken() at most "
+            f"once (hoist to local var). Found {call_count} invocations.\n"
+            f"Current api() body:\n{body}"
+        )
+
+
 class TestApiHelperRePromptsOn401:
     """Issue #411: 401 response must clear sessionStorage and re-prompt."""
 
