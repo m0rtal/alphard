@@ -8,7 +8,7 @@
 
 > **Статус (2026-09-03):** Phase 1 closed (10/10 gaps), Phase 2 closed (10/10
 > merged) — cross-source, delisted cron, metrics, backup, split adjust,
-> sandbox-token redeploy, ohlcv rows panel, alphard-redis removal,
+> sandbox-token redeploy, ohlcv rows panel, alphard-redis removal (PR #426),
 > GOST CA bundle, supervisor circuit breaker. Active phase: see
 > [`docs/PHASE2-ROADMAP.md`](docs/PHASE2-ROADMAP.md).
 > Health: alphard-web operator UI on port 8081 (replaces Grafana/Prometheus, removed, PR #399), alphard-bot `/metrics` on port 8765. Daily Postgres backup at `/mnt/appdata/alphard-backups/`.
@@ -42,7 +42,7 @@ Alphard — автономный multi-agent trading system:
 
 **Phase status (HEAD):** Phase 1 closed (10/10 gaps), Phase 2 closed
 (cross-source, delisted cron, metrics, backup, split adjust,
-sandbox-token redeploy, ohlcv rows panel, alphard-redis removal,
+sandbox-token redeploy, ohlcv rows panel, alphard-redis removal (PR #426),
 GOST CA bundle, supervisor circuit breaker).
 См. [`docs/PHASE2-ROADMAP.md`](docs/PHASE2-ROADMAP.md) для бэклога.
 

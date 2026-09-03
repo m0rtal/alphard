@@ -141,10 +141,13 @@ def test_compose_bind_mount_targets_only_alphard_bot() -> None:
         f"alphard-bot MUST bind-mount the bundle ({target_marker}); " f"bot block:\n{bot_block}"
     )
 
-    # And make sure postgres / redis do NOT have it.
+    # And make sure postgres does NOT have it.
     # Anchor on `^  <svc>:` (no alphard- prefix) so the regex does not
     # match top-level volume entries like `alphard-postgres-data:`.
-    for svc in ("postgres", "redis"):
+    # (alphard-redis was removed by PR #426 — `redis` is no longer a
+    # service in docker-compose.yaml, so the negative-loop only needs
+    # to cover postgres.)
+    for svc in ("postgres",):
         m = re.search(
             rf"^  {re.escape(svc)}:\s",
             text,
