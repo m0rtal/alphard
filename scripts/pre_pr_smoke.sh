@@ -75,6 +75,16 @@ fi
 # alphard-smoke-<PID>-postgres-1, etc.) and never collides with the
 # operator's running alphard-* stack on the same daemon.
 #
+# BUGFIX (cycle?, issue #424): extend the override to drop the hardcoded
+# `alphard-web` host port publish (`127.0.0.1:8081:8080` from
+# docker-compose.yaml:149). `-p alphard-smoke-<PID>` scopes volumes and
+# networks but NOT published ports — exactly the same gap that bit
+# container_name in #374. The smoke gate never reaches alphard-web
+# through the host port; it probes from inside the container via
+# `http://127.0.0.1:8080/api/health`, mirroring the bot's port-8765
+# in-container probe above. Dropping the publish removes the conflict
+# surface on hosts already running the operator's alphard-web stack.
+#
 # Why the override is necessary: docker-compose.yaml hardcodes
 # `container_name: alphard-bot`, `alphard-postgres`, `alphard-redis`.
 # Docker
@@ -136,6 +146,13 @@ services:
       - ./scripts:/app/scripts:ro
   alphard-web:
     container_name: ${COMPOSE_PROJECT_NAME}-alphard-web-1
+    # BUGFIX (issue #424): drop the hardcoded host-port publish
+    # (127.0.0.1:8081:8080 in docker-compose.yaml) so the per-PID smoke
+    # stack does not collide with the operator's alphard-web already
+    # bound to 127.0.0.1:8081. Smoke probes use the in-network
+    # 127.0.0.1:8080 via docker exec, same as the bot's port-8765
+    # probe above.
+    ports: !override []
     volumes:
       - ./src:/app/src:ro
   postgres:
@@ -158,10 +175,14 @@ echo "[pre-pr-smoke] [1/4] bringing up stack..."
 #
 # alphard-web (issue #393, PR #394) is also brought up so the wire-up
 # is exercised in smoke. It bind-mounts ./src:ro via the override above.
-if ! "${COMPOSE[@]}" up -d postgres alphard-bot alphard-web >/dev/null 2>&1; then
+if ! "${COMPOSE[@]}" up -d postgres alphard-bot alphard-web >/tmp/alphard-smoke-compose-up.$$.log 2>&1; then
     echo "[pre-pr-smoke] FAIL: docker compose up failed"
+    echo "[pre-pr-smoke] --- compose log ---"
+    sed 's/^/  /' /tmp/alphard-smoke-compose-up.$$.log
+    rm -f /tmp/alphard-smoke-compose-up.$$.log
     exit 1
 fi
+rm -f /tmp/alphard-smoke-compose-up.$$.log
 
 # Port 8765 is NOT published on the host (it binds only inside
 # alphard-net), so `curl localhost:8765` always refuses. Probe from
