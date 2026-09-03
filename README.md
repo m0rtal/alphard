@@ -2,20 +2,18 @@
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Tests](https://github.com/m0rtal/alphard/actions/workflows/ci.yml/badge.svg)](https://github.com/m0rtal/alphard/actions/workflows/ci.yml)
-[![Coverage](https://img.shields.io/badge/coverage-93%25-yellow.svg)](https://github.com/m0rtal/alphard)
+[![Coverage](https://img.shields.io/badge/coverage-97%25-brightgreen.svg)](https://github.com/m0rtal/alphard)
 
 Автономный multi-agent trading bot на MOEX/Tinkoff. Apache-2.0, self-hosted, Docker-only.
 
-> **Статус (2026-08-20):** Phase 1 closed (10/10 gaps), Phase 2 = **6/10 merged**
-> (2.6 step 1 cross-source, 2.7 delisted cron, 2.8 metrics, 2.9 step 1 backup,
-> 2.5 step 1 split adjust, 2.1 sandbox-token redeploy in flight).
-> Backfill resume-safe via `_backfill_supervisor_loop` (PR #47/#50,
-> 3-layer deadlock fix). Health monitoring live (alphard-web operator
-> dashboard on port 8081, alphard-bot /metrics :8765). Daily Postgres
-> backup at /mnt/appdata/alphard-backups/.
+> **Статус (2026-09-03):** Phase 1 closed (10/10 gaps), Phase 2 closed (10/10
+> merged) — cross-source, delisted cron, metrics, backup, split adjust,
+> sandbox-token redeploy, ohlcv rows panel, alphard-redis removal,
+> GOST CA bundle, supervisor circuit breaker. Active phase: see
+> [`docs/PHASE2-ROADMAP.md`](docs/PHASE2-ROADMAP.md).
+> Health: alphard-web operator UI on port 8081 (replaces Grafana/Prometheus, removed, PR #399), alphard-bot `/metrics` on port 8765. Daily Postgres backup at `/mnt/appdata/alphard-backups/`.
 > **Бот НЕ торгует на реальные деньги** — `LIVE_TRADING=false` hardlock
-> в `src/broker/tinkoff_account.py`. Active phase: **2.3 Macro Agent** + **2.6 step 2
-> multi-source schema** + **2.5 step 2b corporate-actions wiring**.
+> в `src/broker/tinkoff_account.py`.
 
 ## Что это
 
@@ -29,9 +27,8 @@ Alphard — автономный multi-agent trading system:
 - Cross-source validation (Tinkoff MD archive + MOEX ISS, 3-layer fallback)
 - Self-validation (regime detection: CBR key rate + IMOEX + USD/RUB)
 - ML pipeline (planned Phase 2.4)
-- Sandbox token validated 2026-08-20: curl to
-  `https://sandbox-invest-public-api.tinkoff.ru/history-data` → HTTP 404
-  (figi unknown, но TLS handshake + token auth = OK)
+- Sandbox token validated locally through `scripts/pre_pr_smoke.sh` —
+  the same smoke gate the CI uses to gate every PR to `main`.
 
 ## Архитектура
 
@@ -43,9 +40,10 @@ Alphard — автономный multi-agent trading system:
 [`ARCHITECTURE.md`](ARCHITECTURE.md). Для публичного API контракта —
 [`API.md`](API.md).
 
-**Phase status (HEAD):** Phase 1 closed (10/10 gaps), Phase 2 = 7/10 merged
-(2.6 step 1 cross-source, 2.7 delisted cron, 2.8 metrics, 2.9 step 1 backup,
-2.5 step 1 split adjust, 2.1 sandbox-token redeploy, 2.8 step 2 ohlcv rows panel).
+**Phase status (HEAD):** Phase 1 closed (10/10 gaps), Phase 2 closed
+(cross-source, delisted cron, metrics, backup, split adjust,
+sandbox-token redeploy, ohlcv rows panel, alphard-redis removal,
+GOST CA bundle, supervisor circuit breaker).
 См. [`docs/PHASE2-ROADMAP.md`](docs/PHASE2-ROADMAP.md) для бэклога.
 
 Defensive infrastructure (added 2026-08-19/20):
@@ -206,9 +204,7 @@ Branch protection на `main`:
 
 - **alphard-bot** на .107 — `python3 -m src.main`, экспортирует metrics на :8765
 - **alphard-web** — операторская панель на :8081 (PR #394), читает
-  напрямую из `alphard-postgres` через SQL, отображает те же метрики,
-  что и Grafana phase28 dashboard. Заменяет Grafana + Prometheus
-  (PR #399).
+  напрямую из `alphard-postgres` через SQL, отображает те же метрики, что и phase28 Grafana dashboard раньше (Grafana + Prometheus removed, PR #399).
 - **alphard-postgres** — данные OHLCV + decision_log, отдельный bind-mount на
   `/mnt/appdata/alphard-postgres`
 - **Backup** — `/mnt/appdata/alphard-backups/`, daily pg_dump gzip-6, retention
