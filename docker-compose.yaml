@@ -102,6 +102,17 @@ services:
           size: 100M
       # BUGFIX (#122): bind-mount host /root/.env so entrypoint.sh can source ALPHARD_PG_DSN
       - /root/.env:/root/.env:ro
+      # Issue #455 (Closes via this PR): bind-mount the Russian GOST CA bundle
+      # produced by scripts/fetch_tinkoff_gost_ca.py so the bot's
+      # `requests`/`ssl` clients trust invest-public-api.tinkoff.ru +
+      # iss.moex.com TLS chains. scripts/quickstart.sh runs the fetch
+      # script before `compose up`, so the file always exists on a
+      # first-shot-friendly bootstrap. Re-running compose against an
+      # existing repo is a no-op (the file is already there). The `:ro`
+      # flag protects the file from accidental in-container writes —
+      # only the fetch script (running on the host) is allowed to
+      # regenerate it.
+      - ./docker/certs/tinkoff-gost-ca-bundle.pem:/etc/ssl/certs/tinkoff-gost-ca-bundle.pem:ro
     networks:
       - alphard-net
     # BUGFIX (H-7): wait for postgres to be healthy before starting the bot,
