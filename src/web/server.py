@@ -84,22 +84,13 @@ def execute_query(dsn: str, sql: str, params: dict[str, Any]) -> list[dict[str, 
 
     BUGFIX (2026-09-02): `connect_with_timeouts()` was injecting
     `connect_timeout=10` and `options='-c statement_timeout=60000'` as
-    connection kwargs. With psycopg3 + scram-sha-256 + the alphard-web
-    `network_mode: host` setup, libpq discarded the DSN password before
-    sending the auth packet, producing
+    connection kwargs. With psycopg3 + scram-sha-256, libpq discarded the
+    DSN password before sending the auth packet, producing
     `fe_sendauth: no password supplied` even though
     `os.environ['ALPHARD_PG_DSN']` clearly contained the password.
-    Standalone `psycopg.connect(dsn)` from a python -c one-liner inside
-    alphard-web succeeded with the same DSN — only `connect_with_timeouts`
-    failed.
-
-    RE-FIX (2026-09-03, issue #428): the original commit dropped the
-    `statement_timeout=60000` because DSN-options path was broken. The
-    60 s safety is still needed for runaway queries — applied here via
-    `SET LOCAL statement_timeout` inside the same transaction so it
-    does NOT touch the DSN (libpq won't re-parse options) and only
-    affects this call's session, not the underlying pool. Per-statement
-    overhead is one extra round-trip (~0.5 ms on local network).
+    The connection timeout is still applied directly; statement timeout is
+    applied after connection with `SET statement_timeout` so the DSN is not
+    modified.
     """
     import psycopg
 

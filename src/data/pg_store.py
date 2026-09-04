@@ -51,7 +51,6 @@ _IDENTIFIER_RE = re.compile(r"^[a-z_][a-z0-9_]*(?:\s*,\s*[a-z_][a-z0-9_]*)*$")
 #     bad query no longer wedges the daemon.
 _PG_CONNECT_KWARGS: dict[str, Any] = {
     "connect_timeout": 10,
-    "options": "-c statement_timeout=60000",
 }
 
 
@@ -124,19 +123,13 @@ class PostgresDataStore(DataStore):
             # - connect_timeout=10: cap TCP+startup handshake so we fail
             #   fast if Postgres is unreachable (instead of OS default
             #   ~2 minutes).
-            # - options="-c statement_timeout=60000": force Postgres to
-            #   cancel any individual query that runs longer than 60s.
-            #   This is the real deadlock-buster: a hung query on the
-            #   server side now raises QueryCanceled within 60s, the
-            #   connection is returned to the pool, and the next caller
-            #   gets a fresh attempt. Without this, a single bad ticker
-            #   stall can wedge the backfill daemon for hours.
             self._conn = self._psycopg.connect(
                 self._dsn,
                 autocommit=True,
                 connect_timeout=10,
-                options="-c statement_timeout=60000",
             )
+            with self._conn.cursor() as cur:
+                cur.execute("SET statement_timeout = 60000")
             if self._search_path:
                 with self._conn.cursor() as cur:
                     # SET search_path cannot use %s placeholders (Postgres
