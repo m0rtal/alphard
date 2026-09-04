@@ -265,6 +265,66 @@ class TestPositionSize:
         assert gate.evaluate(allowed_intent, base_state).allowed is True
         assert gate.evaluate(rejected_intent, base_state).allowed is False
         assert any("RISK_POSITION" in v for v in gate.evaluate(rejected_intent, base_state).violations)
+        assert gate.evaluate(allowed_intent, base_state).meta["projected_qty"] == pytest.approx(900.0)
+
+    def test_buy_projects_existing_position_level(self, limits: RiskLimits) -> None:
+        """Issue #494: a BUY must include the existing holding in its level."""
+        state = PortfolioState(
+            total_equity=Decimal("1000000"),
+            cash=Decimal("0"),
+            positions=[Position(symbol="GAZP", quantity=Decimal("3000"), avg_price=Decimal("100"), sector="energy")],
+            daily_pnl=Decimal("0"),
+            peak_equity=Decimal("1000000"),
+        )
+        intent = _intent(symbol="GAZP", qty=900, price="100", sector="energy")
+
+        decision = RiskGate(limits).evaluate(intent, state)
+
+        assert decision.allowed is False
+        assert any("RISK_POSITION" in violation for violation in decision.violations)
+        assert decision.meta["existing_qty"] == pytest.approx(3000.0)
+        assert decision.meta["projected_qty"] == pytest.approx(3900.0)
+        assert decision.meta["position_pct"] == pytest.approx(39.0)
+
+    def test_buy_ratchet_rejects_second_sub_limit_order(self, limits: RiskLimits) -> None:
+        """Issue #494: sequential sub-limit BUYs cannot ratchet past the cap."""
+        empty_state = PortfolioState(
+            total_equity=Decimal("1000000"),
+            cash=Decimal("1000000"),
+            positions=[],
+            daily_pnl=Decimal("0"),
+            peak_equity=Decimal("1000000"),
+        )
+        intent = _intent(qty=900, price="100")
+        gate = RiskGate(limits)
+
+        first = gate.evaluate(intent, empty_state)
+        after_first_fill = empty_state.model_copy(
+            update={"positions": [Position(symbol="SBER", quantity=Decimal("900"), avg_price=Decimal("100"))]}
+        )
+        second = gate.evaluate(intent, after_first_fill)
+
+        assert first.allowed is True
+        assert second.allowed is False
+        assert second.meta["projected_qty"] == pytest.approx(1800.0)
+        assert second.meta["position_pct"] == pytest.approx(18.0)
+        assert any("RISK_POSITION" in violation for violation in second.violations)
+
+    def test_buy_at_limit_including_existing_position_is_allowed(self, limits: RiskLimits) -> None:
+        """Issue #494: the post-trade level boundary remains inclusive."""
+        state = PortfolioState(
+            total_equity=Decimal("1000000"),
+            cash=Decimal("0"),
+            positions=[Position(symbol="SBER", quantity=Decimal("100"), avg_price=Decimal("100"))],
+            daily_pnl=Decimal("0"),
+            peak_equity=Decimal("1000000"),
+        )
+        decision = RiskGate(limits).evaluate(_intent(qty=900, price="100"), state)
+
+        assert decision.allowed is True
+        assert decision.violations == ()
+        assert decision.meta["projected_qty"] == pytest.approx(1000.0)
+        assert decision.meta["position_pct"] == pytest.approx(10.0)
 
 
 # ===========================================================================
