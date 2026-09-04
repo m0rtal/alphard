@@ -306,11 +306,7 @@ class TestBackfillFullUniverse:
         store = MagicMock(name="PostgresDataStore")
         _persist_universe_meta(store, meta)
         # At least one call (the class_code patch) carries the timeouts.
-        timeout_calls = [
-            c
-            for c in recording_connect.calls
-            if c.get("connect_timeout") == 10 and "options" not in c
-        ]
+        timeout_calls = [c for c in recording_connect.calls if c.get("connect_timeout") == 10 and "options" not in c]
         assert timeout_calls, f"no timeout-guarded connect calls: {recording_connect.calls}"
 
 
