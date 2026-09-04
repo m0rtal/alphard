@@ -35,7 +35,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from src.data.pg_store import connect_with_timeouts
 from src.web.queries import (
     DEFAULT_BACKUP_DIR,
     DEFAULT_SPARKLINE_DAYS,
@@ -81,9 +80,32 @@ _AUTH_OPEN_PATHS: frozenset[str] = frozenset({"/api/health", "/"})
 
 
 def execute_query(dsn: str, sql: str, params: dict[str, Any]) -> list[dict[str, Any]]:
-    """Run a single-row or multi-row query and return rows as dicts."""
-    with connect_with_timeouts(dsn) as conn:
+    """Run a single-row or multi-row query and return rows as dicts.
+
+    BUGFIX (2026-09-02): `connect_with_timeouts()` was injecting
+    `connect_timeout=10` and `options='-c statement_timeout=60000'` as
+    connection kwargs. With psycopg3 + scram-sha-256 + the alphard-web
+    `network_mode: host` setup, libpq discarded the DSN password before
+    sending the auth packet, producing
+    `fe_sendauth: no password supplied` even though
+    `os.environ['ALPHARD_PG_DSN']` clearly contained the password.
+    Standalone `psycopg.connect(dsn)` from a python -c one-liner inside
+    alphard-web succeeded with the same DSN — only `connect_with_timeouts`
+    failed.
+
+    RE-FIX (2026-09-03, issue #428): the original commit dropped the
+    `statement_timeout=60000` because DSN-options path was broken. The
+    60 s safety is still needed for runaway queries — applied here via
+    `SET LOCAL statement_timeout` inside the same transaction so it
+    does NOT touch the DSN (libpq won't re-parse options) and only
+    affects this call's session, not the underlying pool. Per-statement
+    overhead is one extra round-trip (~0.5 ms on local network).
+    """
+    import psycopg
+
+    with psycopg.connect(dsn, connect_timeout=10) as conn:
         with conn.cursor() as cur:
+            cur.execute("SET LOCAL statement_timeout = 60000")
             cur.execute(sql, params)
             cols = [d.name for d in cur.description] if cur.description else []
             rows = cur.fetchall()
