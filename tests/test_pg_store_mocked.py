@@ -345,10 +345,7 @@ class TestConnectionLifecycle:
             search_path="alphard_test, public",
         )
         s._connect()
-        cur = fake_conn_cls.last.cursors[0]
-        # BUGFIX (C-1): search_path can't use %s placeholders (Postgres
-        # raises SyntaxError for SET). It's validated against _IDENTIFIER_RE
-        # in __init__, then interpolated via f-string (provably safe).
+        cur = fake_conn_cls.last.cursors[1]
         assert any(sql == "SET search_path TO alphard_test, public" for sql, _ in cur.calls)
 
     def test_connect_rejects_unsafe_search_path(self, fake_conn_cls: Any) -> None:
