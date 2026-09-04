@@ -79,7 +79,7 @@ services:
       ALPHARD_METRICS_PORT: ${ALPHARD_METRICS_PORT:-8765}
       # Issue #455 (Closes via this PR): tell Python's `requests`
       # library to verify TLS chains against the Russian GOST CA bundle
-      # bind-mounted at /etc/ssl/certs/tinkoff-gost-ca-bundle.pem.
+      # bind-mounted at /etc/ssl/certs/tinkoff-gost-ca-bundle.txt.
       #
       # Without this env var the bind-mount is dead weight — `requests`
       # uses the `certifi` package's hardcoded bundle by default, which
