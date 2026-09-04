@@ -329,10 +329,18 @@ class RiskGate:
         would fail RISK_POSITION even though it DE-risks the book.
 
         Corrected semantics:
-          * BUY  → counts the full intent notional (new exposure).
+          * BUY  → projects the full post-trade position level, marking
+                   both the existing and incoming quantity at
+                   ``intent.price`` (matches #204 sector price domain).
           * SELL → only the portion that would OPEN a new short counts
                    (qty exceeding the existing long position). The trim
                    portion is allowed because it strictly reduces risk.
+        The BUY projection uses the same live ``intent.price`` domain as
+        the sector check, so position and sector limits evaluate a
+        consistent post-trade exposure level (issue #494: a per-order
+        delta check cannot enforce a per-name level limit; without
+        including the existing holding, N sub-limit BUYs can ratchet a
+        single name past ``max_position_pct``).
         Sector-exposure / drawdown / daily-loss checks are unaffected.
         """
         if state.total_equity <= 0:
@@ -359,7 +367,14 @@ class RiskGate:
             meta["short_qty"] = float(short_qty)
         else:
             # BUY (or anything else — fail-safe: treat as exposure-additive)
-            effective_notional = intent.notional
+            # Project the post-trade POSITION LEVEL: max_position_pct
+            # caps the share of equity one name may represent, so the
+            # existing holding must be included in the check. Marked at
+            # intent.price for price-domain consistency with the sector
+            # check (#204) and the SELL branch.
+            projected_qty = existing_qty + intent.quantity
+            effective_notional = projected_qty * intent.price
+            meta["projected_qty"] = float(projected_qty)
 
         if effective_notional <= Decimal("0"):
             # Pure trim — never trips position limit. Record zero.
@@ -371,7 +386,7 @@ class RiskGate:
 
         if position_pct > self.limits.max_position_pct:
             violations.append(
-                f"RISK_POSITION: intent notional {effective_notional} = {position_pct:.4f}% of equity "
+                f"RISK_POSITION: projected position notional {effective_notional} = {position_pct:.4f}% of equity "
                 f"exceeds limit {self.limits.max_position_pct}%"
             )
 
