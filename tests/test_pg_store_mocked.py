@@ -211,17 +211,13 @@ class _ConnFactory:
         autocommit: bool = False,
         *,
         connect_timeout: int | None = None,
-        options: str | None = None,
     ) -> FakeConnection:
         conn = FakeConnection(dsn, autocommit=autocommit)
         self.instances.append(conn)
         # Record the kwargs alongside the connection so timeout tests can
         # assert that psycopg.connect was called with the right values
         # without reaching into unittest.mock internals.
-        self.last_kwargs = {
-            "connect_timeout": connect_timeout,
-            "options": options,
-        }
+        self.last_kwargs = {"connect_timeout": connect_timeout}
         return conn
 
     @property
@@ -349,10 +345,7 @@ class TestConnectionLifecycle:
             search_path="alphard_test, public",
         )
         s._connect()
-        cur = fake_conn_cls.last.cursors[0]
-        # BUGFIX (C-1): search_path can't use %s placeholders (Postgres
-        # raises SyntaxError for SET). It's validated against _IDENTIFIER_RE
-        # in __init__, then interpolated via f-string (provably safe).
+        cur = fake_conn_cls.last.cursors[1]
         assert any(sql == "SET search_path TO alphard_test, public" for sql, _ in cur.calls)
 
     def test_connect_rejects_unsafe_search_path(self, fake_conn_cls: Any) -> None:
@@ -365,8 +358,9 @@ class TestConnectionLifecycle:
     def test_connect_no_search_path_skips_set(self, fake_conn_cls: Any) -> None:
         s = PostgresDataStore(dsn="host=h dbname=d user=u")
         s._connect()
-        # Only 0 cursors should have been opened — no SET was issued
-        assert fake_conn_cls.last.cursors == []
+        # Only the statement timeout cursor should be opened when no search path
+        assert len(fake_conn_cls.last.cursors) == 1
+        assert fake_conn_cls.last.cursors[0].calls[0][0] == "SET statement_timeout = 60000"
 
     def test_connect_idempotent_when_open(self, fake_conn_cls: Any) -> None:
         s = PostgresDataStore(dsn="host=h dbname=d user=u")
@@ -437,9 +431,8 @@ class TestConnectTimeouts:
     added in src/data/pg_store.py ensure:
     - connect_timeout caps the TCP+startup handshake so a network outage
       surfaces fast (10s) instead of the OS default ~2 minutes.
-    - options="-c statement_timeout=60000" makes Postgres itself cancel
-      any individual query that runs longer than 60s.
-    These tests pin both kwargs so future regressions are caught.
+    - statement_timeout is applied with `SET statement_timeout = 60000`
+      after the connection is established, avoiding libpq's `options` kwarg.
     """
 
     def test_connect_passes_connect_timeout_10(self, fake_conn_cls: Any) -> None:
@@ -450,14 +443,12 @@ class TestConnectTimeouts:
         recorded = fake_conn_cls.last_kwargs  # populated by _ConnFactory
         assert recorded["connect_timeout"] == 10
 
-    def test_connect_passes_statement_timeout_option(self, fake_conn_cls: Any) -> None:
+    def test_connect_passes_statement_timeout(self, fake_conn_cls: Any) -> None:
         s = PostgresDataStore(dsn="host=h dbname=d user=u")
         s._connect()
         recorded = fake_conn_cls.last_kwargs
-        assert "options" in recorded
-        # Statement timeout must be in the libpq options string, in ms.
-        assert "statement_timeout" in recorded["options"]
-        assert "60000" in recorded["options"]
+        assert "options" not in recorded
+        assert fake_conn_cls.last.cursors[0].calls[0][0] == "SET statement_timeout = 60000"
 
     def test_reconnect_uses_timeouts_after_close(self, fake_conn_cls: Any) -> None:
         s = PostgresDataStore(dsn="host=h dbname=d user=u")
@@ -467,7 +458,8 @@ class TestConnectTimeouts:
         assert len(fake_conn_cls.instances) == 2
         # Second connect (re-open) must also carry the timeouts.
         assert fake_conn_cls.last_kwargs["connect_timeout"] == 10
-        assert "statement_timeout" in fake_conn_cls.last_kwargs["options"]
+        assert "options" not in fake_conn_cls.last_kwargs
+        assert fake_conn_cls.last.cursors[0].calls[0][0] == "SET statement_timeout = 60000"
 
 
 class TestInitSchema:
@@ -485,7 +477,7 @@ class TestInitSchema:
         s._connect()
         s._conn = fake_conn_cls.last
         s.init_schema()
-        cur = fake_conn_cls.last.cursors[0]
+        cur = fake_conn_cls.last.cursors[1]
         assert cur.calls[0][0] == "CREATE TABLE foo (id INT);"
         assert fake_conn_cls.last.commit_calls == 1
 

@@ -1,10 +1,10 @@
 """Tests for issue #232: psycopg.connect timeout coverage (PR #46 extension).
 
 PR #46 (commit 1e3b6dd) added ``connect_timeout=10`` + ``options="-c
-statement_timeout=60000"`` to ``src/data/pg_store.py:_connect()``. That fix was
-incomplete: five other psycopg.connect sites in the repo were left
-unprotected. This module verifies the new ``connect_with_timeouts`` helper in
-``src/data.pg_store.py`` AND that the unprotected sites now route through it.
+statement_timeout=60000"`` to ``src/data/pg_store.py:_connect()``. The
+``options`` path was later found to drop the DSN password with psycopg3 +
+scram-sha-256. The shared helper now keeps only ``connect_timeout`` and callers
+enforce statement timeout with server-side SQL.
 
 Coverage targets:
 
@@ -84,11 +84,11 @@ class TestConnectWithTimeouts:
         assert len(recording_connect.calls) == 1
         assert recording_connect.calls[0]["connect_timeout"] == 10
 
-    def test_passes_statement_timeout_option(self, recording_connect: _RecordingConnect) -> None:
+    def test_does_not_pass_statement_timeout_option(self, recording_connect: _RecordingConnect) -> None:
         from src.data.pg_store import connect_with_timeouts
 
         connect_with_timeouts("host=h dbname=d")
-        assert recording_connect.calls[0]["options"] == "-c statement_timeout=60000"
+        assert "options" not in recording_connect.calls[0]
 
     def test_dsn_is_passed_through(self, recording_connect: _RecordingConnect) -> None:
         from src.data.pg_store import connect_with_timeouts
@@ -106,7 +106,7 @@ class TestConnectWithTimeouts:
         assert call["autocommit"] is False
         # Defaults still present
         assert call["connect_timeout"] == 10
-        assert call["options"] == "-c statement_timeout=60000"
+        assert "options" not in call
 
     def test_overrides_can_replace_connect_timeout(self, recording_connect: _RecordingConnect) -> None:
         """A caller may override ``connect_timeout`` for a specific need.
@@ -173,7 +173,7 @@ class TestCoordinatorAudit:
         call = recording_connect.calls[0]
         assert call["dsn"] == "host=alpha dbname=alphard"
         assert call["connect_timeout"] == 10
-        assert call["options"] == "-c statement_timeout=60000"
+        assert "options" not in call
 
     def test_audit_skips_when_no_dsn(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """No store_dsn → audit returns None silently (no psycopg.connect call).
@@ -234,7 +234,7 @@ class TestPostgresAuditLogConnect:
         call = recording_connect.calls[0]
         assert call["dsn"] == "host=alpha dbname=alphard"
         assert call["connect_timeout"] == 10
-        assert call["options"] == "-c statement_timeout=60000"
+        assert "options" not in call
 
     def test_lazy_connect_reuses_existing_connection(
         self,
@@ -280,7 +280,7 @@ class TestBackfillFullUniverse:
         assert len(recording_connect.calls) >= 1
         call = recording_connect.calls[-1]
         assert call["connect_timeout"] == 10
-        assert call["options"] == "-c statement_timeout=60000"
+        assert "options" not in call
 
     def test_persist_universe_meta_passes_timeouts(
         self,
@@ -306,11 +306,7 @@ class TestBackfillFullUniverse:
         store = MagicMock(name="PostgresDataStore")
         _persist_universe_meta(store, meta)
         # At least one call (the class_code patch) carries the timeouts.
-        timeout_calls = [
-            c
-            for c in recording_connect.calls
-            if c.get("connect_timeout") == 10 and c.get("options") == "-c statement_timeout=60000"
-        ]
+        timeout_calls = [c for c in recording_connect.calls if c.get("connect_timeout") == 10 and "options" not in c]
         assert timeout_calls, f"no timeout-guarded connect calls: {recording_connect.calls}"
 
 
@@ -332,7 +328,7 @@ class TestBackfillDelistedViaTinkoff:
         assert len(recording_connect.calls) == 1
         call = recording_connect.calls[0]
         assert call["connect_timeout"] == 10
-        assert call["options"] == "-c statement_timeout=60000"
+        assert "options" not in call
 
 
 # ---------------------------------------------------------------------------
@@ -359,7 +355,7 @@ class TestMarkTerminallyFailed:
         assert len(recording_connect.calls) == 1
         call = recording_connect.calls[0]
         assert call["connect_timeout"] == 10
-        assert call["options"] == "-c statement_timeout=60000"
+        assert "options" not in call
         # Regression: the script's transaction boundary (autocommit=False)
         # must NOT be silently dropped by the helper.
         assert call["autocommit"] is False
@@ -384,7 +380,7 @@ class TestPr46StillApplied:
         s._connect()
         call = recording_connect.calls[-1]
         assert call["connect_timeout"] == 10
-        assert call["options"] == "-c statement_timeout=60000"
+        assert "options" not in call
         # Regression: PR #46's autocommit=True invariant still holds.
         # The MagicMock connection returned by the recorder does not surface
         # autocommit, so this assertion is best-effort; the recorder doesn't

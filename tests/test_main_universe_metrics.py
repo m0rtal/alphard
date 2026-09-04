@@ -404,11 +404,8 @@ def test_uses_connect_with_timeouts_helper(_setup):
         f"expected exactly 1 transitively through connect_with_timeouts"
     )
     assert fake_psycopg.connect.call_args.kwargs == {
-        "connect_timeout": 10,
-        "options": "-c statement_timeout=60000",
-    }, (
-        "H-NETWORK-DETECT two-guard kwargs regressed: " f"{fake_psycopg.connect.call_args.kwargs}"
-    )
+        "connect_timeout": 10
+    }, f"H-NETWORK-DETECT connect guard regressed: {fake_psycopg.connect.call_args.kwargs}"
     # Smoke: gauges still published correctly via the helper.
     assert reg.get_gauge("alphard_tickers_in_universe_total") == 5.0
     assert reg.get_gauge("alphard_tickers_with_full_history_total") == 2.0
