@@ -257,12 +257,20 @@ PG connections count = max (`SELECT count(*) FROM pg_stat_activity`).
 2. Долгосрочно: открыть issue с reproduction; не пытаться «починить»
    увеличением `max_connections` без root cause analysis.
 
-### 5.4 Redis eviction / cache lost
+### 5.4 Rate-limit cache lost (in-process bucket, archaeology note)
 
-Alphard не использует Redis как state store (Postgres — primary),
-поэтому Redis eviction не критичен. Если на стеке включён
-alphard-redis (см. `docker-compose.yaml`) — eviction просто означает
-потерю in-memory cache, не state.
+> **Archaeology note (PR #426, 2026-09-03):** This section is retained
+> as archaeology. The external Redis cache was removed in PR #426.
+> The replacement in-process token bucket lives at
+> `src/data/token_bucket.py`. Old logs from before PR #426 may still
+> mention the alphard-redis container (removed in PR #426); ignore.
+
+On the current stack, rate-limit state lives in the `alphard-bot`
+process memory only — a container restart resets all per-token
+buckets. The first burst after a restart will be unbounded for ~1
+second until the bucket rebuilds from the broker fill history. This
+is by design (PR #426): correctness preserved, throughput is
+per-process rather than cluster-wide.
 
 ---
 

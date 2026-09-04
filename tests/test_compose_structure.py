@@ -4,7 +4,7 @@ Issue #395 (chore: remove Grafana and Prometheus). The Grafana,
 Prometheus, and alphard-chownfix services have been removed from
 docker-compose.yaml. This module:
 
-- Tests that the *remaining* services (postgres, redis, alphard-bot)
+- Tests that the *remaining* services (postgres, alphard-bot)
   are present and structured correctly.
 - Tests that the *removed* services (grafana, prometheus, chownfix)
   are explicitly absent — so a future PR that re-adds them by
@@ -70,14 +70,6 @@ def test_postgres_service_present() -> None:
     # ``volumes`` renders as a list of dicts after ``compose config``.
     vol_sources = [v.get("source") for v in svc.get("volumes", [])]
     assert "alphard-postgres-data" in vol_sources
-
-
-def test_redis_service_present() -> None:
-    cfg = _render_compose()
-    assert "redis" in cfg["services"]
-    svc = cfg["services"]["redis"]
-    assert svc["image"].startswith("redis:")
-    assert svc["container_name"] == "alphard-redis"
 
 
 def test_alphard_bot_service_present() -> None:

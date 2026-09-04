@@ -29,9 +29,10 @@ they run on every CI lane.
      ``ports: !override []`` on the ``alphard-web`` service.
   2. ``scripts/pre_pr_smoke.sh`` no longer redirects ``compose up``
      stderr to ``/dev/null`` — the daemon error must surface on failure.
-  3. The override still scopes ``alphard-bot``, ``alphard-web``,
-     ``postgres`` and (defensively) ``redis`` container_name per-PID,
-     so #374's fix is not regressed by this change.
+  3. The override still scopes ``alphard-bot``, ``alphard-web`` and
+     ``postgres`` container_name per-PID, so #374's fix is not regressed
+     by this change. (alphard-redis was removed by PR #426 — no
+     per-PID override needed.)
 """
 
 from __future__ import annotations
@@ -226,12 +227,13 @@ def test_compose_up_failure_surfaces_daemon_error() -> None:
 def test_override_keeps_per_pid_container_names() -> None:
     """Guard against regression: the #424 port fix must not break #374's
     per-PID container_name overrides for alphard-bot / alphard-web /
-    postgres / redis.
+    postgres. (alphard-redis was removed by PR #426, so it no longer
+    needs a per-PID override.)
     """
     doc = _override_yaml()
     services = doc.get("services", {})
 
-    for service in ("alphard-bot", "alphard-web", "postgres", "redis"):
+    for service in ("alphard-bot", "alphard-web", "postgres"):
         assert service in services, (
             f"Issue #374 regression: override body no longer defines a block "
             f"for service `{service}`. The per-PID container_name override "
@@ -249,7 +251,6 @@ def test_override_keeps_per_pid_container_names() -> None:
         ("alphard-bot", "-alphard-bot-1"),
         ("alphard-web", "-alphard-web-1"),
         ("postgres", "-postgres-1"),
-        ("redis", "-redis-1"),
     ):
         cn = services[service].get("container_name", "")
         assert "${COMPOSE_PROJECT_NAME}" in cn, (

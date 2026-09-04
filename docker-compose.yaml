@@ -6,7 +6,7 @@
 # /srv/alphard; on .107 this is conventionally overridden to
 # /mnt/appdata/alphard to match the rest of the selfhosted fleet: honcho,
 # forgejo, immich, paperclip, bitmagnet, minecraft, etc.). A single
-# mkdir -p's and chown's all four host-data leaves (postgres, redis,
+# mkdir -p's and chown's all four host-data leaves (postgres,
 # before any data service starts. This replaces the per-service
 #
 # PVE LXC userns-mapping bug — root in-container cannot chown across
@@ -30,7 +30,6 @@
 # Phase 1 components:
 #   - alphard-bot        : heartbeat + cron-launched daily_sync.py
 #   - postgres           : DataStore (ohlcv_daily, ticker_universe, decision_log)
-#   - redis              : cache for risk state, news, portfolio drift
 #
 # Phase 3+ additions (profiles: ["observability"]):
 # =============================================================================
@@ -64,7 +63,6 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-alphard}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
       POSTGRES_DB: ${POSTGRES_DB:-alphard}
-      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       LOG_DIR: ${LOG_DIR:-/app/logs}
       RISK_MAX_DD_PCT: ${RISK_MAX_DD_PCT:-10}
@@ -289,93 +287,10 @@ services:
     networks:
       - alphard-net
 
-  redis:
-    image: redis:7-alpine
-    container_name: alphard-redis
-    restart: unless-stopped
-    security_opt:
-      - apparmor=unconfined
-    labels:
-      - "com.centurylinklabs.watchtower.enable=true"
-    # BUGFIX (2026-08-22 #149): Portainer standalone does NOT propagate
-    # stack-level Env vars into service-level environment unless the
-    # service explicitly declares them. Without this explicit declaration
-    # the redis container's entrypoint sees REDIS_PASSWORD as unset,
-    # the inline fail-fast gate trips, and the container restart-loops
-    # forever (verified on .107 stack #111 after StackUpdate from main
-    # HEAD 95c7095 — alphard-redis exited every 1s with "REDIS_PASSWORD
-    # is required (unset/empty in env)").
-    #
-    # The same applies to POSTGRES_PASSWORD on postgres and every other
-    # service that consumes stack-level secrets. Listing them here does
-    # NOT change compose CLI behaviour — `${VAR:-}` defaults still apply
-    # if the operator omits the Env from Portainer stack config — it
-    # just stops Portainer from stripping them from the rendered
-    # container env. Keep this list in sync with the stack Env config
-    # (see /data/compose/111/stack.env on .107 for the canonical list).
-    environment:
-      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
-    # BUGFIX (H-8): fail-fast on missing redis password.
-    #
-    # Why not `${REDIS_PASSWORD:?...}`: YAML anchor (Portainer StackUpdate
-    # `?` semantics) makes the literal form `?` blow up Compose parsing
-    # under Portainer standalone (issue #122 regression). We instead
-    # wrap the redis command in an inline shell script that exits
-    # non-zero if REDIS_PASSWORD is unset/empty. `$$` is escaped so
-    # Compose renders it as a literal `$` for the container shell.
-    # With REDIS_PASSWORD="" the container exits within ~1s of
-    # `docker compose up` → restart loop visible in `docker ps`.
-    command:
-      - sh
-      - -c
-      - |
-        # Issue #129: harden the fail-fast gate against shell-metacharacter
-        # passwords. PR #128 only checked for empty REDIS_PASSWORD, but the
-        # command runs under `sh -c`, so a non-empty password containing
-        # `$`, `"`, `\`, or backtick would be silently mangled before
-        # `redis-server --requirepass` saw it. In the worst case the
-        # mangling produces an empty `--requirepass` arg and Redis starts
-        # without authentication (any container on the alphard-net bridge
-        # can then read/write Redis). In the more common case Redis fails
-        # to start with "wrong number of arguments" and the container
-        # restart-loops until the operator notices.
-        if [ -z "$${REDIS_PASSWORD:-}" ]; then
-          echo "[alphard-redis] FATAL: REDIS_PASSWORD is required (unset/empty in env)" >&2
-          echo "[alphard-redis] FATAL: set REDIS_PASSWORD in .env before 'docker compose up'" >&2
-          exit 1
-        fi
-        # Reject any shell metacharacter in the password. We use printf
-        # to inject literal `$` and `"` into the case pattern because
-        # POSIX case-pattern matching has no portable way to escape them
-        # inside a literal-string pattern; backslash and backtick can be
-        # written as literal `'\'` and `` '`' ``. The heredoc preserves
-        # the backslashes verbatim. See issue #129.
-        case "$${REDIS_PASSWORD}" in
-          *$(printf '%s' '$')*|*$(printf '%s' '"')*|*'\'*|*'`'*)
-            echo "[alphard-redis] FATAL: REDIS_PASSWORD contains shell-unsafe characters (\$, \", \\, or backtick)" >&2
-            echo "[alphard-redis] FATAL: regenerate with: openssl rand -base64 24" >&2
-            echo "[alphard-redis] FATAL: the inline sh -c wrapper would mangle --requirepass before redis-server could read it" >&2
-            exit 1
-            ;;
-        esac
-        exec redis-server --requirepass "$${REDIS_PASSWORD}"
-    volumes:
-      - alphard-redis-data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    # as postgres above. Current redis uses a named volume
-    # the dep keeps the contract future-proof.
-    networks:
-      - alphard-net
 networks:
   alphard-net:
     driver: bridge
 
 volumes:
   alphard-postgres-data:
-    driver: local
-  alphard-redis-data:
     driver: local

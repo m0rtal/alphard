@@ -8,7 +8,7 @@
 
 > **Статус (2026-09-03):** Phase 1 closed (10/10 gaps), Phase 2 closed (10/10
 > merged) — cross-source, delisted cron, metrics, backup, split adjust,
-> sandbox-token redeploy, ohlcv rows panel, alphard-redis removal,
+> sandbox-token redeploy, ohlcv rows panel, alphard-redis removal (PR #426),
 > GOST CA bundle, supervisor circuit breaker. Active phase: see
 > [`docs/PHASE2-ROADMAP.md`](docs/PHASE2-ROADMAP.md).
 > Health: alphard-web operator UI on port 8081 (replaces Grafana/Prometheus, removed, PR #399), alphard-bot `/metrics` on port 8765. Daily Postgres backup at `/mnt/appdata/alphard-backups/`.
@@ -42,7 +42,7 @@ Alphard — автономный multi-agent trading system:
 
 **Phase status (HEAD):** Phase 1 closed (10/10 gaps), Phase 2 closed
 (cross-source, delisted cron, metrics, backup, split adjust,
-sandbox-token redeploy, ohlcv rows panel, alphard-redis removal,
+sandbox-token redeploy, ohlcv rows panel, alphard-redis removal (PR #426),
 GOST CA bundle, supervisor circuit breaker).
 См. [`docs/PHASE2-ROADMAP.md`](docs/PHASE2-ROADMAP.md) для бэклога.
 
@@ -152,7 +152,7 @@ alphard/
 ├── tests/                            # 1621+ tests, ~95% coverage
 ├── .dockerignore
 ├── .env.example                # Шаблон секретов (TINKOFF_SANDBOX_TOKEN/REAL_TOKEN, POSTGRES_PASSWORD)
-├── docker-compose.yaml         # alphard-bot, postgres, redis, alphard-web
+├── docker-compose.yaml         # alphard-bot, postgres, alphard-web
 ├── pyproject.toml              # Poetry (Phase 2+ deps)
 ├── requirements.txt            # Pinned CI deps
 ├── LICENSE                     # Apache-2.0 (canonical, 11.3 KB)
@@ -218,7 +218,7 @@ Branch protection на `main`:
 - `gitleaks` pre-commit + GitHub Actions CI блокируют утечки секретов
 - Контейнер работает от non-root user (UID 1000)
 - Risk Agent — `RiskLimits` frozen=True, любая мутация post-construction → reject
-- Сеть изолирована (postgres/redis только внутри `alphard-net`)
+- Сеть изолирована (postgres только внутри `alphard-net`)
 - Все credentials через `.env`, шаблон в `.env.example`
 - `LIVE_TRADING=false` hardlock в `src/broker/tinkoff_account.py` — бот НЕ
   размещает real orders даже при подмене credentials
