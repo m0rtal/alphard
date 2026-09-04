@@ -211,17 +211,13 @@ class _ConnFactory:
         autocommit: bool = False,
         *,
         connect_timeout: int | None = None,
-        options: str | None = None,
     ) -> FakeConnection:
         conn = FakeConnection(dsn, autocommit=autocommit)
         self.instances.append(conn)
         # Record the kwargs alongside the connection so timeout tests can
         # assert that psycopg.connect was called with the right values
         # without reaching into unittest.mock internals.
-        self.last_kwargs = {
-            "connect_timeout": connect_timeout,
-            "options": options,
-        }
+        self.last_kwargs = {"connect_timeout": connect_timeout}
         return conn
 
     @property
@@ -365,8 +361,9 @@ class TestConnectionLifecycle:
     def test_connect_no_search_path_skips_set(self, fake_conn_cls: Any) -> None:
         s = PostgresDataStore(dsn="host=h dbname=d user=u")
         s._connect()
-        # Only 0 cursors should have been opened — no SET was issued
-        assert fake_conn_cls.last.cursors == []
+        # Only the statement timeout cursor should be opened when no search path
+        assert len(fake_conn_cls.last.cursors) == 1
+        assert fake_conn_cls.last.cursors[0].calls[0][0] == "SET statement_timeout = 60000"
 
     def test_connect_idempotent_when_open(self, fake_conn_cls: Any) -> None:
         s = PostgresDataStore(dsn="host=h dbname=d user=u")
