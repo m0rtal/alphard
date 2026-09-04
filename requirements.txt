@@ -36,4 +36,12 @@ types-requests>=2.31,<3.0
 # Install: pip install t-tech-investments --index-url https://opensource.tbank.ru/api/v4/projects/238/packages/pypi/simple
 t-tech-investments>=1.49,<2.0
 
+# Issue #488: `_is_ca_cert` parses `basicConstraints` via `cryptography.x509`
+# (replacing the openssl-CLI subprocess that broke the openssl-less alpine
+# contract — see #454/#464). Transitive dep of `t-tech-investments`, listed
+# explicitly here so a future Tinkoff-SDK dep-cleanup cannot silently
+# remove the only stdlib-based CA-detection path. Pin to a major version
+# that ships with Python 3.11 wheels.
+cryptography>=42.0,<52.0
+
 PyYAML>=6.0

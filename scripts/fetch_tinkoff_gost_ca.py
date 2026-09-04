@@ -60,6 +60,85 @@ _PEM_BEGIN = "-----BEGIN CERTIFICATE-----"
 _PEM_END = "-----END CERTIFICATE-----"
 
 
+def _drop_leaf(certs: list[bytes]) -> list[bytes]:
+    """Drop leaf cert(s) from the front of a TLS chain.
+
+    `openssl s_client -showcerts` and `SSLSocket.get_verified_chain()`
+    return `[leaf, intermediate_1, intermediate_2, ..., root]`. Some
+    servers (verified against `iss.moex.com` on 2026-09-03) repeat the
+    leaf cert at index 0 AND index 1 — likely a TLS-extension quirk
+    where the server includes the leaf twice in its handshake message.
+    A CA bundle is supposed to contain only CA certs (intermediates +
+    root), so we strip ALL leading leaf certs by walking the front of
+    the chain until we hit a CA (`basicConstraints CA:TRUE`).
+
+    If every cert in the chain is a leaf (broken upstream CA chain —
+    server sending only its own cert with no intermediate), raise so
+    the caller fails the write instead of shipping a leaf-only bundle
+    that has zero usable CAs (issue #482).
+    """
+    if not certs:
+        raise RuntimeError("chain is empty; refusing to ship a leaf-only bundle (issue #482)")
+    # Walk the chain from the front; collect indices that are leaves.
+    leaf_count = 0
+    for der in certs:
+        if _is_ca_cert(der):
+            break
+        leaf_count += 1
+    if leaf_count == len(certs):
+        raise RuntimeError(
+            f"chain has {len(certs)} cert(s) and none is a CA (basicConstraints CA:TRUE); "
+            f"refusing to ship a leaf-only bundle (issue #482)"
+        )
+    return certs[leaf_count:]
+
+
+def _is_ca_cert(der: bytes) -> bool:
+    """Return True iff the DER cert carries ``basicConstraints CA:TRUE``.
+
+    Pure-Python parse via ``cryptography.x509`` (already a project dep
+    used by ``_fetch_chain_python`` for the bytes-shaped-chain fix in
+    #464; listed explicitly in ``requirements.txt`` and
+    ``requirements-ci.txt`` since PR #486 closes #488). Returns False on
+    any decode error (treating undecodable bytes as non-CA so the
+    caller strips them — safer than keeping unknowns).
+
+    Why no ``openssl x509 -ext basicConstraints`` subprocess: the openssl
+    CLI is not guaranteed to exist on the alphard-bot alpine container
+    (per the module docstring: ``python+pyOpenSSL (no openssl CLI)``).
+    Shell-out based CA detection would mark every cert as a leaf on
+    openssl-less hosts, causing ``_drop_leaf`` to raise
+    ``RuntimeError("chain has N cert(s) and none is a CA...")`` and
+    refuse to write the bundle. Issue #488.
+    """
+    try:
+        from cryptography import x509
+        from cryptography.x509.oid import ExtensionOID
+    except ImportError:
+        # cryptography is a hard dep of the project (requirements.txt);
+        # this branch only fires on a manually-stripped install. Treat
+        # the cert as a leaf (caller strips it) so the script fails
+        # loudly on a missing dep rather than silently shipping a
+        # leaf-only bundle.
+        return False
+
+    try:
+        cert = x509.load_der_x509_certificate(der)
+    except Exception:  # noqa: BLE001 — DER parse error → not a CA
+        return False
+
+    try:
+        bc = cert.extensions.get_extension_for_oid(ExtensionOID.BASIC_CONSTRAINTS).value
+    except x509.ExtensionNotFound:
+        # RFC 5280 §4.2.1.9: a cert without basicConstraints is a leaf.
+        return False
+
+    # `bc` is `cryptography.x509.BasicConstraints` at runtime; the type
+    # is reported as `ExtensionType` upstream, so we read the attribute
+    # through ``getattr`` to keep the type checker happy.
+    return bool(getattr(bc, "ca", False))
+
+
 def _parse_pem_blocks(text: str) -> list[bytes]:
     """Parse `BEGIN CERTIFICATE ... END CERTIFICATE` blocks out of `text`.
 
@@ -155,7 +234,9 @@ def fetch_chain(host: str, port: int, timeout: float = 10.0) -> list[bytes]:
             f"(stdout first 200 chars: {proc.stdout[:200]!r})"
         )
 
-    return blocks
+    # Issue #482: openssl `-showcerts` returns [leaf, intermediate, root];
+    # strip the leaf so the bundle contains only CA certs.
+    return _drop_leaf(blocks)
 
 
 def _fetch_chain_python(host: str, port: int, timeout: float, reason: str) -> list[bytes]:
@@ -219,7 +300,9 @@ def _fetch_chain_python(host: str, port: int, timeout: float, reason: str) -> li
                             f"{exc!r}"
                         ) from exc
                     out.append(c.public_bytes(serialization.Encoding.DER))
-                return out
+                # Issue #482: `get_verified_chain()` returns [leaf, ...CA];
+                # strip the leaf so the bundle contains only CA certs.
+                return _drop_leaf(out)
             raise RuntimeError(
                 f"openssl CLI missing and Python <3.13 on {host}:{port}: "
                 f"stdlib ssl module cannot extract the certificate chain (only the leaf "
